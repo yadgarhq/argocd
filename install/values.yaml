@@ -1,0 +1,34 @@
+# Argo CD's own install values. Argo manages Argo: this chart is applied once by
+# hand to bootstrap, then an Application in projects/ points back here so every
+# subsequent change arrives the same way as everything else.
+#
+# Chart: argo-cd from https://argoproj.github.io/argo-helm
+
+configs:
+  params:
+    # Local development terminates TLS at the k3d loadbalancer, not at Argo.
+    server.insecure: true
+  cm:
+    # D54's generator enumerates the organisation, so Argo must be allowed to
+    # create Applications for repos it discovers rather than a fixed list.
+    application.resourceTrackingMethod: annotation
+    timeout.reconciliation: 60s
+
+controller:
+  # One replica in development. Production sizing is a values override, not a
+  # different manifest.
+  replicas: 1
+
+applicationSet:
+  # The SCM Provider generator lives here (D54). Without this component the
+  # module repos are never discovered at all.
+  enabled: true
+  replicas: 1
+
+notifications:
+  enabled: false
+
+dex:
+  # No SSO in development. iam owns identity for the yadgar services themselves;
+  # this is only Argo's own console.
+  enabled: false

@@ -1,0 +1,21 @@
+# The app-of-apps root, applied once during bootstrap. Everything else — Argo's
+# own values, the ApplicationSets, the infra in yadgarhq/deploy — arrives
+# through this.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-20"
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/yadgarhq/argocd
+    targetRevision: main
+    path: applicationsets
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}

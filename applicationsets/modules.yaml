@@ -1,0 +1,53 @@
+# D54: deployment is an ApplicationSet over the organisation, not an umbrella
+# chart. A module is a repo; a repo with a chart/ directory and the opt-in topic
+# is deployed. Nothing central lists the modules — the umbrella's Chart.yaml
+# would have been the fourth instance of the coupling shape D7, D21 and D51
+# already refuse.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: yadgar-modules
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: [missingkey=error]
+  generators:
+    - scmProvider:
+        github:
+          organization: yadgarhq
+          # Enumerating public repos works unauthenticated but is rate-limited
+          # hard. Create with:
+          #   kubectl -n argocd create secret generic github-scm \
+          #     --from-literal=token=<PAT with read-only repo scope>
+          tokenRef:
+            secretName: github-scm
+            key: token
+        filters:
+          # OPT-IN, never opt-out (D54). A generator that deploys anything
+          # appearing in the organisation is aimed squarely at the next scratch
+          # repo. A repo declares itself deployable by carrying the topic.
+          - repositoryMatch: ".*"
+            pathsExist: [chart]
+            labelMatch: "yadgar-deployable"
+  template:
+    metadata:
+      name: '{{ .repository }}'
+      annotations:
+        # Services deploy last. Infra, operators and databases claim the earlier
+        # waves — see infra/. Ordering is what the umbrella gave for free.
+        argocd.argoproj.io/sync-wave: "10"
+    spec:
+      project: default
+      source:
+        repoURL: '{{ .url }}'
+        targetRevision: '{{ .branch }}'
+        path: chart
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: yadgar
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
