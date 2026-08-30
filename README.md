@@ -13,7 +13,25 @@ The cluster and the infrastructure live in
 | `install/values.yaml` | Helm values for the `argo-cd` chart |
 | `projects/root.yaml` | app-of-apps root, applied once during bootstrap |
 | `applicationsets/modules.yaml` | discovers module repos across the organisation |
-| `applicationsets/argocd-self.yaml` | Argo managing Argo — what makes `install/values.yaml` actually apply |
+
+`applications/` holds single `Application` resources; `applicationsets/` holds
+generators that produce many. Keeping them apart matters because the two are
+read differently — one names a thing, the other names a rule.
+
+## What lives where
+
+| | |
+|---|---|
+| **this repo** | Argo itself, and how Argo discovers work |
+| **`yadgarhq/deploy`** | what Argo deploys that is not a module — the infrastructure |
+| **module repos** | each carries its own `chart/`, found by the ApplicationSet |
+
+Infrastructure `Application` resources live in `deploy` beside the manifests and
+values they point at, rather than being centralised here. That is the same
+argument D54 makes against an umbrella chart: a single place listing everything
+becomes the thing every change has to touch. Argo's own configuration is the one
+exception, because it has nowhere else to live.
+| `applications/argocd.yaml` | Argo managing Argo — what makes `install/values.yaml` actually apply |
 
 ## Argo manages Argo
 

@@ -13,7 +13,13 @@ spec:
   source:
     repoURL: https://github.com/yadgarhq/argocd
     targetRevision: main
-    path: applicationsets
+    # Everything Argo needs to know about ITSELF and about how it finds work.
+    # `directory.recurse` picks up both applications/ and applicationsets/, so
+    # adding either is a file rather than an edit here.
+    path: .
+    directory:
+      recurse: true
+      include: "{applications,applicationsets}/*.yaml"
   destination:
     server: https://kubernetes.default.svc
     namespace: argocd
