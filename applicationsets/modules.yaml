@@ -22,6 +22,12 @@ spec:
           tokenRef:
             secretName: github-scm
             key: token
+          # HTTPS, EXPLICITLY. The GitHub provider defaults to the ssh clone URL,
+          # and the repo-server has no SSH agent — so every generated Application
+          # failed with "SSH agent requested but SSH_AUTH_SOCK not-specified" and
+          # sat in Unknown: healthy-looking, syncing nothing. The module
+          # repositories are public, so HTTPS needs no credential at all.
+          cloneProtocol: https
         filters:
           # OPT-IN, never opt-out (D54). A generator that deploys anything
           # appearing in the organisation is aimed squarely at the next scratch
