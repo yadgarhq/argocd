@@ -31,7 +31,7 @@ spec:
             labelMatch: "yadgar-deployable"
   template:
     metadata:
-      name: '{{ .repository }}'
+      name: "{{ .repository }}"
       annotations:
         # Services deploy last. Infra, operators and databases claim the earlier
         # waves — see infra/. Ordering is what the umbrella gave for free.
@@ -39,8 +39,8 @@ spec:
     spec:
       project: default
       source:
-        repoURL: '{{ .url }}'
-        targetRevision: '{{ .branch }}'
+        repoURL: "{{ .url }}"
+        targetRevision: "{{ .branch }}"
         path: chart
       destination:
         server: https://kubernetes.default.svc

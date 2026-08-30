@@ -8,11 +8,11 @@ The cluster and the infrastructure live in
 [`yadgarhq/deploy`](https://github.com/yadgarhq/deploy). Decisions are in
 [`yadgarhq/docs`](https://github.com/yadgarhq/docs) — D54 especially.
 
-| Path | |
-|---|---|
-| `install/values.yaml` | Helm values for the `argo-cd` chart |
-| `projects/root.yaml` | app-of-apps root, applied once during bootstrap |
-| `applicationsets/modules.yaml` | discovers module repos across the organisation |
+| Path                           |                                                 |
+| ------------------------------ | ----------------------------------------------- |
+| `install/values.yaml`          | Helm values for the `argo-cd` chart             |
+| `projects/root.yaml`           | app-of-apps root, applied once during bootstrap |
+| `applicationsets/modules.yaml` | discovers module repos across the organisation  |
 
 `applications/` holds single `Application` resources; `applicationsets/` holds
 generators that produce many. Keeping them apart matters because the two are
@@ -20,11 +20,11 @@ read differently — one names a thing, the other names a rule.
 
 ## What lives where
 
-| | |
-|---|---|
-| **this repo** | Argo itself, and how Argo discovers work |
+|                       |                                                             |
+| --------------------- | ----------------------------------------------------------- |
+| **this repo**         | Argo itself, and how Argo discovers work                    |
 | **`yadgarhq/deploy`** | what Argo deploys that is not a module — the infrastructure |
-| **module repos** | each carries its own `chart/`, found by the ApplicationSet |
+| **module repos**      | each carries its own `chart/`, found by the ApplicationSet  |
 
 Infrastructure `Application` resources live in `deploy` beside the manifests and
 values they point at, rather than being centralised here. That is the same
@@ -36,7 +36,7 @@ exception, because it has nowhere else to live.
 ## Argo manages Argo
 
 `install/values.yaml` is not read by the bootstrap. `make bootstrap` in
-`yadgarhq/deploy` passes only the few `--set` flags needed to *reach* the
+`yadgarhq/deploy` passes only the few `--set` flags needed to _reach_ the
 server; the real values arrive through `applicationsets/argocd-self.yaml`, one
 sync later.
 
