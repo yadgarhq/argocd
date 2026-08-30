@@ -13,6 +13,22 @@ The cluster and the infrastructure live in
 | `install/values.yaml` | Helm values for the `argo-cd` chart |
 | `projects/root.yaml` | app-of-apps root, applied once during bootstrap |
 | `applicationsets/modules.yaml` | discovers module repos across the organisation |
+| `applicationsets/argocd-self.yaml` | Argo managing Argo — what makes `install/values.yaml` actually apply |
+
+## Argo manages Argo
+
+`install/values.yaml` is not read by the bootstrap. `make bootstrap` in
+`yadgarhq/deploy` passes only the few `--set` flags needed to *reach* the
+server; the real values arrive through `applicationsets/argocd-self.yaml`, one
+sync later.
+
+Without that Application the values file would apply to nothing while looking
+authoritative, which is worse than not having it.
+
+Its sync is **not** automated, deliberately. A self-managing Argo that
+auto-syncs its own Deployment can restart itself mid-sync and leave the
+operation in an unknown state — reviewing the diff and syncing on purpose is the
+safer default for the one component that would have to fix itself.
 
 ## How modules get deployed
 

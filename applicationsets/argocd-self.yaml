@@ -1,0 +1,48 @@
+# ARGO MANAGES ARGO. The chart is installed once by hand to bootstrap — a GitOps
+# controller cannot arrive by GitOps — and this Application is what makes every
+# change after that arrive the same way every other change does.
+#
+# Without it, install/values.yaml in this repo applies to nothing: the bootstrap
+# passes only the handful of --set flags needed to REACH the server, and the
+# real values would sit in git being read by nobody. That gap is worse than
+# having no file at all, because the file looks authoritative.
+#
+# On first sync Argo adopts the resources helm installed. They carry no Argo
+# tracking annotation, so they read as OutOfSync until it takes ownership.
+#
+# The chart version lives here rather than in the Makefile once this is
+# syncing: upgrading Argo becomes a bump in this file.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: argocd
+  namespace: argocd
+  annotations:
+    # Before everything. Argo configuring itself precedes anything it deploys.
+    argocd.argoproj.io/sync-wave: "-25"
+spec:
+  project: default
+  sources:
+    # Two sources: the upstream chart, and this repo supplying its values. The
+    # `$self` ref is what lets a chart from one repo read a values file from
+    # another without vendoring the chart.
+    - repoURL: https://argoproj.github.io/argo-helm
+      chart: argo-cd
+      targetRevision: 8.6.1
+      helm:
+        valueFiles:
+          - $self/install/values.yaml
+    - repoURL: https://github.com/yadgarhq/argocd
+      targetRevision: main
+      ref: self
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    # NOT automated, deliberately. A self-managing Argo that auto-syncs its own
+    # Deployment can restart itself mid-sync and leave the operation in an
+    # unknown state. Reviewing the diff and syncing on purpose is the safer
+    # default for the one component that would have to fix itself.
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
