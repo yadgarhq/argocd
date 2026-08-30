@@ -22,12 +22,18 @@ spec:
           tokenRef:
             secretName: github-scm
             key: token
-          # HTTPS, EXPLICITLY. The GitHub provider defaults to the ssh clone URL,
-          # and the repo-server has no SSH agent — so every generated Application
-          # failed with "SSH agent requested but SSH_AUTH_SOCK not-specified" and
-          # sat in Unknown: healthy-looking, syncing nothing. The module
-          # repositories are public, so HTTPS needs no credential at all.
-          cloneProtocol: https
+        # HTTPS, EXPLICITLY, and on scmProvider — NOT inside `github`.
+        #
+        # The GitHub provider defaults to the ssh clone URL and the repo-server
+        # has no SSH agent, so every generated Application failed with "SSH agent
+        # requested but SSH_AUTH_SOCK not-specified" and sat in Unknown: healthy
+        # looking, syncing nothing.
+        #
+        # The nesting matters and fails SILENTLY when wrong. Placed under
+        # `github` the field is not in that object's schema, so Kubernetes prunes
+        # it on apply — the sync reports "successfully synced (all tasks run)",
+        # the resource stays OutOfSync forever, and nothing says why.
+        cloneProtocol: https
         filters:
           # OPT-IN, never opt-out (D54). A generator that deploys anything
           # appearing in the organisation is aimed squarely at the next scratch
