@@ -54,6 +54,28 @@ spec:
         repoURL: "{{ .url }}"
         targetRevision: "{{ .branch }}"
         path: chart
+        # THE REFERENCE DEPLOYMENT IS WHERE THE OPINIONS LIVE (D80).
+        #
+        # Module charts default `autoscaling.enabled` to FALSE, because a chart
+        # that cannot `helm install` without KEDA's CRDs requires an operator the
+        # adopter never chose — D80 names that violation by example. The charts
+        # therefore ship installable on a bare cluster, and this file, which is
+        # the reference deployment, turns autoscaling back on because THIS
+        # cluster does run KEDA.
+        #
+        # Uniform across every module on purpose. The generator enumerates
+        # modules rather than listing them (D54), so there is nowhere to put a
+        # per-module value without reintroducing the central list D54 exists to
+        # delete. Every module wants autoscaling here; a module that one day does
+        # not can override in its own values.yaml.
+        #
+        # D68 requires autoscaling of every module and is not softened by this:
+        # what moved is WHERE the requirement is expressed, from the chart's
+        # default to the deployment that has the operator installed.
+        helm:
+          values: |
+            autoscaling:
+              enabled: true
       destination:
         server: https://kubernetes.default.svc
         namespace: yadgar
