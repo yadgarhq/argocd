@@ -123,6 +123,119 @@ spec:
             # values.yaml is exactly as platform-neutral as a hop count.
             sourceAddress:
               trustedProxyHops: ""
+            # THE TLS CUT-OVER (task 522). Cars 1-3 shipped the code in every
+            # client and every server and left it all defaulting off; this block
+            # is the whole of turning it on, and reverting this block is the
+            # whole of turning it back off.
+            #
+            # THIS IS THE SECOND ATTEMPT, and the first one is worth two minutes
+            # before you review the rest. It was reverted in #12 with a body
+            # blaming a defect in iam-db's listener. THERE IS NO SUCH DEFECT.
+            # The listener honoured this flag the whole time; the pods were
+            # running images from tags cut BEFORE the listener code existed, so
+            # they ignored an environment variable they had never heard of and
+            # served cleartext without logging anything. See D81.
+            #
+            # What makes it safe now is not a code change. It is that iam-db
+            # v0.5.0, task v0.4.0 and task-db v0.3.0 are cut, published AND
+            # rolled, and all three now emit a `tls` field on their listening
+            # log line, which the previous images could not do at all. Before
+            # re-reverting this block for any reason, check that field first:
+            #   kubectl -n yadgar logs <pod> | grep listening
+            # A missing `tls` field means the binary predates the feature. A
+            # `"tls":false` means the flag did not reach it. They are different
+            # faults and they need different fixes.
+            #
+            # ALL FOUR HOPS IN ONE CHANGE, and that is FORCED rather than
+            # preferred. Two facts combine to force it, and a reviewer should
+            # check both rather than take them on trust:
+            #
+            # First, a hop cannot be half cut over. A TLS server does not answer
+            # a cleartext client and a cleartext server does not answer a TLS
+            # one, and no service opens a second listener. So the server and the
+            # client of one hop move together or that hop breaks.
+            #
+            # Second, the four listeners cannot be moved separately from here.
+            # The listener value is `tls.enabled` in ALL FOUR server charts —
+            # iam, iam-db, task and task-db read the identical path — so the one
+            # line below reaches every one of them at once. D54's generator
+            # enumerates modules rather than listing them, so there is nowhere in
+            # this file to say "iam-db only" that is not a central list of
+            # modules, which is the thing D54 exists to delete.
+            #
+            # Together those two mean the intuitive order — the -db hops first,
+            # where an interruption is contained, and the gateway's two hops last
+            # — IS NOT AVAILABLE. Every module Application carries sync-wave 10,
+            # so all five roll together and every hop is briefly interrupted at
+            # once. That cost is real and is the price of not adding a central
+            # list; it is paid once rather than four times.
+            #
+            # THE ROLLING FAILURE IS CRASHLOOPBACKOFF, NOT A SMOOTH DIP, and
+            # that is worth knowing before you watch the roll. Three of the four
+            # clients connect EAGERLY at boot and exit if the upstream name does
+            # not resolve — gateway to task, iam to iam-db and task to task-db
+            # all go through `yadgar_dial::connect_tls`, whose
+            # `BalanceError::NoEndpoints` is a boot failure. Only gateway to iam
+            # is lazy. With replicaCount 2 a rolling update should keep an
+            # endpoint ready, so this is low-probability rather than certain,
+            # but the shape when it happens is a restart count and a backoff,
+            # not a dip.
+            #
+            # THE OFF-FILE ALTERNATIVES WERE ELIMINATED IN #11, whose body is no
+            # longer in effect, so they are named here rather than re-derived.
+            # A per-repo `chart/values.yaml` default makes the chart
+            # uninstallable on a bare cluster (D80). Renaming the listener key
+            # per module is a four-repo chart-surface redesign. A second
+            # ApplicationSet with a narrower filter would own the same
+            # Applications as this one. None is cheaper than paying the
+            # interruption once.
+            #
+            # THE CERTIFICATES EXPIRE 2026-12-01T19:35:07Z, and this is the
+            # commit that leaves TLS on, so the deadline lives here. They carry
+            # duration 2160h with renewBefore 720h, so cert-manager rewrites the
+            # Secrets on 2026-11-01 — and no chart carries a checksum annotation
+            # or a reloader, and the listener reads its PEM once when it is
+            # built. A pod started today therefore serves its day-0 leaf until
+            # 2026-12-01 no matter what cert-manager writes. Ledger 537 owns
+            # closing that; until it is closed, a restart is what picks up a
+            # renewed leaf. (#11's body said 2026-11-30; the certificates were
+            # re-issued on 2026-09-02, so that date is superseded.)
+            #
+            # INERT FOR `gateway`, which reads no top-level `tls` at all — its
+            # chart has no such value and its templates never name one. The
+            # gateway's own certificate is the Gateway API listener's, a
+            # different thing entirely, and it is untouched here.
+            tls:
+              enabled: true
+            # THE DIAL SIDE, which unlike the listener above IS already per-hop.
+            # Each key names the upstream it reaches, so each is read by exactly
+            # one chart: `iam` and `task` by the gateway, `iamDb` by iam and
+            # `taskDb` by task. The same shape `sourceAddress` above relies on —
+            # helm ignores a value the chart it is handed does not read.
+            #
+            # That granularity buys nothing on its own, which is why they are
+            # here rather than in a later change: the listeners above are already
+            # refusing cleartext, so a client left off is a hop left broken.
+            #
+            # HOW TO PROVE THIS TOOK, carried forward from #11 because it is the
+            # only check that cannot pass against a cleartext server. Probe a
+            # listener with a `-plaintext` client: an `Unimplemented` answer
+            # means it ANSWERED, so the cut-over did NOT take. A transport-level
+            # refusal is the pass. The refusal is the result; an answer is the
+            # failure. Then drive a real `create_task` through the gateway,
+            # which is the only check that puts a request across all four hops.
+            iam:
+              tls:
+                enabled: true
+            task:
+              tls:
+                enabled: true
+            iamDb:
+              tls:
+                enabled: true
+            taskDb:
+              tls:
+                enabled: true
       destination:
         server: https://kubernetes.default.svc
         namespace: yadgar
