@@ -97,8 +97,32 @@ spec:
             # for making an audit record's integrity a property of running Envoy.
             # Change this number if the edge ever sits behind something that also
             # appends — a cloud load balancer would make it "2".
+            # REVERTED 2026-09-02, the same day it was set, and it stays "" until
+            # `Source::resolve` checks the PEER.
+            #
+            # Declaring a hop count tells the gateway to read the client's address
+            # out of `X-Forwarded-For` at that depth. It does NOT tell it to check
+            # that the connection came from the declared proxy — `resolve` takes a
+            # `peer` argument and, on the `Hops(n>0)` path, never compares it to
+            # anything. So any pod that reaches the ClusterIP Service directly,
+            # bypassing the ingress, presents a chain of the right length and is
+            # attributed to whatever address it names.
+            #
+            # That is WORSE than leaving it undeclared, which is why this is a
+            # revert rather than a note. Undeclared keys every login on the one
+            # observed hop: a weak bucket, but not a forgeable one. Declared, an
+            # attacker mints a FRESH bucket per forged value — the limiter is
+            # defeated by minting keys rather than by draining one, and the login
+            # throttle is simply absent for that caller.
+            #
+            # A NetworkPolicy does not cover this: the reference CNI is kindnet,
+            # which does not implement one.
+            #
+            # Restore "1" once the gateway checks the peer against a trusted
+            # proxy range. That check is portable under D80 — a CIDR list in
+            # values.yaml is exactly as platform-neutral as a hop count.
             sourceAddress:
-              trustedProxyHops: "1"
+              trustedProxyHops: ""
       destination:
         server: https://kubernetes.default.svc
         namespace: yadgar
