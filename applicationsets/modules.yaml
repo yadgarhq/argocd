@@ -76,6 +76,29 @@ spec:
           values: |
             autoscaling:
               enabled: true
+            # CONSUMED ONLY BY `gateway`, and inert everywhere else — helm
+            # ignores a value a chart does not read. It sits in this shared block
+            # because D54's generator enumerates modules rather than listing
+            # them, so there is nowhere to put a per-module value that would not
+            # reintroduce the central list D54 exists to delete.
+            #
+            # ONE ingress appends to X-Forwarded-For between a client and the
+            # gateway: the Envoy Gateway edge. So the client's address is the
+            # rightmost entry, one place from the right.
+            #
+            # Until this is declared the gateway refuses to attribute an address
+            # at all — authentication events carry none, and /auth/login and
+            # /auth/enrol are bounded per OBSERVED HOP, which behind an ingress
+            # is one bucket shared by everybody. The refusal is the safe
+            # direction and this value is what turns it into a working control.
+            #
+            # It is a hop COUNT and not an ingress resource, per D80: an earlier
+            # revision prescribed an Envoy ClientTrafficPolicy and was retracted
+            # for making an audit record's integrity a property of running Envoy.
+            # Change this number if the edge ever sits behind something that also
+            # appends — a cloud load balancer would make it "2".
+            sourceAddress:
+              trustedProxyHops: "1"
       destination:
         server: https://kubernetes.default.svc
         namespace: yadgar
