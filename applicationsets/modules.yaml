@@ -123,6 +123,62 @@ spec:
             # values.yaml is exactly as platform-neutral as a hop count.
             sourceAddress:
               trustedProxyHops: ""
+            # THE TLS CUT-OVER (task 522). Cars 1-3 shipped the code in every
+            # client and every server and left it all defaulting off; this block
+            # is the whole of turning it on, and reverting this block is the
+            # whole of turning it back off.
+            #
+            # ALL FOUR HOPS IN ONE CHANGE, and that is FORCED rather than
+            # preferred. Two facts combine to force it, and a reviewer should
+            # check both rather than take them on trust:
+            #
+            # First, a hop cannot be half cut over. A TLS server does not answer
+            # a cleartext client and a cleartext server does not answer a TLS
+            # one, and no service opens a second listener. So the server and the
+            # client of one hop move together or that hop breaks.
+            #
+            # Second, the four listeners cannot be moved separately from here.
+            # The listener value is `tls.enabled` in ALL FOUR server charts —
+            # iam, iam-db, task and task-db read the identical path — so the one
+            # line below reaches every one of them at once. D54's generator
+            # enumerates modules rather than listing them, so there is nowhere in
+            # this file to say "iam-db only" that is not a central list of
+            # modules, which is the thing D54 exists to delete.
+            #
+            # Together those two mean the intuitive order — the -db hops first,
+            # where an interruption is contained, and the gateway's two hops last
+            # — IS NOT AVAILABLE. Every module Application carries sync-wave 10,
+            # so all five roll together and every hop is briefly interrupted at
+            # once. That cost is real and is the price of not adding a central
+            # list; it is paid once rather than four times.
+            #
+            # INERT FOR `gateway`, which reads no top-level `tls` at all — its
+            # chart has no such value and its templates never name one. The
+            # gateway's own certificate is the Gateway API listener's, a
+            # different thing entirely, and it is untouched here.
+            tls:
+              enabled: true
+            # THE DIAL SIDE, which unlike the listener above IS already per-hop.
+            # Each key names the upstream it reaches, so each is read by exactly
+            # one chart: `iam` and `task` by the gateway, `iamDb` by iam and
+            # `taskDb` by task. The same shape `sourceAddress` above relies on —
+            # helm ignores a value the chart it is handed does not read.
+            #
+            # That granularity buys nothing on its own, which is why they are
+            # here rather than in a later change: the listeners above are already
+            # refusing cleartext, so a client left off is a hop left broken.
+            iam:
+              tls:
+                enabled: true
+            task:
+              tls:
+                enabled: true
+            iamDb:
+              tls:
+                enabled: true
+            taskDb:
+              tls:
+                enabled: true
       destination:
         server: https://kubernetes.default.svc
         namespace: yadgar
