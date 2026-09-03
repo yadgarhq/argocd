@@ -174,9 +174,16 @@ spec:
             # that is worth knowing before you watch the roll. Three of the four
             # clients connect EAGERLY at boot and exit if the upstream name does
             # not resolve — gateway to task, iam to iam-db and task to task-db
-            # all go through `yadgar_dial::connect_tls`, whose
-            # `BalanceError::NoEndpoints` is a boot failure. Only gateway to iam
-            # is lazy. With replicaCount 2 a rolling update should keep an
+            # all go through `yadgar_dial::connect_tls`, whose DNS failure is a
+            # boot failure. Only gateway to iam is lazy.
+            #
+            # THE VARIANT IS `BalanceError::Dns`, NOT `NoEndpoints`, and an
+            # earlier revision of this comment named the wrong one. Measured:
+            # dialling a name that does not resolve returns `Dns`. `NoEndpoints`
+            # needs `lookup_host` to return `Ok` with an empty list, which
+            # getaddrinfo does not do, so that variant is effectively
+            # unreachable. It matters here because the variant is what an
+            # operator greps for when a pod will not start. With replicaCount 2 a rolling update should keep an
             # endpoint ready, so this is low-probability rather than certain,
             # but the shape when it happens is a restart count and a backoff,
             # not a dip.
