@@ -50,199 +50,300 @@ spec:
         argocd.argoproj.io/sync-wave: "10"
     spec:
       project: default
-      source:
-        repoURL: "{{ .url }}"
-        targetRevision: "{{ .branch }}"
-        path: chart
-        # THE REFERENCE DEPLOYMENT IS WHERE THE OPINIONS LIVE (D80).
+      # TWO SOURCES, AND THE SECOND ONE IS THIS REPOSITORY. The chart still comes
+      # from the module at HEAD; the second source exists only so the chart can
+      # read a values file that lives HERE. `applications/argocd.yaml` already
+      # does exactly this with `$self`, against this same repository — the shape
+      # is in use rather than new.
+      sources:
+        - repoURL: "{{ .url }}"
+          targetRevision: "{{ .branch }}"
+          path: chart
+          # THE REFERENCE DEPLOYMENT IS WHERE THE OPINIONS LIVE (D80).
+          #
+          # Module charts default `autoscaling.enabled` to FALSE, because a chart
+          # that cannot `helm install` without KEDA's CRDs requires an operator the
+          # adopter never chose — D80 names that violation by example. The charts
+          # therefore ship installable on a bare cluster, and this file, which is
+          # the reference deployment, turns autoscaling back on because THIS
+          # cluster does run KEDA.
+          #
+          # Uniform across every module on purpose. The generator enumerates
+          # modules rather than listing them (D54), so there is nowhere to put a
+          # per-module value without reintroducing the central list D54 exists to
+          # delete. Every module wants autoscaling here; a module that one day does
+          # not can override in its own values.yaml.
+          #
+          # D68 requires autoscaling of every module and is not softened by this:
+          # what moved is WHERE the requirement is expressed, from the chart's
+          # default to the deployment that has the operator installed.
+          helm:
+            # PUBLISHING AN IMAGE USED TO ROLL NOTHING, and these three lines are
+            # the fix. A module chart in git names its image by a moving tag
+            # (D65) with `imagePullPolicy: Always`, and `Always` is evaluated
+            # when a container is CREATED — it never itself causes one to be
+            # created. So a release moved `:latest` and no pod restarted, while
+            # this ApplicationSet's Applications reported Synced/Healthy the
+            # whole time. Measured 2026-09-03: FOUR of the five deployed services
+            # were behind for a full day, `task-db` by four releases, and they
+            # were deployed in the end by hand. The fifth was current only
+            # because an unrelated pod-spec change had restarted it.
+            #
+            # The released version is written here by `ci-release` in the module
+            # that released it, into `versions/<repo>.yaml`. A changed tag is a
+            # changed pod template, and a changed pod template is a rollout.
+            #
+            # THIS IS NOT THE CENTRAL LIST D54 DELETES, and the distinction is
+            # the whole design rather than a technicality. A map of module to
+            # version in this file would be that list — it would name every
+            # module, and a new module would not deploy until somebody edited
+            # here. What is below is a PATH templated from the generator: nothing
+            # enumerates anything, a file exists because a module released, and
+            # `ignoreMissingValueFiles` is what makes its absence mean nothing.
+            #
+            # SO THE TWO CASES A REVIEWER SHOULD CHECK BOTH RESOLVE TO "AS
+            # BEFORE". A module that has never released has no file, helm is
+            # handed no `-f`, and the chart's own `image.tag: latest` stands —
+            # which is exactly today's behaviour, so merging this alone changes
+            # no rendered manifest and rolls no pod. A module's FIRST release
+            # creates the file, and that is the first time its Application has
+            # ever differed from what is running.
+            #
+            # THE FILE HOLDS A DIGEST AND A TAG, and the DIGEST is what
+            # governs — a module chart reads `image.digest` in preference to
+            # `image.tag`. A GHCR tag is mutable, since re-running a release's
+            # `image` job on an existing git tag overwrites `:<version>`, so the
+            # digest is the part that cannot drift and the tag is there to read.
+            #
+            # ROLLING BACK IS AN EDIT OF THAT FILE, NEVER A DELETE. Deleting it
+            # returns the module to the chart's `image.tag: latest`, and the
+            # release being rolled back FROM is exactly what `latest` now points
+            # at — so a delete rolls the pod a second time onto the same broken
+            # image. Set both keys to the previous release instead; `:<previous>`
+            # is still in the registry, because only `latest` moves.
+            #
+            # AND THAT EDIT IS NOT CHEAP, which nothing else here says. The
+            # `main` ruleset requires a pull request and has no HUMAN bypass
+            # actor, so an emergency rollback is a pull request, `ci / passed`,
+            # a merge and a reconciliation. `selfHeal: true` below reverts a hand
+            # `kubectl set image` within one reconciliation, so that is not a
+            # shortcut around it.
+            #
+            # BEING ABLE TO ROLL BACK AT ALL IS NEW. Before this a module ran
+            # whatever digest its pods happened to have started on, and there was
+            # no way to ask for a different one that survived a reconciliation.
+            #
+            # D55 IS NOT NARROWED. `repoURL`/`targetRevision`/`path` above are
+            # untouched, so a chart change still arrives from the module at HEAD
+            # with no release involved. Only the image tag is pinned. The
+            # narrowing that IS real: once a module has a file it stops following
+            # `:latest`, so a hand-pushed `:latest` no longer reaches it — and
+            # D55's own "the one module being actively edited has its image tag
+            # overridden locally" is still the way to do that.
+            #
+            # NOR IS THIS D65's "pointing the ApplicationSet at the published
+            # chart", which that decision rejected because a published chart
+            # needs a VERSION — "dev would then lag every merge until something
+            # bumped it". Two things keep that cost away. What is pinned is the
+            # IMAGE and not the chart, so a chart change still arrives at HEAD
+            # with no version anywhere; and the pin is written BY THE RELEASE
+            # rather than bumped by a person, so there is no "until something
+            # bumps it" to wait through. Today dev lags forever, which is the
+            # cost D65 was pricing against, only worse.
+            #
+            # EVERY module Application refs this repository, so ANY module's
+            # release refreshes all of them. Only the module whose file changed
+            # renders differently, so only that one rolls.
+            ignoreMissingValueFiles: true
+            valueFiles:
+              - $argocd/versions/{{ .repository }}.yaml
+            values: |
+              autoscaling:
+                enabled: true
+              # CONSUMED ONLY BY `gateway`, and inert everywhere else — helm
+              # ignores a value a chart does not read. It sits in this shared block
+              # because D54's generator enumerates modules rather than listing
+              # them, so there is nowhere to put a per-module value that would not
+              # reintroduce the central list D54 exists to delete.
+              #
+              # ONE ingress appends to X-Forwarded-For between a client and the
+              # gateway: the Envoy Gateway edge. So the client's address is the
+              # rightmost entry, one place from the right.
+              #
+              # Until this is declared the gateway refuses to attribute an address
+              # at all — authentication events carry none, and /auth/login and
+              # /auth/enrol are bounded per OBSERVED HOP, which behind an ingress
+              # is one bucket shared by everybody. The refusal is the safe
+              # direction and this value is what turns it into a working control.
+              #
+              # It is a hop COUNT and not an ingress resource, per D80: an earlier
+              # revision prescribed an Envoy ClientTrafficPolicy and was retracted
+              # for making an audit record's integrity a property of running Envoy.
+              # Change this number if the edge ever sits behind something that also
+              # appends — a cloud load balancer would make it "2".
+              # REVERTED 2026-09-02, the same day it was set, and it stays "" until
+              # `Source::resolve` checks the PEER.
+              #
+              # Declaring a hop count tells the gateway to read the client's address
+              # out of `X-Forwarded-For` at that depth. It does NOT tell it to check
+              # that the connection came from the declared proxy — `resolve` takes a
+              # `peer` argument and, on the `Hops(n>0)` path, never compares it to
+              # anything. So any pod that reaches the ClusterIP Service directly,
+              # bypassing the ingress, presents a chain of the right length and is
+              # attributed to whatever address it names.
+              #
+              # That is WORSE than leaving it undeclared, which is why this is a
+              # revert rather than a note. Undeclared keys every login on the one
+              # observed hop: a weak bucket, but not a forgeable one. Declared, an
+              # attacker mints a FRESH bucket per forged value — the limiter is
+              # defeated by minting keys rather than by draining one, and the login
+              # throttle is simply absent for that caller.
+              #
+              # A NetworkPolicy does not cover this: the reference CNI is kindnet,
+              # which does not implement one.
+              #
+              # Restore "1" once the gateway checks the peer against a trusted
+              # proxy range. That check is portable under D80 — a CIDR list in
+              # values.yaml is exactly as platform-neutral as a hop count.
+              sourceAddress:
+                trustedProxyHops: ""
+              # THE TLS CUT-OVER (task 522). Cars 1-3 shipped the code in every
+              # client and every server and left it all defaulting off; this block
+              # is the whole of turning it on, and reverting this block is the
+              # whole of turning it back off.
+              #
+              # THIS IS THE SECOND ATTEMPT, and the first one is worth two minutes
+              # before you review the rest. It was reverted in #12 with a body
+              # blaming a defect in iam-db's listener. THERE IS NO SUCH DEFECT.
+              # The listener honoured this flag the whole time; the pods were
+              # running images from tags cut BEFORE the listener code existed, so
+              # they ignored an environment variable they had never heard of and
+              # served cleartext without logging anything. See D81.
+              #
+              # What makes it safe now is not a code change. It is that iam-db
+              # v0.5.0, task v0.4.0 and task-db v0.3.0 are cut, published AND
+              # rolled, and all three now emit a `tls` field on their listening
+              # log line, which the previous images could not do at all. Before
+              # re-reverting this block for any reason, check that field first:
+              #   kubectl -n yadgar logs <pod> | grep listening
+              # A missing `tls` field means the binary predates the feature. A
+              # `"tls":false` means the flag did not reach it. They are different
+              # faults and they need different fixes.
+              #
+              # ALL FOUR HOPS IN ONE CHANGE, and that is FORCED rather than
+              # preferred. Two facts combine to force it, and a reviewer should
+              # check both rather than take them on trust:
+              #
+              # First, a hop cannot be half cut over. A TLS server does not answer
+              # a cleartext client and a cleartext server does not answer a TLS
+              # one, and no service opens a second listener. So the server and the
+              # client of one hop move together or that hop breaks.
+              #
+              # Second, the four listeners cannot be moved separately from here.
+              # The listener value is `tls.enabled` in ALL FOUR server charts —
+              # iam, iam-db, task and task-db read the identical path — so the one
+              # line below reaches every one of them at once. D54's generator
+              # enumerates modules rather than listing them, so there is nowhere in
+              # this file to say "iam-db only" that is not a central list of
+              # modules, which is the thing D54 exists to delete.
+              #
+              # Together those two mean the intuitive order — the -db hops first,
+              # where an interruption is contained, and the gateway's two hops last
+              # — IS NOT AVAILABLE. Every module Application carries sync-wave 10,
+              # so all five roll together and every hop is briefly interrupted at
+              # once. That cost is real and is the price of not adding a central
+              # list; it is paid once rather than four times.
+              #
+              # THE ROLLING FAILURE IS CRASHLOOPBACKOFF, NOT A SMOOTH DIP, and
+              # that is worth knowing before you watch the roll. Three of the four
+              # clients connect EAGERLY at boot and exit if the upstream name does
+              # not resolve — gateway to task, iam to iam-db and task to task-db
+              # all go through `yadgar_dial::connect_tls`, whose DNS failure is a
+              # boot failure. Only gateway to iam is lazy.
+              #
+              # THE VARIANT IS `BalanceError::Dns`, NOT `NoEndpoints`, and an
+              # earlier revision of this comment named the wrong one. Measured:
+              # dialling a name that does not resolve returns `Dns`. `NoEndpoints`
+              # needs `lookup_host` to return `Ok` with an empty list, which
+              # getaddrinfo does not do, so that variant is effectively
+              # unreachable. It matters here because the variant is what an
+              # operator greps for when a pod will not start. With replicaCount 2 a rolling update should keep an
+              # endpoint ready, so this is low-probability rather than certain,
+              # but the shape when it happens is a restart count and a backoff,
+              # not a dip.
+              #
+              # THE OFF-FILE ALTERNATIVES WERE ELIMINATED IN #11, whose body is no
+              # longer in effect, so they are named here rather than re-derived.
+              # A per-repo `chart/values.yaml` default makes the chart
+              # uninstallable on a bare cluster (D80). Renaming the listener key
+              # per module is a four-repo chart-surface redesign. A second
+              # ApplicationSet with a narrower filter would own the same
+              # Applications as this one. None is cheaper than paying the
+              # interruption once.
+              #
+              # THE CERTIFICATES EXPIRE 2026-12-01T19:35:07Z, and this is the
+              # commit that leaves TLS on, so the deadline lives here. They carry
+              # duration 2160h with renewBefore 720h, so cert-manager rewrites the
+              # Secrets on 2026-11-01 — and no chart carries a checksum annotation
+              # or a reloader, and the listener reads its PEM once when it is
+              # built. A pod started today therefore serves its day-0 leaf until
+              # 2026-12-01 no matter what cert-manager writes. Ledger 537 owns
+              # closing that; until it is closed, a restart is what picks up a
+              # renewed leaf. (#11's body said 2026-11-30; the certificates were
+              # re-issued on 2026-09-02, so that date is superseded.)
+              #
+              # INERT FOR `gateway`, which reads no top-level `tls` at all — its
+              # chart has no such value and its templates never name one. The
+              # gateway's own certificate is the Gateway API listener's, a
+              # different thing entirely, and it is untouched here.
+              tls:
+                enabled: true
+              # THE DIAL SIDE, which unlike the listener above IS already per-hop.
+              # Each key names the upstream it reaches, so each is read by exactly
+              # one chart: `iam` and `task` by the gateway, `iamDb` by iam and
+              # `taskDb` by task. The same shape `sourceAddress` above relies on —
+              # helm ignores a value the chart it is handed does not read.
+              #
+              # That granularity buys nothing on its own, which is why they are
+              # here rather than in a later change: the listeners above are already
+              # refusing cleartext, so a client left off is a hop left broken.
+              #
+              # HOW TO PROVE THIS TOOK, carried forward from #11 because it is the
+              # only check that cannot pass against a cleartext server. Probe a
+              # listener with a `-plaintext` client: an `Unimplemented` answer
+              # means it ANSWERED, so the cut-over did NOT take. A transport-level
+              # refusal is the pass. The refusal is the result; an answer is the
+              # failure. Then drive a real `create_task` through the gateway,
+              # which is the only check that puts a request across all four hops.
+              iam:
+                tls:
+                  enabled: true
+              task:
+                tls:
+                  enabled: true
+              iamDb:
+                tls:
+                  enabled: true
+              taskDb:
+                tls:
+                  enabled: true
+        # THIS REPOSITORY, SUPPLYING VALUE FILES AND NOTHING ELSE. It carries no
+        # `path`, deliberately: with one, Argo would try to render manifests from
+        # it as well, and this repository's top level is Applications and
+        # ApplicationSets that `root.yaml` already owns. Without one it is a
+        # checkout that value files are read out of, which is all that is wanted.
         #
-        # Module charts default `autoscaling.enabled` to FALSE, because a chart
-        # that cannot `helm install` without KEDA's CRDs requires an operator the
-        # adopter never chose — D80 names that violation by example. The charts
-        # therefore ship installable on a bare cluster, and this file, which is
-        # the reference deployment, turns autoscaling back on because THIS
-        # cluster does run KEDA.
+        # PINNED TO `main` RATHER THAN A REVISION, for the same reason the module
+        # source is: development follows HEAD (D55). A release writes the file
+        # and the next reconciliation reads it.
         #
-        # Uniform across every module on purpose. The generator enumerates
-        # modules rather than listing them (D54), so there is nowhere to put a
-        # per-module value without reintroducing the central list D54 exists to
-        # delete. Every module wants autoscaling here; a module that one day does
-        # not can override in its own values.yaml.
-        #
-        # D68 requires autoscaling of every module and is not softened by this:
-        # what moved is WHERE the requirement is expressed, from the chart's
-        # default to the deployment that has the operator installed.
-        helm:
-          values: |
-            autoscaling:
-              enabled: true
-            # CONSUMED ONLY BY `gateway`, and inert everywhere else — helm
-            # ignores a value a chart does not read. It sits in this shared block
-            # because D54's generator enumerates modules rather than listing
-            # them, so there is nowhere to put a per-module value that would not
-            # reintroduce the central list D54 exists to delete.
-            #
-            # ONE ingress appends to X-Forwarded-For between a client and the
-            # gateway: the Envoy Gateway edge. So the client's address is the
-            # rightmost entry, one place from the right.
-            #
-            # Until this is declared the gateway refuses to attribute an address
-            # at all — authentication events carry none, and /auth/login and
-            # /auth/enrol are bounded per OBSERVED HOP, which behind an ingress
-            # is one bucket shared by everybody. The refusal is the safe
-            # direction and this value is what turns it into a working control.
-            #
-            # It is a hop COUNT and not an ingress resource, per D80: an earlier
-            # revision prescribed an Envoy ClientTrafficPolicy and was retracted
-            # for making an audit record's integrity a property of running Envoy.
-            # Change this number if the edge ever sits behind something that also
-            # appends — a cloud load balancer would make it "2".
-            # REVERTED 2026-09-02, the same day it was set, and it stays "" until
-            # `Source::resolve` checks the PEER.
-            #
-            # Declaring a hop count tells the gateway to read the client's address
-            # out of `X-Forwarded-For` at that depth. It does NOT tell it to check
-            # that the connection came from the declared proxy — `resolve` takes a
-            # `peer` argument and, on the `Hops(n>0)` path, never compares it to
-            # anything. So any pod that reaches the ClusterIP Service directly,
-            # bypassing the ingress, presents a chain of the right length and is
-            # attributed to whatever address it names.
-            #
-            # That is WORSE than leaving it undeclared, which is why this is a
-            # revert rather than a note. Undeclared keys every login on the one
-            # observed hop: a weak bucket, but not a forgeable one. Declared, an
-            # attacker mints a FRESH bucket per forged value — the limiter is
-            # defeated by minting keys rather than by draining one, and the login
-            # throttle is simply absent for that caller.
-            #
-            # A NetworkPolicy does not cover this: the reference CNI is kindnet,
-            # which does not implement one.
-            #
-            # Restore "1" once the gateway checks the peer against a trusted
-            # proxy range. That check is portable under D80 — a CIDR list in
-            # values.yaml is exactly as platform-neutral as a hop count.
-            sourceAddress:
-              trustedProxyHops: ""
-            # THE TLS CUT-OVER (task 522). Cars 1-3 shipped the code in every
-            # client and every server and left it all defaulting off; this block
-            # is the whole of turning it on, and reverting this block is the
-            # whole of turning it back off.
-            #
-            # THIS IS THE SECOND ATTEMPT, and the first one is worth two minutes
-            # before you review the rest. It was reverted in #12 with a body
-            # blaming a defect in iam-db's listener. THERE IS NO SUCH DEFECT.
-            # The listener honoured this flag the whole time; the pods were
-            # running images from tags cut BEFORE the listener code existed, so
-            # they ignored an environment variable they had never heard of and
-            # served cleartext without logging anything. See D81.
-            #
-            # What makes it safe now is not a code change. It is that iam-db
-            # v0.5.0, task v0.4.0 and task-db v0.3.0 are cut, published AND
-            # rolled, and all three now emit a `tls` field on their listening
-            # log line, which the previous images could not do at all. Before
-            # re-reverting this block for any reason, check that field first:
-            #   kubectl -n yadgar logs <pod> | grep listening
-            # A missing `tls` field means the binary predates the feature. A
-            # `"tls":false` means the flag did not reach it. They are different
-            # faults and they need different fixes.
-            #
-            # ALL FOUR HOPS IN ONE CHANGE, and that is FORCED rather than
-            # preferred. Two facts combine to force it, and a reviewer should
-            # check both rather than take them on trust:
-            #
-            # First, a hop cannot be half cut over. A TLS server does not answer
-            # a cleartext client and a cleartext server does not answer a TLS
-            # one, and no service opens a second listener. So the server and the
-            # client of one hop move together or that hop breaks.
-            #
-            # Second, the four listeners cannot be moved separately from here.
-            # The listener value is `tls.enabled` in ALL FOUR server charts —
-            # iam, iam-db, task and task-db read the identical path — so the one
-            # line below reaches every one of them at once. D54's generator
-            # enumerates modules rather than listing them, so there is nowhere in
-            # this file to say "iam-db only" that is not a central list of
-            # modules, which is the thing D54 exists to delete.
-            #
-            # Together those two mean the intuitive order — the -db hops first,
-            # where an interruption is contained, and the gateway's two hops last
-            # — IS NOT AVAILABLE. Every module Application carries sync-wave 10,
-            # so all five roll together and every hop is briefly interrupted at
-            # once. That cost is real and is the price of not adding a central
-            # list; it is paid once rather than four times.
-            #
-            # THE ROLLING FAILURE IS CRASHLOOPBACKOFF, NOT A SMOOTH DIP, and
-            # that is worth knowing before you watch the roll. Three of the four
-            # clients connect EAGERLY at boot and exit if the upstream name does
-            # not resolve — gateway to task, iam to iam-db and task to task-db
-            # all go through `yadgar_dial::connect_tls`, whose DNS failure is a
-            # boot failure. Only gateway to iam is lazy.
-            #
-            # THE VARIANT IS `BalanceError::Dns`, NOT `NoEndpoints`, and an
-            # earlier revision of this comment named the wrong one. Measured:
-            # dialling a name that does not resolve returns `Dns`. `NoEndpoints`
-            # needs `lookup_host` to return `Ok` with an empty list, which
-            # getaddrinfo does not do, so that variant is effectively
-            # unreachable. It matters here because the variant is what an
-            # operator greps for when a pod will not start. With replicaCount 2 a rolling update should keep an
-            # endpoint ready, so this is low-probability rather than certain,
-            # but the shape when it happens is a restart count and a backoff,
-            # not a dip.
-            #
-            # THE OFF-FILE ALTERNATIVES WERE ELIMINATED IN #11, whose body is no
-            # longer in effect, so they are named here rather than re-derived.
-            # A per-repo `chart/values.yaml` default makes the chart
-            # uninstallable on a bare cluster (D80). Renaming the listener key
-            # per module is a four-repo chart-surface redesign. A second
-            # ApplicationSet with a narrower filter would own the same
-            # Applications as this one. None is cheaper than paying the
-            # interruption once.
-            #
-            # THE CERTIFICATES EXPIRE 2026-12-01T19:35:07Z, and this is the
-            # commit that leaves TLS on, so the deadline lives here. They carry
-            # duration 2160h with renewBefore 720h, so cert-manager rewrites the
-            # Secrets on 2026-11-01 — and no chart carries a checksum annotation
-            # or a reloader, and the listener reads its PEM once when it is
-            # built. A pod started today therefore serves its day-0 leaf until
-            # 2026-12-01 no matter what cert-manager writes. Ledger 537 owns
-            # closing that; until it is closed, a restart is what picks up a
-            # renewed leaf. (#11's body said 2026-11-30; the certificates were
-            # re-issued on 2026-09-02, so that date is superseded.)
-            #
-            # INERT FOR `gateway`, which reads no top-level `tls` at all — its
-            # chart has no such value and its templates never name one. The
-            # gateway's own certificate is the Gateway API listener's, a
-            # different thing entirely, and it is untouched here.
-            tls:
-              enabled: true
-            # THE DIAL SIDE, which unlike the listener above IS already per-hop.
-            # Each key names the upstream it reaches, so each is read by exactly
-            # one chart: `iam` and `task` by the gateway, `iamDb` by iam and
-            # `taskDb` by task. The same shape `sourceAddress` above relies on —
-            # helm ignores a value the chart it is handed does not read.
-            #
-            # That granularity buys nothing on its own, which is why they are
-            # here rather than in a later change: the listeners above are already
-            # refusing cleartext, so a client left off is a hop left broken.
-            #
-            # HOW TO PROVE THIS TOOK, carried forward from #11 because it is the
-            # only check that cannot pass against a cleartext server. Probe a
-            # listener with a `-plaintext` client: an `Unimplemented` answer
-            # means it ANSWERED, so the cut-over did NOT take. A transport-level
-            # refusal is the pass. The refusal is the result; an answer is the
-            # failure. Then drive a real `create_task` through the gateway,
-            # which is the only check that puts a request across all four hops.
-            iam:
-              tls:
-                enabled: true
-            task:
-              tls:
-                enabled: true
-            iamDb:
-              tls:
-                enabled: true
-            taskDb:
-              tls:
-                enabled: true
+        # `versions/` IS INVISIBLE TO `root.yaml`, whose `directory.recurse`
+        # include glob is `{applications,applicationsets}/*.yaml`. So these files
+        # are read only through this ref, and never applied to the cluster as
+        # manifests in their own right.
+        - repoURL: https://github.com/yadgarhq/argocd
+          targetRevision: main
+          ref: argocd
       destination:
         server: https://kubernetes.default.svc
         namespace: yadgar
