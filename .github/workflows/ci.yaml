@@ -10,8 +10,15 @@ name: ci
 # no logs, which says nothing about permissions. Each job states its own instead.
 #
 # Push to main runs the version report only. Validating there would re-run what
-# the pull request just passed, on code already merged, with nobody watching —
-# and the ruleset makes direct pushes impossible, so there is no drift to catch.
+# the pull request just passed, on code already merged, with nobody watching.
+#
+# ONE ACTOR PUSHES TO `main` DIRECTLY HERE, AND IT IS NOT A PERSON. Once the
+# release App is a bypass actor on this repository's `main` ruleset, `ci-release`
+# writes `versions/<module>.yaml` on every module release with no pull request —
+# that is what the bypass is for, and it is why this comment no longer says
+# direct pushes are impossible. Those commits are machine-written and touch
+# nothing this file validates, so there is still no drift for a push-path
+# validation to catch.
 on:
   pull_request:
   push:
@@ -40,8 +47,15 @@ jobs:
       contents: read
 
   # THE SAME SHARED WORKFLOW ON THE PUSH PATH, where the credential is needed
-  # and where nothing unreviewed runs. A push to `main` here is a merge that has
-  # already passed `ci / passed`; the ruleset forbids any other kind.
+  # and where nothing unreviewed runs. A push to `main` here is EITHER a merge
+  # that has already passed `ci / passed`, OR the release App writing a version
+  # file under its ruleset bypass — machine-written, with no reviewable content.
+  # The ruleset forbids every other kind.
+  #
+  # THE VERSION JOB IS INERT HERE EITHER WAY. This repository carries no `v*`
+  # tag, so the derivation finds no baseline and writes nothing, and the App's
+  # commit message is not bullet-shaped. A module's release cannot tag this
+  # repository.
   #
   # NAMED RATHER THAN `secrets: inherit`, and that is the estate's own tooling
   # deciding rather than a preference. `inherit` was the chosen form — same
