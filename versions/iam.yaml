@@ -3,15 +3,15 @@
 # To roll back, set BOTH keys to the previous release.
 # DO NOT DELETE THIS FILE. Deleting it hands helm no values,
 # so the module falls back to the moving tag with nothing
-# reporting it — `ci / passed` refuses the deletion (ledger
-# 608, `scripts/versions_pinned.py`).
+# reporting it — ci / passed refuses the deletion (ledger
+# 608, scripts/versions_pinned.py).
 # That is an EDIT of both keys and never a delete, because
-# `:latest` already points at the release being rolled back
+# :latest already points at the release being rolled back
 # from.
 # Retiring the module is not a reason to delete it either: a
-# module leaves the cluster by losing its `yadgar-deployable`
-# topic or its `chart/`, after which nothing reads this file
+# module leaves the cluster by losing its yadgar-deployable
+# topic or its chart/, after which nothing reads this file
 # and leaving it costs nothing.
 image:
-  digest: "sha256:1a78f712649340f98652f75165cf6968c7160b3ce81f188938313001196e4322"
-  tag: "0.7.13"
+  digest: "sha256:32d33a8a02df54567515dc5affbafb0070419153c26f4dbe201d59c1df4d39bc"
+  tag: "0.7.14"
