@@ -6,5 +6,5 @@
 # reporting it — `ci / passed` refuses the deletion (ledger
 # 608, `scripts/versions_pinned.py`).
 image:
-  digest: "sha256:4348cdb99b671004c54affd5dd27459cbf7979a266e9d279b640bb2b3f29280e"
-  tag: "0.8.13"
+  digest: "sha256:64abc5547dceca50b9def8e758e90d584a467a72591bf4c78ed5dcc1eabe995f"
+  tag: "0.8.14"
