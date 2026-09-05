@@ -98,16 +98,34 @@ spec:
             # version in this file would be that list — it would name every
             # module, and a new module would not deploy until somebody edited
             # here. What is below is a PATH templated from the generator: nothing
-            # enumerates anything, a file exists because a module released, and
-            # `ignoreMissingValueFiles` is what makes its absence mean nothing.
+            # enumerates anything, and a file exists because a module released.
             #
-            # SO THE TWO CASES A REVIEWER SHOULD CHECK BOTH RESOLVE TO "AS
-            # BEFORE". A module that has never released has no file, helm is
-            # handed no `-f`, and the chart's own `image.tag: latest` stands —
-            # which is exactly today's behaviour, so merging this alone changes
-            # no rendered manifest and rolls no pod. A module's FIRST release
-            # creates the file, and that is the first time its Application has
-            # ever differed from what is running.
+            # `ignoreMissingValueFiles` DOES NOT MAKE A MISSING FILE HARMLESS —
+            # it makes it SILENT, and those are different claims. All five
+            # modules have a file on `main` now, so every module is pinned to a
+            # digest. Delete one and helm is handed no `-f`, `image.digest`
+            # renders empty, `chart/templates/deployment.yaml` takes its `else`
+            # arm and the pod is back on `image.repository` plus `image.tag`,
+            # which is `:latest` — the moving tag D81 was written about — while
+            # Application still reports Synced and Healthy and raises no
+            # condition at all. Each generated `versions/<module>.yaml` says as
+            # much in its own header ("Deleting this file returns the module to
+            # the moving tag"), so the behaviour is documented; the SIGNAL is
+            # what is missing. Ledger 608 owns making a missing file visible.
+            #
+            # DO NOT REMOVE THE FLAG AS THAT FIX. A module that has not released
+            # yet has no file, and without the flag its Application fails to
+            # render rather than falling back — so removing it breaks the one
+            # case it exists for. The fix has to distinguish "never released"
+            # from "file deleted", which this flag alone cannot.
+            #
+            # SO THE CASE A REVIEWER SHOULD STILL CHECK. A module that has never
+            # released has no file, helm is handed no `-f`, and the chart's own
+            # `image.tag: latest` stands. That was EVERY module when this block
+            # merged, which is why merging it rendered no new manifest and
+            # rolled no pod; it is the never-released case only now, and a
+            # module's FIRST release is the first time its Application differs
+            # from what is running.
             #
             # THE FILE HOLDS A DIGEST AND A TAG, and the DIGEST is what
             # governs — a module chart reads `image.digest` in preference to
@@ -254,23 +272,41 @@ spec:
               # once. That cost is real and is the price of not adding a central
               # list; it is paid once rather than four times.
               #
-              # THE ROLLING FAILURE IS CRASHLOOPBACKOFF, NOT A SMOOTH DIP, and
-              # that is worth knowing before you watch the roll. Three of the four
-              # clients connect EAGERLY at boot and exit if the upstream name does
-              # not resolve — gateway to task, iam to iam-db and task to task-db
-              # all go through `yadgar_dial::connect_tls`, whose DNS failure is a
-              # boot failure. Only gateway to iam is lazy.
+              # THE ROLLING FAILURE IS SILENT, NOT A CRASHLOOP, and an earlier
+              # revision of this comment asserted the opposite. ALL FOUR HOPS ARE
+              # LAZY. `dial` v0.2.1 — the tag `gateway`, `iam` and `task` all pin
+              # — catches a failed initial resolution inside `connect_with`
+              # instead of returning it: the error becomes a `warn!` whose own
+              # text is "this is not a boot failure", the endpoint set starts
+              # empty, the balancer is seeded with the NAME, and the process goes
+              # on serving. `gateway` to `iam` was already lazy for a different
+              # reason — `connect_iam` calls `connect_lazy` directly, ADR-0514.
               #
-              # THE VARIANT IS `BalanceError::Dns`, NOT `NoEndpoints`, and an
-              # earlier revision of this comment named the wrong one. Measured:
-              # dialling a name that does not resolve returns `Dns`. `NoEndpoints`
-              # needs `lookup_host` to return `Ok` with an empty list, which
-              # getaddrinfo does not do, so that variant is effectively
-              # unreachable. It matters here because the variant is what an
-              # operator greps for when a pod will not start. With replicaCount 2 a rolling update should keep an
-              # endpoint ready, so this is low-probability rather than certain,
-              # but the shape when it happens is a restart count and a backoff,
-              # not a dip.
+              # SO WHAT YOU WILL ACTUALLY SEE while a hop is interrupted is 1/1
+              # Running, a restart count of ZERO, an Argo Application that stays
+              # Healthy — and every call across that hop failing. Nothing in
+              # `kubectl get pods` says anything is wrong, which is the whole
+              # reason `DialUpstreamNeverResolved` exists in `yadgarhq/deploy`:
+              # `yadgar_dial_upstream_never_resolved` sits at 1 for the upstream
+              # that never resolved, and that gauge is the only place the
+              # condition is visible. `iam` and `task` each assert exactly this
+              # in their own tests — a live channel, and the gauge at 1.0 for an
+              # unresolvable upstream — so it is a tested guarantee rather than a
+              # hope.
+              #
+              # THE ONE HOP THAT ALERT CANNOT SEE IS `gateway` TO `iam`. The
+              # gauge is written inside `dial` and that hop does not go through
+              # `dial`, so during this roll it is the hop with no restart count
+              # AND no series. Watch it from the client side instead.
+              #
+              # `BalanceError::Dns` IS STILL THE VARIANT, and it is now a LOG
+              # LINE rather than an exit. Measured: dialling a name that does not
+              # resolve produces `Dns`; `NoEndpoints` needs `lookup_host` to
+              # return `Ok` with an empty list, which getaddrinfo does not do, so
+              # `dial`'s empty-set arm is effectively dead on this platform. Grep
+              # a pod's logs for the variant, not its restart count. With
+              # replicaCount 2 a rolling update should keep an endpoint ready, so
+              # an interruption is low-probability either way.
               #
               # THE OFF-FILE ALTERNATIVES WERE ELIMINATED IN #11, whose body is no
               # longer in effect, so they are named here rather than re-derived.
