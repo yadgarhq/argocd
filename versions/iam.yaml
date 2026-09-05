@@ -1,0 +1,8 @@
+# Written by ci-release in yadgarhq/iam. Do not edit by hand.
+# The digest governs the pull; the tag is here to be read.
+# To roll back, set BOTH keys to the previous release.
+# Deleting this file returns the module to the moving tag,
+# which now points at THIS release.
+image:
+  digest: "sha256:ee31f099b1ba6fec0f1362dfd4372fe6821b8dfacc1e7121416d34e5672d4c31"
+  tag: "0.7.11"
