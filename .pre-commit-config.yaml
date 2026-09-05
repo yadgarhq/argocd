@@ -31,3 +31,31 @@ repos:
       # No Containerfile here yet; the hook is a no-op until one arrives, which is
       # cheaper than remembering to add it on the day it does.
       - id: hadolint
+
+  # LOCAL, BECAUSE ONLY THIS REPOSITORY HAS ANYTHING TO SAY HERE. `versions/`
+  # exists nowhere else, so a shared definition in yadgarhq/actions would be a
+  # hook that is a no-op in every other repository. D62 puts SHARED CI in one
+  # place; this check is not shared.
+  #
+  # THE HOOKS ARE WHERE A GATE BECOMES LOAD-BEARING. `ci-pr.yaml`'s `precommit`
+  # job is "ONE definition of 'is this repository clean'", it runs every hook in
+  # this file, and it feeds the required status check `ci / passed` — the only
+  # merge gate this repository has, since its `main` ruleset requires zero
+  # approving reviews. A workflow of its own would be a red cross that nothing
+  # requires anybody to clear.
+  - repo: local
+    hooks:
+      - id: versions-pinned
+        name: a module that has released stays pinned to a digest (ledger 608)
+        entry: python3 scripts/versions_pinned.py
+        language: python
+        # PyYAML is not in the standard library and is not guaranteed on the
+        # runner — the shared `portability` job installs it for the same reason.
+        # `language: python` builds this hook its own environment, so what CI
+        # runs is what a developer runs.
+        additional_dependencies: ["pyyaml==6.0.3"]
+        # THE ABSENCE OF A FILE IS THE FAILURE, so the changed-file list cannot
+        # be the input. pre-commit passes the files that CHANGED and never a
+        # deleted one, which is exactly the case this gate exists to catch.
+        always_run: true
+        pass_filenames: false

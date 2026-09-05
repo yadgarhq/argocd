@@ -108,16 +108,64 @@ spec:
             # arm and the pod is back on `image.repository` plus `image.tag`,
             # which is `:latest` — the moving tag D81 was written about — while
             # Application still reports Synced and Healthy and raises no
-            # condition at all. Each generated `versions/<module>.yaml` says as
-            # much in its own header ("Deleting this file returns the module to
-            # the moving tag"), so the behaviour is documented; the SIGNAL is
-            # what is missing. Ledger 608 owns making a missing file visible.
+            # condition at all.
             #
             # DO NOT REMOVE THE FLAG AS THAT FIX. A module that has not released
             # yet has no file, and without the flag its Application fails to
             # render rather than falling back — so removing it breaks the one
             # case it exists for. The fix has to distinguish "never released"
             # from "file deleted", which this flag alone cannot.
+            #
+            # `scripts/versions_pinned.py` IS WHAT TELLS THEM APART (ledger 608),
+            # and it does it from THIS REPOSITORY'S OWN HISTORY. A module that
+            # has released has a commit here that wrote its version file, because
+            # `ci-release` writes one on every release; a module that has never
+            # released has no such commit. The gate therefore asserts that every
+            # module ever written about still has a file carrying a non-empty
+            # `image.digest`, and it needs no list of modules to do it — a new
+            # module is named nowhere, which is the property D54 is about.
+            #
+            # IT IS A HOOK RATHER THAN AN ALARM, and that follows from a
+            # measurement rather than a preference. Argo CD v3.1.8 has no health
+            # check for a kind it does not know and `argocd-cm` carries no
+            # `resource.customizations.health.*` entry, so an Application that
+            # went Degraded on this is a mechanism somebody would have to build
+            # before anybody could rely on it. Meanwhile only two paths reach
+            # `main` here: a pull request, gated by the required status check
+            # `ci / passed`, which runs every hook in `.pre-commit-config.yaml`;
+            # and the release App's ruleset bypass, which writes a version file
+            # rather than deleting one.
+            #
+            # WHAT THAT BUYS, WITH ITS QUALIFIERS RATHER THAN WITHOUT THEM. A
+            # pull request that deletes or empties a released module's pin, does
+            # not itself modify the gate, and runs on a full-history checkout is
+            # REFUSED. All three qualifiers are load-bearing: one pull request
+            # can delete the hook stanza and a pin together, and this
+            # repository's `main` requires zero approving reviews and carries no
+            # CODEOWNERS, so nothing obliges a human to look. The silent state
+            # is much harder to reach rather than unreachable — an earlier
+            # revision of this comment claimed the latter and was wrong.
+            #
+            # THE THIRD QUALIFIER IS THE GATE'S OWN PROBLEM AND IT OWNS IT: it
+            # asks `git rev-parse --is-shallow-repository` first and refuses
+            # anything but a confident `false`, because a shallow root commit
+            # reports its whole tree and collapses the derived set onto the
+            # working tree. Before that check the gate passed a `--depth 1`
+            # checkout unconditionally, silently.
+            #
+            # AND IT REVALIDATES THE WHOLE TREE, which is what covers the other
+            # path. The hook runs `always_run: true` with `pass_filenames:
+            # false`, so every pull request re-asks the question of every
+            # released module rather than of its own changed files. Bad state
+            # arriving by the App's bypass is caught by the next pull request
+            # opened here, whatever that pull request is about.
+            #
+            # WHAT AN OPERATOR STILL WATCHES, because a gate is not an alarm. The
+            # rendered image reference is the whole of it — `.spec.template.spec
+            # .containers[0].image` on a module's Deployment reads `@sha256:` for
+            # a pinned module and `:latest` for one that is not. Nothing alerts
+            # on that today. `yadgarhq/deploy` owns the alerting rules, and the
+            # alert belongs there rather than here.
             #
             # SO THE CASE A REVIEWER SHOULD STILL CHECK. A module that has never
             # released has no file, helm is handed no `-f`, and the chart's own
