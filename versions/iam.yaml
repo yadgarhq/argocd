@@ -1,8 +1,10 @@
 # Written by ci-release in yadgarhq/iam. Do not edit by hand.
 # The digest governs the pull; the tag is here to be read.
 # To roll back, set BOTH keys to the previous release.
-# Deleting this file returns the module to the moving tag,
-# which now points at THIS release.
+# DO NOT DELETE THIS FILE. Deleting it hands helm no values,
+# so the module falls back to the moving tag with nothing
+# reporting it — `ci / passed` refuses the deletion (ledger
+# 608, `scripts/versions_pinned.py`).
 image:
   digest: "sha256:d7d085f2493818bbf9611a6dd47ed347873b92aa607f3c39c8f65821b94c13a8"
   tag: "0.7.12"
