@@ -327,8 +327,11 @@ spec:
               # instead of returning it: the error becomes a `warn!` whose own
               # text is "this is not a boot failure", the endpoint set starts
               # empty, the balancer is seeded with the NAME, and the process goes
-              # on serving. `gateway` to `iam` was already lazy for a different
-              # reason — `connect_iam` calls `connect_lazy` directly, ADR-0514.
+              # on serving. `gateway` to `iam` goes through the SAME `dial`
+              # path now — `gateway`#34 routed `connect_iam` through
+              # `yadgar_dial` the way `connect_task` always was, so this hop is
+              # no longer a bypass with its own reasoning; it is lazy for the
+              # one reason above, like every other hop.
               #
               # SO WHAT YOU WILL ACTUALLY SEE while a hop is interrupted is 1/1
               # Running, a restart count of ZERO, an Argo Application that stays
@@ -342,10 +345,27 @@ spec:
               # unresolvable upstream — so it is a tested guarantee rather than a
               # hope.
               #
-              # THE ONE HOP THAT ALERT CANNOT SEE IS `gateway` TO `iam`. The
-              # gauge is written inside `dial` and that hop does not go through
-              # `dial`, so during this roll it is the hop with no restart count
-              # AND no series. Watch it from the client side instead.
+              # ALL FOUR HOPS ARE NOW VISIBLE TO THAT ALERT. An earlier
+              # revision of this comment named `gateway` -> `iam` as the one
+              # hop the gauge could not see, because `connect_iam` bypassed
+              # `dial` entirely. `gateway`#34 closed that: `connect_iam` now
+              # dials through `yadgar_dial` like every other hop, confirmed
+              # from source on `gateway` main, so the gauge is written for
+              # this hop too and `DialUpstreamNeverResolved` has no label
+              # matcher excluding it. Not re-verified against a live scrape —
+              # this reference deployment's kind cluster carries no workloads.
+              #
+              # **VISIBLE MEANS VISIBLE AT BOOT, AND THAT IS THE WHOLE OF WHAT
+              # THE GAUGE ANSWERS.** `yadgar_dial_upstream_never_resolved` is
+              # boot-scoped by construction: it reads 1 only while a live dial
+              # exists AND no address has ever been given to the balancer since
+              # this pod started, and the set is a one-way latch guarded against
+              # an empty resolution. An upstream that resolved once and then
+              # went away reads 0, identical to a healthy one. So this alert
+              # sees a boot-ORDERING failure — the case the sync wave above
+              # exists to prevent — and never a hop lost afterwards. Closing
+              # that second case needs a live endpoint signal rather than this
+              # gauge, and it is not what any of this covers.
               #
               # `BalanceError::Dns` IS STILL THE VARIANT, and it is now a LOG
               # LINE rather than an exit. Measured: dialling a name that does not
