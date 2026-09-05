@@ -4,5 +4,5 @@
 # Deleting this file returns the module to the moving tag,
 # which now points at THIS release.
 image:
-  digest: "sha256:7b5742b0402122495fe277da38fdbf0d1c3d8a1b3473ba628547d8761383a551"
-  tag: "0.5.6"
+  digest: "sha256:f0301e1773c12f288b7ffea13302405bc037d4697338b919f2f8ce1c2cb85b0b"
+  tag: "0.5.7"
