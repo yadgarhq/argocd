@@ -38,6 +38,92 @@ configs:
     application.resourceTrackingMethod: annotation
     timeout.reconciliation: 60s
 
+    # THE ONE KIND IN THIS ESTATE ARGO HAS NO OPINION ABOUT (ledger 745).
+    # `actions.github.com` is a CRD group Argo CD v3.1.8 ships no health check
+    # for, and its fallback is "the object exists, therefore Healthy". Measured
+    # 2026-09-06: `Application/estate-front-runner` reads Synced AND Healthy
+    # while its `AutoscalingRunnerSet` carries no health status at all, so the
+    # whole Application is green on the strength of four objects existing.
+    # ADR-0580 already recorded the consequence — a scale set with no
+    # credential, and therefore no runner, is indistinguishable from a working
+    # idle one, and the only evidence is a line in a controller log in another
+    # namespace.
+    #
+    # IT READS `.status.phase` AND NOT THE `STATE` COLUMN, and that distinction
+    # is the whole trap. `kubectl get autoscalingrunnersets` prints a `STATE`
+    # column, which is a PRINTER COLUMN reading `.status.state` — a field that
+    # does not exist. It is absent from the CRD's own status schema (which
+    # declares `currentRunners`, `failedEphemeralRunners`,
+    # `pendingEphemeralRunners`, `phase`, `runningEphemeralRunners` and nothing
+    # else) and absent from `AutoscalingRunnerSetStatus` in ARC 0.14.2's Go
+    # source. The column is therefore always EMPTY, which is exactly what the
+    # live cluster prints. A rule written against what the table shows would
+    # read `nil` forever and report every scale set unhealthy.
+    #
+    # THE THREE PHASES ARE THE CONTROLLER'S, read out of
+    # `autoscalingrunnerset_controller.go` at tag `gha-runner-scale-set-0.14.2`
+    # rather than guessed: `Pending` is written when a spec change is accepted,
+    # `Running` only after the reconcile reaches "the AutoscalingListener
+    # exists", and `Outdated` while an old ephemeral runner set drains. An
+    # object the controller has never touched carries no phase at all.
+    #
+    # PROGRESSING RATHER THAN DEGRADED for every non-Running phase. All three
+    # are states a healthy scale set passes through within seconds of any edit,
+    # and a rule that goes red on a legitimate change is one an operator learns
+    # to ignore — the same reason Argo calls a rolling Deployment Progressing.
+    # What this buys is precise and it is enough: the Application stops reading
+    # Healthy while the runner cannot run a job.
+    #
+    # ZERO RUNNERS IS HEALTHY, DELIBERATELY. `minRunners: 0` is the design
+    # (deploy/infra/estate-front-runner.yaml), so an idle cluster has no runner
+    # pod and must not be red. The count is reported in the message and judged
+    # by nothing. `failedEphemeralRunners` was considered as a Degraded trigger
+    # and rejected: ARC retains a failed ephemeral runner for inspection, so one
+    # bad job would pin the Application red until somebody deleted the object.
+    #
+    # WHAT IT DOES NOT CATCH, said here rather than left to be found. `Running`
+    # means the AutoscalingListener RESOURCE exists — not that its pod is
+    # working. A listener that exists and crash-loops leaves this rule reporting
+    # Healthy. That case is not reachable from this object at all: the listener
+    # lives in `arc-systems`, carries no ownerReferences, and does not appear in
+    # the Application's resource list, so no Argo health rule can see it. Its
+    # home is an alert on the listener pod beside `deploy/infra/prometheus.yaml`,
+    # and it is not built here.
+    #
+    # NO RULE FOR `AutoscalingListener`, for the same reason. Its CRD status
+    # schema is `type: object` with NO properties, so every field the controller
+    # writes is pruned by the API server and `.status` is permanently `{}`.
+    # There is nothing for a rule to read.
+    resource.customizations.health.actions.github.com_AutoscalingRunnerSet: |
+      hs = {}
+      if obj.status == nil or obj.status.phase == nil or obj.status.phase == "" then
+        hs.status = "Progressing"
+        hs.message = "no .status.phase: the ARC controller has not reconciled this scale set. It is not registered with GitHub and no listener exists, so a dispatched job waits forever."
+        return hs
+      end
+      if obj.status.phase == "Running" then
+        local runners = obj.status.currentRunners or 0
+        hs.status = "Healthy"
+        hs.message = "phase Running: the listener exists and " .. tostring(runners) .. " runner(s) are up."
+        if runners == 0 then
+          hs.message = hs.message .. " Zero is the correct idle state under minRunners: 0."
+        end
+        return hs
+      end
+      if obj.status.phase == "Pending" then
+        hs.status = "Progressing"
+        hs.message = "phase Pending: the controller has accepted a change but has not reached a listener. A scale set that stays here is not registering with GitHub -- check the arc-systems controller log for the githubConfigSecret."
+        return hs
+      end
+      if obj.status.phase == "Outdated" then
+        hs.status = "Progressing"
+        hs.message = "phase Outdated: the spec changed and the controller is draining the old ephemeral runner set before replacing it."
+        return hs
+      end
+      hs.status = "Progressing"
+      hs.message = "unrecognised .status.phase " .. tostring(obj.status.phase) .. ": this rule knows Running, Pending and Outdated. Not Healthy, deliberately -- an unknown phase is the case the rule cannot judge."
+      return hs
+
 controller:
   # One replica in development. Production sizing is a values override, not a
   # different manifest.
