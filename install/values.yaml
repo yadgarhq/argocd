@@ -2,15 +2,39 @@
 # hand to bootstrap, then an Application in projects/ points back here so every
 # subsequent change arrives the same way as everything else.
 #
+# NOT YET APPLIED, and a reader must know that before trusting a line below.
+# `applications/argocd.yaml` is deliberately not `automated` and its adoption
+# sync has never been run: measured 2026-09-06, all 33 of the Application's
+# resources read OutOfSync and the live `argocd-cm` still carries the chart's
+# own `timeout.reconciliation: 180s` against the `60s` set here. So a value
+# added to this file changes nothing until an operator syncs that one
+# Application. The ruling on whether to run that sync is
+# `plans/argocd-adoption-sync.md` in yadgarhq/docs.
+#
 # Chart: argo-cd from https://argoproj.github.io/argo-helm
 
 configs:
   params:
-    # Local development terminates TLS at the k3d loadbalancer, not at Argo.
+    # NOTHING TERMINATES TLS IN FRONT OF ARGO'S OWN CONSOLE. It is reached by
+    # `kubectl port-forward svc/argocd-server` (deploy/Makefile) and by no other
+    # route: the kind node publishes 18080/18443 for the yadgar edge only, and
+    # Argo has no Ingress and no Gateway route. The earlier text here named a
+    # k3d loadbalancer; k3d was abandoned before this cluster was built — see
+    # `deploy/Makefile`'s header — so it terminated nothing.
     server.insecure: true
   cm:
-    # D54's generator enumerates the organisation, so Argo must be allowed to
-    # create Applications for repos it discovers rather than a fixed list.
+    # HOW ARGO MARKS WHAT IT OWNS — the `argocd.argoproj.io/tracking-id`
+    # annotation rather than an `app.kubernetes.io/instance`-style label. The
+    # earlier text here described D54's SCM Provider generator, which is a
+    # different mechanism in a different file (`applicationsets/modules.yaml`)
+    # and is not affected by this key.
+    #
+    # A PIN, NOT A CHANGE. Measured 2026-09-06 against Argo CD v3.1.8 with this
+    # key absent from the live ConfigMap: every module resource already carries
+    # a `tracking-id` annotation (`gateway:apps/Deployment:yadgar/gateway`) and
+    # none carries the instance label, so annotation tracking is already what
+    # runs. Kept because a chart bump that moved the default would silently
+    # re-key ownership of every resource in the estate.
     application.resourceTrackingMethod: annotation
     timeout.reconciliation: 60s
 
