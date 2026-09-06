@@ -13,6 +13,7 @@ The cluster and the infrastructure live in
 | `install/values.yaml`          | Helm values for the `argo-cd` chart             |
 | `projects/root.yaml`           | app-of-apps root, applied once during bootstrap |
 | `applicationsets/modules.yaml` | discovers module repos across the organisation  |
+| `MIGRATION_NOTES.md`           | what a change here needs from a person          |
 
 `applications/` holds single `Application` resources; `applicationsets/` holds
 generators that produce many. Keeping them apart matters because the two are
