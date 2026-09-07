@@ -431,6 +431,35 @@ spec:
               taskDb:
                 tls:
                   enabled: true
+              # `project` DIALS `project-db`, AND THIS KEY IS WHAT TELLS IT TO USE
+              # TLS. It is read by exactly one chart — `yadgarhq/project`'s — and
+              # that chart defaults it to FALSE, because a module chart must
+              # install on a bare cluster (D80).
+              #
+              # WITHOUT THIS KEY THE HOP IS BROKEN AND EVERY LIGHT IS GREEN. The
+              # top-level `tls.enabled` above reaches every module uniformly, so
+              # `project-db`'s listener is ALREADY refusing cleartext and
+              # `project`'s own listener turns on the moment the
+              # `yadgar-deployable` topic is added. A `project` deployed without
+              # this key therefore dials a TLS-only store in cleartext. The dial
+              # is lazy (ADR-0532) and the name resolves, so the pod reads
+              # `1/1 Running`, Argo reads `Healthy`,
+              # `yadgar_dial_upstream_never_resolved` reads 0, and every RPC
+              # fails at the transport.
+              #
+              # SO THIS LANDS BEFORE THE TOPIC, not after. That ordering is the
+              # same shape as ledger 641's certificate-before-topic lesson and it
+              # has the same cost when it is got wrong.
+              #
+              # NOT `project:`. That key would be the GATEWAY's dial TO `project`,
+              # read by the gateway's chart, and it belongs with the gateway work
+              # that has not started. Adding it here changes nothing `project`
+              # reads and leaves this hop broken — helm ignores a value the chart
+              # it is handed does not read, which is what makes the mistake
+              # silent.
+              projectDb:
+                tls:
+                  enabled: true
         # THIS REPOSITORY, SUPPLYING VALUE FILES AND NOTHING ELSE. It carries no
         # `path`, deliberately: with one, Argo would try to render manifests from
         # it as well, and this repository's top level is Applications and
