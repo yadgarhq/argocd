@@ -273,6 +273,59 @@ spec:
               # values.yaml is exactly as platform-neutral as a hop count.
               sourceAddress:
                 trustedProxyHops: ""
+              # THE ADMINISTRATIVE SURFACE, TURNED ON. This is the one entry
+              # that lets D73's bootstrap token reach the gateway (ADR-0492,
+              # ledger 638) — the credential that lets the FIRST administrator
+              # exist before an administrator exists to create one. Naming the
+              # Secret IS the switch; the chart carries no boolean beside it,
+              # because two knobs can disagree and helm cannot refuse the
+              # disagreement.
+              #
+              # WHAT MERGING THIS DOES, rather than what it configures. Until it
+              # landed the gateway rendered no YADGAR_ADMIN_BOOTSTRAP_TOKEN_FILE
+              # and no mount, the binary's bootstrap_token() returned DISABLED,
+              # and every request presenting a bootstrap token was answered
+              # 503 "the bootstrap token is not configured". With it the pods roll
+              # with the Secret mounted at /var/run/secrets/admin-bootstrap/token,
+              # and the two acts that credential reaches — create-an-administrator
+              # and promote-one — start accepting it.
+              #
+              # CONSUMED ONLY BY `gateway`, and inert everywhere else, which is
+              # the same shape `sourceAddress` above relies on: helm ignores a
+              # value a chart does not read. It sits in this shared block for the
+              # same reason too — D54's generator enumerates modules rather than
+              # listing them, so there is nowhere to put a per-module value that
+              # would not reintroduce the central list D54 exists to delete. The
+              # gateway's own values.yaml defaults this key EMPTY under D80 and
+              # says so explicitly: a module chart must install on a bare cluster,
+              # and ONE entry HERE is what turns it on in the reference deployment.
+              #
+              # INERT ELSEWHERE IS NOT INERT HERE, AND THAT IS THE DIFFERENCE FROM
+              # `sourceAddress`. SET-BUT-ABSENT FAILS THE BOOT. The chart's mount
+              # is `optional: true`, so a Secret named here and missing from the
+              # cluster is an empty directory rather than a stuck pod: the file is
+              # not there, and gateway EXITS naming that path — taking MCP,
+              # /auth/login and /auth/enrol down with it over one administrative
+              # knob. The binary tells "not configured", which disables one path
+              # and serves, apart from "configured and broken", which refuses the
+              # boot; this value is what moves it into the second state on a
+              # cluster without the Secret. So DO NOT carry this value to such a
+              # cluster. Clearing it is the way back, and it removes the variable
+              # and the mount together.
+              #
+              # THE SECRET IS `yadgarhq/deploy`'s, minted only-if-absent by the Job
+              # in `infra/bootstrap/admin-bootstrap-token.yaml`, in namespace
+              # `yadgar`, with the token under the key `token`. That key name is
+              # already the chart's `adminBootstrap.tokenSecretKey` default, so it
+              # is not restated below — only what must be set is set.
+              #
+              # A CLUSTER RECREATE MINTS A DIFFERENT TOKEN while the old value
+              # still looks valid in an operator's notes, and nothing in the
+              # cluster distinguishes the two. Retrieving the current one is a
+              # documented command in that repository's MIGRATION_NOTES.md; run it
+              # again after every recreate.
+              adminBootstrap:
+                tokenSecret: admin-bootstrap-token
               # THE TLS CUT-OVER (task 522). Cars 1-3 shipped the code in every
               # client and every server and left it all defaulting off; this block
               # is the whole of turning it on, and reverting this block is the
