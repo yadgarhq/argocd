@@ -13,5 +13,5 @@
 # topic or its chart/, after which nothing reads this file
 # and leaving it costs nothing.
 image:
-  digest: "sha256:932099cc5a4217b4fe928e9e6159555ff2aba02e95dbfdd86021a1a71c786bcf"
-  tag: "0.9.27"
+  digest: "sha256:6bdad5a7ce772a4972f6cd66b8156d286d42262bb5ec21d6680f70794b78db8c"
+  tag: "0.9.28"
