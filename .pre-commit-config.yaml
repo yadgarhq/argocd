@@ -24,7 +24,7 @@ repos:
   # `pre-commit autoupdate`.
 
   - repo: https://github.com/yadgarhq/actions
-    rev: v1.18.2
+    rev: v1.20.0
     hooks:
       - id: gitleaks
       - id: prettier
@@ -43,6 +43,7 @@ repos:
       # the binary is absent, and "Passed, having checked nothing" is the defect
       # the guard closes rather than a state this check may report.
       - id: actionlint
+      - id: no-test-skips
 
   # LOCAL, BECAUSE ONLY THIS REPOSITORY HAS ANYTHING TO SAY HERE. `versions/`
   # exists nowhere else, so a shared definition in yadgarhq/actions would be a
