@@ -504,13 +504,54 @@ spec:
               # same shape as ledger 641's certificate-before-topic lesson and it
               # has the same cost when it is got wrong.
               #
-              # NOT `project:`. That key would be the GATEWAY's dial TO `project`,
-              # read by the gateway's chart, and it belongs with the gateway work
-              # that has not started. Adding it here changes nothing `project`
-              # reads and leaves this hop broken — helm ignores a value the chart
-              # it is handed does not read, which is what makes the mistake
-              # silent.
+              # NOT THE SAME KEY AS `project:` BELOW, and now that the two sit
+              # side by side the distinction is worth stating rather than
+              # assumed. This key, `projectDb:`, is `project`'s dial TO ITS OWN
+              # STORE, read by `yadgarhq/project`'s chart. `project:` below is
+              # the GATEWAY's dial TO `project`, read by `yadgarhq/gateway`'s
+              # chart. They are two different hops that happen to be configured
+              # in the same shared block, for the same D54 reason every other
+              # per-hop key here is, and they were switched on at two different
+              # times.
+              #
+              # AN EARLIER REVISION OF THIS COMMENT SAID THE GATEWAY KEY
+              # "belongs with the gateway work that has not started" and
+              # forbade adding it here. That work has since started and landed
+              # (gateway#77, #78, #79), so the warning below is CURRENT rather
+              # than a restatement of the old one — read the key that follows,
+              # not this paragraph's memory of its absence.
               projectDb:
+                tls:
+                  enabled: true
+              # THE GATEWAY'S DIAL TO `project`, WHICH THE PARAGRAPH ABOVE ONCE
+              # WARNED WAS MISSING. Read by exactly one chart —
+              # `yadgarhq/gateway`'s — which defaults it to FALSE for the same
+              # D80 reason `projectDb:` above does.
+              #
+              # LEDGER 892 IS WHAT MADE THIS KEY'S ABSENCE VISIBLE, AND EVERY
+              # LIGHT WAS GREEN WHILE IT WAS MISSING. `project`'s own listener
+              # went TLS from the top-level `tls.enabled` block above the
+              # moment the `yadgar-deployable` topic was added; the gateway
+              # kept dialling it in cleartext because this key did not exist
+              # yet. Pod Ready, Argo Healthy,
+              # `yadgar_dial_upstream_never_resolved` at 0 — the exact
+              # "broken and every light is green" shape the paragraph above
+              # warns about for the OTHER hop, and it happened anyway, one key
+              # over, the same day. The only evidence was in the gateway's own
+              # log, an h2 GoAway with FRAME_SIZE_ERROR next to "the project
+              # registry has NEVER loaded" (ADR-0674) — cleartext gRPC meeting
+              # a TLS listener, because a registry load is itself a dial and
+              # every one of them was failing at the transport.
+              #
+              # THE GATEWAY CHART ALREADY HAD THE REST OF THE SHAPE WAITING,
+              # which is why one flag is enough. `project.tls.caSecret`
+              # defaults to `project-tls` and `project.tls.caSecretKey` to
+              # `ca.crt`, matching the live `project-tls` Secret's
+              # `ca.crt`/`tls.crt`/`tls.key` shape — the same shape `iam-tls`
+              # and `task-tls` carry, which the gateway already mounts as
+              # `iam-ca` and `task-ca`. So turning this key on is sufficient;
+              # nothing else in the gateway chart needed changing.
+              project:
                 tls:
                   enabled: true
         # THIS REPOSITORY, SUPPLYING VALUE FILES AND NOTHING ELSE. It carries no
