@@ -554,6 +554,123 @@ spec:
               project:
                 tls:
                   enabled: true
+              # THE INGRESS NetworkPolicy FOR `project`, AND FOR NOTHING ELSE
+              # (ledger 511, stage 4, module 1 of 6). Six module charts carry
+              # `chart/templates/networkpolicy.yaml`; all six default
+              # `networkPolicy.enabled: false` and this block turns ON exactly
+              # one of them. ADR-0594 ranks NetworkPolicy and mutual TLS equal
+              # as defence in depth rather than as alternatives, so this is
+              # additional to the `tls:` keys above and replaces none of them.
+              #
+              # THIS IS THE FIRST CONDITIONAL IN THIS FILE, and five more
+              # modules follow the same shape, so it is worth reading as a
+              # pattern rather than as one value. `goTemplate: true` with
+              # `goTemplateOptions: [missingkey=error]` is already declared at
+              # the top of this ApplicationSet, and `.repository` is already
+              # interpolated in `valueFiles` above — so an `if eq .repository
+              # "<module>"` guard, in Go-template delimiters, scopes a value to
+              # ONE module, in this one file, with nothing for a release to
+              # clobber.
+              #
+              # DO NOT WRITE GO-TEMPLATE DELIMITERS IN THESE COMMENTS, and this
+              # is the one rule the next five will trip over. THIS WHOLE STRING
+              # is rendered as a Go template, so a `#` does not comment a
+              # template action out — it is ordinary text inside the action's
+              # operand. A first draft of this block spelled the guard out
+              # literally in the paragraph above and the render failed with
+              # `parse error: unexpected "#" in operand`, which takes down EVERY
+              # Application this generator produces rather than only `project`.
+              # Name the guard without its delimiters, as above.
+              #
+              # THE TWO OTHER SEAMS WERE ELIMINATED, named here so the next
+              # five do not re-derive them. (1) `versions/<module>.yaml` is
+              # UNUSABLE: `ci-release.yaml` in `yadgarhq/actions` writes that
+              # file WHOLE from a `printf` sequence — comments plus `image:
+              # {digest, tag}` — so any hand-added key is silently dropped on
+              # the module's next release. (2) Setting `networkPolicy` here
+              # UNCONDITIONALLY works, but every one of the six charts reads
+              # the identical key path, so one entry would enable all six at
+              # once. Stage 4 goes one module at a time, which is the whole
+              # reason the rollout is stageable: each policy covers only the
+              # pods its own `podSelector` matches, and this change adds no
+              # namespace-wide default-deny.
+              #
+              # `project` GOES FIRST BECAUSE ITS CHART CANNOT BE ENABLED
+              # BLIND. The other five charts default `networkPolicy.clients` to
+              # the caller they have — `[gateway]` for iam and task, `[iam]`
+              # for iam-db, `[task]` for task-db, `[project]` for project-db.
+              # `project`'s is EMPTY, deliberately, and under ADR-0664 a chart
+              # whose policy is enabled while naming no client calls Helm
+              # `fail` and REFUSES TO RENDER — `fail` aborts the whole chart,
+              # so enabling `project` without `clients` makes the Application
+              # refuse to sync rather than emit a policy. That is why the
+              # chart's own values.yaml defaults the list empty and says so:
+              # nothing in a bare deployment dials `project`.
+              #
+              # SO THE CLIENT LIST IS STATED HERE RATHER THAN DEFAULTED IN THE
+              # CHART, which is the same division the five `tls.enabled` keys
+              # above already embody. D80 requires a module chart to install on
+              # a bare cluster, and an allow-list is an ASSERTION ABOUT A
+              # TOPOLOGY — correct for this deployment and a silent partition
+              # in somebody else's. The reference deployment is what opts in.
+              # `[gateway]` is not a guess: the gateway is `project`'s only
+              # caller, and that hop was proved live over TLS on 50052 today
+              # (ledger 890 and 892 — `yadgar_gateway_project_registry_loaded`
+              # reads 1, and a registry load is itself a dial through it).
+              #
+              # `scrapeFrom` IS REQUIRED HERE AND OMITTING IT IS A REGRESSION,
+              # which is the one thing about this block that is not obvious
+              # from the chart. The template emits its 9090 rule ONLY when a
+              # scrape namespace is named, and the chart defaults `scrapeFrom`
+              # empty for the same D80 reason. But `project`'s pods carry
+              # `prometheus.io/scrape: "true"` with `prometheus.io/port:
+              # "9090"`, `prometheus-server` runs in `observability`, and its
+              # `kubernetes-pods` job discovers by that annotation and scrapes
+              # the POD IP — cross-namespace pod-to-pod traffic, which this
+              # policy drops unless the namespace is named. `autoscaling` is
+              # `true` for every module at the top of this block, so
+              # `project`'s KEDA ScaledObject is live and its trigger query is
+              # `sum(rate(yadgar_calls_total{service="project",outcome="OK"}[2m]))
+              # / clamp_min(count(up{app="project"}),1)` — BOTH series come
+              # from that scrape. Without this key the policy renders, syncs,
+              # lists and describes while Prometheus' targets for this module
+              # go down and KEDA stops tracking. Nothing else reports it. The
+              # `namespaceSelector` matches `kubernetes.io/metadata.name`,
+              # which Kubernetes sets on every namespace itself, so nothing
+              # has to be labelled by hand.
+              #
+              # NO POD ROLLS AND NO OTHER MODULE CHANGES. This adds one object
+              # and edits no Deployment, so `project` does not restart; the
+              # other five Applications render byte-identically, so sync-wave
+              # 10 does not move them. Reverting this block deletes the policy,
+              # and `prune: true` above is what makes that a delete rather
+              # than an orphan.
+              #
+              # THE PROOF THAT MATTERS IS STILL OUTSTANDING, AND IT IS NOT
+              # "everything still works". Under ADR-0592 an unbroken probe
+              # carries NO information about whether an ingress policy is in
+              # force — kubelet probe traffic never matches a pod-selector
+              # rule, so `restartCount: 0` and a Healthy Application are
+              # produced by a mechanism unrelated to the policy. The honest
+              # check is a DEMANDED REFUSAL: a peer this list excludes attempts
+              # 50052 and is refused, and the check FAILS if it connects. Two
+              # traps in running it. `svc/project` selects `{"app":"project"}`
+              # and `svc/gateway` selects `{"app":"gateway"}` (ADR-0665), so a
+              # probe pod wearing either label JOINS that Service and takes
+              # real traffic — an outage, not a measurement; read
+              # `kubectl get svc/<name> -o jsonpath='{.spec.selector}'` first
+              # and pick a label no Service selects. And `nc -z` is
+              # unsupported in busybox: it prints `punt!` and exits non-zero,
+              # which is indistinguishable from a refusal. Use
+              # `nc -w N HOST PORT </dev/null` and read the exit code AND the
+              # elapsed time.
+              {{- if eq .repository "project" }}
+              networkPolicy:
+                enabled: true
+                clients: [gateway]
+                scrapeFrom:
+                  namespace: observability
+              {{- end }}
         # THIS REPOSITORY, SUPPLYING VALUE FILES AND NOTHING ELSE. It carries no
         # `path`, deliberately: with one, Argo would try to render manifests from
         # it as well, and this repository's top level is Applications and
