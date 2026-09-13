@@ -792,6 +792,75 @@ spec:
                 scrapeFrom:
                   namespace: observability
               {{- end }}
+              # THE INGRESS NetworkPolicy FOR `iam` (ledger 511, stage 4, module
+              # 4 of 6). Three keys and the same guard shape as `project` above.
+              # The reasoning that is SHARED is written out once up there and is
+              # not repeated here: why the guard lives in this file rather than
+              # in `versions/<module>.yaml` or unconditionally, why the rollout
+              # goes one module at a time, and the rule about never writing
+              # Go-template delimiters into these comments. What follows is only
+              # what DIFFERS for this module.
+              #
+              # THIS IS THE FIRST SERVICE MODULE AFTER `project`, so the port is
+              # 50052 rather than the 50051 the two `-db` entries above use. The
+              # live `svc/iam` publishes `grpc` on 50052 and the chart pins that
+              # literal itself, so nothing here sets it. The number still matters
+              # to the reader: the demanded refusal that proves this policy is
+              # aimed at the wrong port if it is misread.
+              #
+              # ADR-0664's REFUSAL DOES NOT PROTECT THIS ONE EITHER. That guard
+              # fires only where `networkPolicy.clients` is empty, and it is
+              # empty in exactly one chart — `project`'s. THIS chart defaults
+              # `clients: [gateway]`, read by parsing its `chart/values.yaml` as
+              # YAML rather than grepping it, so an enable that sets `enabled`
+              # and `clients` and forgets `scrapeFrom` renders happily, syncs,
+              # lists and describes, and silently drops the scrape. Nothing
+              # refuses it. A render check before the commit is the only thing
+              # between that mistake and the cluster.
+              #
+              # SO `scrapeFrom` IS LOAD-BEARING HERE TOO, measured rather than
+              # assumed. `iam`'s pods carry `prometheus.io/scrape: "true"` with
+              # `prometheus.io/port: "9090"`; `prometheus-server` runs in
+              # `observability`, and its `kubernetes-pods` job builds each target
+              # address from the POD IP plus that annotation — so the scrape is
+              # cross-namespace pod-to-pod traffic, which this policy drops
+              # unless the namespace is named. `iam`'s KEDA ScaledObject is live
+              # and Ready with fallback off, and its trigger query is
+              # `sum(rate(yadgar_calls_total{service="iam", outcome="OK"}[2m]))
+              # / clamp_min(count(up{app="iam"}), 1)` — BOTH series come from
+              # that scrape. Lose it and KEDA stops tracking while every object
+              # still lists and describes correctly.
+              #
+              # ITS ScaledObject READS `ACTIVE=False`, AND THAT IS NOT A REASON
+              # TO SKIP THE KEY. All seven modules have a ScaledObject and all
+              # seven read Ready with fallback off; `ACTIVE` reports whether
+              # load is currently above the trigger, not whether the autoscaler
+              # is tracking. `project` and `project-db` read `True` because
+              # traffic is flowing through them today. An inactive autoscaler
+              # still evaluates these two series every polling interval.
+              #
+              # THE CLIENT LIST IS THIS CHART'S OWN DEFAULT, RESTATED. Unlike
+              # `project`, where `[gateway]` was information the chart could not
+              # carry, `[gateway]` is already this chart's default. It is written
+              # out anyway so that the allow-list is VISIBLE in the deployment
+              # that asserts it — under D80 the chart ships installable and
+              # opinion-free and the reference deployment is what opts in, and an
+              # allow-list read only out of a chart default is an assertion
+              # nobody looking at this file can see. The gateway is `iam`'s only
+              # caller.
+              #
+              # THE ADR-0665 TRAP APPLIES UNCHANGED, and on this module both
+              # labels in play are Service selectors: `svc/iam` selects
+              # `{"app":"iam"}` and `svc/gateway` selects `{"app":"gateway"}`,
+              # so a probe pod wearing either JOINS that Service and takes real
+              # traffic. Pick a label no Service in the namespace selects.
+              {{- if eq .repository "iam" }}
+              networkPolicy:
+                enabled: true
+                clients: [gateway]
+                scrapeFrom:
+                  namespace: observability
+              {{- end }}
         # THIS REPOSITORY, SUPPLYING VALUE FILES AND NOTHING ELSE. It carries no
         # `path`, deliberately: with one, Argo would try to render manifests from
         # it as well, and this repository's top level is Applications and
