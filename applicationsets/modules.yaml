@@ -730,6 +730,68 @@ spec:
                 scrapeFrom:
                   namespace: observability
               {{- end }}
+              # THE INGRESS NetworkPolicy FOR `iam-db` (ledger 511, stage 4,
+              # module 3 of 6). Three keys and the same guard shape as `project`
+              # above. The reasoning that is SHARED is written out once up there
+              # and is not repeated here: why the guard lives in this file
+              # rather than in `versions/<module>.yaml` or unconditionally, why
+              # the rollout goes one module at a time, and the rule about never
+              # writing Go-template delimiters into these comments. What follows
+              # is only what DIFFERS for this module.
+              #
+              # ADR-0664's REFUSAL DOES NOT PROTECT THIS ONE, and that is the
+              # thing about this entry a reader of `project`'s would get wrong.
+              # That guard fires only where `networkPolicy.clients` is empty,
+              # and it is empty in exactly one chart — `project`'s. THIS chart
+              # defaults `clients: [iam]`, so an enable that sets `enabled` and
+              # `clients` and forgets `scrapeFrom` renders happily, syncs, lists
+              # and describes, and silently drops the scrape. Nothing refuses
+              # it. A render check before the commit is the only thing between
+              # that mistake and the cluster.
+              #
+              # SO `scrapeFrom` IS LOAD-BEARING HERE TOO, measured rather than
+              # assumed, and it is NOT weaker here than for `project-db`.
+              # `iam-db`'s pods carry `prometheus.io/scrape: "true"` with
+              # `prometheus.io/port: "9090"`; `prometheus-server` runs in
+              # `observability`, and its `kubernetes-pods` job builds each
+              # target address from the POD IP plus that annotation — so the
+              # scrape is cross-namespace pod-to-pod traffic, which this policy
+              # drops unless the namespace is named. `iam-db`'s KEDA
+              # ScaledObject is live and Ready with fallback off, and its
+              # trigger query is
+              # `sum(rate(yadgar_calls_total{service="iam-db",
+              # outcome="OK"}[2m])) / clamp_min(count(up{app="iam-db"}),1)` —
+              # BOTH series come from that scrape. Lose it and KEDA stops
+              # tracking while every object still lists and describes correctly.
+              # Every module in this deployment has a live ScaledObject of that
+              # shape, so this key belongs in all six entries and not only in
+              # the ones whose autoscaler happens to be active.
+              #
+              # THE CLIENT LIST IS THIS CHART'S OWN DEFAULT, RESTATED. Unlike
+              # `project`, where `[gateway]` was information the chart could not
+              # carry, `[iam]` is already this chart's default. It is written
+              # out anyway so that the allow-list is VISIBLE in the deployment
+              # that asserts it — under D80 the chart ships installable and
+              # opinion-free and the reference deployment is what opts in, and
+              # an allow-list read only out of a chart default is an assertion
+              # nobody looking at this file can see. `iam` is `iam-db`'s only
+              # caller.
+              #
+              # THE PORT IS 50051, NOT 50052. The `-db` modules serve gRPC on
+              # 50051 and the services on 50052. The chart pins its own literal
+              # so nothing here sets it, but the demanded refusal that proves
+              # this policy is aimed at the wrong port if the number is misread.
+              # The ADR-0665 trap applies unchanged: `svc/iam-db` selects
+              # `{"app":"iam-db"}` and `svc/iam` selects `{"app":"iam"}`, so a
+              # probe pod wearing either label JOINS that Service and takes real
+              # traffic. Pick a label no Service in the namespace selects.
+              {{- if eq .repository "iam-db" }}
+              networkPolicy:
+                enabled: true
+                clients: [iam]
+                scrapeFrom:
+                  namespace: observability
+              {{- end }}
         # THIS REPOSITORY, SUPPLYING VALUE FILES AND NOTHING ELSE. It carries no
         # `path`, deliberately: with one, Argo would try to render manifests from
         # it as well, and this repository's top level is Applications and
