@@ -861,6 +861,58 @@ spec:
                 scrapeFrom:
                   namespace: observability
               {{- end }}
+              # THE INGRESS NetworkPolicy FOR `task` (ledger 511, stage 4, module
+              # 5 of 6). Three keys and the same guard shape as `project` above.
+              # The reasoning that is SHARED is written out once up there and is
+              # not repeated here: why the guard lives in this file rather than
+              # in `versions/<module>.yaml` or unconditionally, why the rollout
+              # goes one module at a time, and the rule about never writing
+              # Go-template delimiters into these comments. What follows is only
+              # what DIFFERS for this module.
+              #
+              # THIS ENTRY IS `iam`'s WITH THE NAME CHANGED, and saying so is
+              # more use to the next reader than restating it. Both are service
+              # modules, both are reached on 50052, and both default
+              # `clients: [gateway]` — verified by parsing each chart's
+              # `chart/values.yaml` as YAML, not by grepping it. So the two
+              # paragraphs directly above, on the port and on ADR-0664 not
+              # protecting a chart whose client list defaults non-empty, apply
+              # here word for word. `svc/task` publishes `grpc` on 50052 and the
+              # chart pins that literal itself.
+              #
+              # `scrapeFrom` IS LOAD-BEARING HERE ON THE SAME MEASUREMENT.
+              # `task`'s pods carry `prometheus.io/scrape: "true"` with
+              # `prometheus.io/port: "9090"`; `prometheus-server` runs in
+              # `observability`, and its `kubernetes-pods` job builds each target
+              # address from the POD IP plus that annotation — cross-namespace
+              # pod-to-pod traffic, which this policy drops unless the namespace
+              # is named. `task`'s KEDA ScaledObject is live and Ready with
+              # fallback off, and its trigger query is
+              # `sum(rate(yadgar_calls_total{service="task", outcome="OK"}[2m]))
+              # / clamp_min(count(up{app="task"}), 1)` — BOTH series come from
+              # that scrape. Its `ACTIVE` reads False, which reports load rather
+              # than health, as `iam`'s entry above explains.
+              #
+              # THIS POLICY DOES NOT TOUCH `task`'s OWN DIAL TO `task-db`, and
+              # the next entry is where that matters. `policyTypes: [Ingress]` is
+              # written out in the chart and no egress rule exists, so nothing
+              # here constrains this pod's outbound traffic. `task` appears as
+              # the sole client in `task-db`'s allow-list below, and it is that
+              # policy — not this one — that admits the hop. Enabling this entry
+              # and the next one in either order cannot break the pair, because
+              # neither governs the same direction.
+              #
+              # THE ADR-0665 TRAP APPLIES UNCHANGED: `svc/task` selects
+              # `{"app":"task"}` and `svc/gateway` selects `{"app":"gateway"}`,
+              # so a probe pod wearing either JOINS that Service and takes real
+              # traffic. Pick a label no Service in the namespace selects.
+              {{- if eq .repository "task" }}
+              networkPolicy:
+                enabled: true
+                clients: [gateway]
+                scrapeFrom:
+                  namespace: observability
+              {{- end }}
         # THIS REPOSITORY, SUPPLYING VALUE FILES AND NOTHING ELSE. It carries no
         # `path`, deliberately: with one, Argo would try to render manifests from
         # it as well, and this repository's top level is Applications and
