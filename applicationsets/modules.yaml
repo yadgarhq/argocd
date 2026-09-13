@@ -913,6 +913,79 @@ spec:
                 scrapeFrom:
                   namespace: observability
               {{- end }}
+              # THE INGRESS NetworkPolicy FOR `task-db` (ledger 511, stage 4,
+              # module 6 of 6, and the last entry this stage adds). Three keys
+              # and the same guard shape as `project` above. The reasoning that
+              # is SHARED is written out once up there and is not repeated here:
+              # why the guard lives in this file rather than in
+              # `versions/<module>.yaml` or unconditionally, why the rollout goes
+              # one module at a time, and the rule about never writing
+              # Go-template delimiters into these comments. What follows is only
+              # what DIFFERS for this module.
+              #
+              # THE PORT IS 50051, NOT 50052. The `-db` modules serve gRPC on
+              # 50051 and the services on 50052 — read off the live Services
+              # rather than assumed: `svc/task-db`, `svc/iam-db` and
+              # `svc/project-db` publish `grpc` on 50051, while `svc/task`,
+              # `svc/iam` and `svc/project` publish it on 50052. The chart pins
+              # its own literal so nothing here sets it, but the demanded refusal
+              # that proves this policy is aimed at the wrong port if the number
+              # is misread.
+              #
+              # ADR-0664's REFUSAL DOES NOT PROTECT THIS ONE. That guard fires
+              # only where `networkPolicy.clients` is empty, and it is empty in
+              # exactly one chart — `project`'s. THIS chart defaults
+              # `clients: [task]`, read by parsing its `chart/values.yaml` as
+              # YAML rather than grepping it, so an enable that sets `enabled`
+              # and `clients` and forgets `scrapeFrom` renders happily, syncs,
+              # lists and describes, and silently drops the scrape. Nothing
+              # refuses it. A render check before the commit is the only thing
+              # between that mistake and the cluster.
+              #
+              # SO `scrapeFrom` IS LOAD-BEARING HERE TOO, measured rather than
+              # assumed. `task-db`'s pods carry `prometheus.io/scrape: "true"`
+              # with `prometheus.io/port: "9090"`; `prometheus-server` runs in
+              # `observability`, and its `kubernetes-pods` job builds each target
+              # address from the POD IP plus that annotation — cross-namespace
+              # pod-to-pod traffic, which this policy drops unless the namespace
+              # is named. `task-db`'s KEDA ScaledObject is live and Ready with
+              # fallback off, and its trigger query is
+              # `sum(rate(yadgar_calls_total{service="task-db",
+              # outcome="OK"}[2m])) / clamp_min(count(up{app="task-db"}), 1)` —
+              # BOTH series come from that scrape. Its `ACTIVE` reads False,
+              # which reports load rather than health, as `iam`'s entry explains.
+              #
+              # THE CLIENT LIST IS THIS CHART'S OWN DEFAULT, RESTATED. Unlike
+              # `project`, where `[gateway]` was information the chart could not
+              # carry, `[task]` is already this chart's default. It is written
+              # out anyway so that the allow-list is VISIBLE in the deployment
+              # that asserts it — under D80 the chart ships installable and
+              # opinion-free and the reference deployment is what opts in, and an
+              # allow-list read only out of a chart default is an assertion
+              # nobody looking at this file can see. `task` is `task-db`'s only
+              # caller.
+              #
+              # WITH THIS ENTRY THE `task` HOP IS POLICED AT ONE END ONLY, and
+              # that is the whole design rather than an omission. This policy
+              # admits `task` to 50051 here; `task`'s own entry above admits the
+              # gateway to 50052 there. Neither carries an egress rule, so
+              # nothing in this file constrains what either pod dials OUT to —
+              # module egress policies were declined, and `policyTypes:
+              # [Ingress]` is written out in every one of these charts so that
+              # the type set cannot be inferred from which rule blocks happen to
+              # be present.
+              #
+              # THE ADR-0665 TRAP APPLIES UNCHANGED: `svc/task-db` selects
+              # `{"app":"task-db"}` and `svc/task` selects `{"app":"task"}`, so a
+              # probe pod wearing either JOINS that Service and takes real
+              # traffic. Pick a label no Service in the namespace selects.
+              {{- if eq .repository "task-db" }}
+              networkPolicy:
+                enabled: true
+                clients: [task]
+                scrapeFrom:
+                  namespace: observability
+              {{- end }}
         # THIS REPOSITORY, SUPPLYING VALUE FILES AND NOTHING ELSE. It carries no
         # `path`, deliberately: with one, Argo would try to render manifests from
         # it as well, and this repository's top level is Applications and
