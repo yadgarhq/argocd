@@ -265,8 +265,38 @@ spec:
               # defeated by minting keys rather than by draining one, and the login
               # throttle is simply absent for that caller.
               #
-              # A NetworkPolicy does not cover this: the reference CNI is kindnet,
-              # which does not implement one.
+              # THIS SAID "A NetworkPolicy does not cover this: the reference CNI
+              # is kindnet, which does not implement one" UNTIL LEDGER 896. The
+              # measurement was right and the inference drawn from it was wrong.
+              # The correction is recorded in place rather than deleted, because a
+              # reader told only "that was wrong" re-measures the CNI, finds
+              # kindnet, and derives the same false conclusion again.
+              #
+              # STILL TRUE: the CNI is kindnet, and `kube-system` runs a `kindnet`
+              # DaemonSet with no Calico, Cilium or Weave. NO LONGER TRUE: that
+              # nothing evaluates a NetworkPolicy here. kindnetd
+              # `v20260528-9350166c` runs a `kube-network-policies` controller
+              # (ledger 684) and ledger 511 proved ingress enforcement live twelve
+              # times over. Seven module ingress policies are live in `yadgar`
+              # today, six of them switched on by the `networkPolicy` blocks
+              # further down THIS FILE.
+              #
+              # AND THE BYPASS ABOVE IS NOW CONFINED AT THE NETWORK LAYER, which
+              # is the seventh of those policies. `gateway-ingress` (ADR-0685,
+              # ledger 896, in `deploy/infra/network-policies/`) admits port 8080
+              # from the Envoy edge data-plane pods and from nothing else, so "any
+              # pod that reaches the ClusterIP Service directly" is no longer any
+              # pod. That file argues the same increment from the other side: the
+              # unattributed login bucket keys on the TCP peer, so constraining who
+              # may BECOME a peer is a thing only a network control can do.
+              #
+              # THE VALUE STILL STAYS "", AND NOW FOR THE D80 REASON ALONE. A
+              # declared hop count that is safe only because a NetworkPolicy
+              # confines the callers makes an audit record's integrity a property
+              # of the platform enforcing that policy — the same objection that
+              # retracted the Envoy ClientTrafficPolicy nine lines above. The peer
+              # check inside `Source::resolve` holds on every platform; the policy
+              # is defence in depth under it, not a substitute for it.
               #
               # Restore "1" once the gateway checks the peer against a trusted
               # proxy range. That check is portable under D80 — a CIDR list in
