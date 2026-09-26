@@ -69,6 +69,50 @@ spec:
           - repositoryMatch: ".*"
             pathsExist: [chart]
             labelMatch: "yadgar-deployable"
+      # THE SEVEN MODULES IN THE PARENT CHART LEAVE THIS GENERATOR'S MATCH.
+      # Step 3 of plans/dogfooding-the-parent-chart.md in yadgarhq/docs, under
+      # ADR-0786: this organisation's Argo CD deploys the estate as ONE
+      # Application at the published parent chart, so a module change reaches
+      # this cluster by a parent VERSION and never by a merge to a module's
+      # main. The `yadgar` Application in yadgarhq/deploy owns those objects
+      # from the cutover's sync onward, and two Applications owning one object
+      # is a fight neither wins.
+      #
+      # AN EXCLUSION HERE RATHER THAN SEVEN REMOVED TOPICS, deliberately. The
+      # retirement plan's step 10 deletes this file; a revert of that deletion
+      # must restore a file that generates NOTHING, because a file whose match
+      # regenerates seven Applications at branch HEAD would fight `yadgar` for
+      # objects it owns by then. Seven removed topics would leave nothing here
+      # to make that revert inert, and would leave seven repositories silently
+      # different with the reason recorded nowhere.
+      #
+      # A POST-SELECTOR, BECAUSE THE SCM FILTERS CANNOT EXPRESS THIS. The
+      # filters above carry `repositoryMatch`, `branchMatch`, `labelMatch`,
+      # `pathsExist` and `pathsDoNotExist` — all positive, and Go's RE2 has no
+      # negative lookahead, so no regex spells "every repo but these seven".
+      # `selector` is applied by the controller AFTER generation, over the
+      # parameters as if they were labels, and `NotIn` is the exclusion. It sits
+      # on the generator itself rather than inside a matrix, so
+      # `spec.applyNestedSelectors` is not needed.
+      #
+      # THE FAILURE MODE, SO THE GATE IS THE RIGHT ONE: a label selector's
+      # `NotIn` is satisfied by an ABSENT key, so a mistyped `repository` here
+      # excludes nothing and says nothing. The gate for this change is therefore
+      # the seven generated Applications being GONE from the cluster, never this
+      # file merging. The values below are the live Application names, which the
+      # template above mints from `{{ .repository }}`.
+      selector:
+        matchExpressions:
+          - key: repository
+            operator: NotIn
+            values:
+              - gateway
+              - iam
+              - iam-db
+              - project
+              - project-db
+              - task
+              - task-db
   template:
     metadata:
       name: "{{ .repository }}"
