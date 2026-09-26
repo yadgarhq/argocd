@@ -11,6 +11,34 @@ metadata:
 spec:
   goTemplate: true
   goTemplateOptions: [missingkey=error]
+  # THE CASCADE, DISARMED. Step 1 of plans/dogfooding-the-parent-chart.md in
+  # yadgarhq/docs. Every Application this generator produces carries
+  # `resources-finalizer.argocd.argoproj.io`, so removing a repository from the
+  # generator — or deleting this ApplicationSet — DELETES that module's live
+  # objects rather than orphaning them. The cutover to the parent chart performs
+  # exactly that removal, on an estate holding real databases, so the safety net
+  # lands before anything else moves.
+  #
+  # THE TEMPLATE BELOW DECLARES NO FINALIZER, and that is why this key is the
+  # only lever. The ApplicationSet controller ADDS the finalizer itself to every
+  # Application it generates; measured 2026-09-26 on this cluster, all seven read
+  # `[resources-finalizer.argocd.argoproj.io]` while `template.metadata` carries
+  # no `finalizers` field at all. Editing the template cannot take it off.
+  #
+  # WHAT THIS KEY DOES: the controller stops adding the finalizer, so an
+  # Application it deletes goes while its resources stay — unowned — for the
+  # `yadgar` Application to adopt by annotation rewrite.
+  #
+  # IT IS NOT WHY THE FINAL DELETION IS SAFE, and recording the wrong reason here
+  # would let a later reader disarm the wrong thing. Deleting this ApplicationSet
+  # at the retiring plan's step 10 is safe because `finalizeApplicationDeletion`
+  # -> `getPermittedAppLiveObjects` -> `GetManagedLiveObjs` enumerates by
+  # TRACKING-ID: once the objects carry `yadgar:…` the module Applications manage
+  # nothing and the cascade has nothing to walk. That safety depends on the
+  # re-annotation having completed, never on this key. This key is belt and
+  # braces on a data-bearing estate, and it is worth having for that alone.
+  syncPolicy:
+    preserveResourcesOnDeletion: true
   generators:
     - scmProvider:
         github:
