@@ -36,15 +36,15 @@ WHAT IS ASSERTED, and each has a red case below:
   8. D4 OF THE OPERATORS HANDOVER (ADR-0824): `keda`, `cert-manager`,
      `envoy-gateway` and `prometheus` no longer pin to deploy's copy, and
      since D7.3 neither does `mariadb-operator`. Each sources `yadgarhq`'s
-     `platform` chart at the version embedded at `yadgarhq/chart` v0.3.15,
-     with its own `operators.<op>.create` true and every other operator, Argo
-     CD included, explicitly false. Deploy's values, where it had any, are
-     carried over under the operator's subchart key; `mariadb-operator` had
-     none, so its values hold `operators` alone. Each name, destination,
-     `syncPolicy` and release name is pinned unchanged, so the release
-     instance label and every immutable selector stay as they are.
-     PLATFORM_SOURCED holds one row per operator. Checks 2 to 7 cover all
-     five.
+     `platform` chart at the version `scripts/chart_pin.json` commits (ledger
+     1206), with its own `operators.<op>.create` true and every other
+     operator, Argo CD included, explicitly false. Deploy's values, where it
+     had any, are carried over under the operator's subchart key;
+     `mariadb-operator` had none, so its values hold `operators` alone. Each
+     name, destination, `syncPolicy` and release name is pinned unchanged, so
+     the release instance label and every immutable selector stay as they
+     are. PLATFORM_SOURCED holds one row per operator. Checks 2 to 7 cover
+     all five.
   9. D7.1 OF THE OPERATORS HANDOVER (ADR-0824): `mariadb-operator-crds` is
      retired. No file under `applications/` or `applicationsets/` is named for
      it, and no manifest there declares an Application with its name. Its 12
@@ -52,6 +52,12 @@ WHAT IS ASSERTED, and each has a red case below:
      `mariadb-operator` to `platform`, which renders them. A revived
      Application would apply the same CRDs beside that one, as the same
      server-side apply manager. RETIRED holds the name.
+  10. LEDGER 1212. Each Application's `metadata.annotations` — at minimum its
+      `argocd.argoproj.io/sync-wave` — is pinned per row. Before this, nothing
+      read the annotation a wave is declared with, so moving `mariadb-operator`
+      from `-10` to `5` left every other gate here green: wrong wave order
+      against the CRDs it now renders is a cold-install failure mode
+      (ledger 1212), not a diff `platform_errors` would ever have reported.
 """
 
 from __future__ import annotations
@@ -61,6 +67,7 @@ import hashlib
 import json
 import re
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -109,6 +116,15 @@ PRUNE_FALSE = "Prune=false"
 # `yadgarhq/chart`'s own `example/operators-application.yaml` at its latest
 # release tag, read with `gh-personal api repos/yadgarhq/chart/contents/...`.
 # That example also omits `automated.prune`, which is the other half of S0.
+#
+# PINNED SEPARATELY FROM `CHART_TAG` (`v0.3.13`, ledger 1206), AND DELIBERATELY
+# NOT RE-DERIVED FROM IT. This constant names "the latest tag read for S0's
+# example", `CHART_TAG` names "the tag this organisation runs" (ledger 1206),
+# and the two have no reason to move together. MEASURED 2026-10-01:
+# `example/operators-application.yaml` is byte-identical at `v0.3.13`,
+# `v0.3.14` and `v0.3.15` (`diff` on all three pulled copies, exit 0) — the
+# `retry` block below is the same at `CHART_TAG` too, so there is nothing for
+# this difference to hide today.
 CHART_EXAMPLE_SOURCE = "yadgarhq/chart@v0.3.15:example/operators-application.yaml"
 EXPECTED_RETRY: dict = {
     "limit": 6,
@@ -121,12 +137,46 @@ EXPECTED_RETRY: dict = {
 
 # D4 OF THE OPERATORS HANDOVER (ADR-0824). Each Application here sources the
 # `platform` chart with exactly one operator on. The version is the `platform`
-# dependency embedded at `yadgarhq/chart` v0.3.15 (its `chart/Chart.yaml`),
-# which is also the `targetRevision` of that tag's
-# `example/operators-application.yaml`. This is a hardcoded copy: no test yet
-# holds it equal to the parent chart's embedded version (ledger 1206).
-PLATFORM_SOURCE = "yadgarhq/chart@v0.3.15:chart/Chart.yaml"
-PLATFORM_VERSION = "0.1.21"
+# dependency embedded at `yadgarhq/chart`'s `chart/Chart.yaml`, at the chart tag
+# this organisation runs.
+#
+# LEDGER 1206. This used to be a hardcoded literal with no test holding it equal
+# to the parent chart's embedded version. It now comes from `chart_pin.json`,
+# committed beside this file, which is the single source both halves read:
+#
+#   `chart_tag`         the `yadgarhq/chart` git tag this organisation runs,
+#                        read from kind-yadgar's `yadgar` Application
+#                        (`spec.source.targetRevision`, as the published OCI
+#                        chart version — the same number with a `v` in front is
+#                        the git tag `ref=` takes).
+#   `platform_version`  `platform`'s pinned `version` among that tag's
+#                        `chart/Chart.yaml` `dependencies`.
+#
+# This test module reads the file and, with it, needs no network: every
+# platform-sourced Application's `targetRevision` is asserted equal to
+# `PLATFORM_VERSION` below (the `target-revision` clause of
+# `platform_clause_errors`), which is exactly "the platform pin in every
+# platform-sourced Application equals the committed `platform_version`".
+# `test_a_mismatched_chart_pin_reddens` is this gate's red case.
+#
+# THE REVERSE CHECKS — that the committed file still describes `yadgarhq/chart`'s
+# actual state, AND that `chart_tag` itself is still the tag this organisation
+# runs rather than one that merely matched once — each need a real request, so
+# both run as their own CI job (`chart-pin` in `.github/workflows/ci.yaml`,
+# `scripts/check_chart_pin.py`), not here and not as a pre-commit hook.
+CHART_PIN_PATH = REPOSITORY / "scripts" / "chart_pin.json"
+CHART_PIN: dict = json.loads(CHART_PIN_PATH.read_text())
+CHART_TAG = CHART_PIN["chart_tag"]
+PLATFORM_SOURCE = f"yadgarhq/chart@{CHART_TAG}:chart/Chart.yaml"
+PLATFORM_VERSION = CHART_PIN["platform_version"]
+
+# `chart_tag` is a git tag (`v` prefix); `platform_version` is the OCI chart
+# version `yadgarhq/chart`'s `Chart.yaml` and `yadgar-app.yaml`'s
+# `targetRevision` both write it as (no `v`). `chart_pin_errors` below is the
+# one clause that reads these.
+CHART_TAG_PATTERN = re.compile(r"v\d+\.\d+\.\d+")
+PLATFORM_VERSION_PATTERN = re.compile(r"\d+\.\d+\.\d+")
+
 OPERATOR_KEYS = ("argoCd", "certManager", "envoyGateway", "keda", "mariadbOperator", "prometheus")
 
 # Every field of a platform-sourced Application's `spec.syncPolicy`, as deploy's
@@ -167,6 +217,11 @@ PLATFORM_SYNC_POLICY: dict = {
 #   unchanged  every field of `spec` other than `source`, as deploy's copy
 #              declared it with S0's two changes. A change here is a change to
 #              the release.
+#   annotations  required (ledger 1212). Exactly `metadata.annotations`, sync-
+#              wave included. Nothing else gated this: changing a wave alone
+#              touches no `spec` field `unchanged` reads, and a wrong wave
+#              order against the CRDs an operator now renders is a cold-install
+#              failure mode, not a diff.
 PLATFORM_SOURCED: dict[str, dict] = {
     "keda": {
         "toggle": "keda",
@@ -183,6 +238,7 @@ PLATFORM_SOURCED: dict[str, dict] = {
             "destination": {"server": "https://kubernetes.default.svc", "namespace": "keda"},
             "syncPolicy": PLATFORM_SYNC_POLICY,
         },
+        "annotations": {"argocd.argoproj.io/sync-wave": "-10"},
     },
     "cert-manager": {
         "toggle": "certManager",
@@ -202,6 +258,7 @@ PLATFORM_SOURCED: dict[str, dict] = {
             "destination": {"server": "https://kubernetes.default.svc", "namespace": "cert-manager"},
             "syncPolicy": PLATFORM_SYNC_POLICY,
         },
+        "annotations": {"argocd.argoproj.io/sync-wave": "-10"},
     },
     "envoy-gateway": {
         "toggle": "envoyGateway",
@@ -216,6 +273,7 @@ PLATFORM_SOURCED: dict[str, dict] = {
             "destination": {"server": "https://kubernetes.default.svc", "namespace": "envoy-gateway-system"},
             "syncPolicy": PLATFORM_SYNC_POLICY,
         },
+        "annotations": {"argocd.argoproj.io/sync-wave": "-10"},
     },
     "prometheus": {
         "toggle": "prometheus",
@@ -239,6 +297,9 @@ PLATFORM_SOURCED: dict[str, dict] = {
             # deploy declared no `ServerSideApply=true` for prometheus.
             "syncPolicy": {**PLATFORM_SYNC_POLICY, "syncOptions": ["CreateNamespace=true"]},
         },
+        # Before the modules, which is what it scrapes — but after the
+        # operators, so it is not competing for the first wave.
+        "annotations": {"argocd.argoproj.io/sync-wave": "-8"},
     },
     # D7.3 (ADR-0824). deploy's copy set no values, so there is nothing to
     # carry and no `mariadb-operator:` subchart key. `platform` vendors the 12
@@ -256,6 +317,10 @@ PLATFORM_SOURCED: dict[str, dict] = {
             "destination": {"server": "https://kubernetes.default.svc", "namespace": "mariadb-system"},
             "syncPolicy": PLATFORM_SYNC_POLICY,
         },
+        # ONE WAVE, NOT TWO (ledger 1212): the CRDs used to sync at -12 from
+        # their own Application; within -10, Argo applies CRDs before the RBAC
+        # and workload kinds this chart renders.
+        "annotations": {"argocd.argoproj.io/sync-wave": "-10"},
     },
 }
 
@@ -416,11 +481,14 @@ def platform_clause_errors(tree: Path) -> list[tuple[str, str]]:
       carried-digest   each key in the row's `digests` hashes to its value.
                        Only for a row with `values`.
       unchanged        every field of `spec` outside `source` equals `unchanged`
+      annotations      `metadata.annotations` equals the row's `annotations`
+                       (ledger 1212), sync-wave included
     """
     errors = []
     for name, row in PLATFORM_SOURCED.items():
         path = tree / "applications" / f"{name}.yaml"
         document = (yaml.safe_load(path.read_text()) if path.is_file() else None) or {}
+        metadata = document.get("metadata") or {}
         spec = document.get("spec") or {}
         source = spec.get("source") or {}
         helm = source.get("helm") or {}
@@ -452,6 +520,7 @@ def platform_clause_errors(tree: Path) -> list[tuple[str, str]]:
                 key in subchart and canonical_digest(subchart[key]) == digest for key, digest in digests.items()
             )
         checks["unchanged"] = rest == row["unchanged"]
+        checks["annotations"] = (metadata.get("annotations") or {}) == row["annotations"]
         errors.extend((name, clause) for clause, passed in checks.items() if not passed)
     return errors
 
@@ -459,6 +528,23 @@ def platform_clause_errors(tree: Path) -> list[tuple[str, str]]:
 def platform_errors(tree: Path) -> list[str]:
     """Every platform-sourced name with at least one clause of `platform_clause_errors` failing."""
     return list(dict.fromkeys(name for name, _ in platform_clause_errors(tree)))
+
+
+def chart_pin_errors(pin: dict) -> list[str]:
+    """Every clause of `chart_pin.json`'s own shape that `pin` fails (ledger 1206).
+
+    `keys` short-circuits the other two: a missing key leaves nothing for
+    either pattern to check, and `pin["chart_tag"]` would raise rather than
+    fail a clause.
+    """
+    if set(pin) != {"chart_tag", "platform_version"}:
+        return ["keys"]
+    errors = []
+    if not CHART_TAG_PATTERN.fullmatch(pin["chart_tag"]):
+        errors.append("chart_tag")
+    if not PLATFORM_VERSION_PATTERN.fullmatch(pin["platform_version"]):
+        errors.append("platform_version")
+    return errors
 
 
 def retired_present(tree: Path) -> list[str]:
@@ -508,6 +594,52 @@ def test_every_platform_sourced_application_is_the_d4_shape() -> None:
         f" {PLATFORM_VERSION} from {PLATFORM_SOURCE}"
     )
     assert platform_errors(REPOSITORY) == []
+
+
+def test_chart_pin_file_is_well_formed() -> None:
+    """LEDGER 1206. `chart_pin.json` carries exactly the two keys this module reads,
+    each in the shape `scripts/check_chart_pin.py`'s requests expect.
+
+    Whether its `platform_version` and `chart_tag` are still true of
+    `yadgarhq/chart` and the running `yadgar` Application is that script's
+    question, in CI, not this one's — this is the one clause for the file's
+    own shape.
+    """
+    assert chart_pin_errors(CHART_PIN) == []
+
+
+def test_a_chart_tag_missing_the_v_prefix_reddens() -> None:
+    """The contents API's `ref=` query string takes a git tag, which this
+    organisation always writes with a leading `v` (`git tag` convention); a
+    bare semver string is not one.
+    """
+    assert chart_pin_errors({**CHART_PIN, "chart_tag": "0.3.13"}) == ["chart_tag"]
+
+
+def test_a_platform_version_carrying_a_v_prefix_reddens() -> None:
+    """`platform_version` is the OCI chart version as `Chart.yaml` and
+    `yadgar-app.yaml`'s `targetRevision` both write it: no leading `v`.
+    """
+    assert chart_pin_errors({**CHART_PIN, "platform_version": "v0.1.21"}) == ["platform_version"]
+
+
+def test_an_extra_chart_pin_key_reddens() -> None:
+    assert chart_pin_errors({**CHART_PIN, "extra": "x"}) == ["keys"]
+
+
+def test_a_mismatched_chart_pin_reddens(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LEDGER 1206's gate: every platform-sourced Application's pin equals `PLATFORM_VERSION`.
+
+    `scripts/chart_pin.json` is read once at import, so a drift in the committed
+    file cannot be reproduced by editing it here without reloading the module.
+    What CAN be shown without that is the gate itself: with `PLATFORM_VERSION`
+    wrong, every row's `target-revision` clause fails, because `applications/`
+    still carries the real (correct) pin. The reverse direction — a correct
+    `PLATFORM_VERSION` against a wrong `targetRevision` in one file — is already
+    covered by `test_a_moved_platform_pin_reddens`.
+    """
+    monkeypatch.setattr(sys.modules[__name__], "PLATFORM_VERSION", "9.9.9")
+    assert sorted(platform_errors(REPOSITORY)) == sorted(PLATFORM_SOURCED)
 
 
 def test_no_retired_application_is_declared() -> None:
@@ -706,6 +838,44 @@ def test_a_moved_destination_reddens(copy: Path) -> None:
     document["spec"]["destination"]["namespace"] = "yadgar-operators"
     path.write_text(yaml.safe_dump(document))
     assert platform_errors(copy) == ["keda"]
+
+
+def test_a_changed_sync_wave_reddens(copy: Path) -> None:
+    """LEDGER 1212. Before `annotations`, moving a wave changed no `spec` field
+
+    `unchanged` reads, so it stayed green: a wrong wave order against the CRDs
+    an operator now renders is a cold-install failure mode, not a diff any
+    other clause here would have reported.
+    """
+    path = copy / "applications" / "mariadb-operator.yaml"
+    document = yaml.safe_load(path.read_text())
+    document["metadata"]["annotations"]["argocd.argoproj.io/sync-wave"] = "5"
+    path.write_text(yaml.safe_dump(document))
+    assert platform_clause_errors(copy) == [("mariadb-operator", "annotations")]
+
+
+def test_a_dropped_annotation_reddens(copy: Path) -> None:
+    path = copy / "applications" / "mariadb-operator.yaml"
+    document = yaml.safe_load(path.read_text())
+    del document["metadata"]["annotations"]
+    path.write_text(yaml.safe_dump(document))
+    assert platform_clause_errors(copy) == [("mariadb-operator", "annotations")]
+
+
+def test_an_added_annotation_reddens(copy: Path) -> None:
+    """A clause that compared only `sync-wave` would stay green here.
+
+    Both other `annotations` red cases change or remove `sync-wave` itself, so
+    a clause reading only that one key still catches them — a mutant that
+    narrows the comparison to `sync-wave` survives both. An annotation added
+    BESIDE an unchanged `sync-wave` is the case only a full `metadata.annotations`
+    comparison catches.
+    """
+    path = copy / "applications" / "mariadb-operator.yaml"
+    document = yaml.safe_load(path.read_text())
+    document["metadata"]["annotations"]["argocd.argoproj.io/example"] = "x"
+    path.write_text(yaml.safe_dump(document))
+    assert platform_clause_errors(copy) == [("mariadb-operator", "annotations")]
 
 
 def test_dropped_keda_resources_reddens(copy: Path) -> None:

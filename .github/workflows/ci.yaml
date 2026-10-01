@@ -87,3 +87,67 @@ jobs:
       contents: read
       packages: write
       id-token: write
+
+  # LEDGER 1206. `scripts/chart_pin.json`'s `platform_version` is read by
+  # `scripts/tests/test_operator_applications.py` with no network, so that gate
+  # alone cannot tell "committed value is still true" from "committed value went
+  # stale while nobody told it". This job makes the two requests that can —
+  # `scripts/check_chart_pin.py`'s own module docstring has the full argument,
+  # this is the short form:
+  #
+  #   platform-version  reads `yadgarhq/chart@<chart_tag>`'s `chart/Chart.yaml`
+  #                      and fails if `platform`'s pinned version there has
+  #                      moved away from what is committed.
+  #   chart-tag          reads `yadgarhq/deploy`'s `infra/yadgar-app.yaml` for
+  #                      the `targetRevision` the running `yadgar` Application
+  #                      actually pins, and fails if `chart_tag` disagrees. A
+  #                      git tag never moves, so `platform-version` ALONE
+  #                      cannot detect `chart_pin.json` going stale after this
+  #                      organisation moves to a newer chart release — this is
+  #                      the half that can.
+  #
+  # NOT A PRE-COMMIT HOOK, UNLIKE `operator-applications`. That hook's whole
+  # point (`versions-pinned`'s own comment makes the same argument) is that what
+  # a developer runs locally is what CI runs — which requires no network call a
+  # developer might not have. Both halves above need one, so they live here
+  # instead, LOCAL TO THIS REPOSITORY rather than in `yadgarhq/actions`: no
+  # other repository carries a `chart_pin.json` for this to check.
+  #
+  # THIS IS NOT THE REQUIRED CHECK. `main`'s ruleset gates on `ci / passed`
+  # alone (the comment on the `ci` job above), so a red `chart-pin` here is a
+  # visible signal, not a merge block — same posture `ci-pr.yaml`'s own
+  # `ci / workflows` zizmor job takes on this very file.
+  #
+  # `GITHUB_TOKEN` ONLY RAISES THE RATE LIMIT, FOR BOTH READS. `yadgarhq/chart`
+  # AND `yadgarhq/deploy` are both public repositories (checked by hand,
+  # `gh api repos/yadgarhq/<repo> --jq .private` → `false` for both), so a
+  # default `GITHUB_TOKEN` — scoped read-only to THIS repository's own
+  # `contents` — reads either one exactly as an unauthenticated request would;
+  # the token is passed because it costs nothing. If `yadgarhq/deploy` (or
+  # wherever the `yadgar` Application lives after it moves into this
+  # repository — option A, `scripts/check_chart_pin.py`'s docstring) ever turns
+  # private, this job needs a token minted for cross-repository read (e.g. a
+  # GitHub App installation token with `Contents: Read` on that repository),
+  # not a wider `permissions:` block here. `scripts/check_chart_pin.py` never
+  # prints the token.
+  chart-pin:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.x"
+
+      - name: install pyyaml
+        run: pip install --quiet pyyaml==6.0.3
+
+      - name: chart_pin.json matches yadgarhq/chart and the running yadgar Application
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/check_chart_pin.py
