@@ -82,7 +82,7 @@ MANIFEST_DIGESTS: dict[str, str] = {
     # script's stale "60 attempts" / hours-long text to the S0 numbers (6
     # attempts, ~13 minutes, ADR-0828) after `tls`'s retry dropped from 60 to
     # 6. Every other file in this dict is still byte-identical to deploy's copy.
-    "manifests/tls/ca-preflight.yaml": "16eff74aa211250beeb3c1cc5ab931e3be020b84b0954373eec22de5959f6428",
+    "manifests/tls/ca-preflight.yaml": "f5aaa1775e40cdbfa99fe1a2b844f7f9cfed6f926d0301794446e862a24db14a",
     "manifests/tls/clusterissuer.yaml": "ceaea049f75d527493dd1d7fd70d17ec119e4d6cca339a27147fd9c1c5964e68",
 }
 
