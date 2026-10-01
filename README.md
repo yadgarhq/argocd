@@ -133,6 +133,13 @@ operation, a Secret resourceVersion change, or a wrong edge status. It **warns**
 on a syncPolicy change, a restart, other generation changes and a root prune.
 It **refuses** snapshots from two clusters or with nothing in them.
 
+**Only root's objects fail.** Each custom resource, workload and pod carries a
+scope. An Argo tracking-id names its Application; without one it takes its
+owner's scope through ownerReferences. Another Application's object (yadgar's
+HTTPRoutes and MariaDBs, or the `envoy-yadgar-edge` proxy its Gateway drives)
+and an untracked custom resource are reported as WARN, never FAIL. Hook
+resources are skipped: Argo recreates them on every sync.
+
 **A merge that means to roll something goes red, by design.** A resource or
 image change bumps a Deployment's generation and replaces its pods. The diff
 names each change. Red means "read this", and the reviewer decides whether it

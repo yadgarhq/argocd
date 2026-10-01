@@ -32,6 +32,9 @@ WHAT `diff` FAILS ON (exit 1):
   - a Secret resourceVersion change (only when both snapshots read Secrets);
   - an edge probe that is not the expected status over a verified TLS session.
 
+A FAIL ON AN OBJECT ANOTHER APPLICATION OWNS IS A WARN (see `_classify`), and
+hook resources are never compared.
+
 WHAT IT ONLY WARNS ON (exit 0): a syncPolicy change, a restart-count increase, a
 generation change outside Deployments and CRDs, and root pruning something on a
 new revision. Additions are INFO.
@@ -61,7 +64,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 from urllib.parse import urlsplit
 
-SCHEMA = 1
+SCHEMA = 2
 
 # Pods that come and go by design: hook and Job pods, and ARC runner pods (the
 # verifier's own runner among them).
@@ -73,6 +76,7 @@ SECRET_COLUMNS = "custom-columns=NAME:.metadata.name,UID:.metadata.uid,RV:.metad
 # created and garbage-collected per renewal, as Job pods are per hook; and
 # Applications are compared in their own section, where an operation's
 # generation bump is not a finding.
+TRACKING_ID = "argocd.argoproj.io/tracking-id"
 UNLISTED_INSTANCE_CRDS = frozenset(
     {
         "certificaterequests.cert-manager.io",
@@ -201,6 +205,51 @@ def _identity(obj: dict) -> dict:
     return {"uid": meta.get("uid"), "generation": meta.get("generation"), "deletionTimestamp": meta.get("deletionTimestamp")}
 
 
+def _ownership(obj: dict, kind: str | None = None) -> dict:
+    """Working fields `_classify` reads and then removes: who tracks the object, and who owns it."""
+    meta = _meta(obj)
+    tracking = str((meta.get("annotations") or {}).get(TRACKING_ID) or "").split(":", 1)[0] or None
+    return {
+        "_kind": kind or obj.get("kind"),
+        "_ns": meta.get("namespace") or "",
+        "_name": meta.get("name"),
+        "_tracking": tracking,
+        "_owners": [(o.get("kind"), o.get("name")) for o in meta.get("ownerReferences") or []],
+    }
+
+
+def _classify(sections: list[tuple[dict, str]], root_apps: set[str]) -> None:
+    """Give every record a `scope`: `root`, or `foreign:<why>`. `diff` lowers a foreign FAIL to WARN.
+
+    An Argo tracking-id names the Application that owns an object. With none,
+    the object takes the scope of its owner, following ownerReferences
+    (a ReplicaSet stands for the Deployment its name extends). With neither, it
+    takes its section's default: `root` for workloads and pods in a root
+    Application's namespace, `foreign:untracked` for custom resources listed
+    cluster-wide. An owner that is not in the snapshot also falls to the
+    default.
+    """
+    index = {(r["_kind"], r["_ns"], r["_name"]): r for records, _default in sections for r in records.values()}
+
+    def scope(record: dict, default: str, depth: int = 0) -> str:
+        if record.get("_tracking"):
+            return "root" if record["_tracking"] in root_apps else f"foreign:{record['_tracking']}"
+        for kind, name in record.get("_owners") or []:
+            if kind == "ReplicaSet" and "-" in (name or ""):
+                kind, name = "Deployment", name.rsplit("-", 1)[0]
+            owner = index.get((kind, record["_ns"], name)) or index.get((kind, "", name))
+            if owner is not None and owner is not record and depth < 8:
+                return scope(owner, default, depth + 1)
+        return default
+
+    scopes = {id(r): scope(r, default) for records, default in sections for r in records.values()}
+    for records, _default in sections:
+        for record in records.values():
+            for key in [k for k in record if k.startswith("_")]:
+                del record[key]
+            record["scope"] = scopes[id(record)]
+
+
 def _operation(app: dict) -> dict | None:
     op = (app.get("status") or {}).get("operationState")
     if not op:
@@ -233,7 +282,9 @@ def _application_record(app: dict) -> dict:
         "operation": _operation(app),
         "reconciledAt": status.get("reconciledAt"),
         "destinationNamespace": (spec.get("destination") or {}).get("namespace"),
-        "resources": sorted(_resource_key(r) for r in status.get("resources") or []),
+        # A hook is deleted and recreated on every sync (BeforeHookCreation), so
+        # its uid always changes. It is neither listed nor compared.
+        "resources": sorted(_resource_key(r) for r in status.get("resources") or [] if not r.get("hook")),
     }
 
 
@@ -319,7 +370,7 @@ def _custom_resources(cluster: Cluster, records: dict, crds: dict) -> dict:
             continue
         for item in cluster.json("get", name, "-A").get("items") or []:
             meta = _meta(item)
-            instances[f"{name}/{meta.get('namespace') or ''}/{meta.get('name')}"] = _identity(item)
+            instances[f"{name}/{meta.get('namespace') or ''}/{meta.get('name')}"] = {**_identity(item), **_ownership(item)}
     return instances
 
 
@@ -340,6 +391,7 @@ def _workloads(cluster: Cluster, namespaces: Iterable[str]) -> tuple[dict, dict]
                     "uid": meta.get("uid"),
                     "restarts": sum(int(s.get("restartCount") or 0) for s in statuses),
                     "deletionTimestamp": meta.get("deletionTimestamp"),
+                    **_ownership(item, "Pod"),
                 }
             elif kind == "PersistentVolumeClaim":
                 workloads[f"{kind}/{name}"] = {
@@ -347,9 +399,10 @@ def _workloads(cluster: Cluster, namespaces: Iterable[str]) -> tuple[dict, dict]
                     "volumeName": (item.get("spec") or {}).get("volumeName"),
                     "phase": (item.get("status") or {}).get("phase"),
                     "deletionTimestamp": meta.get("deletionTimestamp"),
+                    **_ownership(item),
                 }
             else:
-                workloads[f"{kind}/{name}"] = _identity(item)
+                workloads[f"{kind}/{name}"] = {**_identity(item), **_ownership(item)}
     return workloads, pods
 
 
@@ -394,6 +447,8 @@ def collect(
 
     namespaces = sorted({r["destinationNamespace"] for r in records.values() if r["destinationNamespace"]} | set(extra_namespaces))
     workloads, pods = _workloads(cluster, namespaces)
+    custom_resources = _custom_resources(cluster, records, crds)
+    _classify([(custom_resources, "foreign:untracked"), (workloads, "root"), (pods, "root")], set(records))
     secrets_namespaces = list(secrets_namespaces)
 
     return {
@@ -409,7 +464,7 @@ def collect(
         "crd_count": len(crds),
         "crd_hash": crd_hash,
         "objects": _tracked_objects(cluster, records),
-        "custom_resources": _custom_resources(cluster, records, crds),
+        "custom_resources": custom_resources,
         "namespaces": namespaces,
         "workloads": workloads,
         "pods": pods,
@@ -485,23 +540,32 @@ def _compare_identities(report: Report, area: str, before: dict, after: dict, ge
     for key in sorted(set(before) | set(after)):
         b, a = before.get(key), after.get(key)
         label = f"{area}/{key}"
-        if a is not None and (a.get("skipped") or (b or {}).get("skipped")):
+        if (a or {}).get("skipped") or (b or {}).get("skipped"):
             continue
+        # Another Application's object, or one nobody tracks: reported, never
+        # failed. Its owner's own sync is what changes it.
+        scope = (a or b).get("scope", "root")
+        foreign = scope.startswith("foreign:")
+        fail = "WARN" if foreign else "FAIL"
+        suffix = f" [{scope}]" if foreign else ""
         if b is None:
-            report.add("INFO", label, f"added (uid {a.get('uid')})")
+            report.add("INFO", label, f"added (uid {a.get('uid')}){suffix}")
         elif a is None or a.get("missing"):
-            report.add("FAIL", label, f"gone (was uid {b.get('uid')})")
+            if b.get("missing"):
+                report.add("WARN", label, "tracked but missing in both snapshots")
+            else:
+                report.add(fail, label, f"gone (was uid {b.get('uid')}){suffix}")
             continue
         elif b.get("missing"):
             report.add("INFO", label, f"appeared (uid {a.get('uid')})")
         else:
             if a.get("uid") != b.get("uid"):
-                report.add("FAIL", label, f"uid {b.get('uid')} -> {a.get('uid')}")
+                report.add(fail, label, f"uid {b.get('uid')} -> {a.get('uid')}{suffix}")
             if a.get("generation") != b.get("generation") and "generation" in a and "generation" in b:
-                level = "FAIL" if generation_fails(key) else "WARN"
-                report.add(level, label, f"generation {b.get('generation')} -> {a.get('generation')}")
+                level = fail if generation_fails(key) else "WARN"
+                report.add(level, label, f"generation {b.get('generation')} -> {a.get('generation')}{suffix}")
         if a.get("deletionTimestamp"):
-            report.add("FAIL", label, f"deletionTimestamp {a['deletionTimestamp']}")
+            report.add(fail, label, f"deletionTimestamp {a['deletionTimestamp']}{suffix}")
 
 
 def _compare_applications(report: Report, before: dict, after: dict) -> None:

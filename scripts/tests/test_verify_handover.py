@@ -276,9 +276,10 @@ def test_collect_records_crds_and_their_hash(snap) -> None:
     assert snap["crds"] == {
         "applications.argoproj.io": {"uid": "crd-app", "generation": 2, "deletionTimestamp": None},
         "certificaterequests.cert-manager.io": {"uid": "crd-cr", "generation": 1, "deletionTimestamp": None},
+        "gatewayclasses.gateway.networking.k8s.io": {"uid": "crd-gc", "generation": 1, "deletionTimestamp": None},
         "scaledobjects.keda.sh": {"uid": "crd-so", "generation": 1, "deletionTimestamp": None},
     }
-    assert snap["crd_count"] == 3
+    assert snap["crd_count"] == 4
     assert len(snap["crd_hash"]) == 16
 
 
@@ -298,24 +299,37 @@ def test_collect_records_tracked_objects_and_never_reads_a_secret(snap, response
 
 def test_collect_records_namespace_workloads_and_filters_pods(snap) -> None:
     w = snap["workloads"]
-    assert w["Deployment/keda/keda-operator"] == {"uid": "dep-keda", "generation": 5, "deletionTimestamp": None}
+    assert w["Deployment/keda/keda-operator"] == {"uid": "dep-keda", "generation": 5, "deletionTimestamp": None, "scope": "root"}
     assert w["StatefulSet/argocd/argocd-application-controller"]["uid"] == "sts-argocd"
     assert w["PersistentVolumeClaim/keda/keda-data"] == {
         "uid": "pvc-keda",
         "volumeName": "pv-1",
         "phase": "Bound",
         "deletionTimestamp": None,
+        "scope": "root",
     }
     pods = snap["pods"]
-    assert sorted(pods) == ["argocd/argocd-application-controller-0", "keda/keda-operator-5569f5fbcc-fn6ll"]
+    assert sorted(pods) == [
+        "argocd/argocd-application-controller-0",
+        "keda/envoy-proxy-6689769b8b-abcde",
+        "keda/keda-operator-5569f5fbcc-fn6ll",
+    ]
     assert pods["keda/keda-operator-5569f5fbcc-fn6ll"]["restarts"] == 2
     assert snap["namespaces"] == ["argocd", "iam-ns", "keda"]
 
 
 def test_collect_records_instances_of_every_tracked_crd(snap) -> None:
-    assert snap["custom_resources"] == {
-        "scaledobjects.keda.sh/yadgar/gateway": {"uid": "so-gateway", "generation": 3, "deletionTimestamp": None},
+    crs = snap["custom_resources"]
+    assert crs["scaledobjects.keda.sh/yadgar/gateway"] == {
+        "uid": "so-gateway",
+        "generation": 3,
+        "deletionTimestamp": None,
+        "scope": "foreign:yadgar",
     }
+    assert crs["scaledobjects.keda.sh/keda/keda-own"]["scope"] == "root"
+    assert crs["scaledobjects.keda.sh/keda/loose"]["scope"] == "foreign:untracked"
+    assert crs["gatewayclasses.gateway.networking.k8s.io//eg"]["scope"] == "foreign:yadgar"
+    assert not any(k.startswith("_") for record in crs.values() for k in record)
 
 
 def test_collect_never_lists_issuance_records_or_absent_crds(responses) -> None:
@@ -344,6 +358,20 @@ def test_the_edge_probe_context_verifies() -> None:
     context = vh.tls_context(None)
     assert context.verify_mode == ssl.CERT_REQUIRED
     assert context.check_hostname is True
+
+
+def test_an_object_owned_through_another_apps_object_is_foreign(snap) -> None:
+    """envoy-proxy is owned by GatewayClass eg, which yadgar tracks; its pod inherits that through the ReplicaSet."""
+    assert snap["workloads"]["Deployment/keda/envoy-proxy"]["scope"] == "foreign:yadgar"
+    assert snap["pods"]["keda/envoy-proxy-6689769b8b-abcde"]["scope"] == "foreign:yadgar"
+    assert snap["pods"]["keda/keda-operator-5569f5fbcc-fn6ll"]["scope"] == "root"
+    assert snap["pods"]["argocd/argocd-application-controller-0"]["scope"] == "root"
+
+
+def test_hook_resources_are_never_listed_or_compared(snap) -> None:
+    """A hook is recreated on every sync (BeforeHookCreation), so its uid always changes."""
+    assert not any("keda-certgen" in key for key in snap["objects"])
+    assert not any("keda-certgen" in key for key in snap["applications"]["keda"]["resources"])
 
 
 def test_collect_reads_secret_metadata_only_when_asked(snap) -> None:
@@ -393,7 +421,7 @@ def test_identical_snapshots_pass_and_report_what_was_compared(snap) -> None:
     report = vh.diff(snap, copy_module.deepcopy(snap))
     assert report.exit_code == 0, report.render()
     text = report.render()
-    assert "compared 4 Application(s), 3 CRD(s)" in text
+    assert "compared 4 Application(s), 4 CRD(s)" in text
     assert levels(report)["FAIL"] == []
 
 
@@ -490,16 +518,16 @@ FAILURES = {
         "pod/keda/keda-operator-5569f5fbcc-fn6ll",
     ),
     "cr-uid": (
-        lambda s: s["custom_resources"]["scaledobjects.keda.sh/yadgar/gateway"].update(uid="new"),
-        "cr/scaledobjects.keda.sh/yadgar/gateway",
+        lambda s: s["custom_resources"]["scaledobjects.keda.sh/keda/keda-own"].update(uid="new"),
+        "cr/scaledobjects.keda.sh/keda/keda-own",
     ),
     "cr-gone": (
-        lambda s: s["custom_resources"].pop("scaledobjects.keda.sh/yadgar/gateway"),
-        "cr/scaledobjects.keda.sh/yadgar/gateway",
+        lambda s: s["custom_resources"].pop("scaledobjects.keda.sh/keda/keda-own"),
+        "cr/scaledobjects.keda.sh/keda/keda-own",
     ),
     "cr-terminating": (
-        lambda s: s["custom_resources"]["scaledobjects.keda.sh/yadgar/gateway"].update(deletionTimestamp="t"),
-        "cr/scaledobjects.keda.sh/yadgar/gateway",
+        lambda s: s["custom_resources"]["scaledobjects.keda.sh/keda/keda-own"].update(deletionTimestamp="t"),
+        "cr/scaledobjects.keda.sh/keda/keda-own",
     ),
     "secret-uid": (lambda s: s["secrets"]["yadgar/iam-keys"].update(uid="new"), "secret/yadgar/iam-keys"),
     "secret-rv": (lambda s: s["secrets"]["yadgar/iam-keys"].update(resourceVersion="101"), "secret/yadgar/iam-keys"),
@@ -551,8 +579,8 @@ WARNINGS = {
         "workload/StatefulSet/argocd/argocd-application-controller",
     ),
     "cr-generation": (
-        lambda s: s["custom_resources"]["scaledobjects.keda.sh/yadgar/gateway"].update(generation=4),
-        "cr/scaledobjects.keda.sh/yadgar/gateway",
+        lambda s: s["custom_resources"]["scaledobjects.keda.sh/keda/keda-own"].update(generation=4),
+        "cr/scaledobjects.keda.sh/keda/keda-own",
     ),
     "root-pruned": (
         lambda s: s["root_operation"].update(revision="2" * 40),
@@ -561,12 +589,55 @@ WARNINGS = {
 }
 
 
+WARNINGS.update(
+    {
+        "foreign-cr-uid": (
+            lambda s: s["custom_resources"]["scaledobjects.keda.sh/yadgar/gateway"].update(uid="new"),
+            "cr/scaledobjects.keda.sh/yadgar/gateway",
+        ),
+        "foreign-cr-terminating": (
+            lambda s: s["custom_resources"]["scaledobjects.keda.sh/yadgar/gateway"].update(deletionTimestamp="t"),
+            "cr/scaledobjects.keda.sh/yadgar/gateway",
+        ),
+        "untracked-cr-gone": (
+            lambda s: s["custom_resources"].pop("scaledobjects.keda.sh/keda/loose"),
+            "cr/scaledobjects.keda.sh/keda/loose",
+        ),
+        "foreign-deployment-generation": (
+            lambda s: s["workloads"]["Deployment/keda/envoy-proxy"].update(generation=3),
+            "workload/Deployment/keda/envoy-proxy",
+        ),
+        "foreign-pod-gone": (
+            lambda s: s["pods"].pop("keda/envoy-proxy-6689769b8b-abcde"),
+            "pod/keda/envoy-proxy-6689769b8b-abcde",
+        ),
+        "missing-in-both": (None, "object//ConfigMap/keda/keda-cfg"),
+    }
+)
+
+
 @pytest.mark.parametrize("case", sorted(WARNINGS))
 def test_each_warning_rule_warns_and_passes(snap, case) -> None:
     mutate, key = WARNINGS[case]
-    report = mutated(snap, mutate)
+    if case == "missing-in-both":
+        before = copy_module.deepcopy(snap)
+        before["objects"]["/ConfigMap/keda/keda-cfg"] = {"missing": True}
+        report = mutated(before, lambda _s: None)
+    else:
+        report = mutated(snap, mutate)
     assert report.exit_code == 0, report.render()
     assert key in levels(report)["WARN"], report.render()
+
+
+def test_a_secret_skipped_before_and_absent_after_is_not_compared(snap) -> None:
+    report = mutated(snap, lambda s: s["objects"].pop("/Secret/keda/keda-certs"))
+    assert report.exit_code == 0, report.render()
+    assert not any("keda-certs" in f.key for f in report.findings)
+
+
+def test_a_foreign_failure_names_its_owner(snap) -> None:
+    report = mutated(snap, lambda s: s["custom_resources"]["scaledobjects.keda.sh/yadgar/gateway"].update(uid="new"))
+    assert "foreign:yadgar" in report.render()
 
 
 def test_an_added_object_is_info(snap) -> None:

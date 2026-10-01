@@ -1,5 +1,5 @@
 {
-  "_comment": "A fake cluster for scripts/tests/test_verify_handover.py. Each key is the kubectl argument list after `--context <ctx>`, joined by spaces; each value is what kubectl prints. Shapes are trimmed copies of kind-yadgar objects read 2026-10-01. No Secret data appears anywhere: the one Secret call is custom-columns text. `certificaterequests.cert-manager.io` is tracked but has no instance fixture: an issuance record is never listed. `absent.example.com` is tracked but not in the cluster's CRD list, so it is never listed either.",
+  "_comment": "A fake cluster for scripts/tests/test_verify_handover.py. Each key is the kubectl argument list after `--context <ctx>`, joined by spaces; each value is what kubectl prints. Shapes are trimmed copies of kind-yadgar objects read 2026-10-01. No Secret data appears anywhere: the one Secret call is custom-columns text. `certificaterequests.cert-manager.io` is tracked but has no instance fixture: an issuance record is never listed. `absent.example.com` is tracked but not in the cluster's CRD list, so it is never listed either. Ownership: `envoy-proxy` is owned by GatewayClass `eg`, which yadgar tracks, so it and its pod are foreign; ScaledObject `gateway` is yadgar's, `keda-own` is keda's (root's), `loose` is untracked. `keda-certgen` is a hook: never listed, never compared.",
   "get namespace kube-system -o json": {
     "kind": "Namespace",
     "metadata": {
@@ -182,6 +182,17 @@
               "group": "apiextensions.k8s.io",
               "kind": "CustomResourceDefinition",
               "name": "absent.example.com"
+            },
+            {
+              "kind": "ServiceAccount",
+              "namespace": "keda",
+              "name": "keda-certgen",
+              "hook": true
+            },
+            {
+              "group": "apiextensions.k8s.io",
+              "kind": "CustomResourceDefinition",
+              "name": "gatewayclasses.gateway.networking.k8s.io"
             }
           ]
         }
@@ -272,6 +283,13 @@
         "metadata": {
           "name": "certificaterequests.cert-manager.io",
           "uid": "crd-cr",
+          "generation": 1
+        }
+      },
+      {
+        "metadata": {
+          "name": "gatewayclasses.gateway.networking.k8s.io",
+          "uid": "crd-gc",
           "generation": 1
         }
       }
@@ -397,7 +415,10 @@
           "name": "keda-operator",
           "namespace": "keda",
           "uid": "dep-keda",
-          "generation": 5
+          "generation": 5,
+          "annotations": {
+            "argocd.argoproj.io/tracking-id": "keda:apps/Deployment:keda/keda-operator"
+          }
         }
       },
       {
@@ -466,6 +487,45 @@
         "status": {
           "phase": "Succeeded"
         }
+      },
+      {
+        "kind": "Deployment",
+        "metadata": {
+          "name": "envoy-proxy",
+          "namespace": "keda",
+          "uid": "dep-proxy",
+          "generation": 2,
+          "ownerReferences": [
+            {
+              "kind": "GatewayClass",
+              "name": "eg",
+              "controller": true
+            }
+          ]
+        }
+      },
+      {
+        "kind": "Pod",
+        "metadata": {
+          "name": "envoy-proxy-6689769b8b-abcde",
+          "namespace": "keda",
+          "uid": "pod-proxy",
+          "ownerReferences": [
+            {
+              "kind": "ReplicaSet",
+              "name": "envoy-proxy-6689769b8b",
+              "controller": true
+            }
+          ]
+        },
+        "status": {
+          "phase": "Running",
+          "containerStatuses": [
+            {
+              "restartCount": 0
+            }
+          ]
+        }
       }
     ]
   },
@@ -482,7 +542,48 @@
           "name": "gateway",
           "namespace": "yadgar",
           "uid": "so-gateway",
-          "generation": 3
+          "generation": 3,
+          "annotations": {
+            "argocd.argoproj.io/tracking-id": "yadgar:keda.sh/ScaledObject:yadgar/gateway"
+          }
+        },
+        "kind": "ScaledObject"
+      },
+      {
+        "kind": "ScaledObject",
+        "metadata": {
+          "name": "keda-own",
+          "namespace": "keda",
+          "uid": "so-own",
+          "generation": 1,
+          "annotations": {
+            "argocd.argoproj.io/tracking-id": "keda:keda.sh/ScaledObject:keda/keda-own"
+          }
+        }
+      },
+      {
+        "kind": "ScaledObject",
+        "metadata": {
+          "name": "loose",
+          "namespace": "keda",
+          "uid": "so-loose",
+          "generation": 1
+        }
+      }
+    ]
+  },
+  "get gatewayclasses.gateway.networking.k8s.io -A -o json": {
+    "kind": "List",
+    "items": [
+      {
+        "kind": "GatewayClass",
+        "metadata": {
+          "name": "eg",
+          "uid": "gc-eg",
+          "generation": 1,
+          "annotations": {
+            "argocd.argoproj.io/tracking-id": "yadgar:gateway.networking.k8s.io/GatewayClass:yadgar/eg"
+          }
         }
       }
     ]
