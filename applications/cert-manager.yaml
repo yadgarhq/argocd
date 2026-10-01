@@ -39,7 +39,7 @@
 # absent `releaseName`, and every field outside `source`. It does not render
 # anything. The 50-object render equivalence, the CRD schema equality, and
 # `platform` 0.1.21 embedding `cert-manager` v1.21.1 are a 2026-10-01
-# measurement, recorded in yadgarhq/argocd#PR, and no check re-runs them.
+# measurement, recorded in yadgarhq/argocd#45, and no check re-runs them.
 #
 # cert-manager — here to sign the development TLS certificate the gateway serves,
 # and nothing else yet.
