@@ -1,0 +1,266 @@
+"""`applications/yadgar.yaml` is the chart's own example, and renders what ran (E3, K3).
+
+RETIRING `infra`, OPTION A (ADR-0824). The `yadgar` Application moved here from
+`yadgarhq/deploy` as the parent chart's `example/application.yaml` at the
+pinned tag, with this organisation's values inlined as `valuesObject`. Two
+properties hold that shape, and both need the network, so this file sits in
+`scripts/gates/` beside `test_no_two_owners.py` and runs in the `two-owners`
+CI job, never in the offline pre-commit hook.
+
+  E3  The file equals `yadgarhq/chart@v<targetRevision>:example/application.yaml`
+      everywhere EXCEPT `spec.syncPolicy` and `spec.source.helm.valuesObject`.
+      `syncPolicy` is excepted because S0 (ADR-0824) removes the example's
+      `automated.prune`; `scripts/tests/test_infra_children.py` pins it exactly,
+      offline. So a `syncPolicy`-only change stays green HERE by design, and
+      that is asserted below rather than left to be discovered. The example is
+      read at the tag the file pins, so a pin bump compares against that
+      release's example and the file moves with it.
+
+  K3  The render of the pinned parent at `valuesObject` equals, object for
+      object, the committed per-object digests in `yadgar_render.sha256`
+      beside this file: 88 objects, measured 2026-10-01 at 0.3.13. That table was
+      written from this exact render AND proved equal to the render of deploy's
+      `infra/yadgar/values.yaml` at 05b160b with the same flags — "this
+      organisation's render, before and after the move of its values:
+      byte-identical, 0 differing objects". A difference is named by object.
+
+      A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
+      ON PURPOSE. Re-measure in the same pull request, read the named objects,
+      and rewrite the table:
+
+          python3 scripts/gates/test_yadgar_application.py --write
+
+      (helm 3.18.4 on PATH, as in CI). The diff of `yadgar_render.sha256` is
+      then the review: every changed line is an object the sync would change.
+
+      `sha256sum`'S LAYOUT, NOT JSON, AND THE REASON IS gitleaks. A JSON map of
+      object name to digest reads to gitleaks' `generic-api-key` rule as
+      `"<name containing secret|key>": "<high-entropy string>"`, and it refused
+      the first draft on `bootstrap-secrets` and `valkey`. A digest written
+      BEFORE its name carries no assignment for the rule to match, so the
+      file stays scannable rather than allow-listed.
+
+WHAT IS ONLY MEASURED, NOT GATED: that this render equals what Argo CD renders
+live. Argo passes the cluster's own `--api-versions` and `--kube-version`; this
+gate passes the six `test_no_two_owners.py` uses. The pull request that
+adopted the file measured both, and both were 0-diff.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import sys
+import urllib.request
+from pathlib import Path
+
+import pytest
+import yaml
+from test_no_two_owners import REPOSITORY, parent_render, tuples_of  # noqa: F401  (same flags as P)
+
+APPLICATION = REPOSITORY / "applications" / "yadgar.yaml"
+TABLE = Path(__file__).resolve().parent / "yadgar_render.sha256"
+EXAMPLE_URL = "https://raw.githubusercontent.com/yadgarhq/chart/v{revision}/example/application.yaml"
+EXPECTED_OBJECTS = 88
+
+# The two paths E3 excepts, and nothing else.
+EXCEPTED = (("spec", "syncPolicy"), ("spec", "source", "helm", "valuesObject"))
+
+
+# ── E3 ───────────────────────────────────────────────────────────────────────
+
+
+def fetch_example(revision: str) -> dict:
+    with urllib.request.urlopen(EXAMPLE_URL.format(revision=revision), timeout=30) as response:  # noqa: S310
+        return yaml.safe_load(response.read())
+
+
+def without_excepted(document: dict) -> dict:
+    trimmed = json.loads(json.dumps(document))
+    for path in EXCEPTED:
+        node = trimmed
+        for key in path[:-1]:
+            node = node.get(key) if isinstance(node, dict) else None
+        if isinstance(node, dict):
+            node.pop(path[-1], None)
+    return trimmed
+
+
+def field_differences(old, new, path: str = "") -> list[str]:
+    """Every dotted path where `old` and `new` differ."""
+    if isinstance(old, dict) and isinstance(new, dict):
+        return [
+            difference
+            for key in sorted(set(old) | set(new))
+            for difference in field_differences(old.get(key), new.get(key), f"{path}.{key}".lstrip("."))
+        ]
+    return [] if old == new else [path or "<root>"]
+
+
+def example_differences(document: dict, example: dict) -> list[str]:
+    return field_differences(without_excepted(example), without_excepted(document))
+
+
+def committed() -> dict:
+    return yaml.safe_load(APPLICATION.read_text())
+
+
+def revision_of(document: dict) -> str:
+    return document["spec"]["source"]["targetRevision"]
+
+
+@pytest.fixture(scope="module")
+def example() -> dict:
+    return fetch_example(revision_of(committed()))
+
+
+def test_the_application_is_the_example_outside_sync_policy_and_values(example: dict) -> None:
+    document = committed()
+    print(f"[E3] applications/yadgar.yaml vs yadgarhq/chart@v{revision_of(document)}:example/application.yaml")
+    assert example_differences(document, example) == []
+
+
+def test_a_dropped_ignore_differences_reddens(example: dict) -> None:
+    document = committed()
+    del document["spec"]["ignoreDifferences"]
+    assert example_differences(document, example) == ["spec.ignoreDifferences"]
+
+
+def test_an_added_annotation_reddens(example: dict) -> None:
+    document = committed()
+    document["metadata"]["annotations"] = {"argocd.argoproj.io/sync-wave": "10"}
+    assert example_differences(document, example) == ["metadata.annotations"]
+
+
+def test_a_second_source_reddens(example: dict) -> None:
+    document = committed()
+    document["spec"]["sources"] = [document["spec"].pop("source")]
+    assert example_differences(document, example) == ["spec.source", "spec.sources"]
+
+
+def test_a_value_file_beside_the_object_reddens(example: dict) -> None:
+    document = committed()
+    document["spec"]["source"]["helm"]["valueFiles"] = ["values.yaml"]
+    assert example_differences(document, example) == ["spec.source.helm.valueFiles"]
+
+
+def test_a_sync_policy_change_is_excepted_here(example: dict) -> None:
+    """By design (Max, 2026-10-01): E3 is "the example except `syncPolicy`".
+
+    `test_infra_children.py` is what reddens on this; see its
+    `test_a_reintroduced_prune_reddens` and siblings.
+    """
+    document = committed()
+    document["spec"]["syncPolicy"]["syncOptions"].append("ServerSideApply=true")
+    assert example_differences(document, example) == []
+
+
+def test_the_example_with_prune_differs_only_there(example: dict) -> None:
+    """The one place S0 departs from the example, read off the example itself."""
+    assert example["spec"]["syncPolicy"]["automated"] == {"prune": True, "selfHeal": True}
+    assert committed()["spec"]["syncPolicy"]["automated"] == {"selfHeal": True}
+    rest = {k: v for k, v in example["spec"]["syncPolicy"].items() if k != "automated"}
+    assert rest == {k: v for k, v in committed()["spec"]["syncPolicy"].items() if k != "automated"}
+
+
+# ── K3 ───────────────────────────────────────────────────────────────────────
+
+
+def object_key(document: dict) -> str:
+    api_version = str(document.get("apiVersion", ""))
+    group = api_version.split("/")[0] if "/" in api_version else ""
+    metadata = document.get("metadata") or {}
+    return f"{group}/{document['kind']}/{metadata.get('namespace', '')}/{metadata['name']}"
+
+
+def digests(documents: list) -> dict[str, str]:
+    """Per object, sha256 of its canonical JSON. A key rendered twice is a failure, not an overwrite."""
+    table: dict[str, str] = {}
+    for document in documents:
+        if not isinstance(document, dict) or not document.get("kind"):
+            continue
+        key = object_key(document)
+        assert key not in table, f"{key} rendered twice"
+        table[key] = hashlib.sha256(json.dumps(document, sort_keys=True).encode()).hexdigest()
+    return table
+
+
+def render_differences(table: dict[str, str], rendered: dict[str, str]) -> dict[str, list[str]]:
+    return {
+        "removed": sorted(table.keys() - rendered.keys()),
+        "added": sorted(rendered.keys() - table.keys()),
+        "changed": sorted(k for k in table.keys() & rendered.keys() if table[k] != rendered[k]),
+    }
+
+
+NO_DIFFERENCE = {"removed": [], "added": [], "changed": []}
+
+
+TABLE_HEADER = "# K3: sha256 of each object `applications/yadgar.yaml` renders, as canonical JSON."
+TABLE_REGENERATE = "# Regenerate: python3 scripts/gates/test_yadgar_application.py --write"
+
+
+def read_table() -> tuple[str, dict[str, str]]:
+    """`(targetRevision, {object: digest})` from the committed table."""
+    revision, objects = "", {}
+    for line in TABLE.read_text().splitlines():
+        if not line or line.startswith("#"):
+            continue
+        first, _, rest = line.partition("  ")
+        if first == "targetRevision":
+            revision = rest
+        else:
+            assert rest not in objects, f"{rest} listed twice in {TABLE.name}"
+            objects[rest] = first
+    return revision, objects
+
+
+@pytest.fixture(scope="module")
+def table() -> dict[str, str]:
+    return read_table()[1]
+
+
+def test_the_render_is_the_committed_table(table: dict[str, str]) -> None:
+    rendered = digests(parent_render(REPOSITORY))
+    print(f"[K3] {len(rendered)} object(s) rendered, {len(table)} in {TABLE.name}")
+    assert len(table) == EXPECTED_OBJECTS
+    assert render_differences(table, rendered) == NO_DIFFERENCE
+
+
+def test_the_table_names_its_pin(table: dict[str, str]) -> None:
+    assert read_table()[0] == revision_of(committed())
+
+
+def test_a_moved_node_port_names_the_edge_only(table: dict[str, str]) -> None:
+    """Red case: the edge's pinned HTTPS nodePort moved. Only `EnvoyProxy/edge` changes."""
+    rendered = digests(parent_render(REPOSITORY, ("--set", "platform.gatewayListener.envoyProxy.httpsNodePort=30444")))
+    assert render_differences(table, rendered) == {
+        "removed": [],
+        "added": [],
+        "changed": ["gateway.envoyproxy.io/EnvoyProxy//edge"],
+    }
+
+
+def test_autoscaling_off_names_the_scaled_object_and_the_deployment(table: dict[str, str]) -> None:
+    """Red case: gateway's autoscaling off. Its ScaledObject goes, and its Deployment changes and rolls."""
+    rendered = digests(parent_render(REPOSITORY, ("--set", "gateway.autoscaling.enabled=false")))
+    assert render_differences(table, rendered) == {
+        "removed": ["keda.sh/ScaledObject//gateway"],
+        "added": [],
+        "changed": ["apps/Deployment//gateway"],
+    }
+
+
+def write_table() -> None:
+    document = committed()
+    rendered = digests(parent_render(REPOSITORY))
+    lines = [TABLE_HEADER, TABLE_REGENERATE, f"targetRevision  {revision_of(document)}"]
+    lines += [f"{digest}  {key}" for key, digest in sorted(rendered.items())]
+    TABLE.write_text("\n".join(lines) + "\n")
+    print(f"wrote {len(rendered)} object digest(s) at {revision_of(document)} to {TABLE}")
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] != ["--write"]:
+        sys.exit("usage: python3 scripts/gates/test_yadgar_application.py --write")
+    write_table()

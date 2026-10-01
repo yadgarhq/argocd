@@ -41,8 +41,20 @@ jobs:
   # THE NAME `ci` IS LOAD-BEARING. The ruleset on `main` requires the check
   # `ci / passed`, which is `<caller job id> / <called job id>` — renaming this
   # job breaks the merge gate rather than reporting anything.
+  #
+  # `needs:` FOLDS THIS REPOSITORY'S OWN NETWORK GATES INTO THAT ONE REQUIRED
+  # CHECK, with no ruleset change. `signature` and `two-owners` (below) came
+  # with the five Applications `infra` released (ADR-0824). `passed` is a job
+  # INSIDE the shared workflow, so its own `needs:` cannot name a job here;
+  # this caller job can. If either gate fails, this job is skipped, the shared
+  # workflow never runs, and `ci / passed` is never reported. The ruleset then
+  # waits for a check that never arrives, so the pull request cannot merge.
+  # It reads as "expected, waiting", not as a red `ci / passed` — the red is
+  # on the failed gate itself. The cost is time: the shared checks start only
+  # after both gates finish.
   ci:
     if: github.event_name == 'pull_request'
+    needs: [signature, two-owners]
     uses: yadgarhq/actions/.github/workflows/ci-pr.yaml@main
     permissions:
       contents: read
@@ -98,38 +110,37 @@ jobs:
   #   platform-version  reads `yadgarhq/chart@<chart_tag>`'s `chart/Chart.yaml`
   #                      and fails if `platform`'s pinned version there has
   #                      moved away from what is committed.
-  #   chart-tag          reads `yadgarhq/deploy`'s `infra/yadgar-app.yaml` for
-  #                      the `targetRevision` the running `yadgar` Application
-  #                      actually pins, and fails if `chart_tag` disagrees. A
-  #                      git tag never moves, so `platform-version` ALONE
-  #                      cannot detect `chart_pin.json` going stale after this
-  #                      organisation moves to a newer chart release — this is
-  #                      the half that can.
+  #   chart-tag          reads this repository's own `applications/yadgar.yaml`
+  #                      for the `targetRevision` the running `yadgar`
+  #                      Application actually pins, and fails if `chart_tag`
+  #                      disagrees. A git tag never moves, so
+  #                      `platform-version` ALONE cannot detect `chart_pin.json`
+  #                      going stale after this organisation moves to a newer
+  #                      chart release — this is the half that can. It read
+  #                      `yadgarhq/deploy`'s `infra/yadgar-app.yaml` over the
+  #                      network until that Application moved here (option A,
+  #                      ADR-0824); now it is a local read, and
+  #                      `scripts/tests/test_check_chart_pin.py` covers it
+  #                      offline in the `operator-applications` hook.
   #
   # NOT A PRE-COMMIT HOOK, UNLIKE `operator-applications`. That hook's whole
   # point (`versions-pinned`'s own comment makes the same argument) is that what
   # a developer runs locally is what CI runs — which requires no network call a
-  # developer might not have. Both halves above need one, so they live here
-  # instead, LOCAL TO THIS REPOSITORY rather than in `yadgarhq/actions`: no
-  # other repository carries a `chart_pin.json` for this to check.
+  # developer might not have. The platform-version half needs one, so the
+  # script runs here instead, LOCAL TO THIS REPOSITORY rather than in
+  # `yadgarhq/actions`: no other repository carries a `chart_pin.json`.
   #
   # THIS IS NOT THE REQUIRED CHECK. `main`'s ruleset gates on `ci / passed`
   # alone (the comment on the `ci` job above), so a red `chart-pin` here is a
   # visible signal, not a merge block — same posture `ci-pr.yaml`'s own
   # `ci / workflows` zizmor job takes on this very file.
   #
-  # `GITHUB_TOKEN` ONLY RAISES THE RATE LIMIT, FOR BOTH READS. `yadgarhq/chart`
-  # AND `yadgarhq/deploy` are both public repositories (checked by hand,
-  # `gh api repos/yadgarhq/<repo> --jq .private` → `false` for both), so a
-  # default `GITHUB_TOKEN` — scoped read-only to THIS repository's own
-  # `contents` — reads either one exactly as an unauthenticated request would;
-  # the token is passed because it costs nothing. If `yadgarhq/deploy` (or
-  # wherever the `yadgar` Application lives after it moves into this
-  # repository — option A, `scripts/check_chart_pin.py`'s docstring) ever turns
-  # private, this job needs a token minted for cross-repository read (e.g. a
-  # GitHub App installation token with `Contents: Read` on that repository),
-  # not a wider `permissions:` block here. `scripts/check_chart_pin.py` never
-  # prints the token.
+  # `GITHUB_TOKEN` ONLY RAISES THE RATE LIMIT. `yadgarhq/chart` is a public
+  # repository (checked by hand, `gh api repos/yadgarhq/chart --jq .private` →
+  # `false`), so a default `GITHUB_TOKEN` — scoped read-only to THIS
+  # repository's own `contents` — reads it exactly as an unauthenticated
+  # request would; the token is passed because it costs nothing.
+  # `scripts/check_chart_pin.py` never prints the token.
   chart-pin:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -151,3 +162,89 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 scripts/check_chart_pin.py
+
+  # PORTED FROM yadgarhq/deploy WITH ITS SUBJECT (retiring `infra`, option A,
+  # ADR-0824). `applications/estate-front-runner.yaml` pins the ARC runner pod
+  # to a digest `yadgarhq/actions`' `estate-runner image` workflow published;
+  # `scripts/runner_image_pinned.py` checks the pin offline as the
+  # `runner-image-pinned` pre-commit hook, and THIS job asks cosign whether CI
+  # signed it. Not a hook, because a hook may not depend on a registry.
+  #
+  # A MERGE GATE THROUGH `ci`'s `needs:` (above), not through the ruleset.
+  # PULL REQUESTS ONLY: on `push` to main it would re-ask, against merged
+  # code, a question the pull request just answered.
+  signature:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.x"
+
+      - name: install PyYAML
+        run: python3 -m pip install --disable-pip-version-check "pyyaml==6.0.3"
+
+      # THE SAME PIN THE PUBLISHING WORKFLOW USES. `yadgarhq/actions`'s
+      # `estate-runner image` workflow signs with this action at this digest;
+      # verifying with a different cosign major is a question nobody asked.
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # NO REGISTRY CREDENTIAL, DELIBERATELY, and it matches how the pod pulls.
+      # `applications/estate-front-runner.yaml` carries no `imagePullSecrets`
+      # and the package is public (ledger 661), so an anonymous verify asks the
+      # same question the kubelet asks. A verify that only works when
+      # authenticated would stay green through a visibility flip that the
+      # cluster experiences as ImagePullBackOff.
+      - name: the pinned digest carries CI's signature
+        run: python3 scripts/runner_image_pinned.py --verify-signature
+
+  # THE TWO-OWNERS GATE AND THE `yadgar` APPLICATION'S SHAPE, ported from
+  # yadgarhq/deploy with their subject (retiring `infra`, ADR-0824).
+  # `scripts/gates/test_no_two_owners.py`: no object in namespace `yadgar` has
+  # two owners. `scripts/gates/test_yadgar_application.py`:
+  # `applications/yadgar.yaml` is the chart's own example outside `syncPolicy`
+  # and `valuesObject` (E3), and its render equals the committed per-object
+  # digests (K3).
+  #
+  # NOT A PRE-COMMIT HOOK. Both need helm and the registry (`helm pull` of the
+  # pinned parent), and the example is read from `yadgarhq/chart` at the pinned
+  # tag. That is why they live in `scripts/gates/`, outside the path the
+  # offline `operator-applications` hook runs (`scripts/tests`).
+  #
+  # A MERGE GATE THROUGH `ci`'s `needs:` (above). PULL REQUESTS ONLY.
+  two-owners:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.x"
+
+      # The same pytest the `operator-applications` hook pins.
+      - name: install PyYAML and pytest
+        run: |
+          python3 -m pip install --disable-pip-version-check \
+            "pyyaml==6.0.3" "pytest==9.1.1"
+
+      # NO REGISTRY CREDENTIAL. The parent chart and every module package are
+      # public, so the pull is anonymous — the same pull an adopter makes.
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          # THE HELM ARGO CD v3.1.8 BUNDLES, and the one `yadgarhq/chart`
+          # renders the parent with.
+          version: v3.18.4
+
+      - name: no object in namespace yadgar has two owners, and yadgar is the example
+        run: python3 -m pytest scripts/gates -q

@@ -14,6 +14,9 @@ The cluster and the infrastructure live in
 | `projects/root.yaml`           | app-of-apps root, applied once during bootstrap |
 | `applicationsets/modules.yaml` | discovers module repos across the organisation  |
 | `applications/<operator>.yaml` | the six operator Applications root adopted (E3) |
+| `applications/<child>.yaml`    | the five Applications `infra` released (M3)     |
+| `manifests/<name>/`            | directory sources; outside root's include glob  |
+| `scripts/gates/`               | gates that need helm or the network (CI only)   |
 | `MIGRATION_NOTES.md`           | what a change here needs from a person          |
 | `scripts/verify_handover.py`   | read-only post-merge verifier (below)           |
 | `verifier/manifests/`          | its read-only ServiceAccount and ClusterRole    |
@@ -48,6 +51,18 @@ same test now pins that shape. D7.1 deleted `mariadb-operator-crds`. Its 12
 CRDs stayed in the cluster, untracked, until D7.3 sourced `mariadb-operator`
 from `platform`, which renders them. The same test holds the deleted
 Application absent.
+
+**`infra`'s five children followed (M3, option A, ADR-0824).** `arc`,
+`estate-front`, `estate-front-runner`, `tls` and `yadgar` left `deploy`'s
+`infra/` and root adopted each live object by name. `yadgar` is the parent
+chart's own `example/application.yaml` with this organisation's values inlined
+as `valuesObject`. The two directory sources, `tls` and `estate-front`, read
+`manifests/<name>/` here. `manifests/` sits outside root's
+`{applications,applicationsets}/*.yaml` include on purpose: that glob lets `*`
+cross `/`, so a file under `applications/` would be applied by root as well.
+`scripts/tests/test_infra_children.py` pins the five offline;
+`scripts/gates/` holds the two-owners gate and the `yadgar` example and render
+gates, which need helm and run in CI's `two-owners` job.
 | `applications/argocd.yaml` | Argo managing Argo — what makes `install/values.yaml` actually apply |
 
 ## Argo manages Argo
