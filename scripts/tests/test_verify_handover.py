@@ -142,6 +142,85 @@ def test_kubectl_refuses_a_secret_in_any_position(args) -> None:
     assert runner.calls == []
 
 
+SECRET_ARGV = ["get", "secrets", "-n", "yadgar", "-o", vh.SECRET_COLUMNS, "--no-headers"]
+
+
+def test_kubectl_runs_the_one_secret_argv_it_allows() -> None:
+    runner = FakeRunner({" ".join(SECRET_ARGV): "a b c\n"})
+    assert vh.kubectl(CONTEXT, SECRET_ARGV, runner=runner) == "a b c\n"
+    assert len(runner.calls) == 1
+
+
+SECRET_BYPASSES = {
+    # `last-applied-configuration` holds the whole Secret, data included (measured live).
+    "annotations-column": ["get", "secrets", "-n", "yadgar", "-o", "custom-columns=A:.metadata.annotations", "--no-headers"],
+    "managed-fields-column": ["get", "secrets", "-n", "yadgar", "-o", "custom-columns=M:.metadata.managedFields", "--no-headers"],
+    "data-column": ["get", "secrets", "-n", "yadgar", "-o", "custom-columns=NAME:.metadata.name,D:.data", "--no-headers"],
+    # kubectl honours the LAST -o.
+    "repeated-output": ["get", "secrets", "-n", "yadgar", "-o", vh.SECRET_COLUMNS, "--no-headers", "-o", "json"],
+    "repeated-output-eq": ["get", "secrets", "-n", "yadgar", "-o", vh.SECRET_COLUMNS, "--no-headers", "--output=json"],
+    "filename": ["get", "-f", "secret.yaml", "-o", vh.SECRET_COLUMNS, "--no-headers"],
+    "filename-long": ["get", "--filename=secret.yaml", "-o", "json"],
+    "kustomize": ["get", "-k", "overlay", "-o", "json"],
+    "template": ["get", "secrets", "-n", "yadgar", "--template={{.data}}"],
+    "show-managed-fields": ["get", "secrets", "-n", "yadgar", "-o", vh.SECRET_COLUMNS, "--no-headers", "--show-managed-fields"],
+    "named-secret": ["get", "secrets", "iam-keys", "-n", "yadgar", "-o", vh.SECRET_COLUMNS, "--no-headers"],
+    "go-template": ["get", "secrets", "-n", "yadgar", "-o=go-template={{.data}}"],
+}
+
+
+@pytest.mark.parametrize("case", sorted(SECRET_BYPASSES))
+def test_every_secret_bypass_is_refused(case) -> None:
+    runner = FakeRunner({})
+    with pytest.raises(vh.UsageError):
+        vh.kubectl(CONTEXT, SECRET_BYPASSES[case], runner=runner)
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "-shttps://x",
+        "-s",
+        "--server=https://x",
+        "--as-group=system:masters",
+        "--as-uid=0",
+        "--as=admin",
+        "--username=admin",
+        "--password=x",
+        "--client-key=k.pem",
+        "--client-certificate=c.pem",
+        "--certificate-authority=ca.pem",
+        "--insecure-skip-tls-verify",
+        "--insecure-skip-tls-verify=true",
+        "--token=x",
+        "--kubeconfig=/tmp/k",
+        "--cluster=prod",
+        "--user=admin",
+        "--raw=/api",
+        "-l",
+        "--selector=a=b",
+        "-w",
+    ],
+)
+def test_kubectl_refuses_every_flag_outside_the_allowlist(flag) -> None:
+    runner = FakeRunner({})
+    with pytest.raises(vh.UsageError, match="not allowed"):
+        vh.kubectl(CONTEXT, ["get", "pods", "-n", "keda", flag, "-o", "json"], runner=runner)
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize("output", ["yaml", "wide", "name", "custom-columns=N:.metadata.name", "jsonpath={.items}"])
+def test_kubectl_refuses_any_output_but_json_outside_the_secret_argv(output) -> None:
+    with pytest.raises(vh.UsageError, match="output"):
+        vh.kubectl(CONTEXT, ["get", "pods", "-n", "keda", "-o", output], runner=FakeRunner({}))
+
+
+def test_kubectl_refuses_a_flag_as_the_namespace_value() -> None:
+    with pytest.raises(vh.UsageError):
+        vh.kubectl(CONTEXT, ["get", "pods", "-n", "--kubeconfig=/tmp/k", "-o", "json"], runner=FakeRunner({}))
+
+
 def test_kubectl_refuses_an_override_of_the_context_in_args() -> None:
     runner = FakeRunner({})
     with pytest.raises(vh.UsageError, match="--context"):
@@ -844,3 +923,9 @@ def test_a_pull_request_trigger_on_the_verifier_workflow_reddens(workflows_copy)
     path = workflows_copy / VERIFIER_WORKFLOW
     path.write_text(path.read_text().replace("on:\n  push:\n    branches: [main]\n", "on:\n  push:\n    branches: [main]\n  pull_request:\n"))
     assert len(label_errors(workflows_copy)) == 1
+
+
+def test_a_repeated_output_flag_is_refused_by_name() -> None:
+    """kubectl honours the LAST -o, so even two identical ones are refused, before any other output rule."""
+    with pytest.raises(vh.UsageError, match="repeated"):
+        vh.kubectl(CONTEXT, ["get", "pods", "-n", "keda", "-o", "json", "--output=json"], runner=FakeRunner({}))

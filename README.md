@@ -98,7 +98,8 @@ There is no `argocd` CLI dependency — the server runs in the cluster, and
 `scripts/verify_handover.py` proves a merge recreated nothing. It is read-only:
 every kubectl call goes through one function that requires `--context` (there
 is no default, and the operator's default context is production), allows only
-`get`, and reads a Secret only as metadata columns.
+`get` with an allowlist of flags (`-n`, `-A`, one `-o json`, `--no-headers`), and
+reads a Secret only through one exact argv: name, uid and resourceVersion columns.
 
 ```bash
 S=scripts/verify_handover.py

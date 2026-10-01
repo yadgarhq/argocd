@@ -17,7 +17,8 @@ nothing that changed.
 READ-ONLY BY CONSTRUCTION. Every kubectl call goes through `kubectl()`. It
 refuses to run without an explicit `--context` (there is no default, because the
 default context on the operator's machine is production), refuses every verb but
-`get`, and refuses a Secret read that is not metadata custom-columns.
+`get`, accepts only the flags -n/--namespace, -A, one -o and --no-headers, requires
+`-o json`, and allows exactly one Secret argv: name, uid and resourceVersion columns.
 
 WHAT `diff` FAILS ON (exit 1):
   - a changed or vanished uid: Application, CRD, custom resource, tracked
@@ -80,7 +81,6 @@ UNLISTED_INSTANCE_CRDS = frozenset(
         "applications.argoproj.io",
     }
 )
-FORBIDDEN_FLAGS = ("--context", "--kubeconfig", "--cluster", "--user", "--token", "--as", "--server", "-s")
 
 
 class UsageError(Exception):
@@ -106,33 +106,61 @@ def _is_secret_resource(token: str) -> bool:
     return False
 
 
-def _output_format(args: list[str]) -> str | None:
-    for index, arg in enumerate(args):
-        if arg in {"-o", "--output"} and index + 1 < len(args):
-            return args[index + 1]
-        if arg.startswith(("-o=", "--output=")):
-            return arg.split("=", 1)[1]
-    return None
+# THE ARGUMENT ALLOWLIST. Anything else starting with `-` is refused, so a
+# kubectl flag that selects a target, a credential or a template cannot slip
+# through a denylist. `--context` is added by this tool and is never accepted
+# from the caller.
+VALUE_FLAGS = frozenset({"-n", "--namespace", "-o", "--output"})
+BOOL_FLAGS = frozenset({"-A", "--all-namespaces", "--no-headers"})
+
+
+def _parse(rest: list[str]) -> tuple[list[str], list[str], list[str]]:
+    """(positionals, namespaces, outputs) of the arguments after `get`. Refuses any flag outside the allowlist."""
+    positionals: list[str] = []
+    namespaces: list[str] = []
+    outputs: list[str] = []
+    index = 0
+    while index < len(rest):
+        arg = rest[index]
+        if not arg.startswith("-"):
+            positionals.append(arg)
+        else:
+            name, equals, value = arg.partition("=")
+            if name in VALUE_FLAGS:
+                if not equals:
+                    index += 1
+                    value = rest[index] if index < len(rest) else ""
+                if not value or value.startswith("-"):
+                    raise UsageError(f"{name} needs a value, not {value!r}")
+                (outputs if name in {"-o", "--output"} else namespaces).append(value)
+            elif arg not in BOOL_FLAGS:
+                raise UsageError(
+                    f"flag {arg!r} is not allowed: only -n/--namespace, -A/--all-namespaces, -o and --no-headers are."
+                    " --context is set by this tool, and nothing else may select the target or the credential"
+                )
+        index += 1
+    return positionals, namespaces, outputs
 
 
 def _check_args(context: str | None, args: list[str]) -> None:
     if not isinstance(context, str) or not context.strip():
         raise UsageError("an explicit --context is required; this tool never uses kubectl's default context")
-    for arg in args:
-        if any(arg == flag or arg.startswith(flag + "=") for flag in FORBIDDEN_FLAGS):
-            raise UsageError(f"{arg!r} may not be passed through: --context is the only target selector")
     if not args or args[0] != "get":
         raise UsageError(f"read-only: only `get` is allowed, not {args[:1]!r}")
-    if "--raw" in args or any(a.startswith("--raw=") for a in args):
-        raise UsageError("read-only: `get --raw` is not allowed")
-    # Every token but the output format's value, so `get -n ns secrets` and
-    # `get -A deployments,secrets` are caught too. A namespace or label value
-    # spelled `secrets` is refused as well; that is the fail-closed cost.
-    output = _output_format(args) or ""
-    if any(_is_secret_resource(a) for a in args[1:] if a != output):
-        columns = output.removeprefix("custom-columns=").split(",") if output.startswith("custom-columns=") else []
-        if not columns or not all(":" in c and c.split(":", 1)[1].startswith(".metadata.") for c in columns):
-            raise UsageError("a Secret may be read only as metadata custom-columns, never its data")
+    positionals, namespaces, outputs = _parse(args[1:])
+    if len(outputs) > 1:
+        raise UsageError(f"repeated output flag {outputs!r}: kubectl uses the last one, so only one is allowed")
+    if any(_is_secret_resource(p) for p in positionals):
+        # ONE Secret argv, exactly. A custom-columns path such as
+        # `.metadata.annotations` returns `last-applied-configuration`, which
+        # holds the whole Secret, data included (measured live).
+        if not (len(namespaces) == 1 and args == ["get", "secrets", "-n", namespaces[0], "-o", SECRET_COLUMNS, "--no-headers"]):
+            raise UsageError(
+                f"a Secret may be read only as `get secrets -n NS -o {SECRET_COLUMNS} --no-headers`, never its data"
+            )
+        return
+    if outputs != ["json"]:
+        raise UsageError(f"output must be `-o json` outside the one Secret metadata read, not {outputs!r}")
 
 
 def kubectl(context: str | None, args: list[str], *, runner: Callable = subprocess.run) -> str:
