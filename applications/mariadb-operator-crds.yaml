@@ -40,9 +40,15 @@ spec:
     server: https://kubernetes.default.svc
     namespace: mariadb-system
   syncPolicy:
-    automated: { prune: true, selfHeal: true }
+    automated: { selfHeal: true }
     syncOptions:
       - CreateNamespace=true
       # CRDs exceed the annotation size limit that client-side apply uses to
       # store its last-applied state.
       - ServerSideApply=true
+    retry:
+      limit: 6
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m

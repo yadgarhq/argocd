@@ -73,10 +73,15 @@ spec:
     namespace: cert-manager
   syncPolicy:
     automated:
-      prune: true
       selfHeal: true
     syncOptions:
       - CreateNamespace=true
       # CRDs exceed the annotation size limit client-side apply uses to store its
       # last-applied state.
       - ServerSideApply=true
+    retry:
+      limit: 6
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m

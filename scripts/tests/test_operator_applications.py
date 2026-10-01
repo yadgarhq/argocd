@@ -11,11 +11,13 @@ namespace and name — so the uid does not change.
 
 WHAT IS ASSERTED, and each has a red case below:
 
-  1. Each `spec` is BYTE-IDENTICAL to deploy's last copy. The text from the
-     `spec:` line to the end of the file is hashed, and the hash is pinned to
+  1. Each `spec` is identical to deploy's last copy, with two named
+     exceptions (S0 of the operators handover, ADR-0824): `automated.prune`
+     is absent, and `retry` equals the chart's own example at the tag named
+     by CHART_EXAMPLE_SOURCE below. Everything else is hashed and pinned to
      `yadgarhq/deploy` at `fa7ccb5`, the E1 merge and the last commit that
-     declared them. A changed spec is a changed operator, which a handover must
-     not carry.
+     declared them. A changed spec is a changed operator, which a handover
+     must not carry.
   2. Each file is `argoproj.io/Application`, named `<name>`, in namespace
      `argocd`. A different name or namespace is a new object, not an adoption.
   3. Each file is inside root's own source: `projects/root.yaml`'s `path` and
@@ -25,6 +27,10 @@ WHAT IS ASSERTED, and each has a red case below:
      step prune the old operator Application. A census prints the count read.
   5. No file carries a finalizer, so a later prune of an Application never
      cascades into the operator it runs.
+  6. No `automated` block carries a `prune` key at all. S0 deletes the key
+     rather than writing `prune: false`, matching the chart's own example.
+  7. Each `retry` block has a finite, positive `limit` and matches the
+     chart's own example byte-for-byte once parsed.
 """
 
 from __future__ import annotations
@@ -57,6 +63,24 @@ PINNED_SPECS: dict[str, str] = {
 SYNC_OPTIONS = "argocd.argoproj.io/sync-options"
 PRUNE_FALSE = "Prune=false"
 
+# S0 OF THE OPERATORS HANDOVER (ADR-0824). `retry` below is copied verbatim from
+# `yadgarhq/chart`'s own `example/operators-application.yaml` at its latest
+# release tag, read with `gh-personal api repos/yadgarhq/chart/contents/...`.
+# That example also omits `automated.prune`, which is the other half of S0.
+CHART_EXAMPLE_SOURCE = "yadgarhq/chart@v0.3.15:example/operators-application.yaml"
+EXPECTED_RETRY: dict = {
+    "limit": 6,
+    "backoff": {
+        "duration": "15s",
+        "factor": 2,
+        "maxDuration": "5m",
+    },
+}
+
+# Matches the finite `retry:` block S0 appends at the end of each file (nothing
+# follows it), so this safely spans from the key to end-of-file.
+RETRY_BLOCK_RE = re.compile(r"\n {4}retry:\n.*\Z", re.DOTALL)
+
 
 def spec_text(path: Path) -> str:
     """The file's text from the `spec:` line to the end, exactly as stored."""
@@ -65,14 +89,78 @@ def spec_text(path: Path) -> str:
     return text[match.start() :] if match else ""
 
 
+def normalize_for_pin(text: str) -> str:
+    """Undo S0's two `syncPolicy` changes (ADR-0824) so the rest still pins to deploy's copy.
+
+    S0 drops `automated.prune` and appends a `retry` block sourced from the
+    chart's own example (CHART_EXAMPLE_SOURCE). Both are restored to their
+    deploy-era shape here so hashing still catches drift in anything else.
+    """
+    text = RETRY_BLOCK_RE.sub("\n", text)
+    text = text.replace(
+        "    automated: { selfHeal: true }",
+        "    automated: { prune: true, selfHeal: true }",
+    )
+    text = text.replace(
+        "    automated:\n      selfHeal: true\n",
+        "    automated:\n      prune: true\n      selfHeal: true\n",
+    )
+    return text
+
+
 def spec_drift(tree: Path) -> list[str]:
-    """Every pinned name whose file is missing or whose spec text hash differs."""
+    """Every pinned name whose file is missing or whose normalized spec hash differs."""
     drift = []
     for name, expected in PINNED_SPECS.items():
         path = tree / "applications" / f"{name}.yaml"
-        if not path.is_file() or hashlib.sha256(spec_text(path).encode()).hexdigest() != expected:
+        if not path.is_file():
+            drift.append(name)
+            continue
+        normalized = normalize_for_pin(spec_text(path))
+        if hashlib.sha256(normalized.encode()).hexdigest() != expected:
             drift.append(name)
     return drift
+
+
+def automated_blocks(tree: Path) -> dict[str, dict]:
+    """Each pinned name's parsed `spec.syncPolicy.automated` (empty dict if absent)."""
+    blocks = {}
+    for name in PINNED_SPECS:
+        path = tree / "applications" / f"{name}.yaml"
+        document = yaml.safe_load(path.read_text()) if path.is_file() else {}
+        blocks[name] = ((document or {}).get("spec") or {}).get("syncPolicy", {}).get("automated") or {}
+    return blocks
+
+
+def automated_prune_present(tree: Path) -> list[str]:
+    """Every pinned name whose `automated` block still carries a `prune` key."""
+    return sorted(name for name, automated in automated_blocks(tree).items() if "prune" in automated)
+
+
+def retry_blocks(tree: Path) -> dict[str, object]:
+    """Each pinned name's parsed `spec.syncPolicy.retry` (None if absent)."""
+    blocks = {}
+    for name in PINNED_SPECS:
+        path = tree / "applications" / f"{name}.yaml"
+        document = yaml.safe_load(path.read_text()) if path.is_file() else {}
+        blocks[name] = ((document or {}).get("spec") or {}).get("syncPolicy", {}).get("retry")
+    return blocks
+
+
+def retry_errors(tree: Path) -> list[str]:
+    """Every pinned name whose `retry` is absent, non-finite/non-positive, or not the chart's block.
+
+    `-1` is Argo CD's own sentinel for an unlimited retry budget — the chart's
+    example calls that out explicitly ("Never -1"), so a finite positive int is
+    required rather than merely "is an int".
+    """
+    errors = []
+    for name, retry in retry_blocks(tree).items():
+        limit = retry.get("limit") if isinstance(retry, dict) else None
+        valid_limit = isinstance(limit, int) and not isinstance(limit, bool) and limit > 0
+        if not valid_limit or retry != EXPECTED_RETRY:
+            errors.append(name)
+    return sorted(errors)
 
 
 def identity_errors(tree: Path) -> list[str]:
@@ -177,6 +265,15 @@ def test_no_application_carries_a_finalizer() -> None:
     assert finalized(REPOSITORY) == []
 
 
+def test_no_application_automated_block_carries_prune() -> None:
+    assert automated_prune_present(REPOSITORY) == []
+
+
+def test_every_application_retry_matches_the_chart_example() -> None:
+    print(f"[S0] {len(PINNED_SPECS)} retry block(s) compared against {CHART_EXAMPLE_SOURCE}")
+    assert retry_errors(REPOSITORY) == []
+
+
 def test_a_changed_spec_reddens(copy: Path) -> None:
     path = copy / "applications" / "keda.yaml"
     text = path.read_text()
@@ -225,3 +322,21 @@ def test_a_finalizer_reddens(copy: Path) -> None:
         text.replace(anchor, anchor + "  finalizers:\n    - resources-finalizer.argocd.argoproj.io\n", 1)
     )
     assert finalized(copy) == ["mariadb-operator"]
+
+
+def test_a_reintroduced_prune_reddens(copy: Path) -> None:
+    path = copy / "applications" / "keda.yaml"
+    text = path.read_text()
+    anchor = "    automated:\n      selfHeal: true\n"
+    assert anchor in text
+    path.write_text(text.replace(anchor, "    automated:\n      prune: true\n      selfHeal: true\n", 1))
+    assert automated_prune_present(copy) == ["keda"]
+
+
+def test_a_negative_retry_limit_reddens(copy: Path) -> None:
+    path = copy / "applications" / "cert-manager.yaml"
+    text = path.read_text()
+    anchor = "      limit: 6\n"
+    assert anchor in text
+    path.write_text(text.replace(anchor, "      limit: -1\n", 1))
+    assert retry_errors(copy) == ["cert-manager"]
