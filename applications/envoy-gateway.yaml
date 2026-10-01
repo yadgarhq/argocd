@@ -12,7 +12,7 @@
 # from `gateway-helm-1.9.1` to `gateway-helm-v1.9.1` on 17 objects. That label is
 # in no selector and no pod template, so nothing rolls. Ten of the 17 are
 # ordinary objects, which Argo patches in place. The other 7 are helm hooks,
-# which Argo deletes and recreates on the sync rather than patching (below).
+# which Argo does not patch (below).
 #
 # WHAT D4 KEPT, so that the handover adopts in place: the Application name, the
 # destination namespace `envoy-gateway-system`, `syncPolicy`, and no
@@ -38,7 +38,9 @@
 # are helm `pre-install, pre-upgrade` hooks, which Argo runs as PreSync on the
 # sync this change triggers: the label change puts the Application OutOfSync,
 # and automated sync runs every hook. None sets a delete policy, so Argo
-# deletes and recreates each one. In v1.9.1 `envoy-gateway certgen` writes the
+# deletes and recreates the 6 that exist live: the 5 certgen RBAC objects and
+# the webhook. The certgen Job sets `ttlSecondsAfterFinished: 30` and no longer
+# exists live, so Argo only creates it. In v1.9.1 `envoy-gateway certgen` writes the
 # control-plane Secrets (`envoy-gateway`, `envoy`, `envoy-rate-limit`,
 # `envoy-oidc-hmac`) through `CreateOrUpdateSecrets` with `update` set only by
 # `--overwrite`. The rendered Job passes no arguments, so an existing Secret is
@@ -93,8 +95,9 @@
 # compatibility matrix, and supports Kubernetes v1.33 through v1.36 — this cluster
 # runs v1.36.1, at the top of that range. Both verified 2026-08-30 against the
 # project's matrix and a live `helm show chart`, per O10.
-# Since D4 Argo fetches it inside `platform` from ghcr.io/yadgarhq/charts, not
-# from docker.io/envoyproxy.
+# Since D4 Argo fetches the chart inside `platform` from ghcr.io/yadgarhq/charts,
+# not from docker.io/envoyproxy. The images still come from Docker Hub:
+# docker.io/envoyproxy/gateway:v1.9.1.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
