@@ -200,8 +200,10 @@ spec:
                     'hand meanwhile: the operation is in flight and Argo' \
                     'refuses a second one.' \
                     '' \
-                    'That budget is 60 attempts - hours, not minutes, but not' \
-                    'unlimited. If it has run out, one command starts it again:' \
+                    'That budget is 6 attempts - about 13 minutes, not' \
+                    'unlimited, and each attempt is itself bounded at 300s' \
+                    '(activeDeadlineSeconds below). If it has run out, one' \
+                    'command starts it again:' \
                     '' \
                     '  kubectl -n cert-manager delete job yadgar-tls-preflight' >&2
                   exit 1

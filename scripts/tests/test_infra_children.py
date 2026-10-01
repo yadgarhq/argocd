@@ -72,11 +72,17 @@ def canonical_digest(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
-# sha256 of each file's bytes, equal to `git -C deploy show 05b160b:infra/<x>`.
+# sha256 of each file's bytes, equal to `git -C deploy show 05b160b:infra/<x>`,
+# EXCEPT `ca-preflight.yaml` (see its own comment below: ledger 1223 diverged
+# it deliberately).
 MANIFEST_DIGESTS: dict[str, str] = {
     "manifests/estate-front/edge-service.yaml": "0cb712e37ea851ef7cb8c7c824f1dd00b6b83b76e5024206122316f43ae02ee1",
     "manifests/estate-front/networkpolicy.yaml": "cbf75b1456c741f2a927d9e50e4ae36068df41d6ff7431c2daadabe1c7158fe7",
-    "manifests/tls/ca-preflight.yaml": "e0ea5280ed08c4926a11de54d4e64f54f62450ab166ca98dfb7abb1b1b229429",
+    # DIVERGES FROM deploy@05b160b, DELIBERATELY: ledger 1223 fixed the Job
+    # script's stale "60 attempts" / hours-long text to the S0 numbers (6
+    # attempts, ~13 minutes, ADR-0828) after `tls`'s retry dropped from 60 to
+    # 6. Every other file in this dict is still byte-identical to deploy's copy.
+    "manifests/tls/ca-preflight.yaml": "16eff74aa211250beeb3c1cc5ab931e3be020b84b0954373eec22de5959f6428",
     "manifests/tls/clusterissuer.yaml": "ceaea049f75d527493dd1d7fd70d17ec119e4d6cca339a27147fd9c1c5964e68",
 }
 
