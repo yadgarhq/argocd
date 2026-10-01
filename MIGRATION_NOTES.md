@@ -359,8 +359,17 @@ commit on `main`.
    `scripts/tests/test_verify_handover.py`:
 
    ```yaml
+   # All four ARC plurals. The verifier lists the AutoscalingRunnerSet root
+   # tracks; it never lists EphemeralRunner, EphemeralRunnerSet or
+   # AutoscalingListener instances (UNLISTED_INSTANCE_CRDS: they churn on
+   # every poll), but naming them keeps a later tracked one from failing as
+   # Forbidden.
    - apiGroups: [actions.github.com]
-     resources: [autoscalingrunnersets]
+     resources:
+       - autoscalingrunnersets
+       - ephemeralrunnersets
+       - ephemeralrunners
+       - autoscalinglisteners
      verbs: [get, list, watch]
    ```
 
@@ -378,6 +387,15 @@ commit on `main`.
 
    The first run has no baseline. Its summary says "BASELINE ONLY", and it
    compares nothing. The next move of `main` is the first real check.
+
+   **A red run stays red.** Its snapshot is not uploaded, so the next poll
+   compares against the last passing snapshot again and fails again, every
+   10 minutes, until the cause is fixed. When the change was intended (a
+   roll), accept it as the new baseline by hand:
+
+   ```bash
+   gh-personal workflow run verify.yaml --repo yadgarhq/argocd-verify -f accept=true
+   ```
 
 ### Egress: not a control yet
 
@@ -418,15 +436,27 @@ name: verify-argocd
 # latency (up to the cron period plus GitHub's schedule delay) and a runner pod
 # per poll; when several merges land between two polls, one run covers them.
 #
-# THE BASELINE IS THE PREVIOUS SUCCESSFUL SNAPSHOT ARTIFACT of THIS workflow in
+# THE BASELINE IS THE SNAPSHOT OF THE LAST SUCCESSFUL RUN of THIS workflow in
 # THIS repository: same repository and head repository, the default branch, a
-# `schedule` or `workflow_dispatch` event, and this file's path. Anything else
-# with the same artifact name is ignored.
+# `schedule` or `workflow_dispatch` event, this file's path, and
+# `conclusion == success`. A snapshot is uploaded only after its diff passed,
+# so a red run never becomes the next baseline: it stays red on every poll
+# until the cause is fixed, or until a person accepts the new state with
+# `workflow_dispatch` and `accept: true` (an intended roll, say).
+#
+# NOT CHECKED HERE: the edge probe (`--edge-url`; the edge CA is not in the
+# cluster) and Secret metadata (`--secrets-namespace`; the role cannot read
+# Secrets). Both stay operator-run checks with the operator's kubeconfig.
 
 on:
   schedule:
     - cron: "*/10 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      accept:
+        description: "Record the current state as the new baseline even if the diff fails (an intended change)"
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -472,6 +502,7 @@ jobs:
             for (const a of candidates) {
               const run = (await github.rest.actions.getWorkflowRun({ owner, repo, run_id: a.workflow_run.id })).data;
               if (run.path === process.env.WORKFLOW_PATH
+                && run.conclusion === "success"
                 && ["schedule", "workflow_dispatch"].includes(run.event)
                 && run.head_repository && run.head_repository.id === self.id) {
                 core.info(`baseline: artifact ${a.id} from run ${run.id} (${run.event}), ${a.created_at}`);
@@ -481,7 +512,7 @@ jobs:
                 return;
               }
             }
-            core.warning("no previous argocd-snapshot from this workflow: this run records a baseline only");
+            core.warning("no snapshot from a successful run of this workflow: this run records a baseline only");
             core.setOutput("found", "false");
 
       - name: download the baseline
@@ -493,15 +524,16 @@ jobs:
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/before
 
-      - name: skip when main has not moved
+      - name: skip when the last passing snapshot is already at main
         id: decide
         env:
           SHA: ${{ steps.state.outputs.sha }}
           FOUND: ${{ steps.state.outputs.found }}
+          ACCEPT: ${{ inputs.accept }}
         run: |
           set -euo pipefail
-          if [ "$FOUND" = "true" ] && [ "$(cat "$RUNNER_TEMP/before/argocd-sha" 2>/dev/null)" = "$SHA" ]; then
-            echo "argocd main $SHA is already verified" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$ACCEPT" != "true" ] && [ "$FOUND" = "true" ] && [ "$(cat "$RUNNER_TEMP/before/argocd-sha" 2>/dev/null)" = "$SHA" ]; then
+            echo "argocd main $SHA already has a passing snapshot; nothing new to verify" >> "$GITHUB_STEP_SUMMARY"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -587,21 +619,11 @@ jobs:
           python3 argocd/scripts/verify_handover.py snapshot --context "$CONTEXT" --out "$RUNNER_TEMP/after/snapshot.json"
           echo "$SHA" > "$RUNNER_TEMP/after/argocd-sha"
 
-      - name: keep the snapshot as the next run's baseline
-        if: steps.decide.outputs.skip != 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: argocd-snapshot
-          path: |
-            ${{ runner.temp }}/after/snapshot.json
-            ${{ runner.temp }}/after/argocd-sha
-          if-no-files-found: error
-          retention-days: 90
-
       - name: diff against the baseline
         if: steps.decide.outputs.skip != 'true'
         env:
           FOUND: ${{ steps.state.outputs.found }}
+          ACCEPT: ${{ inputs.accept }}
         run: |
           set -euo pipefail
           if [ "$FOUND" != "true" ]; then
@@ -621,7 +643,24 @@ jobs:
             cat "$RUNNER_TEMP/diff.txt"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" -ne 0 ] && [ "$ACCEPT" = "true" ]; then
+            echo "## ACCEPTED by $GITHUB_ACTOR as the new baseline despite exit $status" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::diff exit $status accepted as the new baseline"
+            exit 0
+          fi
           exit "$status"
+      - name: keep the snapshot as the next run's baseline
+        # Only after the diff passed (or was accepted): a red snapshot must
+        # never become the next baseline.
+        if: success() && steps.decide.outputs.skip != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: argocd-snapshot
+          path: |
+            ${{ runner.temp }}/after/snapshot.json
+            ${{ runner.temp }}/after/argocd-sha
+          if-no-files-found: error
+          retention-days: 90
 ````
 
 `.github/actionlint.yaml`:
