@@ -33,7 +33,7 @@ WHAT IS ASSERTED, and each has a red case below:
      chart's own example byte-for-byte once parsed.
   8. D4 OF THE OPERATORS HANDOVER (ADR-0824): `keda` no longer pins to
      deploy's copy. It sources `yadgarhq`'s `platform` chart at the version
-     the chart's latest release embeds, with `operators.keda.create` true and
+     embedded at `yadgarhq/chart` v0.3.15, with `operators.keda.create` true and
      every other operator, Argo CD included, explicitly false. Its name,
      destination, `syncPolicy` and release name are pinned unchanged, so the
      release instance label and every immutable selector stay as they are.
@@ -102,9 +102,10 @@ RETRY_BLOCK_SUFFIX = "\n" + RETRY_BLOCK_TEXT
 
 # D4 OF THE OPERATORS HANDOVER (ADR-0824). Each Application here sources the
 # `platform` chart with exactly one operator on. The version is the `platform`
-# dependency `yadgarhq/chart`'s `chart/Chart.yaml` pins at its latest release
-# tag, which is also the `targetRevision` of that tag's
-# `example/operators-application.yaml`.
+# dependency embedded at `yadgarhq/chart` v0.3.15 (its `chart/Chart.yaml`),
+# which is also the `targetRevision` of that tag's
+# `example/operators-application.yaml`. This is a hardcoded copy: no test yet
+# holds it equal to the parent chart's embedded version (ledger 1206).
 PLATFORM_SOURCE = "yadgarhq/chart@v0.3.15:chart/Chart.yaml"
 PLATFORM_VERSION = "0.1.21"
 OPERATOR_KEYS = ("argoCd", "certManager", "envoyGateway", "keda", "mariadbOperator", "prometheus")
@@ -519,5 +520,49 @@ def test_a_moved_destination_reddens(copy: Path) -> None:
     path = copy / "applications" / "keda.yaml"
     document = yaml.safe_load(path.read_text())
     document["spec"]["destination"]["namespace"] = "yadgar-operators"
+    path.write_text(yaml.safe_dump(document))
+    assert platform_errors(copy) == ["keda"]
+
+
+def test_dropped_keda_resources_reddens(copy: Path) -> None:
+    """Without the sizing, both KEDA Deployments' pod templates change and they roll.
+
+    The `keda:` key stays, so only the resources clause can catch this.
+    """
+    path = copy / "applications" / "keda.yaml"
+    document = yaml.safe_load(path.read_text())
+    del document["spec"]["source"]["helm"]["valuesObject"]["keda"]["resources"]
+    path.write_text(yaml.safe_dump(document))
+    assert platform_errors(copy) == ["keda"]
+
+
+def test_extra_platform_value_reddens(copy: Path) -> None:
+    path = copy / "applications" / "keda.yaml"
+    document = yaml.safe_load(path.read_text())
+    document["spec"]["source"]["helm"]["valuesObject"]["nats"] = {"create": True}
+    path.write_text(yaml.safe_dump(document))
+    assert platform_errors(copy) == ["keda"]
+
+
+def test_a_changed_repo_url_reddens(copy: Path) -> None:
+    path = copy / "applications" / "keda.yaml"
+    document = yaml.safe_load(path.read_text())
+    document["spec"]["source"]["repoURL"] = "https://kedacore.github.io/charts"
+    path.write_text(yaml.safe_dump(document))
+    assert platform_errors(copy) == ["keda"]
+
+
+def test_a_changed_chart_reddens(copy: Path) -> None:
+    path = copy / "applications" / "keda.yaml"
+    document = yaml.safe_load(path.read_text())
+    document["spec"]["source"]["chart"] = "keda"
+    path.write_text(yaml.safe_dump(document))
+    assert platform_errors(copy) == ["keda"]
+
+
+def test_an_extra_source_key_reddens(copy: Path) -> None:
+    path = copy / "applications" / "keda.yaml"
+    document = yaml.safe_load(path.read_text())
+    document["spec"]["source"]["path"] = "chart"
     path.write_text(yaml.safe_dump(document))
     assert platform_errors(copy) == ["keda"]

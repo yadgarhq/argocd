@@ -31,7 +31,13 @@
 # `example/operators-application.yaml`. No `Prune=false` here: root's apply
 # removes the one E1 left on the live object.
 #
-# scripts/tests/test_operator_applications.py pins all of the above.
+# WHAT IS GATED, AND WHAT IS ONLY MEASURED.
+# scripts/tests/test_operator_applications.py pins this Application's shape:
+# the source, the platform version, every operator key, the sizing, the
+# absent `releaseName`, and every field outside `source`. It does not render
+# anything. The 29-object render equivalence, the CRD schema equality, and
+# `platform` 0.1.21 embedding `keda` 2.20.2 are a 2026-10-01 measurement,
+# recorded in yadgarhq/argocd#44, and no check re-runs them.
 #
 # KEDA — the autoscaling mechanism D68 chose, installed as cluster infrastructure
 # in its own namespace like the database operator.
