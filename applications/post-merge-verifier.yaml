@@ -1,14 +1,13 @@
-# The read-only identity of the post-merge verifier (`scripts/verify_handover.py`,
-# run by `.github/workflows/post-merge-verify.yaml`). `root` selects this file;
-# this Application syncs `verifier/manifests/`: a Namespace, a ServiceAccount, and a
-# get/list/watch ClusterRole with no Secrets, bound to that ServiceAccount.
+# The read-only identity of the post-merge verifier (`scripts/verify_handover.py`).
+# `root` selects this file; this Application syncs `verifier/manifests/`: a
+# Namespace, a ServiceAccount, and a get/list/watch ClusterRole with no Secrets,
+# bound to that ServiceAccount.
 #
-# NO RUNNER HERE, DELIBERATELY. The one ARC scale set on kind-yadgar,
-# `estate-front`, cannot run this: it registers against `yadgarhq/estate`, its
-# namespace's egress policy excludes the API server, and its pod holds the
-# `estate` environment's secrets. MIGRATION_NOTES.md proposes a dedicated scale
-# set in this namespace; it needs a GitHub App Secret created by hand first, so
-# it is not an Application root would create on merge.
+# NO RUNNER AND NO WORKFLOW HERE, DELIBERATELY. This repository is public, so a
+# runner registered against it would take jobs from any workflow a collaborator
+# pushes. The runner registers against a PRIVATE repository that runs only the
+# verifier; MIGRATION_NOTES.md, "The post-merge verifier", holds its exact
+# files and the order a person creates them in.
 #
 # `verifier/` sits outside root's `{applications,applicationsets}/*.yaml`
 # include, so root applies this Application and only this Application applies

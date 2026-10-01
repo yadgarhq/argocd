@@ -150,12 +150,14 @@ Root resolves `main` once per poll, so two quick merges take it straight past
 the first. It needs the git history to see that: `--ancestry-repo`, by default
 the current directory.
 
-**In CI**, `.github/workflows/post-merge-verify.yaml` runs the same sequence on
-each push to `main`, as the `post-merge-verifier` ServiceAccount that
-`applications/post-merge-verifier.yaml` syncs from `verifier/manifests/`. Its
-baseline is the previous run's AFTER snapshot, kept as an artifact, so each diff
-covers everything since the last run. It is switched off until a runner exists:
-`MIGRATION_NOTES.md`, "The post-merge verifier", says why the existing ARC
-runner cannot serve it and what a dedicated one needs. In CI the Secret check
-and the edge probe do not run: the role cannot read Secrets, and the edge CA is
-not in the cluster.
+**Not in this repository's CI, on purpose.** This repository is public, so a
+self-hosted runner registered against it would run whatever workflow a
+collaborator pushes, with the verifier's cluster-read token. The scheduled
+workflow lives in a private repository, `yadgarhq/argocd-verify`, whose runner
+registers against that repository alone; it checks out this repository at
+`main`'s sha and runs the script above as the `post-merge-verifier`
+ServiceAccount, which `applications/post-merge-verifier.yaml` syncs from
+`verifier/manifests/`. `MIGRATION_NOTES.md`, "The post-merge verifier", holds
+that repository's exact files and the steps to create it. In that workflow the
+Secret check and the edge probe do not run: the role cannot read Secrets, and
+the edge CA is not in the cluster.
