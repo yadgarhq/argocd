@@ -15,6 +15,8 @@ The cluster and the infrastructure live in
 | `applicationsets/modules.yaml` | discovers module repos across the organisation  |
 | `applications/<operator>.yaml` | the six operator Applications root adopted (E3) |
 | `MIGRATION_NOTES.md`           | what a change here needs from a person          |
+| `scripts/verify_handover.py`   | read-only post-merge verifier (below)           |
+| `verifier/manifests/`          | its read-only ServiceAccount and ClusterRole    |
 
 `applications/` holds single `Application` resources; `applicationsets/` holds
 generators that produce many. Keeping them apart matters because the two are
@@ -90,3 +92,76 @@ kubectl -n argocd create secret generic github-scm \
 
 There is no `argocd` CLI dependency — the server runs in the cluster, and
 `kubectl` on its CRDs does the same job.
+
+## Post-merge verification
+
+`scripts/verify_handover.py` proves a merge recreated nothing. It is read-only:
+every kubectl call goes through one function that requires `--context` (there
+is no default, and the operator's default context is production), allows only
+`get` with an allowlist of flags (`-n`, `-A`, one `-o json`, `--no-headers`), and
+reads a Secret only through one exact argv: name, uid and resourceVersion columns.
+
+```bash
+S=scripts/verify_handover.py
+python3 $S snapshot --context kind-yadgar --out before.json
+# ... merge ...
+python3 $S wait --context kind-yadgar --app root --revision <merge sha>
+python3 $S wait --context kind-yadgar --settled --since <time root reached the sha>
+python3 $S snapshot --context kind-yadgar --out after.json
+python3 $S diff before.json after.json   # 0 pass, 1 a failure, 2 a refusal
+```
+
+Wait, then settle, then snapshot. A snapshot taken before root syncs the merge
+compares the old state with itself.
+
+**What it reads**, for every Application under `root` (root's own Applications,
+and those its ApplicationSets generate): uid, finalizers, syncPolicy, sync and
+health; every CRD's uid and generation, with the same name=uid hash the
+handover scripts printed; every object those Applications track, except Secrets;
+every instance of every CRD they track, cluster-wide (cert-manager's
+CertificateRequests, Orders and Challenges excepted); the Deployments,
+StatefulSets, DaemonSets, PVCs and pods in their destination namespaces; root's
+prune result. `--secrets-namespace` adds Secret
+name/uid/resourceVersion, and `--edge-url`/`--edge-ca` add a verified-TLS probe
+of the edge. There is no unverified probe.
+
+**`diff` fails** on a changed or vanished uid, a Deployment or CRD generation
+change, any deletionTimestamp, a changed finalizer list, an Application not
+Healthy, an automated one not Synced, a manual one that went Synced to
+OutOfSync (`argocd` is manual and OutOfSync by design), a failed last
+operation, a Secret resourceVersion change, or a wrong edge status. It **warns**
+on a syncPolicy change, a restart, other generation changes and a root prune.
+It **refuses** snapshots from two clusters or with nothing in them.
+
+**Destruction always fails; other changes fail only on root's objects.** Each
+custom resource, workload and pod carries a scope. An Argo tracking-id names its
+Application; without one it takes its owner's scope through ownerReferences.
+An object is root's when EITHER snapshot says so. A custom resource or workload
+that vanishes or gets a deletionTimestamp is a FAIL whoever owns it: a
+root-managed operator upgrade that deletes yadgar's MariaDBs, Users and Grants,
+or the `envoy-yadgar-edge` proxy, is exactly the damage this exists to catch.
+Non-destructive changes to another Application's object (a new uid, a new
+generation) and a foreign pod coming or going are WARN. Hook resources are
+skipped: Argo recreates them on every sync.
+
+**A merge that means to roll something goes red, by design.** A resource or
+image change bumps a Deployment's generation and replaces its pods. The diff
+names each change. Red means "read this", and the reviewer decides whether it
+was the intent.
+
+`wait --revision` accepts a later commit on `main` as well as the sha itself.
+Root resolves `main` once per poll, so two quick merges take it straight past
+the first. It needs the git history to see that: `--ancestry-repo`, by default
+the current directory.
+
+**Not in this repository's CI, on purpose.** This repository is public, so a
+self-hosted runner registered against it would run whatever workflow a
+collaborator pushes, with the verifier's cluster-read token. The scheduled
+workflow lives in a private repository, `yadgarhq/argocd-verify`, whose runner
+registers against that repository alone; it checks out this repository at
+`main`'s sha and runs the script above as the `post-merge-verifier`
+ServiceAccount, which `applications/post-merge-verifier.yaml` syncs from
+`verifier/manifests/`. `MIGRATION_NOTES.md`, "The post-merge verifier", holds
+that repository's exact files and the steps to create it. In that workflow the
+Secret check and the edge probe do not run: the role cannot read Secrets, and
+the edge CA is not in the cluster.
