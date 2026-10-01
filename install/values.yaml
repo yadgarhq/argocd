@@ -32,18 +32,19 @@ configs:
     # (`controller/appcontroller.go:1420-1424` and `:1429`, v3.1.8), so the value
     # must outlast the longest retry chain of any automated Application here.
     # `yadgar` is the longest: limit 6, 15s x2, max 5m is 1050 s of backoff and
-    # 7 attempts, and each attempt may run the bounds `platform` 0.1.21
-    # documents: the preflight's eight 120 s loops plus 300 s, the
-    # envoy-gateway probe's three 300 s loops plus 600 s, and the two parallel
-    # bootstrap Jobs' pod backoff, 2955 s in all. 1050 + 7 x 2955 = 21735 s, and
-    # 22200 s (6.2 h) clears it. Max ruled 2026-10-01: keep the documented
-    # margins now, tighten through per-hook deadlines later (ledger 1224). Argo
-    # reads the value as an int32 and treats a larger one as 0.
+    # 7 attempts. Each attempt may spend the ceilings `platform` 0.1.21
+    # documents for its preflight (eight 120 s loops plus 300 s) and its
+    # envoy-gateway probe (three 300 s loops plus 600 s), the two parallel
+    # bootstrap Jobs' pod backoff, and the unbounded wait for Sync-phase health
+    # (3x the 90 s measured): 3225 s. 1050 + 7 x 3225 = 23625 s, and 24000 s
+    # (6.7 h) clears it. Max ruled 2026-10-01: honest numbers now, tightened
+    # through per-hook deadlines later (ledger 1224). Argo reads the value as
+    # an int32 and treats a larger one as 0.
     # `scripts/tests/test_install_values.py` derives the floor.
     #
     # SET ON THE LIVE CLUSTER BY A TARGETED PATCH, not by syncing
     # `Application/argocd` (see the header): MIGRATION_NOTES.md, ledger 1208.
-    controller.sync.timeout.seconds: "22200"
+    controller.sync.timeout.seconds: "24000"
   cm:
     # HOW ARGO MARKS WHAT IT OWNS — the `argocd.argoproj.io/tracking-id`
     # annotation rather than an `app.kubernetes.io/instance`-style label. The
