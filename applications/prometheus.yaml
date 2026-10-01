@@ -1,8 +1,10 @@
 # ADOPTED FROM yadgarhq/deploy AT E3 OF THE OPERATORS HANDOVER (ADR-0824).
-# `spec` is byte-identical to deploy's infra/prometheus.yaml at fa7ccb5, and
-# scripts/tests/test_operator_applications.py pins it. Root adopts the live
-# Application by name, keeping its uid. No `Prune=false` here: root's apply
-# removes the one E1 left on the live object.
+# `spec` equals deploy's infra/prometheus.yaml at fa7ccb5, except S0 of the
+# operators handover (ADR-0824): `automated.prune` is omitted, and `retry` is
+# copied from `yadgarhq/chart@v0.3.15`'s `example/operators-application.yaml`.
+# scripts/tests/test_operator_applications.py pins it, those two exceptions
+# included. Root adopts the live Application by name, keeping its uid. No
+# `Prune=false` here: root's apply removes the one E1 left on the live object.
 #
 # Prometheus, and it is here for ONE reason: D68's autoscaler needs somewhere to
 # read D67's metrics from. KEDA's prometheus scaler queries a server; the services
@@ -504,7 +506,12 @@ spec:
     namespace: observability
   syncPolicy:
     automated:
-      prune: true
       selfHeal: true
     syncOptions:
       - CreateNamespace=true
+    retry:
+      limit: 6
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m
