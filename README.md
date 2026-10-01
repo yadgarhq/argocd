@@ -13,6 +13,7 @@ The cluster and the infrastructure live in
 | `install/values.yaml`          | Helm values for the `argo-cd` chart             |
 | `projects/root.yaml`           | app-of-apps root, applied once during bootstrap |
 | `applicationsets/modules.yaml` | discovers module repos across the organisation  |
+| `applications/<operator>.yaml` | the six operator Applications root adopted (E3) |
 | `MIGRATION_NOTES.md`           | what a change here needs from a person          |
 
 `applications/` holds single `Application` resources; `applicationsets/` holds
@@ -32,6 +33,15 @@ values they point at, rather than being centralised here. That is the same
 argument D54 makes against an umbrella chart: a single place listing everything
 becomes the thing every change has to touch. Argo's own configuration is the one
 exception, because it has nowhere else to live.
+
+**The operators are the second exception, and the first step of retiring
+`deploy`.** ADR-0803 moves what this organisation still needs from
+`yadgarhq/deploy` to here, and ADR-0824 keeps one Application per operator:
+`cert-manager`, `keda`, `mariadb-operator`, `mariadb-operator-crds`,
+`envoy-gateway` and `prometheus`. E2 deleted them from `deploy`'s `infra/`.
+E3 declares the same specs under `applications/`, and `root` adopts each live
+object by name, so every uid is kept. `scripts/tests/test_operator_applications.py`
+pins each spec to `deploy`'s last copy.
 | `applications/argocd.yaml` | Argo managing Argo — what makes `install/values.yaml` actually apply |
 
 ## Argo manages Argo
