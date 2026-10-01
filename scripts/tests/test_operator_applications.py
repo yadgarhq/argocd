@@ -31,6 +31,13 @@ WHAT IS ASSERTED, and each has a red case below:
      rather than writing `prune: false`, matching the chart's own example.
   7. Each `retry` block has a finite, positive `limit` and matches the
      chart's own example byte-for-byte once parsed.
+  8. D4 OF THE OPERATORS HANDOVER (ADR-0824): `keda` no longer pins to
+     deploy's copy. It sources `yadgarhq`'s `platform` chart at the version
+     embedded at `yadgarhq/chart` v0.3.15, with `operators.keda.create` true and
+     every other operator, Argo CD included, explicitly false. Its name,
+     destination, `syncPolicy` and release name are pinned unchanged, so the
+     release instance label and every immutable selector stay as they are.
+     Checks 2 to 7 still cover `keda`.
 """
 
 from __future__ import annotations
@@ -51,9 +58,11 @@ APPLICATIONS = REPOSITORY / "applications"
 # sha256 of each file's text from the `spec:` line to the end, taken from
 # `git -C deploy show fa7ccb5:infra/<name>.yaml | sed -n '/^spec:/,$p' | sha256sum`.
 SOURCE = "yadgarhq/deploy@fa7ccb529fd12911a7ccca1dc53f10490063f446"
+# `keda` left this table at D4 (ADR-0824): it now sources `platform`, which
+# PLATFORM_SOURCED below pins. Its deploy-era hash was
+# 19e6856ba5ebc99ba0f24702cc5840b1d94f19a5f0e0d38115b0d280f666f6b6.
 PINNED_SPECS: dict[str, str] = {
     "cert-manager": "f402c7c04defb9ba09118f243357d16dc2df91eff35ea47f5e52dd0b19d579cb",
-    "keda": "19e6856ba5ebc99ba0f24702cc5840b1d94f19a5f0e0d38115b0d280f666f6b6",
     "mariadb-operator": "485a08bcc620570e35ea6c216872e0d64c757d47ea43cc6479de9edf407c65be",
     "mariadb-operator-crds": "bd68b4915105319e1fdf3dcc10f7d6651955cf9b546db944ce4172be9d90536e",
     "envoy-gateway": "1d8b30ab563c10c623bd0e0bebd502273c8a8fab833d9c58661b82d6aa0059b4",
@@ -90,6 +99,41 @@ RETRY_BLOCK_TEXT = (
     "        maxDuration: 5m\n"
 )
 RETRY_BLOCK_SUFFIX = "\n" + RETRY_BLOCK_TEXT
+
+# D4 OF THE OPERATORS HANDOVER (ADR-0824). Each Application here sources the
+# `platform` chart with exactly one operator on. The version is the `platform`
+# dependency embedded at `yadgarhq/chart` v0.3.15 (its `chart/Chart.yaml`),
+# which is also the `targetRevision` of that tag's
+# `example/operators-application.yaml`. This is a hardcoded copy: no test yet
+# holds it equal to the parent chart's embedded version (ledger 1206).
+PLATFORM_SOURCE = "yadgarhq/chart@v0.3.15:chart/Chart.yaml"
+PLATFORM_VERSION = "0.1.21"
+OPERATOR_KEYS = ("argoCd", "certManager", "envoyGateway", "keda", "mariadbOperator", "prometheus")
+
+# The development sizing deploy's copy passed to KEDA's own chart (D55), now
+# under `platform`'s `keda:` subchart key. Measured 2026-10-01: without it the
+# render's `keda-operator` and `keda-operator-metrics-apiserver` pod templates
+# fall back to KEDA's defaults and both Deployments roll.
+KEDA_RESOURCES: dict = {
+    "operator": {"requests": {"cpu": "50m", "memory": "128Mi"}},
+    "metricServer": {"requests": {"cpu": "50m", "memory": "128Mi"}},
+}
+
+# Every field of the `keda` Application other than `source`, as deploy's copy
+# declared it with S0's two changes. A change here is a change to the release.
+KEDA_UNCHANGED: dict = {
+    "project": "default",
+    "destination": {"server": "https://kubernetes.default.svc", "namespace": "keda"},
+    "syncPolicy": {
+        "automated": {"selfHeal": True},
+        "syncOptions": ["CreateNamespace=true", "ServerSideApply=true"],
+        "retry": EXPECTED_RETRY,
+    },
+}
+
+PLATFORM_SOURCED: dict[str, str] = {"keda": "keda"}
+
+ADOPTED: tuple[str, ...] = (*PINNED_SPECS, *PLATFORM_SOURCED)
 
 
 def spec_text(path: Path) -> str:
@@ -143,7 +187,7 @@ def spec_drift(tree: Path) -> list[str]:
 def automated_blocks(tree: Path) -> dict[str, dict]:
     """Each pinned name's parsed `spec.syncPolicy.automated` (empty dict if absent)."""
     blocks = {}
-    for name in PINNED_SPECS:
+    for name in ADOPTED:
         path = tree / "applications" / f"{name}.yaml"
         document = yaml.safe_load(path.read_text()) if path.is_file() else {}
         blocks[name] = ((document or {}).get("spec") or {}).get("syncPolicy", {}).get("automated") or {}
@@ -158,7 +202,7 @@ def automated_prune_present(tree: Path) -> list[str]:
 def retry_blocks(tree: Path) -> dict[str, object]:
     """Each pinned name's parsed `spec.syncPolicy.retry` (None if absent)."""
     blocks = {}
-    for name in PINNED_SPECS:
+    for name in ADOPTED:
         path = tree / "applications" / f"{name}.yaml"
         document = yaml.safe_load(path.read_text()) if path.is_file() else {}
         blocks[name] = ((document or {}).get("spec") or {}).get("syncPolicy", {}).get("retry")
@@ -184,7 +228,7 @@ def retry_errors(tree: Path) -> list[str]:
 def identity_errors(tree: Path) -> list[str]:
     """Every pinned name whose file is not `argoproj.io/Application` `argocd/<name>`."""
     errors = []
-    for name in PINNED_SPECS:
+    for name in ADOPTED:
         path = tree / "applications" / f"{name}.yaml"
         documents = [d for d in yaml.safe_load_all(path.read_text()) if d] if path.is_file() else []
         identity = [
@@ -218,7 +262,7 @@ def outside_root(tree: Path) -> list[str]:
     include = (source.get("directory") or {}).get("include", "*")
     patterns = expand_braces(include)
     missing = []
-    for name in PINNED_SPECS:
+    for name in ADOPTED:
         path = (tree / "applications" / f"{name}.yaml").resolve()
         relative = path.relative_to(base).as_posix() if path.is_relative_to(base) else None
         if relative is None or not path.is_file() or not any(fnmatch.fnmatchcase(relative, p) for p in patterns):
@@ -242,12 +286,47 @@ def manifests_with_prune_false(tree: Path) -> tuple[list[str], int]:
 def finalized(tree: Path) -> list[str]:
     """Every pinned name whose Application declares a finalizer."""
     names = []
-    for name in PINNED_SPECS:
+    for name in ADOPTED:
         path = tree / "applications" / f"{name}.yaml"
         for document in yaml.safe_load_all(path.read_text()):
             if ((document or {}).get("metadata") or {}).get("finalizers"):
                 names.append(name)
     return names
+
+
+def platform_errors(tree: Path) -> list[str]:
+    """Every platform-sourced name whose Application is not the D4 shape (ADR-0824).
+
+    Required: `source` is `platform` at PLATFORM_VERSION from
+    `ghcr.io/yadgarhq/charts`, no `releaseName` (so the release keeps the
+    Application's name), `operators.<op>.create` true for the one operator and
+    explicitly false for every other key in OPERATOR_KEYS, no
+    `operators.create`, and every field outside `source` unchanged.
+    """
+    errors = []
+    for name, operator in PLATFORM_SOURCED.items():
+        path = tree / "applications" / f"{name}.yaml"
+        document = (yaml.safe_load(path.read_text()) if path.is_file() else None) or {}
+        spec = document.get("spec") or {}
+        source = spec.get("source") or {}
+        helm = source.get("helm") or {}
+        values = helm.get("valuesObject") or {}
+        operators = values.get("operators") or {}
+        expected_operators = {key: {"create": key == operator} for key in OPERATOR_KEYS}
+        rest = {key: value for key, value in spec.items() if key != "source"}
+        if (
+            source.get("repoURL") != "ghcr.io/yadgarhq/charts"
+            or source.get("chart") != "platform"
+            or source.get("targetRevision") != PLATFORM_VERSION
+            or set(source) != {"repoURL", "chart", "targetRevision", "helm"}
+            or set(helm) != {"valuesObject"}
+            or operators != expected_operators
+            or rest != KEDA_UNCHANGED
+            or values.get("keda") != {"resources": KEDA_RESOURCES}
+            or set(values) != {"operators", "keda"}
+        ):
+            errors.append(name)
+    return errors
 
 
 @pytest.fixture
@@ -264,6 +343,11 @@ def test_every_spec_equals_deploys_last_copy() -> None:
     assert spec_drift(REPOSITORY) == []
 
 
+def test_every_platform_sourced_application_is_the_d4_shape() -> None:
+    print(f"[D4] {len(PLATFORM_SOURCED)} Application(s) pinned to platform {PLATFORM_VERSION} from {PLATFORM_SOURCE}")
+    assert platform_errors(REPOSITORY) == []
+
+
 def test_every_file_is_the_application_root_adopts_by_name() -> None:
     assert identity_errors(REPOSITORY) == []
 
@@ -275,7 +359,7 @@ def test_root_selects_every_file() -> None:
 def test_no_application_carries_prune_false() -> None:
     found, read = manifests_with_prune_false(REPOSITORY)
     print(f"[E3] {read} manifest(s) under applications/ read, {len(found)} carry {PRUNE_FALSE}")
-    assert read >= len(PINNED_SPECS)
+    assert read >= len(ADOPTED)
     assert found == []
 
 
@@ -288,16 +372,16 @@ def test_no_application_automated_block_carries_prune() -> None:
 
 
 def test_every_application_retry_matches_the_chart_example() -> None:
-    print(f"[S0] {len(PINNED_SPECS)} retry block(s) compared against {CHART_EXAMPLE_SOURCE}")
+    print(f"[S0] {len(ADOPTED)} retry block(s) compared against {CHART_EXAMPLE_SOURCE}")
     assert retry_errors(REPOSITORY) == []
 
 
 def test_a_changed_spec_reddens(copy: Path) -> None:
-    path = copy / "applications" / "keda.yaml"
+    path = copy / "applications" / "mariadb-operator.yaml"
     text = path.read_text()
     assert "selfHeal: true" in text
     path.write_text(text.replace("selfHeal: true", "selfHeal: false", 1))
-    assert spec_drift(copy) == ["keda"]
+    assert spec_drift(copy) == ["mariadb-operator"]
 
 
 def test_a_missing_file_reddens(copy: Path) -> None:
@@ -318,7 +402,7 @@ def test_a_narrowed_root_include_reddens(copy: Path) -> None:
     text = path.read_text()
     assert "{applications,applicationsets}/*.yaml" in text
     path.write_text(text.replace("{applications,applicationsets}/*.yaml", "applicationsets/*.yaml"))
-    assert outside_root(copy) == list(PINNED_SPECS)
+    assert outside_root(copy) == list(ADOPTED)
 
 
 def test_prune_false_on_one_copy_reddens(copy: Path) -> None:
@@ -397,3 +481,88 @@ def test_normalize_for_pin_refuses_a_repeated_block_style_literal() -> None:
         "      selfHeal: true\n"  # deliberately ambiguous duplicate
     ) + RETRY_BLOCK_TEXT
     assert normalize_for_pin(text) is None
+
+
+def test_keda_turned_off_reddens(copy: Path) -> None:
+    path = copy / "applications" / "keda.yaml"
+    document = yaml.safe_load(path.read_text())
+    document["spec"]["source"]["helm"]["valuesObject"]["operators"]["keda"]["create"] = False
+    path.write_text(yaml.safe_dump(document))
+    assert platform_errors(copy) == ["keda"]
+
+
+def test_argo_cd_left_unset_reddens(copy: Path) -> None:
+    """An unset key falls back to `operators.create`; each one must be written false."""
+    path = copy / "applications" / "keda.yaml"
+    document = yaml.safe_load(path.read_text())
+    del document["spec"]["source"]["helm"]["valuesObject"]["operators"]["argoCd"]
+    path.write_text(yaml.safe_dump(document))
+    assert platform_errors(copy) == ["keda"]
+
+
+def test_a_release_name_reddens(copy: Path) -> None:
+    path = copy / "applications" / "keda.yaml"
+    document = yaml.safe_load(path.read_text())
+    document["spec"]["source"]["helm"]["releaseName"] = "operators"
+    path.write_text(yaml.safe_dump(document))
+    assert platform_errors(copy) == ["keda"]
+
+
+def test_a_moved_platform_pin_reddens(copy: Path) -> None:
+    path = copy / "applications" / "keda.yaml"
+    document = yaml.safe_load(path.read_text())
+    document["spec"]["source"]["targetRevision"] = "0.1.20"
+    path.write_text(yaml.safe_dump(document))
+    assert platform_errors(copy) == ["keda"]
+
+
+def test_a_moved_destination_reddens(copy: Path) -> None:
+    path = copy / "applications" / "keda.yaml"
+    document = yaml.safe_load(path.read_text())
+    document["spec"]["destination"]["namespace"] = "yadgar-operators"
+    path.write_text(yaml.safe_dump(document))
+    assert platform_errors(copy) == ["keda"]
+
+
+def test_dropped_keda_resources_reddens(copy: Path) -> None:
+    """Without the sizing, both KEDA Deployments' pod templates change and they roll.
+
+    The `keda:` key stays, so only the resources clause can catch this.
+    """
+    path = copy / "applications" / "keda.yaml"
+    document = yaml.safe_load(path.read_text())
+    del document["spec"]["source"]["helm"]["valuesObject"]["keda"]["resources"]
+    path.write_text(yaml.safe_dump(document))
+    assert platform_errors(copy) == ["keda"]
+
+
+def test_extra_platform_value_reddens(copy: Path) -> None:
+    path = copy / "applications" / "keda.yaml"
+    document = yaml.safe_load(path.read_text())
+    document["spec"]["source"]["helm"]["valuesObject"]["nats"] = {"create": True}
+    path.write_text(yaml.safe_dump(document))
+    assert platform_errors(copy) == ["keda"]
+
+
+def test_a_changed_repo_url_reddens(copy: Path) -> None:
+    path = copy / "applications" / "keda.yaml"
+    document = yaml.safe_load(path.read_text())
+    document["spec"]["source"]["repoURL"] = "https://kedacore.github.io/charts"
+    path.write_text(yaml.safe_dump(document))
+    assert platform_errors(copy) == ["keda"]
+
+
+def test_a_changed_chart_reddens(copy: Path) -> None:
+    path = copy / "applications" / "keda.yaml"
+    document = yaml.safe_load(path.read_text())
+    document["spec"]["source"]["chart"] = "keda"
+    path.write_text(yaml.safe_dump(document))
+    assert platform_errors(copy) == ["keda"]
+
+
+def test_an_extra_source_key_reddens(copy: Path) -> None:
+    path = copy / "applications" / "keda.yaml"
+    document = yaml.safe_load(path.read_text())
+    document["spec"]["source"]["path"] = "chart"
+    path.write_text(yaml.safe_dump(document))
+    assert platform_errors(copy) == ["keda"]
