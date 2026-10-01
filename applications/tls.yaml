@@ -1,5 +1,5 @@
 # ADOPTED FROM yadgarhq/deploy's `infra/tls-app.yaml` at 05b160b,
-# WHEN `infra` RETIRED (option A, ADR-0824). Root adopts the live Application
+# WHEN `infra` RETIRED (option A, ADR-0828). Root adopts the live Application
 # by name, keeping its uid. What the move changed, and only this: the source is
 # this repository's `manifests/tls/` (byte copies of deploy's `infra/tls/`),
 # and S0's `syncPolicy`, which also shortens `retry` from 60 attempts to 6 (see
@@ -25,8 +25,9 @@
 # retries into place. Both of those land at -10.
 #
 # EXPECT THIS APPLICATION TO BE UNHEALTHY UNTIL STEP 3 OF "THE DEVELOPMENT TLS
-# EDGE" IN MIGRATION_NOTES.md HAS RUN. There is a second step 3, in "Move the
-# development domain to yadgar.internal"; that one is not this one.
+# EDGE" IN yadgarhq/deploy's MIGRATION_NOTES.md HAS RUN. There is a second
+# step 3, in "Move the development domain to yadgar.internal"; that one is not
+# this one.
 # The ClusterIssuer references a secret holding the CA private key, which is
 # created by hand from 1Password and is deliberately not in git. Until it exists
 # the issuer reports NotReady and the Certificate stays unissued. That is the
@@ -58,7 +59,7 @@ spec:
     server: https://kubernetes.default.svc
     namespace: yadgar
   syncPolicy:
-    # S0 OF THE HANDOVER (ADR-0824), THE SAME AS THE OPERATOR APPLICATIONS: no
+    # S0 OF THE HANDOVER (ADR-0828), THE SAME AS THE OPERATOR APPLICATIONS: no
     # `automated.prune`, and the chart example's bounded `retry` below.
     automated:
       selfHeal: true
@@ -98,7 +99,7 @@ spec:
     # second operation while one is in flight — so `limit: -1` would leave a
     # broken `tls` unable to pick up the very commit that fixes it.
     #
-    # 6 ATTEMPTS, NOT deploy's 60, BY S0 (ADR-0824). deploy sized 60 attempts
+    # 6 ATTEMPTS, NOT deploy's 60, BY S0 (ADR-0828). deploy sized 60 attempts
     # at 30s doubling to 5m — hours — for somebody fetching a root CA out of
     # 1Password (ledger 75). S0's 15s doubling to 5m over 6 attempts is about
     # 13 minutes. On a cold cluster without `yadgar-dev-ca` this Application

@@ -3,7 +3,7 @@
 THE CHART-TAG HALF READS A FILE IN THIS REPOSITORY NOW. Until `infra` retired
 it fetched `yadgarhq/deploy`'s `infra/yadgar-app.yaml` over the contents API.
 The `yadgar` Application moved here as `applications/yadgar.yaml` (option A,
-ADR-0824), so that half reads the local file and needs no request at all. It
+ADR-0828), so that half reads the local file and needs no request at all. It
 is tested against the real file and against a copy with the pin moved.
 
 THE PLATFORM-VERSION HALF STILL NEEDS THE NETWORK, so its request is replaced

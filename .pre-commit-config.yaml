@@ -86,13 +86,13 @@ repos:
       # nothing here is still compared against deploy's copy — the name was
       # false. The hook id is unchanged, because nothing references the name.
       #
-      # RETIRING `infra` (ADR-0824) ADDED TWO OFFLINE FILES TO `scripts/tests`,
+      # RETIRING `infra` (ADR-0828) ADDED TWO OFFLINE FILES TO `scripts/tests`,
       # and this hook runs them as it runs the rest: `test_infra_children.py`
       # (the five Applications root adopted from `infra`, S0 shape) and
       # `test_check_chart_pin.py`. The gates that need helm or the network live
       # in `scripts/gates/` and run in CI's `two-owners` job, never here.
       - id: operator-applications
-        name: the adopted Applications are pinned — operators D4+, infra's children S0 (ADR-0824)
+        name: the adopted Applications are pinned — operators D4+, infra's children S0 (ADR-0824, ADR-0828)
         entry: python -m pytest scripts/tests -q
         language: python
         additional_dependencies: ["pytest==9.1.1", "pyyaml==6.0.3"]
@@ -100,7 +100,7 @@ repos:
         pass_filenames: false
 
       # PORTED FROM yadgarhq/deploy WITH THEIR SUBJECTS (retiring `infra`,
-      # option A, ADR-0824). Local for the reason `versions-pinned` gives: the
+      # option A, ADR-0828). Local for the reason `versions-pinned` gives: the
       # subjects exist in this repository only. `always_run` because a deleted
       # subject is the failure, and pre-commit never passes a deleted file.
       #

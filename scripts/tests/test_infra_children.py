@@ -1,4 +1,4 @@
-"""The five Applications root adopted when `infra` retired are pinned (ADR-0824).
+"""The five Applications root adopted when `infra` retired are pinned (ADR-0828).
 
 RETIRING `infra`, OPTION A. `yadgarhq/deploy`'s `infra` app-of-apps declared
 five Applications beside itself: `arc`, `estate-front`, `estate-front-runner`,

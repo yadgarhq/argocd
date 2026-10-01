@@ -2,7 +2,7 @@
 """The ARC runner pod runs a digest the estate's own CI published and signed.
 
 PORTED FROM yadgarhq/deploy AT 05b160b WHEN `infra` RETIRED (option A,
-ADR-0824). Its subject, the `estate-front-runner` Application, moved here as
+ADR-0828). Its subject, the `estate-front-runner` Application, moved here as
 `applications/estate-front-runner.yaml`, so the gate moved with it. The port
 changed the directory read (`infra/` -> `applications/`) and the prose that
 named deploy's paths, and nothing else.

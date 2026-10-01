@@ -1,6 +1,6 @@
 """`applications/yadgar.yaml` is the chart's own example, and renders what ran (E3, K3).
 
-RETIRING `infra`, OPTION A (ADR-0824). The `yadgar` Application moved here from
+RETIRING `infra`, OPTION A (ADR-0828). The `yadgar` Application moved here from
 `yadgarhq/deploy` as the parent chart's `example/application.yaml` at the
 pinned tag, with this organisation's values inlined as `valuesObject`. Two
 properties hold that shape, and both need the network, so this file sits in
@@ -9,7 +9,7 @@ CI job, never in the offline pre-commit hook.
 
   E3  The file equals `yadgarhq/chart@v<targetRevision>:example/application.yaml`
       everywhere EXCEPT `spec.syncPolicy` and `spec.source.helm.valuesObject`.
-      `syncPolicy` is excepted because S0 (ADR-0824) removes the example's
+      `syncPolicy` is excepted because S0 (ADR-0828) removes the example's
       `automated.prune`; `scripts/tests/test_infra_children.py` pins it exactly,
       offline. So a `syncPolicy`-only change stays green HERE by design, and
       that is asserted below rather than left to be discovered. The example is

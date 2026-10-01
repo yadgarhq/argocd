@@ -1,5 +1,5 @@
 # ADOPTED FROM yadgarhq/deploy's `infra/estate-front-app.yaml` at 05b160b,
-# WHEN `infra` RETIRED (option A, ADR-0824). Root adopts the live Application by name, keeping its
+# WHEN `infra` RETIRED (option A, ADR-0828). Root adopts the live Application by name, keeping its
 # uid. What the move changed, and only this: the source is this
 # repository's `manifests/estate-front/` (byte copies of deploy's
 # `infra/estate-front/`), and S0's `syncPolicy`.
@@ -49,7 +49,7 @@ spec:
     # Envoy pods it selects, not beside the runner that dials it.
     namespace: estate-front
   syncPolicy:
-    # S0 OF THE HANDOVER (ADR-0824), THE SAME AS THE OPERATOR APPLICATIONS: no
+    # S0 OF THE HANDOVER (ADR-0828), THE SAME AS THE OPERATOR APPLICATIONS: no
     # `automated.prune`, and the chart example's bounded `retry`.
     automated:
       selfHeal: true

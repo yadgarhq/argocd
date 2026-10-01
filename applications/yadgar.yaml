@@ -3,7 +3,7 @@
 # inlined as `valuesObject` (ADR-0786, ADR-0803 option A).
 #
 # ADOPTED FROM yadgarhq/deploy's `infra/yadgar-app.yaml` at 05b160b, WHEN
-# `infra` RETIRED (ADR-0824). Root adopts the live Application by name, keeping
+# `infra` RETIRED (ADR-0828). Root adopts the live Application by name, keeping
 # its uid. What the move changed, and only this:
 #
 #   - `sources` (the OCI chart plus `ref: self` on yadgarhq/deploy, reading
@@ -24,7 +24,7 @@
 # asserts that this file equals `yadgarhq/chart@v<targetRevision>`'s
 # `example/application.yaml` everywhere outside `spec.syncPolicy` and
 # `spec.source.helm.valuesObject`, and that the render at the pin equals the
-# committed per-object digests in `scripts/gates/yadgar_render.json` (K3).
+# committed per-object digests in `scripts/gates/yadgar_render.sha256` (K3).
 # A pin bump therefore moves three things in one merge: `targetRevision`
 # below, `scripts/chart_pin.json`'s `chart_tag`, and that digest table.
 #
@@ -489,7 +489,7 @@ spec:
     # than a namespace called `yadgar`.
     namespace: yadgar
   syncPolicy:
-    # S0 OF THE HANDOVER (ADR-0824), AND THE ONE PLACE THIS FILE DIFFERS FROM
+    # S0 OF THE HANDOVER (ADR-0828), AND THE ONE PLACE THIS FILE DIFFERS FROM
     # THE EXAMPLE OUTSIDE `valuesObject`: no `automated.prune`. The example
     # carries `prune: true`. Without it, an object a later pin or values change
     # stops rendering stays live and reads OutOfSync with `requiresPruning`

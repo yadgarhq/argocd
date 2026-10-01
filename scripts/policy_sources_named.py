@@ -1,7 +1,7 @@
 """Every ingress rule in this repository names a source (ledger 897).
 
 PORTED FROM yadgarhq/deploy AT 05b160b WHEN `infra` RETIRED (option A,
-ADR-0824). Its one subject, `estate-front-egress`, moved here byte-identical
+ADR-0828). Its one subject, `estate-front-egress`, moved here byte-identical
 as `manifests/estate-front/networkpolicy.yaml`, so the gate moved with it. The
 code is unchanged: it already walks the whole tree. The history below is
 deploy's, and the `infra/...` paths in it are deploy's.

@@ -52,7 +52,7 @@ CRDs stayed in the cluster, untracked, until D7.3 sourced `mariadb-operator`
 from `platform`, which renders them. The same test holds the deleted
 Application absent.
 
-**`infra`'s five children followed (M3, option A, ADR-0824).** `arc`,
+**`infra`'s five children followed (M3, option A, ADR-0828).** `arc`,
 `estate-front`, `estate-front-runner`, `tls` and `yadgar` left `deploy`'s
 `infra/` and root adopted each live object by name. `yadgar` is the parent
 chart's own `example/application.yaml` with this organisation's values inlined

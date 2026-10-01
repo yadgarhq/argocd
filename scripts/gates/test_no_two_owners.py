@@ -1,7 +1,7 @@
 """No object in namespace `yadgar` has two owners.
 
 PORTED FROM yadgarhq/deploy AT 05b160b WHEN `infra` RETIRED (option A,
-ADR-0824). Everything this gate reads moved here in one pull request: the
+ADR-0828). Everything this gate reads moved here in one pull request: the
 `yadgar` Application (`applications/yadgar.yaml`, which holds the pinned parent
 version AND this organisation's values as `valuesObject`), and every other
 Application, under `applications/`, with the two directory sources under
@@ -32,7 +32,9 @@ WHAT THE PORT CHANGED, AND ONLY THIS:
 
 THE HISTORY IN THE COMMENTS BELOW IS deploy's, and the `infra/...` paths in it
 are deploy's paths at the time each rung was measured. The counts are unchanged
-by the port: D is 5 and P is 88 here, as they were in deploy at 05b160b.
+by the port: D was 5 and P 88 here, as in deploy at 05b160b. D became 8 when
+argocd#52's `post-merge-verifier` brought three cluster-scoped objects (see
+`EXPECTED_D_TUPLES`).
 
 THE GATE `plans/retiring-the-deploy-copies.md` ASKS FOR. It needs both sides of
 the retirement at once: the parent chart's render at THIS organisation's values,
@@ -194,12 +196,21 @@ TARGET_NAMESPACE = "yadgar"
 # which `deploy_side` (now `d_side`) never rendered, so none was in D. Measured 2026-10-01: 5
 # before the deletion and 5 after.
 #
-# STILL 5 AFTER THE PORT TO yadgarhq/argocd (retiring `infra`, ADR-0824). The
+# STILL 5 AFTER THE PORT TO yadgarhq/argocd (retiring `infra`, ADR-0828). The
 # same `tls` Application sources the same two files, byte-identical, from
 # `manifests/tls/`. The six operator Applications and `argocd` source charts
 # into their own namespaces, which `d_side` does not render. Measured
 # 2026-10-01 on this tree: 5.
-EXPECTED_D_TUPLES = 5
+#
+# 8 AFTER argocd#52 ADDED `applications/post-merge-verifier.yaml`, which
+# sources `verifier/manifests` from this repository into namespace
+# `post-merge-verifier`. Its ServiceAccount is namespaced outside `yadgar` and
+# is not admitted; its `Namespace`, `ClusterRole` and `ClusterRoleBinding`
+# `post-merge-verifier` are CLUSTER-SCOPED, so they are admitted whatever the
+# destination, exactly as the module docstring says. None of the three is in P,
+# so C1 still reads 0 failures. Measured 2026-10-01 on this tree rebased onto
+# #52 (97786f0): 5 before, 8 after.
+EXPECTED_D_TUPLES = 8
 
 # THE `--api-versions` FLAGS, AND EACH NEEDS ITS OWN FLAG. The `-db` charts call
 # `fail` when `database.create` is true and `k8s.mariadb.com/v1alpha1` is absent,

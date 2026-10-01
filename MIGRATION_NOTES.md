@@ -706,7 +706,7 @@ kubectl --context kind-yadgar delete clusterrole post-merge-verifier
 kubectl --context kind-yadgar delete namespace post-merge-verifier
 ```
 
-## M3 — root adopts `infra`'s five children (retiring `infra`, option A, ADR-0824)
+## M3 — root adopts `infra`'s five children (retiring `infra`, option A, ADR-0828)
 
 **What the merge does.** It adds `applications/arc.yaml`, `estate-front.yaml`,
 `estate-front-runner.yaml`, `tls.yaml` and `yadgar.yaml`, and
@@ -758,7 +758,7 @@ kubectl --context kind-yadgar -n argocd get application infra -o json \
 # 2. The snapshot this merge is checked against. Keep the output.
 kubectl --context kind-yadgar get crd -o jsonpath='{range .items[*]}{.metadata.name}={.metadata.uid}{"\n"}{end}' \
   | sort | sha256sum | cut -c1-16                      # K6: a8026323ea9d31c2
-kubectl --context kind-yadgar -n argocd get applications --no-headers | wc -l   # K4: 13
+kubectl --context kind-yadgar -n argocd get applications --no-headers | wc -l   # K4: 14
 for ns in yadgar arc-systems; do
   kubectl --context kind-yadgar -n "$ns" get deploy,statefulset \
     -o jsonpath='{range .items[*]}{.kind}/{.metadata.name} {.metadata.uid} gen={.metadata.generation}{"\n"}{end}'
@@ -808,7 +808,7 @@ for app in tls estate-front; do
 done
 
 # 3. Workloads untouched: re-run the snapshot of "Before" step 2. Every uid
-#    and generation, K6 a8026323ea9d31c2, K4 13, and each Secret's
+#    and generation, K6 a8026323ea9d31c2, K4 14, and each Secret's
 #    creationTimestamp and resourceVersion unchanged.
 
 # 4. infra let go: it lists only itself.
@@ -822,6 +822,14 @@ curl -sS -o /dev/null -w '%{http_code} %{ssl_verify_result}\n' \
     -o jsonpath='{.data.tls\.crt}' | base64 -d) \
   --resolve gateway.yadgar.internal:18443:127.0.0.1 https://gateway.yadgar.internal:18443/
 ```
+
+K4 IS 14 HERE, NOT 13: argocd#52 added `post-merge-verifier`. M4, which
+deletes `infra` by hand, takes it to 13.
+
+THE POST-MERGE VERIFIER (#52) DOES NOT GATE THIS MERGE. It sees the five as
+newly added Applications (INFO) and does not compare them across the merge, so
+the manual snapshot above ("Before" step 2, re-read in "After" step 3) is M3's
+gate.
 
 If `yadgar.spec.sources` survives (step 2), STOP before deploy deletes
 `infra/yadgar/values.yaml`, and report it.

@@ -1,5 +1,5 @@
 # ADOPTED FROM yadgarhq/deploy's `infra/arc.yaml` at 05b160b,
-# WHEN `infra` RETIRED (option A, ADR-0824). Root adopts the live Application by name, keeping its
+# WHEN `infra` RETIRED (option A, ADR-0828). Root adopts the live Application by name, keeping its
 # uid. What the move changed, and only this: S0's `syncPolicy`
 # (no `automated.prune`, a bounded `retry`), and the values moved from the
 # `helm.values` string to `valuesObject`, parsed-equal.
@@ -60,7 +60,7 @@
 # `Terminating` until a person patches the finalizer off by hand. They are two
 # separate Applications, so sync waves order nothing here — waves order a sync,
 # and this is two deletions. The order is written out under "Removing it again"
-# in MIGRATION_NOTES.md.
+# in yadgarhq/deploy's MIGRATION_NOTES.md.
 #
 # Licence and supply chain, per O10: Apache-2.0 (actions/actions-runner-controller
 # LICENSE), maintained by GitHub, chart served over HTTPS from the OCI registry
@@ -97,7 +97,7 @@ spec:
     server: https://kubernetes.default.svc
     namespace: arc-systems
   syncPolicy:
-    # S0 OF THE HANDOVER (ADR-0824), THE SAME AS THE OPERATOR APPLICATIONS: no
+    # S0 OF THE HANDOVER (ADR-0828), THE SAME AS THE OPERATOR APPLICATIONS: no
     # `automated.prune`, and the chart example's bounded `retry`.
     automated:
       selfHeal: true

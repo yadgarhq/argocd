@@ -1,5 +1,5 @@
 # ADOPTED FROM yadgarhq/deploy's `infra/estate-front-runner.yaml` at 05b160b,
-# WHEN `infra` RETIRED (option A, ADR-0824). Root adopts the live Application by name, keeping its
+# WHEN `infra` RETIRED (option A, ADR-0828). Root adopts the live Application by name, keeping its
 # uid. What the move changed, and only this: S0's `syncPolicy`
 # (no `automated.prune`, a bounded `retry`), and the values moved from the
 # `helm.values` string to `valuesObject`, parsed-equal.
@@ -75,7 +75,7 @@
 #
 # `githubConfigSecret` is a NAME. The Secret is created out of band by an
 # operator and is deliberately not in git — see "The estate-front runner" in
-# MIGRATION_NOTES.md for the exact command.
+# yadgarhq/deploy's MIGRATION_NOTES.md for the exact command.
 #
 # A MISSING OR WRONG SECRET IS A QUIET FAILURE, NOT A LOUD ONE, and an earlier
 # revision of this comment claimed the opposite. It said the Application goes
@@ -183,7 +183,7 @@ spec:
             # THE EDGE, BY THE NAME A REAL CLIENT USES. This is the whole of the
             # in-cluster DNS answer, and it is deliberately not a CoreDNS
             # rewrite — see "Resolving gateway.yadgar.internal" in
-            # MIGRATION_NOTES.md for why that would be the nix repo's object to
+            # yadgarhq/deploy's MIGRATION_NOTES.md for why that would be the nix repo's object to
             # own under ADR-0480, and why this is not.
             #
             # 10.96.0.100 is the pinned ClusterIP of `yadgar-edge`, declared in
@@ -294,7 +294,7 @@ spec:
     server: https://kubernetes.default.svc
     namespace: estate-front
   syncPolicy:
-    # S0 OF THE HANDOVER (ADR-0824), THE SAME AS THE OPERATOR APPLICATIONS: no
+    # S0 OF THE HANDOVER (ADR-0828), THE SAME AS THE OPERATOR APPLICATIONS: no
     # `automated.prune`, and the chart example's bounded `retry`.
     automated:
       selfHeal: true

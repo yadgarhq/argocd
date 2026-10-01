@@ -20,7 +20,7 @@ TWO INDEPENDENT CHECKS, because one tag alone cannot prove either half:
 
 OPTION A LANDED, AND THIS READ FOLLOWED IT. The `yadgar` Application moved out
 of `yadgarhq/deploy` (`infra/yadgar-app.yaml`) and into this repository as
-`applications/yadgar.yaml` when `infra` retired (ADR-0824), in the same pull
+`applications/yadgar.yaml` when `infra` retired (ADR-0828), in the same pull
 request that repointed this read. So the chart-tag half reads a LOCAL file and
 makes no request; `scripts/tests/test_check_chart_pin.py` covers it offline.
 
