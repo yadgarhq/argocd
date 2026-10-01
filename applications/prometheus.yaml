@@ -41,9 +41,17 @@
 # the configmap-reload container. The rules and the PVC's 2Gi are deploy's
 # values. The PVC itself, Recreate, the empty reloader resources and the 1m
 # interval are the community chart 29.27.0's own defaults, which `platform`
-# overrides for the PVC, the reloader and the interval. The PVC renders under the same name from both charts, with an equal
-# spec and no `helm.sh/resource-policy`; Argo patches an existing object and
-# never replaces it without `Replace=true`, so the claim and its TSDB stay.
+# overrides for the PVC, the reloader and the interval. The PVC renders under
+# the same name from both charts, with an equal spec and no
+# `helm.sh/resource-policy`; Argo patches an existing object and never
+# replaces it without `Replace=true`, so the claim and its TSDB stay.
+#
+# 2Gi IS NOT A BOUND. The `standard` StorageClass (rancher.io/local-path) does
+# not enforce the requested size: `df` inside the pod shows the host file
+# system. The only bound on the TSDB is `--storage.tsdb.retention.time=24h`;
+# `retention.size` is unset. Measured 2026-10-01 at today's series count, the
+# upper bound at 15s is about 1.5 to 1.6 GB: blocks about 1.0 GB plus WAL about
+# 0.55 GB.
 #
 # EACH OPERATOR KEY IS WRITTEN, NOT LEFT UNSET. `platform` resolves an unset
 # `operators.<op>.create` through `operators.create`, so an unset key is a
@@ -58,7 +66,9 @@
 #   rolls. `null` deletes the key in helm's merge; an empty map `{}` does not
 #   (measured: `{}` still renders 10m/32Mi). That `null` is why these values
 #   are the `helm.values` STRING and not `valuesObject`, unlike the other three:
-#   a `null` inside `valuesObject` can be dropped on root's apply.
+#   a `null` inside `valuesObject` can be dropped on root's apply. That is
+#   REASONED, NOT MEASURED: root applies client-side, and a JSON merge patch
+#   on a custom resource reads `null` as "delete this key".
 # - `serverFiles."alerting_rules.yml"`. deploy's rules, verbatim. `platform`
 #   carries none.
 # deploy's server sizing (100m/256Mi), `retention: 24h` and the four disabled

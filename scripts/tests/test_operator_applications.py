@@ -132,7 +132,8 @@ PLATFORM_SYNC_POLICY: dict = {
 #   form       optional. The `helm` key that holds the values: `valuesObject`
 #              when absent, or `values`, the YAML string, which is parsed.
 #              Only `prometheus` uses `values`, because its `null` must reach
-#              helm and a `null` inside `valuesObject` can be dropped on apply.
+#              helm and a `null` inside `valuesObject` can be dropped on apply
+#              (reasoned from client-side apply's merge patch, not measured).
 #   digests    optional. Keys under `values` pinned by the sha256 of their
 #              canonical JSON (`json.dumps(..., sort_keys=True)`) rather than
 #              written out here. `carried` holds every other key.
@@ -519,8 +520,8 @@ def test_a_changed_spec_reddens(copy: Path) -> None:
 
 
 def test_a_missing_file_reddens(copy: Path) -> None:
-    (copy / "applications" / "mariadb-operator-crds.yaml").unlink()
-    assert spec_drift(copy) == ["mariadb-operator-crds"]
+    (copy / "applications" / "mariadb-operator.yaml").unlink()
+    assert spec_drift(copy) == ["mariadb-operator"]
 
 
 def test_a_renamed_application_reddens(copy: Path) -> None:
@@ -580,11 +581,11 @@ def test_a_negative_retry_limit_reddens(copy: Path) -> None:
 
 def test_content_appended_after_retry_reddens(copy: Path) -> None:
     """A line appended after the retry block must not vanish from the pinned hash."""
-    path = copy / "applications" / "mariadb-operator-crds.yaml"
+    path = copy / "applications" / "mariadb-operator.yaml"
     text = path.read_text()
     assert text.endswith(RETRY_BLOCK_SUFFIX)
     path.write_text(text + "  ignoreDifferences: []\n")
-    assert spec_drift(copy) == ["mariadb-operator-crds"]
+    assert spec_drift(copy) == ["mariadb-operator"]
 
 
 def test_normalize_for_pin_refuses_a_repeated_automated_literal() -> None:
@@ -850,6 +851,8 @@ def test_a_second_operator_on_prometheus_reddens(copy: Path) -> None:
 
 def test_prometheus_values_as_value_object_reddens(copy: Path) -> None:
     """`valuesObject` in place of the `values` string: the `null` it carries can be dropped on apply.
+
+    That drop is reasoned from client-side apply's merge patch, not measured.
 
     Membership, not the exact list, on purpose: the row reads `values`, so with
     it gone the parsed values are empty and every clause that reads them fails
