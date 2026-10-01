@@ -1000,3 +1000,45 @@ def test_a_repeated_output_flag_is_refused_by_name() -> None:
     """kubectl honours the LAST -o, so even two identical ones are refused, before any other output rule."""
     with pytest.raises(vh.UsageError, match="repeated"):
         vh.kubectl(CONTEXT, ["get", "pods", "-n", "keda", "-o", "json", "--output=json"], runner=FakeRunner({}))
+
+
+# --- git ancestry: a runner image without git must not hang the wait ----------
+
+
+def _no_git(*_args, **_kwargs):
+    raise FileNotFoundError("git")
+
+
+def test_git_is_ancestor_without_git_answers_false() -> None:
+    check = vh.git_is_ancestor(Path("."), runner=_no_git)
+    assert check("a" * 40, "b" * 40) is False
+
+
+def test_ancestry_problem_names_a_missing_git() -> None:
+    assert "git" in vh.ancestry_problem(Path("."), runner=_no_git)
+
+
+def test_ancestry_problem_names_a_directory_without_history(tmp_path) -> None:
+    assert vh.ancestry_problem(tmp_path) is not None
+
+
+def test_ancestry_problem_is_none_in_this_checkout() -> None:
+    assert vh.ancestry_problem(REPOSITORY) is None
+
+
+def test_ancestry_ignores_git_environment_variables(tmp_path, monkeypatch) -> None:
+    """A pre-commit hook (and some CI) exports GIT_DIR; `git -C` would then answer for the wrong repository."""
+    monkeypatch.setenv("GIT_DIR", str(REPOSITORY / ".git"))
+    assert vh.ancestry_problem(tmp_path) is not None
+
+
+def test_require_ancestry_refuses_before_any_kubectl_call(tmp_path, capsys, monkeypatch) -> None:
+    def no_kubectl(*_args, **_kwargs):
+        raise AssertionError("kubectl was called")
+
+    monkeypatch.setattr(vh, "kubectl", no_kubectl)
+    code = vh.main(
+        ["wait", "--context", CONTEXT, "--app", "root", "--revision", SHA, "--ancestry-repo", str(tmp_path), "--require-ancestry"]
+    )
+    assert code == 2
+    assert "ancestry" in capsys.readouterr().err

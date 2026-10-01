@@ -55,6 +55,7 @@ import datetime as dt
 import hashlib
 import http.client
 import json
+import os
 import socket
 import ssl
 import subprocess
@@ -702,12 +703,33 @@ def revision_state(
     return "done", f"Synced at {at}" + ("" if at == sha else f", which descends from {sha}")
 
 
-def git_is_ancestor(repo: Path) -> Callable[[str, str], bool]:
+def _git(repo: Path, args: list[str], runner: Callable) -> int | None:
+    """Exit code of `git -C repo <args>`, or None when there is no git binary."""
+    # GIT_DIR and friends override `-C`; a pre-commit hook exports them.
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    try:
+        return runner(["git", "-C", str(repo), *args], capture_output=True, check=False, env=env).returncode
+    except FileNotFoundError:
+        return None
+
+
+def ancestry_problem(repo: Path, *, runner: Callable = subprocess.run) -> str | None:
+    """Why `repo` cannot answer ancestry questions, or None when it can."""
+    code = _git(repo, ["rev-parse", "--git-dir"], runner)
+    if code is None:
+        return "no git binary on PATH"
+    if code != 0:
+        return f"{repo} is not a git checkout"
+    return None
+
+
+def git_is_ancestor(repo: Path, *, runner: Callable = subprocess.run) -> Callable[[str, str], bool]:
     """`git merge-base --is-ancestor` in `repo`, fetching `origin` once if a revision is unknown.
 
     Only full shas are compared; anything else (a chart version) is never an
-    ancestor. A repository without the history answers False, which leaves
-    `revision_state` waiting for the exact sha.
+    ancestor. No git, or a repository without the history, answers False,
+    which leaves `revision_state` waiting for the exact sha. `--require-ancestry`
+    turns that into a refusal up front instead of a timeout.
     """
     fetched = False
 
@@ -716,13 +738,13 @@ def git_is_ancestor(repo: Path) -> Callable[[str, str], bool]:
         if not all(len(r) == 40 and all(c in "0123456789abcdef" for c in r) for r in (old, new)):
             return False
         for _ in range(2):
-            proc = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", old, new], capture_output=True, check=False)
-            if proc.returncode in (0, 1):
-                return proc.returncode == 0
-            if fetched:
+            code = _git(repo, ["merge-base", "--is-ancestor", old, new], runner)
+            if code in (0, 1):
+                return code == 0
+            if code is None or fetched:
                 return False
             fetched = True
-            subprocess.run(["git", "-C", str(repo), "fetch", "--quiet", "origin"], capture_output=True, check=False)
+            _git(repo, ["fetch", "--quiet", "origin"], runner)
         return False
 
     return check
@@ -816,6 +838,11 @@ def _parser() -> argparse.ArgumentParser:
     wait.add_argument(
         "--ancestry-repo", type=Path, default=Path("."), help="git checkout used to accept a descendant of --revision"
     )
+    wait.add_argument(
+        "--require-ancestry",
+        action="store_true",
+        help="refuse to start when --ancestry-repo cannot answer ancestry (no git, no checkout)",
+    )
     wait.add_argument("--timeout", type=float, default=900)
     wait.add_argument("--interval", type=float, default=10)
 
@@ -832,6 +859,10 @@ def _wait(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         parser.error("wait --settled needs --since")
     if args.app and bool(args.since) == bool(args.revision):
         parser.error("wait --app needs exactly one of --since or --revision")
+    if args.revision and args.require_ancestry:
+        problem = ancestry_problem(args.ancestry_repo)
+        if problem:
+            raise UsageError(f"--require-ancestry: {problem}; a later commit on main could never be accepted")
     cluster = Cluster(args.context)
     is_ancestor = git_is_ancestor(args.ancestry_repo)
 
