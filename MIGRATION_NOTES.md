@@ -843,13 +843,14 @@ merge, and delete it in a second.
 
 ## The sync timeout (ledger 1208)
 
-`install/values.yaml` gained `controller.sync.timeout.seconds: "4200"` under
+`install/values.yaml` gained `controller.sync.timeout.seconds: "22200"` under
 `configs.params`. **Apply this only after M3 has moved `Application/tls` here
 with its limit-6 retry.** The tls Application on the cluster before M3 retries 60
-times, about ten hours, and a 70-minute timeout would end that retry.
+times, about ten hours. M3 has since moved it here with the limit-6 shape.
 
 **Merging changes nothing live.** `Application/argocd` is manual and has never
-synced. **Do not sync it to land this.** That sync applies every other drift in the Application as well. Land the one key with a targeted
+synced. **Do not sync it to land this.** That sync applies every other drift in
+the Application as well. Land the one key with a targeted
 patch and a controller restart instead. Every command names
 `--context kind-yadgar`. The default context is not this cluster.
 
@@ -871,7 +872,7 @@ kubectl --context kind-yadgar -n argocd get statefulset argocd-application-contr
   | jq '.spec.template.spec.containers[].env[]? | select(.name=="ARGOCD_APPLICATION_CONTROLLER_SYNC_TIMEOUT")'
 
 # 3. No operation in flight. Expect: no rows. The restart resumes an operation
-#    in flight, and the new timeout terminates any operation older than 70 min at once.
+#    in flight, and the new timeout terminates any operation older than 6.2 h at once.
 #    Any row → STOP.
 kubectl --context kind-yadgar get applications -A -o json \
   | jq -r '.items[] | select(.status.operationState.phase == "Running" or .status.operationState.phase == "Terminating")
@@ -891,13 +892,18 @@ kubectl --context kind-yadgar -n argocd get pod argocd-application-controller-0 
 ```bash
 # (a) The one key.
 kubectl --context kind-yadgar -n argocd patch configmap argocd-cmd-params-cm \
-  --type merge -p '{"data":{"controller.sync.timeout.seconds":"4200"}}'
+  --type merge -p '{"data":{"controller.sync.timeout.seconds":"22200"}}'
 
 # (b) Restart the controller: delete its one pod, and the StatefulSet recreates it.
 #     Use this, not `kubectl rollout restart`. A rollout restart writes a
 #     `kubectl.kubernetes.io/restartedAt` annotation into the pod template, which is
 #     one more field git does not hold.
 kubectl --context kind-yadgar -n argocd delete pod argocd-application-controller-0
+# The StatefulSet recreates the pod a moment later, and `kubectl wait` fails on a
+# pod that does not exist yet. Wait for it to exist first.
+until kubectl --context kind-yadgar -n argocd get pod argocd-application-controller-0 >/dev/null 2>&1; do
+  sleep 2
+done
 kubectl --context kind-yadgar -n argocd wait --for=condition=Ready \
   pod/argocd-application-controller-0 --timeout=300s
 ```
@@ -905,7 +911,7 @@ kubectl --context kind-yadgar -n argocd wait --for=condition=Ready \
 ### After — verify
 
 ```bash
-# 1. The ConfigMap holds the value. Expect: 4200
+# 1. The ConfigMap holds the value. Expect: 22200
 kubectl --context kind-yadgar -n argocd get configmap argocd-cmd-params-cm \
   -o jsonpath='{.data.controller\.sync\.timeout\.seconds}'; echo
 
@@ -913,7 +919,7 @@ kubectl --context kind-yadgar -n argocd get configmap argocd-cmd-params-cm \
 kubectl --context kind-yadgar -n argocd get pod argocd-application-controller-0 \
   -o jsonpath='{.metadata.uid} {.status.startTime}{"\n"}'
 
-# 3. The process has the value. Expect: 4200. This is an exec, but it only reads.
+# 3. The process has the value. Expect: 22200. This is an exec, but it only reads.
 kubectl --context kind-yadgar -n argocd exec argocd-application-controller-0 \
   -c application-controller -- printenv ARGOCD_APPLICATION_CONTROLLER_SYNC_TIMEOUT
 

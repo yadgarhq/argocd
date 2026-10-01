@@ -30,20 +30,20 @@ configs:
     #
     # THE CLOCK COVERS THE WHOLE OPERATION, retries and backoff included
     # (`controller/appcontroller.go:1420-1424` and `:1429`, v3.1.8), so the value
-    # must outlast the longest retry chain under `applications/`. Every retry
-    # there since M3 is limit 6, 15s x2, max 5m: 1050 s of backoff and 7
-    # attempts. `yadgar` (chart 0.3.13) spends the most per attempt: its
-    # preflight and envoy-gateway probe scripts are bounded at 120 s and 300 s,
-    # and its two unbounded bootstrap Jobs get 3x their measured 3 s. So
-    # 1050 + 7 x 438 = 4116 s, and 4200 s clears it, the same as
-    # `yadgarhq/chart`'s kind install. Unbounded hooks count only at 3x their
-    # measured time, so they do not raise the floor. Argo reads the value as an
-    # int32 and treats a larger one as 0. `scripts/tests/test_install_values.py`
-    # derives the floor from those files.
+    # must outlast the longest retry chain of any automated Application here.
+    # `yadgar` is the longest: limit 6, 15s x2, max 5m is 1050 s of backoff and
+    # 7 attempts, and each attempt may run the bounds `platform` 0.1.21
+    # documents: the preflight's eight 120 s loops plus 300 s, the
+    # envoy-gateway probe's three 300 s loops plus 600 s, and the two parallel
+    # bootstrap Jobs' pod backoff, 2955 s in all. 1050 + 7 x 2955 = 21735 s, and
+    # 22200 s (6.2 h) clears it. Max ruled 2026-10-01: keep the documented
+    # margins now, tighten through per-hook deadlines later (ledger 1224). Argo
+    # reads the value as an int32 and treats a larger one as 0.
+    # `scripts/tests/test_install_values.py` derives the floor.
     #
     # SET ON THE LIVE CLUSTER BY A TARGETED PATCH, not by syncing
     # `Application/argocd` (see the header): MIGRATION_NOTES.md, ledger 1208.
-    controller.sync.timeout.seconds: "4200"
+    controller.sync.timeout.seconds: "22200"
   cm:
     # HOW ARGO MARKS WHAT IT OWNS — the `argocd.argoproj.io/tracking-id`
     # annotation rather than an `app.kubernetes.io/instance`-style label. The
