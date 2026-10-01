@@ -41,7 +41,10 @@ exception, because it has nowhere else to live.
 `envoy-gateway` and `prometheus`. E2 deleted them from `deploy`'s `infra/`.
 E3 declares the same specs under `applications/`, and `root` adopts each live
 object by name, so every uid is kept. `scripts/tests/test_operator_applications.py`
-pins each spec to `deploy`'s last copy.
+pins each spec to `deploy`'s last copy. D7.1 deleted `mariadb-operator-crds`.
+Its 12 CRDs stay in the cluster, untracked, until D7.3 sources
+`mariadb-operator` from `platform`, which renders them. The same test holds the
+deleted Application absent.
 | `applications/argocd.yaml` | Argo managing Argo — what makes `install/values.yaml` actually apply |
 
 ## Argo manages Argo
