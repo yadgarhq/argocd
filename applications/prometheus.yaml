@@ -27,7 +27,8 @@
 # running server without a restart: `config-volume` is mounted at /etc/config
 # with no `subPath`, so kubelet updates the file (allow about a minute), and the
 # configmap-reload sidecar watches that directory and calls
-# `/-/reload`, which `--web.enable-lifecycle` enables. Read from the render.
+# `/-/reload`, which `--web.enable-lifecycle` enables. Read from the render
+# and from the live Deployment, which carries the same mounts and arguments.
 #
 # THIS SWAP IS NOT 0-DIFF. The ConfigMap differs, so the Application goes
 # OutOfSync and automated sync patches it. Neither chart renders a helm hook, so
