@@ -105,10 +105,10 @@ spec:
     # 13 minutes. On a cold cluster without `yadgar-dev-ca` this Application
     # therefore stays Degraded after that window, until the next commit syncs
     # it or `kubectl delete job yadgar-tls-preflight -n cert-manager` re-runs
-    # the preflight. The preflight Job's own message still says "60 attempts"
-    # and names deploy's files: it is a byte copy, and changing its text
-    # changes the Job's pod template, which forces a tls sync that recreates the
-    # Job. A later, separate change fixes that text.
+    # the preflight. The preflight Job's own message said "60 attempts" too
+    # (ledger 1223 fixes that text here): the Job script is a byte copy, so
+    # editing it changes the Job's pod template, which forces a tls sync that
+    # recreates the Job.
     retry:
       limit: 6
       backoff:

@@ -194,14 +194,17 @@ spec:
                     'the gateway serves. This check does not verify that.' \
                     '' \
                     'Then wait. Argo retries this failed sync on its own, every' \
-                    'few minutes (the retry block in tls-app.yaml), and each' \
-                    'attempt recreates this Job - so it re-reads the API server' \
-                    'and goes green with no further command. Do not resync by' \
-                    'hand meanwhile: the operation is in flight and Argo' \
-                    'refuses a second one.' \
+                    'few minutes (the retry block in applications/tls.yaml,' \
+                    'yadgarhq/argocd), and each attempt recreates this Job - so' \
+                    'it re-reads the API server and goes green with no further' \
+                    'command. Do not resync by hand meanwhile: the operation is' \
+                    'in flight and Argo refuses a second one.' \
                     '' \
-                    'That budget is 60 attempts - hours, not minutes, but not' \
-                    'unlimited. If it has run out, one command starts it again:' \
+                    'That budget is 6 attempts - about 13 minutes of backoff,' \
+                    'not unlimited, but each attempt is itself bounded at 300s' \
+                    '(activeDeadlineSeconds below) too: worst case, 7 attempts' \
+                    'at 300s apiece, is about 48 minutes. If it has run out,' \
+                    'one command starts it again:' \
                     '' \
                     '  kubectl -n cert-manager delete job yadgar-tls-preflight' >&2
                   exit 1
