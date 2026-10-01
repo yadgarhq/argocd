@@ -1,10 +1,67 @@
-# ADOPTED FROM yadgarhq/deploy AT E3 OF THE OPERATORS HANDOVER (ADR-0824).
-# `spec` equals deploy's infra/envoy-gateway.yaml at fa7ccb5, except S0 of the
-# operators handover (ADR-0824): `automated.prune` is omitted, and `retry` is
-# copied from `yadgarhq/chart@v0.3.15`'s `example/operators-application.yaml`.
-# scripts/tests/test_operator_applications.py pins it, those two exceptions
-# included. Root adopts the live Application by name, keeping its uid. No
-# `Prune=false` here: root's apply removes the one E1 left on the live object.
+# ADOPTED FROM yadgarhq/deploy AT E3 OF THE OPERATORS HANDOVER (ADR-0824), and
+# SOURCED FROM yadgarhq's `platform` CHART SINCE D4. Root adopts the live
+# Application by name, keeping its uid.
+#
+# WHAT D4 CHANGED, AND ONLY THIS: `source`. It was Envoy's own chart,
+# `gateway-helm` 1.9.1 from oci://docker.io/envoyproxy. It is now `platform` at
+# the version `yadgarhq/chart@v0.3.15` embeds, with
+# `operators.envoyGateway.create` true and every other operator explicitly
+# false. `platform` 0.1.21 carries the same Envoy Gateway v1.9.1 as its
+# `gateway-helm` subchart, so the image tags do not move. The subchart's own
+# version string is `v1.9.1`, not `1.9.1`, so the `helm.sh/chart` label moves
+# from `gateway-helm-1.9.1` to `gateway-helm-v1.9.1` on 17 objects. That label is
+# in no selector and no pod template, so nothing rolls. Ten of the 17 are
+# ordinary objects, which Argo patches in place. The other 7 are helm hooks,
+# which Argo deletes and recreates on the sync rather than patching (below).
+#
+# WHAT D4 KEPT, so that the handover adopts in place: the Application name, the
+# destination namespace `envoy-gateway-system`, `syncPolicy`, and no
+# `releaseName`. Argo uses the Application name as the helm release name, so the
+# release stays `envoy-gateway`, `app.kubernetes.io/instance` stays
+# `envoy-gateway`, and no immutable Deployment selector changes. Measured
+# 2026-10-01 with both sources rendered as release `envoy-gateway` in namespace
+# `envoy-gateway-system`: the same 40 objects, and the only difference is that
+# label. The Deployment's selector and pod template are equal, and the 21 CRDs
+# (Envoy Gateway's own and Gateway API v1.6.1 experimental) have equal `spec`.
+# `platform` 0.1.21's Chart.yaml and Chart.lock pin `gateway-helm` at v1.9.1.
+#
+# EACH OPERATOR KEY IS WRITTEN, NOT LEFT UNSET. `platform` resolves an unset
+# `operators.<op>.create` through `operators.create`, so an unset key is a
+# second place that decides what this Application installs.
+#
+# THE `gateway-helm:` VALUES ARE deploy's, moved under `platform`'s subchart key
+# unchanged: the development sizing (D55). Without it the envoy-gateway
+# Deployment's pod template falls back to the chart's defaults, and it rolls.
+#
+# THE `certgen` HOOK RE-RUNS ON THE SWAP AND ROTATES NOTHING. gateway-helm's
+# `certgen` Job, its RBAC and the topology-injector MutatingWebhookConfiguration
+# are helm `pre-install, pre-upgrade` hooks, which Argo runs as PreSync on the
+# sync this change triggers: the label change puts the Application OutOfSync,
+# and automated sync runs every hook. None sets a delete policy, so Argo
+# deletes and recreates each one. In v1.9.1 `envoy-gateway certgen` writes the
+# control-plane Secrets (`envoy-gateway`, `envoy`, `envoy-rate-limit`,
+# `envoy-oidc-hmac`) through `CreateOrUpdateSecrets` with `update` set only by
+# `--overwrite`. The rendered Job passes no arguments, so an existing Secret is
+# skipped and the xDS CA the edge proxies trust stays as it is. certgen then
+# sets the recreated webhook's `caBundle` from the existing `envoy-gateway`
+# Secret. Until it does, the `caBundle` is empty; the webhook is
+# `failurePolicy: Ignore` and matches only `pods/binding` in this namespace. Read from the
+# v1.9.1 source (internal/cmd/certgen.go, internal/provider/kubernetes/secrets.go)
+# and the render, 2026-10-01.
+#
+# `syncPolicy` is S0 of the operators handover (ADR-0824): `automated.prune` is
+# omitted, and `retry` is copied from `yadgarhq/chart@v0.3.15`'s
+# `example/operators-application.yaml`. No `Prune=false` here: root's apply
+# removes the one E1 left on the live object.
+#
+# WHAT IS GATED, AND WHAT IS ONLY MEASURED.
+# scripts/tests/test_operator_applications.py pins this Application's shape:
+# the source, the platform version, every operator key, the carried values, the
+# absent `releaseName`, and every field outside `source`. It does not render
+# anything. The 40-object render equivalence, the one label difference, the CRD
+# equality, `platform` 0.1.21 embedding Envoy Gateway v1.9.1, and certgen's
+# skip-if-present behaviour are a 2026-10-01 measurement, recorded in the pull
+# request that made this change, and no check re-runs them.
 #
 # Envoy Gateway — the Gateway API implementation that terminates TLS at the edge
 # (D71).
@@ -36,6 +93,8 @@
 # compatibility matrix, and supports Kubernetes v1.33 through v1.36 — this cluster
 # runs v1.36.1, at the top of that range. Both verified 2026-08-30 against the
 # project's matrix and a live `helm show chart`, per O10.
+# Since D4 Argo fetches it inside `platform` from ghcr.io/yadgarhq/charts, not
+# from docker.io/envoyproxy.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
@@ -49,28 +108,35 @@ metadata:
 spec:
   project: default
   source:
-    # OCI, in the form Argo CD 3.1 documents for a Helm chart held as an OCI
-    # artifact: the `oci://` scheme carries the full reference including the chart
-    # name, and `path` is `.`. Argo also accepts the Helm-source form — repoURL
-    # `docker.io/envoyproxy` with `chart: gateway-helm` and no scheme — but the
-    # two must not be mixed, and this one names the exact reference that
-    # `helm show chart` was verified against.
-    #
-    # No repository Secret: the chart is public, and Argo's own OCI examples
-    # declare public Docker Hub charts with no registration at all.
-    repoURL: oci://docker.io/envoyproxy/gateway-helm
-    path: .
-    targetRevision: 1.9.1
+    # SCHEME-LESS `repoURL` WITH `chart:`, the same form as the chart's own
+    # `example/operators-application.yaml`.
+    repoURL: ghcr.io/yadgarhq/charts
+    chart: platform
+    targetRevision: 0.1.21
     helm:
-      values: |
-        # Development sizing (D55). The ceiling on this machine is the ~19
-        # database instances, not the controllers.
-        deployment:
+      valuesObject:
+        operators:
           envoyGateway:
-            resources:
-              requests:
-                cpu: 50m
-                memory: 128Mi
+            create: true
+          argoCd:
+            create: false
+          certManager:
+            create: false
+          keda:
+            create: false
+          mariadbOperator:
+            create: false
+          prometheus:
+            create: false
+        gateway-helm:
+          # Development sizing (D55). The ceiling on this machine is the ~19
+          # database instances, not the controllers.
+          deployment:
+            envoyGateway:
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
   destination:
     server: https://kubernetes.default.svc
     namespace: envoy-gateway-system
