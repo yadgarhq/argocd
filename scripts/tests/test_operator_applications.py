@@ -208,7 +208,8 @@ PLATFORM_SYNC_POLICY: dict = {
 #              written out here. `carried` holds every other key.
 #   carried    required when `values` is set. Exactly what sits under
 #              `values`, less `digests`: deploy's
-#              copy, moved under that key. Measured 2026-10-01: without a row's sizing blocks
+#              copy, moved under that key, plus any value set since D4 (the
+#              row's comment names it: prometheus's ledger-1210 sizing). Measured 2026-10-01: without a row's sizing blocks
 #              the render's pod templates change and the Deployments roll.
 #              cert-manager's `crds` block changes nothing in today's render,
 #              because `platform` and cert-manager v1.21.1 already default to
@@ -279,16 +280,33 @@ PLATFORM_SOURCED: dict[str, dict] = {
         "toggle": "prometheus",
         "values": "prometheus",
         "form": "values",
-        # deploy's alerting rules, verbatim: `serverFiles` parsed from deploy's
-        # copy at SOURCE equals this file's. `platform` carries no rules.
-        "digests": {"serverFiles": "fc7255aec26edb02827487ecb30f4780343d67504390ba5c3f55fc7948b35435"},
+        # deploy's four alerting rules, verbatim (D4 measured `serverFiles`
+        # parsed from deploy's copy at SOURCE equal to this file's, digest
+        # fc7255aec26edb02827487ecb30f4780343d67504390ba5c3f55fc7948b35435),
+        # plus ledger 1210's fifth, `PrometheusSizeRetentionDeletedBlocks`.
+        # `platform` carries no rules.
+        "digests": {"serverFiles": "a448774a4fb225a2f4d3a0e75cc5c35d8496f896701334f7e28bb876d56b8a0a"},
         # deploy's PVC (`platform` defaults `enabled` to false, which renders an
         # emptyDir), and `null` on the reload sidecar's resources, which deletes
         # `platform`'s 10m/32Mi requests. Measured 2026-10-01: without either the
         # pod template changes and the pod rolls; without the PVC the TSDB is
         # empty. An empty map `{}` does not delete the requests.
+        #
+        # `server.resources` and `server.retentionSize` are NOT deploy's: ledger
+        # 1210 set them after D4, and the pod rolls once for them. Measured
+        # 2026-10-01 at the 15s scrape interval: RSS peak >=790 MB and still
+        # rising, so the request covers it and the limit leaves room for WAL
+        # replay. The TSDB's 24h upper bound is PROJECTED at 1.5 to 1.6 GB, so
+        # 4GB (4 GiB: Prometheus counts in powers of 2) keeps `retention: 24h`
+        # the bound that binds, with room for about 2.5 times the series.
+        # local-path does not enforce the nominal 2Gi. A drop or a change of
+        # any of them reddens `carried`.
         "carried": {
-            "server": {"persistentVolume": {"enabled": True, "size": "2Gi"}},
+            "server": {
+                "persistentVolume": {"enabled": True, "size": "2Gi"},
+                "resources": {"requests": {"cpu": "100m", "memory": "1Gi"}, "limits": {"memory": "2Gi"}},
+                "retentionSize": "4GB",
+            },
             "configmapReload": {"prometheus": {"resources": None}},
         },
         "unchanged": {
@@ -1055,6 +1073,54 @@ def test_prometheus_reloader_resources_empty_map_reddens(copy: Path) -> None:
 def test_prometheus_reloader_resources_dropped_reddens(copy: Path) -> None:
     mutate_prometheus_values(copy, lambda values: values["prometheus"].pop("configmapReload"))
     assert platform_clause_errors(copy) == [("prometheus", "carried")]
+
+
+def test_prometheus_memory_limit_dropped_reddens(copy: Path) -> None:
+    """Ledger 1210: with no limit, the server's growth has no bound but the node's memory."""
+    mutate_prometheus_values(copy, lambda values: values["prometheus"]["server"]["resources"].pop("limits"))
+    assert platform_clause_errors(copy) == [("prometheus", "carried")]
+
+
+def test_prometheus_memory_request_lowered_reddens(copy: Path) -> None:
+    """`platform`'s 256Mi is below the measured >=790 MB peak, which is what ledger 1210 corrected."""
+    mutate_prometheus_values(
+        copy, lambda values: values["prometheus"]["server"]["resources"]["requests"].update(memory="256Mi")
+    )
+    assert platform_clause_errors(copy) == [("prometheus", "carried")]
+
+
+def test_prometheus_server_resources_dropped_reddens(copy: Path) -> None:
+    """Without the block, `platform`'s 100m/256Mi with no limit comes back, and the pod rolls."""
+    mutate_prometheus_values(copy, lambda values: values["prometheus"]["server"].pop("resources"))
+    assert platform_clause_errors(copy) == [("prometheus", "carried")]
+
+
+def test_prometheus_retention_size_dropped_reddens(copy: Path) -> None:
+    """local-path does not enforce the PVC's 2Gi, so without it nothing bounds the TSDB's size."""
+    mutate_prometheus_values(copy, lambda values: values["prometheus"]["server"].pop("retentionSize"))
+    assert platform_clause_errors(copy) == [("prometheus", "carried")]
+
+
+def test_prometheus_retention_size_changed_reddens(copy: Path) -> None:
+    """Any other value reddens; this one is the first revision's 1700MB.
+
+    The clause is an equality, not a threshold: it cannot tell a safe value
+    from one that cuts the 24h window. 1700 MiB is about 11% above the
+    PROJECTED 1.5 to 1.6 GB 24h bound, which a review judged too thin.
+    """
+    mutate_prometheus_values(copy, lambda values: values["prometheus"]["server"].update(retentionSize="1700MB"))
+    assert platform_clause_errors(copy) == [("prometheus", "carried")]
+
+
+def test_prometheus_size_retention_rule_dropped_reddens(copy: Path) -> None:
+    """Without it, size retention binding would shorten every `[24h]` range with no sign."""
+
+    def drop_size_rule(values: dict) -> None:
+        rules = values["prometheus"]["serverFiles"]["alerting_rules.yml"]["groups"][0]["rules"]
+        rules[:] = [rule for rule in rules if rule["alert"] != "PrometheusSizeRetentionDeletedBlocks"]
+
+    mutate_prometheus_values(copy, drop_size_rule)
+    assert platform_clause_errors(copy) == [("prometheus", "carried-digest")]
 
 
 def test_prometheus_turned_off_reddens(copy: Path) -> None:
