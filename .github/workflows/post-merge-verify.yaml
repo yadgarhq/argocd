@@ -59,6 +59,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # Full history: when two merges land inside one Argo poll, root goes
+          # straight to the later one, and `wait` accepts it only because
+          # `git merge-base --is-ancestor` can see both commits.
+          fetch-depth: 0
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -139,9 +143,9 @@ jobs:
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/before
 
-      # Root first: Synced at the merge sha with no operation running. A merge
-      # that changes nothing root renders starts no operation, so none is
-      # required.
+      # Root first: Synced at the merge sha, or at a later commit on main, with
+      # no operation running. A merge that changes nothing root renders starts
+      # no operation, so none is required.
       - name: wait for root at the merge sha
         run: |
           set -euo pipefail

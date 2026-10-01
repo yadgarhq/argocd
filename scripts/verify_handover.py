@@ -20,8 +20,8 @@ default context on the operator's machine is production), refuses every verb but
 `get`, and refuses a Secret read that is not metadata custom-columns.
 
 WHAT `diff` FAILS ON (exit 1):
-  - a changed or vanished uid: Application, CRD, tracked object, workload, pod,
-    PVC, Secret;
+  - a changed or vanished uid: Application, CRD, custom resource, tracked
+    object, workload, pod, PVC, Secret;
   - a generation change on a Deployment or a CRD;
   - any deletionTimestamp;
   - a changed Application finalizer list (a finalizer makes a prune cascade);
@@ -68,6 +68,18 @@ EPHEMERAL_POD_OWNERS = frozenset({"Job", "EphemeralRunner"})
 FINISHED_POD_PHASES = frozenset({"Succeeded", "Failed"})
 WORKLOAD_LIST = "deployments.apps,statefulsets.apps,daemonsets.apps,persistentvolumeclaims,pods"
 SECRET_COLUMNS = "custom-columns=NAME:.metadata.name,UID:.metadata.uid,RV:.metadata.resourceVersion"
+# CRDs whose instances `collect` never lists. cert-manager's issuance records are
+# created and garbage-collected per renewal, as Job pods are per hook; and
+# Applications are compared in their own section, where an operation's
+# generation bump is not a finding.
+UNLISTED_INSTANCE_CRDS = frozenset(
+    {
+        "certificaterequests.cert-manager.io",
+        "orders.acme.cert-manager.io",
+        "challenges.acme.cert-manager.io",
+        "applications.argoproj.io",
+    }
+)
 FORBIDDEN_FLAGS = ("--context", "--kubeconfig", "--cluster", "--user", "--token", "--as", "--server", "-s")
 
 
@@ -113,8 +125,11 @@ def _check_args(context: str | None, args: list[str]) -> None:
         raise UsageError(f"read-only: only `get` is allowed, not {args[:1]!r}")
     if "--raw" in args or any(a.startswith("--raw=") for a in args):
         raise UsageError("read-only: `get --raw` is not allowed")
-    if any(_is_secret_resource(a) for a in args[1:2]):
-        output = _output_format(args) or ""
+    # Every token but the output format's value, so `get -n ns secrets` and
+    # `get -A deployments,secrets` are caught too. A namespace or label value
+    # spelled `secrets` is refused as well; that is the fail-closed cost.
+    output = _output_format(args) or ""
+    if any(_is_secret_resource(a) for a in args[1:] if a != output):
         columns = output.removeprefix("custom-columns=").split(",") if output.startswith("custom-columns=") else []
         if not columns or not all(":" in c and c.split(":", 1)[1].startswith(".metadata.") for c in columns):
             raise UsageError("a Secret may be read only as metadata custom-columns, never its data")
@@ -255,6 +270,31 @@ def _tracked_objects(cluster: Cluster, records: dict) -> dict:
     return objects
 
 
+def _custom_resources(cluster: Cluster, records: dict, crds: dict) -> dict:
+    """uid, generation and deletionTimestamp of every instance of every CRD an Application under root tracks.
+
+    This is what a CRD swap destroys when it goes wrong: deleting a CRD cascades
+    to its instances, and they show a deletionTimestamp first. A tracked CRD
+    absent from the cluster is not listed; the CRD section reports it.
+    """
+    names = sorted(
+        {
+            key.split("/", 3)[3]
+            for record in records.values()
+            for key in record["resources"]
+            if key.split("/", 3)[1] == "CustomResourceDefinition"
+        }
+    )
+    instances: dict[str, dict] = {}
+    for name in names:
+        if name in UNLISTED_INSTANCE_CRDS or name not in crds:
+            continue
+        for item in cluster.json("get", name, "-A").get("items") or []:
+            meta = _meta(item)
+            instances[f"{name}/{meta.get('namespace') or ''}/{meta.get('name')}"] = _identity(item)
+    return instances
+
+
 def _workloads(cluster: Cluster, namespaces: Iterable[str]) -> tuple[dict, dict]:
     workloads: dict[str, dict] = {}
     pods: dict[str, dict] = {}
@@ -341,6 +381,7 @@ def collect(
         "crd_count": len(crds),
         "crd_hash": crd_hash,
         "objects": _tracked_objects(cluster, records),
+        "custom_resources": _custom_resources(cluster, records, crds),
         "namespaces": namespaces,
         "workloads": workloads,
         "pods": pods,
@@ -476,7 +517,8 @@ def diff(before: dict, after: dict) -> Report:
     report.notes.append(f"BEFORE {before.get('taken_at')} ({before.get('context')})  AFTER {after.get('taken_at')} ({after.get('context')})")
     report.notes.append(
         f"compared {len(after['applications'])} Application(s), {len(after['crds'])} CRD(s), "
-        f"{len(after.get('objects') or {})} tracked object(s), {len(after.get('workloads') or {})} workload(s), "
+        f"{len(after.get('objects') or {})} tracked object(s), {len(after.get('custom_resources') or {})} custom resource(s), "
+        f"{len(after.get('workloads') or {})} workload(s), "
         f"{len(after.get('pods') or {})} pod(s); CRD hash {before.get('crd_hash')} -> {after.get('crd_hash')}"
     )
 
@@ -487,6 +529,9 @@ def diff(before: dict, after: dict) -> Report:
     )
     _compare_identities(
         report, "workload", before.get("workloads") or {}, after.get("workloads") or {}, lambda key: key.startswith("Deployment/")
+    )
+    _compare_identities(
+        report, "cr", before.get("custom_resources") or {}, after.get("custom_resources") or {}, lambda _key: False
     )
     _compare_identities(report, "pod", before.get("pods") or {}, after.get("pods") or {}, lambda _key: False)
     for key in sorted(set(before.get("pods") or {}) & set(after.get("pods") or {})):
@@ -528,25 +573,60 @@ def _time(value: str | None) -> dt.datetime | None:
     return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def revision_state(app: dict, sha: str) -> tuple[str, str]:
-    """`done` once the Application is Synced at `sha` with no operation running.
+def revision_state(
+    app: dict, sha: str, is_ancestor: Callable[[str, str], bool] | None = None
+) -> tuple[str, str]:
+    """`done` once the Application is Synced at `sha`, or at a commit descending from it, with no operation running.
 
     No operation on `sha` is required: a merge that changes nothing root renders
-    (a README edit) moves the revision without starting an operation.
+    (a README edit) moves the revision without starting an operation. A
+    descendant counts because root resolves `main` once per poll: two merges
+    inside one poll take root straight past the first.
     """
     status = app.get("status") or {}
     sync, op = status.get("sync") or {}, status.get("operationState") or {}
     op_revision = (op.get("syncResult") or {}).get("revision")
+
+    def reached(revision: str | None) -> bool:
+        return bool(revision) and (revision == sha or (is_ancestor is not None and is_ancestor(sha, revision)))
+
     if op.get("phase") in {"Running", "Terminating"}:
         return "pending", f"operation {op.get('phase')} on {op_revision}"
-    if op_revision == sha and op.get("phase") in TERMINAL_FAILURES:
-        return "failed", f"operation on {sha} {op.get('phase')}: {op.get('message', '')}"
-    revisions = [sync.get("revision"), *(sync.get("revisions") or [])]
-    if sha not in revisions:
-        return "pending", f"at {[r for r in revisions if r]}, waiting for {sha}"
+    if reached(op_revision) and op.get("phase") in TERMINAL_FAILURES:
+        return "failed", f"operation on {op_revision} {op.get('phase')}: {op.get('message', '')}"
+    revisions = [r for r in [sync.get("revision"), *(sync.get("revisions") or [])] if r]
+    at = next((r for r in revisions if reached(r)), None)
+    if at is None:
+        return "pending", f"at {revisions}, waiting for {sha} or a descendant"
     if sync.get("status") != "Synced":
-        return "pending", f"{sync.get('status')} at {sha}"
-    return "done", f"Synced at {sha}"
+        return "pending", f"{sync.get('status')} at {at}"
+    return "done", f"Synced at {at}" + ("" if at == sha else f", which descends from {sha}")
+
+
+def git_is_ancestor(repo: Path) -> Callable[[str, str], bool]:
+    """`git merge-base --is-ancestor` in `repo`, fetching `origin` once if a revision is unknown.
+
+    Only full shas are compared; anything else (a chart version) is never an
+    ancestor. A repository without the history answers False, which leaves
+    `revision_state` waiting for the exact sha.
+    """
+    fetched = False
+
+    def check(old: str, new: str) -> bool:
+        nonlocal fetched
+        if not all(len(r) == 40 and all(c in "0123456789abcdef" for c in r) for r in (old, new)):
+            return False
+        for _ in range(2):
+            proc = subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", old, new], capture_output=True, check=False)
+            if proc.returncode in (0, 1):
+                return proc.returncode == 0
+            if fetched:
+                return False
+            fetched = True
+            subprocess.run(["git", "-C", str(repo), "fetch", "--quiet", "origin"], capture_output=True, check=False)
+        return False
+
+    return check
 
 
 def operation_state(app: dict, since: str) -> tuple[str, str]:
@@ -634,6 +714,9 @@ def _parser() -> argparse.ArgumentParser:
     wait.add_argument("--settled", action="store_true", help="every Application under root reconciled after --since")
     wait.add_argument("--since", help="RFC 3339 UTC time, e.g. 2026-10-01T12:00:00Z")
     wait.add_argument("--revision", help="git sha the Application must be Synced at")
+    wait.add_argument(
+        "--ancestry-repo", type=Path, default=Path("."), help="git checkout used to accept a descendant of --revision"
+    )
     wait.add_argument("--timeout", type=float, default=900)
     wait.add_argument("--interval", type=float, default=10)
 
@@ -651,13 +734,14 @@ def _wait(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     if args.app and bool(args.since) == bool(args.revision):
         parser.error("wait --app needs exactly one of --since or --revision")
     cluster = Cluster(args.context)
+    is_ancestor = git_is_ancestor(args.ancestry_repo)
 
     def check() -> tuple[str, str]:
         if args.settled:
             records, _declared, _root = read_applications(cluster, args.root, args.argocd_namespace)
             return settled_state(records.values(), args.since)
         app = cluster.json("get", "applications.argoproj.io", args.app, "-n", args.argocd_namespace)
-        return revision_state(app, args.revision) if args.revision else operation_state(app, args.since)
+        return revision_state(app, args.revision, is_ancestor) if args.revision else operation_state(app, args.since)
 
     state, message = poll(check, timeout=args.timeout, interval=args.interval)
     print(f"{state}: {message}")
@@ -690,6 +774,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"snapshot {args.out}: {len(snapshot['applications'])} Application(s), {snapshot['crd_count']} CRD(s) "
             f"(hash {snapshot['crd_hash']}), {len(snapshot['objects'])} tracked object(s), "
+            f"{len(snapshot['custom_resources'])} custom resource(s), "
             f"{len(snapshot['workloads'])} workload(s), {len(snapshot['pods'])} pod(s) in {len(snapshot['namespaces'])} namespace(s)"
         )
         return 0

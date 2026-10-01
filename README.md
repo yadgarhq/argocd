@@ -117,8 +117,10 @@ compares the old state with itself.
 and those its ApplicationSets generate): uid, finalizers, syncPolicy, sync and
 health; every CRD's uid and generation, with the same name=uid hash the
 handover scripts printed; every object those Applications track, except Secrets;
-the Deployments, StatefulSets, DaemonSets, PVCs and pods in their destination
-namespaces; root's prune result. `--secrets-namespace` adds Secret
+every instance of every CRD they track, cluster-wide (cert-manager's
+CertificateRequests, Orders and Challenges excepted); the Deployments,
+StatefulSets, DaemonSets, PVCs and pods in their destination namespaces; root's
+prune result. `--secrets-namespace` adds Secret
 name/uid/resourceVersion, and `--edge-url`/`--edge-ca` add a verified-TLS probe
 of the edge. There is no unverified probe.
 
@@ -129,6 +131,16 @@ OutOfSync (`argocd` is manual and OutOfSync by design), a failed last
 operation, a Secret resourceVersion change, or a wrong edge status. It **warns**
 on a syncPolicy change, a restart, other generation changes and a root prune.
 It **refuses** snapshots from two clusters or with nothing in them.
+
+**A merge that means to roll something goes red, by design.** A resource or
+image change bumps a Deployment's generation and replaces its pods. The diff
+names each change. Red means "read this", and the reviewer decides whether it
+was the intent.
+
+`wait --revision` accepts a later commit on `main` as well as the sha itself.
+Root resolves `main` once per poll, so two quick merges take it straight past
+the first. It needs the git history to see that: `--ancestry-repo`, by default
+the current directory.
 
 **In CI**, `.github/workflows/post-merge-verify.yaml` runs the same sequence on
 each push to `main`, as the `post-merge-verifier` ServiceAccount that

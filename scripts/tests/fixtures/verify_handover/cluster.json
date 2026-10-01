@@ -1,8 +1,11 @@
 {
-  "_comment": "A fake cluster for scripts/tests/test_verify_handover.py. Each key is the kubectl argument list after `--context <ctx>`, joined by spaces; each value is what kubectl prints. Shapes are trimmed copies of kind-yadgar objects read 2026-10-01. No Secret data appears anywhere: the one Secret call is custom-columns text.",
+  "_comment": "A fake cluster for scripts/tests/test_verify_handover.py. Each key is the kubectl argument list after `--context <ctx>`, joined by spaces; each value is what kubectl prints. Shapes are trimmed copies of kind-yadgar objects read 2026-10-01. No Secret data appears anywhere: the one Secret call is custom-columns text. `certificaterequests.cert-manager.io` is tracked but has no instance fixture: an issuance record is never listed. `absent.example.com` is tracked but not in the cluster's CRD list, so it is never listed either.",
   "get namespace kube-system -o json": {
     "kind": "Namespace",
-    "metadata": { "name": "kube-system", "uid": "cluster-0000" }
+    "metadata": {
+      "name": "kube-system",
+      "uid": "cluster-0000"
+    }
   },
   "get applications.argoproj.io -n argocd -o json": {
     "kind": "List",
@@ -15,15 +18,24 @@
           "generation": 41
         },
         "spec": {
-          "destination": { "namespace": "argocd" },
-          "syncPolicy": { "automated": { "prune": true, "selfHeal": true } }
+          "destination": {
+            "namespace": "argocd"
+          },
+          "syncPolicy": {
+            "automated": {
+              "prune": true,
+              "selfHeal": true
+            }
+          }
         },
         "status": {
           "sync": {
             "status": "Synced",
             "revision": "1111111111111111111111111111111111111111"
           },
-          "health": { "status": "Healthy" },
+          "health": {
+            "status": "Healthy"
+          },
           "reconciledAt": "2026-10-01T12:05:00Z",
           "operationState": {
             "phase": "Succeeded",
@@ -77,10 +89,19 @@
           "uid": "app-argocd",
           "generation": 7
         },
-        "spec": { "destination": { "namespace": "argocd" } },
+        "spec": {
+          "destination": {
+            "namespace": "argocd"
+          }
+        },
         "status": {
-          "sync": { "status": "OutOfSync", "revisions": ["8.6.1", "2222"] },
-          "health": { "status": "Healthy" },
+          "sync": {
+            "status": "OutOfSync",
+            "revisions": ["8.6.1", "2222"]
+          },
+          "health": {
+            "status": "Healthy"
+          },
           "reconciledAt": "2026-10-01T12:05:00Z",
           "resources": [
             {
@@ -100,21 +121,35 @@
           "generation": 12
         },
         "spec": {
-          "destination": { "namespace": "keda" },
+          "destination": {
+            "namespace": "keda"
+          },
           "syncPolicy": {
-            "automated": { "selfHeal": true },
-            "retry": { "limit": 6 }
+            "automated": {
+              "selfHeal": true
+            },
+            "retry": {
+              "limit": 6
+            }
           }
         },
         "status": {
-          "sync": { "status": "Synced", "revision": "0.1.21" },
-          "health": { "status": "Healthy" },
+          "sync": {
+            "status": "Synced",
+            "revision": "0.1.21"
+          },
+          "health": {
+            "status": "Healthy"
+          },
           "reconciledAt": "2026-10-01T12:05:00Z",
           "operationState": {
             "phase": "Succeeded",
             "startedAt": "2026-10-01T11:00:00Z",
             "finishedAt": "2026-10-01T11:00:30Z",
-            "syncResult": { "revision": "0.1.21", "resources": [] }
+            "syncResult": {
+              "revision": "0.1.21",
+              "resources": []
+            }
           },
           "resources": [
             {
@@ -137,6 +172,16 @@
               "kind": "Secret",
               "namespace": "keda",
               "name": "keda-certs"
+            },
+            {
+              "group": "apiextensions.k8s.io",
+              "kind": "CustomResourceDefinition",
+              "name": "certificaterequests.cert-manager.io"
+            },
+            {
+              "group": "apiextensions.k8s.io",
+              "kind": "CustomResourceDefinition",
+              "name": "absent.example.com"
             }
           ]
         }
@@ -156,12 +201,23 @@
           ]
         },
         "spec": {
-          "destination": { "namespace": "iam-ns" },
-          "syncPolicy": { "automated": { "selfHeal": true } }
+          "destination": {
+            "namespace": "iam-ns"
+          },
+          "syncPolicy": {
+            "automated": {
+              "selfHeal": true
+            }
+          }
         },
         "status": {
-          "sync": { "status": "Synced", "revision": "abc" },
-          "health": { "status": "Healthy" },
+          "sync": {
+            "status": "Synced",
+            "revision": "abc"
+          },
+          "health": {
+            "status": "Healthy"
+          },
           "reconciledAt": "2026-10-01T12:05:00Z",
           "resources": []
         }
@@ -174,12 +230,22 @@
           "generation": 99
         },
         "spec": {
-          "destination": { "namespace": "argocd" },
-          "syncPolicy": { "automated": { "prune": true } }
+          "destination": {
+            "namespace": "argocd"
+          },
+          "syncPolicy": {
+            "automated": {
+              "prune": true
+            }
+          }
         },
         "status": {
-          "sync": { "status": "OutOfSync" },
-          "health": { "status": "Degraded" },
+          "sync": {
+            "status": "OutOfSync"
+          },
+          "health": {
+            "status": "Degraded"
+          },
           "resources": []
         }
       }
@@ -200,6 +266,13 @@
           "name": "applications.argoproj.io",
           "uid": "crd-app",
           "generation": 2
+        }
+      },
+      {
+        "metadata": {
+          "name": "certificaterequests.cert-manager.io",
+          "uid": "crd-cr",
+          "generation": 1
         }
       }
     ]
@@ -281,12 +354,19 @@
           "namespace": "argocd",
           "uid": "pod-argocd-0",
           "ownerReferences": [
-            { "kind": "StatefulSet", "name": "argocd-application-controller" }
+            {
+              "kind": "StatefulSet",
+              "name": "argocd-application-controller"
+            }
           ]
         },
         "status": {
           "phase": "Running",
-          "containerStatuses": [{ "restartCount": 1 }]
+          "containerStatuses": [
+            {
+              "restartCount": 1
+            }
+          ]
         }
       },
       {
@@ -295,9 +375,16 @@
           "name": "verifier-runner-abc",
           "namespace": "argocd",
           "uid": "pod-runner",
-          "ownerReferences": [{ "kind": "EphemeralRunner", "name": "x" }]
+          "ownerReferences": [
+            {
+              "kind": "EphemeralRunner",
+              "name": "x"
+            }
+          ]
         },
-        "status": { "phase": "Running" }
+        "status": {
+          "phase": "Running"
+        }
       }
     ]
   },
@@ -320,8 +407,12 @@
           "namespace": "keda",
           "uid": "pvc-keda"
         },
-        "spec": { "volumeName": "pv-1" },
-        "status": { "phase": "Bound" }
+        "spec": {
+          "volumeName": "pv-1"
+        },
+        "status": {
+          "phase": "Bound"
+        }
       },
       {
         "kind": "Pod",
@@ -330,12 +421,22 @@
           "namespace": "keda",
           "uid": "pod-keda",
           "ownerReferences": [
-            { "kind": "ReplicaSet", "name": "keda-operator-5569f5fbcc" }
+            {
+              "kind": "ReplicaSet",
+              "name": "keda-operator-5569f5fbcc"
+            }
           ]
         },
         "status": {
           "phase": "Running",
-          "containerStatuses": [{ "restartCount": 0 }, { "restartCount": 2 }]
+          "containerStatuses": [
+            {
+              "restartCount": 0
+            },
+            {
+              "restartCount": 2
+            }
+          ]
         }
       },
       {
@@ -344,9 +445,16 @@
           "name": "keda-hook-xyz",
           "namespace": "keda",
           "uid": "pod-hook",
-          "ownerReferences": [{ "kind": "Job", "name": "keda-hook" }]
+          "ownerReferences": [
+            {
+              "kind": "Job",
+              "name": "keda-hook"
+            }
+          ]
         },
-        "status": { "phase": "Running" }
+        "status": {
+          "phase": "Running"
+        }
       },
       {
         "kind": "Pod",
@@ -355,7 +463,9 @@
           "namespace": "keda",
           "uid": "pod-done"
         },
-        "status": { "phase": "Succeeded" }
+        "status": {
+          "phase": "Succeeded"
+        }
       }
     ]
   },
@@ -363,5 +473,18 @@
     "kind": "List",
     "items": []
   },
-  "get secrets -n yadgar -o custom-columns=NAME:.metadata.name,UID:.metadata.uid,RV:.metadata.resourceVersion --no-headers": "iam-keys   sec-iam   100\nyadgar-dev-ca   sec-ca   200\n"
+  "get secrets -n yadgar -o custom-columns=NAME:.metadata.name,UID:.metadata.uid,RV:.metadata.resourceVersion --no-headers": "iam-keys   sec-iam   100\nyadgar-dev-ca   sec-ca   200\n",
+  "get scaledobjects.keda.sh -A -o json": {
+    "kind": "List",
+    "items": [
+      {
+        "metadata": {
+          "name": "gateway",
+          "namespace": "yadgar",
+          "uid": "so-gateway",
+          "generation": 3
+        }
+      }
+    ]
+  }
 }

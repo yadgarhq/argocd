@@ -262,10 +262,17 @@ Read on kind-yadgar, 2026-10-01, with `get` only:
 
 ### Proposal: a dedicated scale set (needs a person, in this order)
 
-1. **A GitHub App credential for this repository only.** ARC registers a
-   repository-level runner with an App that has Administration read and write
-   and Metadata read on `yadgarhq/argocd`. Do not reuse `yadgarhq-bot`: it holds
-   write on every repository (ADR-0563). Create the Secret by hand:
+1. **A GitHub App credential for this repository only.** ARC authenticates
+   a repository-level scale set as a GitHub App installed on that repository.
+   The permission set here is from memory, not read from ARC's docs:
+   Administration read and write, and Metadata read. Confirm it against ARC's
+   "Authenticating to the GitHub API" page before creating the App. Prefer a
+   new App installed on `yadgarhq/argocd` alone over `yadgarhq-bot`. That App
+   holds write on every repository in the organisation (measured 2026-09-05,
+   recorded in `yadgarhq/estate`'s `.github/actionlint.yaml`), and a listener
+   Secret is one more copy of its key in the cluster. ADR-0563 governs which
+   runner may hold that key in a workflow. It does not decide this; it is a
+   choice to make. Create the Secret by hand:
 
    ```bash
    kubectl --context kind-yadgar -n post-merge-verifier create secret generic argocd-verify-github \

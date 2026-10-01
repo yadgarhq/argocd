@@ -127,6 +127,21 @@ def test_kubectl_refuses_a_secret_read_that_is_not_metadata_columns(kind) -> Non
     assert runner.calls == []
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["get", "-n", "yadgar", "secrets", "-o", "json"],
+        ["get", "--namespace=yadgar", "secret", "x", "-o", "yaml"],
+        ["get", "-A", "deployments,secrets", "-o", "json"],
+    ],
+)
+def test_kubectl_refuses_a_secret_in_any_position(args) -> None:
+    runner = FakeRunner({})
+    with pytest.raises(vh.UsageError, match="Secret"):
+        vh.kubectl(CONTEXT, args, runner=runner)
+    assert runner.calls == []
+
+
 def test_kubectl_refuses_an_override_of_the_context_in_args() -> None:
     runner = FakeRunner({})
     with pytest.raises(vh.UsageError, match="--context"):
@@ -181,9 +196,10 @@ def test_collect_records_root_operation_and_prune_result(snap) -> None:
 def test_collect_records_crds_and_their_hash(snap) -> None:
     assert snap["crds"] == {
         "applications.argoproj.io": {"uid": "crd-app", "generation": 2, "deletionTimestamp": None},
+        "certificaterequests.cert-manager.io": {"uid": "crd-cr", "generation": 1, "deletionTimestamp": None},
         "scaledobjects.keda.sh": {"uid": "crd-so", "generation": 1, "deletionTimestamp": None},
     }
-    assert snap["crd_count"] == 2
+    assert snap["crd_count"] == 3
     assert len(snap["crd_hash"]) == 16
 
 
@@ -215,6 +231,20 @@ def test_collect_records_namespace_workloads_and_filters_pods(snap) -> None:
     assert sorted(pods) == ["argocd/argocd-application-controller-0", "keda/keda-operator-5569f5fbcc-fn6ll"]
     assert pods["keda/keda-operator-5569f5fbcc-fn6ll"]["restarts"] == 2
     assert snap["namespaces"] == ["argocd", "iam-ns", "keda"]
+
+
+def test_collect_records_instances_of_every_tracked_crd(snap) -> None:
+    assert snap["custom_resources"] == {
+        "scaledobjects.keda.sh/yadgar/gateway": {"uid": "so-gateway", "generation": 3, "deletionTimestamp": None},
+    }
+
+
+def test_collect_never_lists_issuance_records_or_absent_crds(responses) -> None:
+    runner = FakeRunner(responses)
+    vh.collect(vh.Cluster(CONTEXT, runner=runner))
+    listed = [" ".join(c[3:]) for c in runner.calls]
+    assert "get scaledobjects.keda.sh -A -o json" in listed
+    assert not any("certificaterequests" in c or "absent.example.com" in c for c in listed)
 
 
 def test_collect_reads_secret_metadata_only_when_asked(snap) -> None:
@@ -264,7 +294,7 @@ def test_identical_snapshots_pass_and_report_what_was_compared(snap) -> None:
     report = vh.diff(snap, copy_module.deepcopy(snap))
     assert report.exit_code == 0, report.render()
     text = report.render()
-    assert "compared 4 Application(s), 2 CRD(s)" in text
+    assert "compared 4 Application(s), 3 CRD(s)" in text
     assert levels(report)["FAIL"] == []
 
 
@@ -360,6 +390,18 @@ FAILURES = {
         lambda s: s["pods"]["keda/keda-operator-5569f5fbcc-fn6ll"].update(deletionTimestamp="t"),
         "pod/keda/keda-operator-5569f5fbcc-fn6ll",
     ),
+    "cr-uid": (
+        lambda s: s["custom_resources"]["scaledobjects.keda.sh/yadgar/gateway"].update(uid="new"),
+        "cr/scaledobjects.keda.sh/yadgar/gateway",
+    ),
+    "cr-gone": (
+        lambda s: s["custom_resources"].pop("scaledobjects.keda.sh/yadgar/gateway"),
+        "cr/scaledobjects.keda.sh/yadgar/gateway",
+    ),
+    "cr-terminating": (
+        lambda s: s["custom_resources"]["scaledobjects.keda.sh/yadgar/gateway"].update(deletionTimestamp="t"),
+        "cr/scaledobjects.keda.sh/yadgar/gateway",
+    ),
     "secret-uid": (lambda s: s["secrets"]["yadgar/iam-keys"].update(uid="new"), "secret/yadgar/iam-keys"),
     "secret-rv": (lambda s: s["secrets"]["yadgar/iam-keys"].update(resourceVersion="101"), "secret/yadgar/iam-keys"),
     "secret-gone": (lambda s: s["secrets"].pop("yadgar/iam-keys"), "secret/yadgar/iam-keys"),
@@ -408,6 +450,10 @@ WARNINGS = {
     "statefulset-generation": (
         lambda s: s["workloads"]["StatefulSet/argocd/argocd-application-controller"].update(generation=3),
         "workload/StatefulSet/argocd/argocd-application-controller",
+    ),
+    "cr-generation": (
+        lambda s: s["custom_resources"]["scaledobjects.keda.sh/yadgar/gateway"].update(generation=4),
+        "cr/scaledobjects.keda.sh/yadgar/gateway",
     ),
     "root-pruned": (
         lambda s: s["root_operation"].update(revision="2" * 40),
@@ -482,6 +528,24 @@ def test_revision_failed_operation_fails() -> None:
 def test_revision_matches_a_multi_source_revision() -> None:
     a = app(sync={"status": "Synced", "revisions": ["8.6.1", SHA]})
     assert vh.revision_state(a, SHA)[0] == "done"
+
+
+def test_revision_descending_from_the_sha_is_done() -> None:
+    """Two merges inside one poll: root jumps past the earlier sha. Its descendant counts."""
+    later = "c" * 40
+    a = app(sync={"status": "Synced", "revision": later})
+    assert vh.revision_state(a, SHA, is_ancestor=lambda old, new: (old, new) == (SHA, later))[0] == "done"
+
+
+def test_an_unrelated_revision_stays_pending() -> None:
+    a = app(sync={"status": "Synced", "revision": "d" * 40})
+    assert vh.revision_state(a, SHA, is_ancestor=lambda _old, _new: False)[0] == "pending"
+
+
+def test_a_failed_operation_on_a_descendant_fails() -> None:
+    later = "c" * 40
+    a = app(sync={"status": "OutOfSync", "revision": later}, operationState={"phase": "Failed", "syncResult": {"revision": later}})
+    assert vh.revision_state(a, SHA, is_ancestor=lambda old, new: (old, new) == (SHA, later))[0] == "failed"
 
 
 def test_new_operation_since_t() -> None:
@@ -584,7 +648,30 @@ REQUIRED = {
     ("rbac.authorization.k8s.io", "clusterrolebindings"),
     ("rbac.authorization.k8s.io", "roles"),
     ("rbac.authorization.k8s.io", "rolebindings"),
+    ("argoproj.io", "appprojects"),
 }
+# Every CRD root's Applications tracked on kind-yadgar on 2026-10-01, less the
+# issuance records and Applications `collect` never lists. `collect` lists each
+# one's instances, so the role must grant it.
+TRACKED_CUSTOM_RESOURCES = {
+    "cert-manager.io": {"certificates", "clusterissuers", "issuers"},
+    "eventing.keda.sh": {"cloudeventsources", "clustercloudeventsources"},
+    "gateway.envoyproxy.io": {
+        "backends", "backendtrafficpolicies", "clienttrafficpolicies", "envoyextensionpolicies",
+        "envoypatchpolicies", "envoyproxies", "httproutefilters", "securitypolicies",
+    },
+    "gateway.networking.k8s.io": {
+        "backendtlspolicies", "gatewayclasses", "gateways", "grpcroutes", "httproutes",
+        "listenersets", "referencegrants", "tcproutes", "tlsroutes", "udproutes",
+    },
+    "gateway.networking.x-k8s.io": {"xbackends", "xbackendtrafficpolicies", "xmeshes"},
+    "k8s.mariadb.com": {
+        "backups", "connections", "databases", "externalmariadbs", "grants", "mariadbs", "maxscales",
+        "physicalbackups", "pointintimerecoveries", "restores", "sqljobs", "users",
+    },
+    "keda.sh": {"clustertriggerauthentications", "scaledjobs", "scaledobjects", "triggerauthentications"},
+}
+REQUIRED |= {(group, plural) for group, plurals in TRACKED_CUSTOM_RESOURCES.items() for plural in plurals}
 
 
 def rbac_documents(tree: Path) -> list[dict]:
