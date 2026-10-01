@@ -222,9 +222,12 @@ PLATFORM_SOURCED: dict[str, dict] = {
         "toggle": "prometheus",
         "values": "prometheus",
         "form": "values",
-        # deploy's alerting rules, verbatim: `serverFiles` parsed from deploy's
-        # copy at SOURCE equals this file's. `platform` carries no rules.
-        "digests": {"serverFiles": "fc7255aec26edb02827487ecb30f4780343d67504390ba5c3f55fc7948b35435"},
+        # deploy's four alerting rules, verbatim (D4 measured `serverFiles`
+        # parsed from deploy's copy at SOURCE equal to this file's, digest
+        # fc7255aec26edb02827487ecb30f4780343d67504390ba5c3f55fc7948b35435),
+        # plus ledger 1210's fifth, `PrometheusSizeRetentionDeletedBlocks`.
+        # `platform` carries no rules.
+        "digests": {"serverFiles": "a448774a4fb225a2f4d3a0e75cc5c35d8496f896701334f7e28bb876d56b8a0a"},
         # deploy's PVC (`platform` defaults `enabled` to false, which renders an
         # emptyDir), and `null` on the reload sidecar's resources, which deletes
         # `platform`'s 10m/32Mi requests. Measured 2026-10-01: without either the
@@ -233,17 +236,18 @@ PLATFORM_SOURCED: dict[str, dict] = {
         #
         # `server.resources` and `server.retentionSize` are NOT deploy's: ledger
         # 1210 set them after D4, and the pod rolls once for them. Measured
-        # 2026-10-01 at the 15s scrape interval: RSS peak 757 MB (24h max), so
-        # the request covers it and the limit leaves room for WAL replay. The
-        # TSDB's 24h upper bound is about 1.5 to 1.6 GB, so 1700MB (MiB: helm
-        # passes it to Prometheus, which counts in powers of 2) keeps
-        # `retention: 24h` the bound that binds and stays under 85% of the
-        # nominal 2Gi. A drop or a change of any of them reddens `carried`.
+        # 2026-10-01 at the 15s scrape interval: RSS peak >=790 MB and still
+        # rising, so the request covers it and the limit leaves room for WAL
+        # replay. The TSDB's 24h upper bound is PROJECTED at 1.5 to 1.6 GB, so
+        # 4GB (4 GiB: Prometheus counts in powers of 2) keeps `retention: 24h`
+        # the bound that binds, with room for about 2.5 times the series.
+        # local-path does not enforce the nominal 2Gi. A drop or a change of
+        # any of them reddens `carried`.
         "carried": {
             "server": {
                 "persistentVolume": {"enabled": True, "size": "2Gi"},
                 "resources": {"requests": {"cpu": "100m", "memory": "1Gi"}, "limits": {"memory": "2Gi"}},
-                "retentionSize": "1700MB",
+                "retentionSize": "4GB",
             },
             "configmapReload": {"prometheus": {"resources": None}},
         },
@@ -908,7 +912,7 @@ def test_prometheus_memory_limit_dropped_reddens(copy: Path) -> None:
 
 
 def test_prometheus_memory_request_lowered_reddens(copy: Path) -> None:
-    """`platform`'s 256Mi is below the measured 757 MB peak, which is what ledger 1210 corrected."""
+    """`platform`'s 256Mi is below the measured >=790 MB peak, which is what ledger 1210 corrected."""
     mutate_prometheus_values(
         copy, lambda values: values["prometheus"]["server"]["resources"]["requests"].update(memory="256Mi")
     )
@@ -927,10 +931,26 @@ def test_prometheus_retention_size_dropped_reddens(copy: Path) -> None:
     assert platform_clause_errors(copy) == [("prometheus", "carried")]
 
 
-def test_prometheus_retention_size_below_the_24h_bound_reddens(copy: Path) -> None:
-    """1500MB sits inside the measured 24h upper bound, so size, not time, would cut the window."""
-    mutate_prometheus_values(copy, lambda values: values["prometheus"]["server"].update(retentionSize="1500MB"))
+def test_prometheus_retention_size_changed_reddens(copy: Path) -> None:
+    """Any other value reddens; this one is the first revision's 1700MB.
+
+    The clause is an equality, not a threshold: it cannot tell a safe value
+    from one that cuts the 24h window. 1700 MiB is about 11% above the
+    PROJECTED 1.5 to 1.6 GB 24h bound, which a review judged too thin.
+    """
+    mutate_prometheus_values(copy, lambda values: values["prometheus"]["server"].update(retentionSize="1700MB"))
     assert platform_clause_errors(copy) == [("prometheus", "carried")]
+
+
+def test_prometheus_size_retention_rule_dropped_reddens(copy: Path) -> None:
+    """Without it, size retention binding would shorten every `[24h]` range with no sign."""
+
+    def drop_size_rule(values: dict) -> None:
+        rules = values["prometheus"]["serverFiles"]["alerting_rules.yml"]["groups"][0]["rules"]
+        rules[:] = [rule for rule in rules if rule["alert"] != "PrometheusSizeRetentionDeletedBlocks"]
+
+    mutate_prometheus_values(copy, drop_size_rule)
+    assert platform_clause_errors(copy) == [("prometheus", "carried-digest")]
 
 
 def test_prometheus_turned_off_reddens(copy: Path) -> None:

@@ -48,38 +48,46 @@
 #
 # 2Gi IS NOT A BOUND. The `standard` StorageClass (rancher.io/local-path) does
 # not enforce the requested size: `df` inside the pod shows the host file
-# system. Measured 2026-10-01 at today's series count, the upper bound of the
+# system. PROJECTED 2026-10-01 at today's series count, the upper bound of the
 # TSDB at 15s is about 1.5 to 1.6 GB: blocks about 1.0 GB plus WAL about
-# 0.55 GB. `--storage.tsdb.retention.time=24h` binds first; since ledger 1210
-# `retention.size` is a second bound (below).
+# 0.55 GB. That is a projection: the TSDB had not yet held 24h at 15s (650 MB
+# on disk, WAL peak 460 MB). `--storage.tsdb.retention.time=24h` binds;
+# since ledger 1210 `retention.size` is a second bound, set so that it should
+# never bind (below).
 #
 # LEDGER 1210 SIZES THE SERVER, AND THE POD ROLLS ONCE FOR IT. `platform`'s
 # 100m/256Mi request with no limit was deploy's sizing from the 1m interval.
 # Measured read-only 2026-10-01 on kind-yadgar (Prometheus 3.14.0, 88.6k head
 # series): at 1m the RSS ran 430 to 500 MB. The 15s interval reached the
-# server at 12:07 UTC, and in the next three hours the RSS rose to 700 to
-# 730 MB, with a 24h peak of 757 MB (722Mi); the container's working set
-# peaked at 730 MB.
-# - Request 1Gi: the 757 MB peak plus about 40% headroom. The head grows for
-#   3h before it compacts. The peak came at 14:58 UTC, with a full 3h head of
-#   15s data, two minutes before the compaction.
+# server at 12:07 UTC, and after that the RSS rose to 700 MB and more. The
+# 24h peak was >=790 MB (789.6 MB at 15:42 UTC, measured 2026-10-01), and it
+# was still rising: re-measure after a full 24h at 15s.
+# - Request 1Gi (1,074 MB): it covers the >=790 MB peak with about 35%
+#   headroom. The head grows for 3h before it compacts, and the TSDB holds
+#   more blocks as it fills its first 24h at 15s.
 # - Limit 2Gi on memory only: a restart replays a WAL of about 0.5 GB, and
 #   compaction adds short spikes, so the limit sits well above the steady
 #   peak. An OOM kill is a full monitoring outage, so the limit is generous.
 #   Prometheus 3 sets GOMEMLIMIT to 0.9 of the cgroup limit (live flag
 #   `auto-gomemlimit` true, ratio 0.9), so the GC tightens near 1.8Gi.
 #   No CPU limit: throttling would delay scrapes and rule evaluation.
-# - `retentionSize: 1700MB`. Prometheus counts it in powers of 2 (MiB), and
-#   counts the WAL and the head chunks in the total, but deletes only whole
-#   blocks. 1700 MiB (1.78 GB) is above the 1.5 to 1.6 GB 24h upper bound, so
-#   time still binds and the 24h window that `BootstrapTokenAccepted` reads
-#   stays whole. It is 83% of the nominal 2Gi, inside Prometheus' 80-85%
-#   advice for compaction headroom. It bounds a series explosion, which time
-#   retention alone does not.
+# - `retentionSize: 4GB`. Prometheus counts it in powers of 2 (4 GiB =
+#   4.29 GB). It counts the WAL and the head chunks in the total, but deletes
+#   only whole blocks. TIME MUST BIND, NOT SIZE: if size binds, it silently
+#   deletes the oldest blocks and shortens the 24h window that
+#   `BootstrapTokenAccepted` reads. 4 GiB is about 2.7 times the projected
+#   1.6 GB upper bound, so the series count can grow about 2.5 times before
+#   size binds. It is above the nominal 2Gi on purpose: local-path does not
+#   enforce the PVC size, and the host file system had 387 GB free
+#   (2026-10-01). It is a backstop against a series explosion, which time
+#   retention alone does not bound. `PrometheusSizeRetentionDeletedBlocks`
+#   (below) fires if it ever binds.
 #
 # The changed pod template rolls the pod once. Strategy Recreate stops the old
 # pod before the new one starts, so monitoring is down until the WAL replays
-# (KEDA's prometheus queries fail for that time). The PVC and its TSDB stay.
+# (KEDA's prometheus queries fail for that time). The 7 ScaledObjects in
+# `yadgar` set no `fallback`, so their HPAs keep the replica count they have:
+# 2, the minimum, on 2026-10-01. The PVC and its TSDB stay.
 #
 # EACH OPERATOR KEY IS WRITTEN, NOT LEFT UNSET. `platform` resolves an unset
 # `operators.<op>.create` through `operators.create`, so an unset key is a
@@ -175,7 +183,7 @@ spec:
               enabled: true
               size: 2Gi
             # Ledger 1210, not deploy's. Measured 2026-10-01 at the 15s
-            # interval: RSS peak 757 MB. `platform`'s 100m/256Mi sat below
+            # interval: RSS peak >=790 MB. `platform`'s 100m/256Mi sat below
             # that with no limit. The header has the arithmetic.
             resources:
               requests:
@@ -183,9 +191,9 @@ spec:
                 memory: 1Gi
               limits:
                 memory: 2Gi
-            # Powers of 2 (MiB). Above the measured 24h upper bound, so
-            # `retention: 24h` still binds; under 85% of the nominal 2Gi.
-            retentionSize: 1700MB
+            # Powers of 2 (4 GiB). About 2.7 times the projected 24h upper
+            # bound, so `retention: 24h` binds and this is only a backstop.
+            retentionSize: 4GB
           # `null`, not `{}`: it deletes `platform`'s 10m/32Mi requests, so the
           # pod template stays as deploy rendered it and nothing rolls.
           configmapReload:
@@ -635,6 +643,48 @@ spec:
                           reports a new series. Enumerate the administrators iam
                           holds and confirm every one of them was expected, then
                           rotate the admin-bootstrap-token Secret.
+                    # THE ONE RULE ABOUT THIS STORE ITSELF, and the guard on the
+                    # rule above. `BootstrapTokenAccepted` reads `[24h]`, and
+                    # that window is only whole while TIME retention is the
+                    # bound that deletes data. `retentionSize` (ledger 1210)
+                    # is set far above the projected 24h size so that it never
+                    # binds. If it does bind, Prometheus deletes the oldest
+                    # blocks with no other sign, and every `[24h]` range here
+                    # silently covers less than a day. This rule makes that
+                    # visible.
+                    #
+                    # THE COUNTER IS PRESENT AT 0 FROM BOOT, unlike the gateway
+                    # counter above: Prometheus registers its own TSDB metrics
+                    # at start, and the self-scrape job `prometheus` publishes
+                    # `prometheus_tsdb_size_retentions_total` = 0 (measured
+                    # 2026-10-01). So `increase(...) > 0` catches the FIRST
+                    # size-based deletion; the baseline problem described
+                    # above applies only to a series that starts absent.
+                    #
+                    # `[24h]`, NOT `[1h]`. A deletion is an event, and with no
+                    # Alertmanager the alert is seen only on `/alerts`; a 1h
+                    # window would show it for an hour and then clear. 24h
+                    # matches the retention window: the alert holds for as long
+                    # as the store may be missing part of its day. NO `for:`,
+                    # for the reason the two rules above give: the value only
+                    # rises, so there is nothing to flap.
+                    - alert: PrometheusSizeRetentionDeletedBlocks
+                      expr: increase(prometheus_tsdb_size_retentions_total[24h]) > 0
+                      labels:
+                        severity: warning
+                      annotations:
+                        summary: >-
+                          Prometheus deleted blocks for SIZE, not time, so
+                          its 24h window is shorter than 24h
+                        description: >-
+                          `retentionSize` bound before `retention: 24h`, so
+                          the oldest blocks were deleted early. Every rule here
+                          that reads a `[24h]` range, `BootstrapTokenAccepted`
+                          first, now covers less than a day, and a quiet alert
+                          there means less than it says. Check
+                          `prometheus_tsdb_head_series` for a series explosion
+                          and the TSDB size against `retentionSize` in
+                          applications/prometheus.yaml.
   destination:
     server: https://kubernetes.default.svc
     namespace: observability
