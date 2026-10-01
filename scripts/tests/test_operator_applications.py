@@ -803,7 +803,7 @@ def test_prometheus_values_round_trip_is_green(copy: Path) -> None:
 
 
 def test_prometheus_pvc_disabled_reddens(copy: Path) -> None:
-    """`enabled: false` renders an emptyDir: the pod rolls onto an empty TSDB and the PVC is pruned later."""
+    """`enabled: false` renders an emptyDir: the pod rolls onto an empty TSDB, and the PVC is left extraneous."""
     mutate_prometheus_values(
         copy, lambda values: values["prometheus"]["server"]["persistentVolume"].update(enabled=False)
     )
@@ -849,7 +849,12 @@ def test_a_second_operator_on_prometheus_reddens(copy: Path) -> None:
 
 
 def test_prometheus_values_as_value_object_reddens(copy: Path) -> None:
-    """`valuesObject` in place of the `values` string: the `null` it carries can be dropped on apply."""
+    """`valuesObject` in place of the `values` string: the `null` it carries can be dropped on apply.
+
+    Membership, not the exact list, on purpose: the row reads `values`, so with
+    it gone the parsed values are empty and every clause that reads them fails
+    too. `helm` is the clause that names this change.
+    """
     path = copy / "applications" / "prometheus.yaml"
     document = yaml.safe_load(path.read_text())
     helm = document["spec"]["source"]["helm"]

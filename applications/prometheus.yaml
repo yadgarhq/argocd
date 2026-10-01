@@ -23,8 +23,11 @@
 # `prometheus` in namespace `observability`: the same 7 objects, and the only
 # difference is `global.scrape_interval` in ConfigMap `prometheus-server`'s
 # `prometheus.yml`. `evaluation_interval` stays 1m. The Deployment's selector
-# and pod template are equal, so nothing rolls; the configmap-reload sidecar
-# reloads the server when the mounted file changes.
+# and pod template are equal, so nothing rolls. The new interval reaches the
+# running server without a restart: `config-volume` is mounted at /etc/config
+# with no `subPath`, so kubelet updates the file (allow about a minute), and the
+# configmap-reload sidecar watches that directory and calls
+# `/-/reload`, which `--web.enable-lifecycle` enables. Read from the render.
 #
 # THIS SWAP IS NOT 0-DIFF. The ConfigMap differs, so the Application goes
 # OutOfSync and automated sync patches it. Neither chart renders a helm hook, so
@@ -34,7 +37,10 @@
 # PVC `prometheus-server` (2Gi, Bound, ReadWriteOnce, storage class `standard`
 # on the rancher.io/local-path provisioner, node-pinned to yadgar-worker), the
 # four yadgar alerting rules, Deployment strategy Recreate, and no resources on
-# the configmap-reload container. All came from deploy's values. The PVC renders under the same name from both charts, with an equal
+# the configmap-reload container. The rules and the PVC's 2Gi are deploy's
+# values. The PVC itself, Recreate, the empty reloader resources and the 1m
+# interval are the community chart 29.27.0's own defaults, which `platform`
+# overrides for the PVC, the reloader and the interval. The PVC renders under the same name from both charts, with an equal
 # spec and no `helm.sh/resource-policy`; Argo patches an existing object and
 # never replaces it without `Replace=true`, so the claim and its TSDB stay.
 #
@@ -44,7 +50,8 @@
 #
 # WHAT THE `prometheus:` VALUES CARRY, AND WHY EACH ONE:
 # - `server.persistentVolume`. `platform` defaults it to `enabled: false`,
-#   which renders an emptyDir and drops the PVC: an empty TSDB on the next pod.
+#   which renders an emptyDir and drops the PVC from the release: the pod
+#   rolls onto an empty TSDB. `enabled: true` restores the community default.
 # - `configmapReload.prometheus.resources: null`. `platform` adds 10m/32Mi
 #   requests to the reload sidecar, which changes the pod template, and the pod
 #   rolls. `null` deletes the key in helm's merge; an empty map `{}` does not
