@@ -543,6 +543,45 @@ FAILURES = {
 }
 
 
+# DESTRUCTIVE CHANGES FAIL WHATEVER THE SCOPE. A root-managed operator upgrade
+# that deletes yadgar's MariaDB, or the edge proxy, is the damage this exists to
+# catch, and that object is foreign by construction.
+FAILURES.update(
+    {
+        "foreign-cr-gone": (
+            lambda s: s["custom_resources"].pop("scaledobjects.keda.sh/yadgar/gateway"),
+            "cr/scaledobjects.keda.sh/yadgar/gateway",
+        ),
+        "foreign-cr-terminating": (
+            lambda s: s["custom_resources"]["scaledobjects.keda.sh/yadgar/gateway"].update(deletionTimestamp="t"),
+            "cr/scaledobjects.keda.sh/yadgar/gateway",
+        ),
+        "untracked-cr-gone": (
+            lambda s: s["custom_resources"].pop("scaledobjects.keda.sh/keda/loose"),
+            "cr/scaledobjects.keda.sh/keda/loose",
+        ),
+        "foreign-workload-gone": (
+            lambda s: s["workloads"].pop("Deployment/keda/envoy-proxy"),
+            "workload/Deployment/keda/envoy-proxy",
+        ),
+        "foreign-workload-terminating": (
+            lambda s: s["workloads"]["Deployment/keda/envoy-proxy"].update(deletionTimestamp="t"),
+            "workload/Deployment/keda/envoy-proxy",
+        ),
+        # Root in EITHER snapshot is root: a root Deployment deleted, recreated
+        # and claimed by another Application must not soften to WARN.
+        "root-then-foreign": (
+            lambda s: s["workloads"]["Deployment/keda/keda-operator"].update(uid="new", scope="foreign:yadgar"),
+            "workload/Deployment/keda/keda-operator",
+        ),
+        "foreign-then-root": (
+            lambda s: s["workloads"]["Deployment/keda/envoy-proxy"].update(uid="new", scope="root"),
+            "workload/Deployment/keda/envoy-proxy",
+        ),
+    }
+)
+
+
 @pytest.mark.parametrize("case", sorted(FAILURES))
 def test_each_failure_rule_reddens(snap, case) -> None:
     mutate, key = FAILURES[case]
@@ -594,14 +633,6 @@ WARNINGS.update(
         "foreign-cr-uid": (
             lambda s: s["custom_resources"]["scaledobjects.keda.sh/yadgar/gateway"].update(uid="new"),
             "cr/scaledobjects.keda.sh/yadgar/gateway",
-        ),
-        "foreign-cr-terminating": (
-            lambda s: s["custom_resources"]["scaledobjects.keda.sh/yadgar/gateway"].update(deletionTimestamp="t"),
-            "cr/scaledobjects.keda.sh/yadgar/gateway",
-        ),
-        "untracked-cr-gone": (
-            lambda s: s["custom_resources"].pop("scaledobjects.keda.sh/keda/loose"),
-            "cr/scaledobjects.keda.sh/keda/loose",
         ),
         "foreign-deployment-generation": (
             lambda s: s["workloads"]["Deployment/keda/envoy-proxy"].update(generation=3),

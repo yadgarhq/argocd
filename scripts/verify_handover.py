@@ -32,8 +32,10 @@ WHAT `diff` FAILS ON (exit 1):
   - a Secret resourceVersion change (only when both snapshots read Secrets);
   - an edge probe that is not the expected status over a verified TLS session.
 
-A FAIL ON AN OBJECT ANOTHER APPLICATION OWNS IS A WARN (see `_classify`), and
-hook resources are never compared.
+A NON-DESTRUCTIVE FAIL ON AN OBJECT ANOTHER APPLICATION OWNS IS A WARN (see
+`_classify`). A custom resource or workload that vanishes or gets a
+deletionTimestamp fails whoever owns it. An object root owns in EITHER snapshot
+is root's. Hook resources are never compared.
 
 WHAT IT ONLY WARNS ON (exit 0): a syncPolicy change, a restart-count increase, a
 generation change outside Deployments and CRDs, and root pruning something on a
@@ -537,17 +539,30 @@ class Report:
         return "\n".join(lines)
 
 
-def _compare_identities(report: Report, area: str, before: dict, after: dict, generation_fails: Callable[[str], bool]) -> None:
+def _compare_identities(
+    report: Report,
+    area: str,
+    before: dict,
+    after: dict,
+    generation_fails: Callable[[str], bool],
+    destruction_fails: bool = False,
+) -> None:
+    """Compare two identity maps. `destruction_fails`: a vanished object or a deletionTimestamp is a
+    FAIL whatever the object's scope; only non-destructive changes to a foreign object soften to WARN."""
     for key in sorted(set(before) | set(after)):
         b, a = before.get(key), after.get(key)
         label = f"{area}/{key}"
         if (a or {}).get("skipped") or (b or {}).get("skipped"):
             continue
-        # Another Application's object, or one nobody tracks: reported, never
-        # failed. Its owner's own sync is what changes it.
-        scope = (a or b).get("scope", "root")
-        foreign = scope.startswith("foreign:")
+        # Another Application's object, or one nobody tracks: a non-destructive
+        # change is reported, not failed, since its owner's own sync makes it.
+        # Root in EITHER snapshot counts as root, so an object root lost to
+        # another Application still fails.
+        scopes = [r.get("scope", "root") for r in (b, a) if r is not None]
+        foreign = all(s.startswith("foreign:") for s in scopes)
+        scope = " -> ".join(dict.fromkeys(scopes))
         fail = "WARN" if foreign else "FAIL"
+        destroyed = "FAIL" if destruction_fails else fail
         suffix = f" [{scope}]" if foreign else ""
         if b is None:
             report.add("INFO", label, f"added (uid {a.get('uid')}){suffix}")
@@ -555,7 +570,7 @@ def _compare_identities(report: Report, area: str, before: dict, after: dict, ge
             if b.get("missing"):
                 report.add("WARN", label, "tracked but missing in both snapshots")
             else:
-                report.add(fail, label, f"gone (was uid {b.get('uid')}){suffix}")
+                report.add(destroyed, label, f"gone (was uid {b.get('uid')}){suffix}")
             continue
         elif b.get("missing"):
             report.add("INFO", label, f"appeared (uid {a.get('uid')})")
@@ -566,7 +581,7 @@ def _compare_identities(report: Report, area: str, before: dict, after: dict, ge
                 level = fail if generation_fails(key) else "WARN"
                 report.add(level, label, f"generation {b.get('generation')} -> {a.get('generation')}{suffix}")
         if a.get("deletionTimestamp"):
-            report.add(fail, label, f"deletionTimestamp {a['deletionTimestamp']}{suffix}")
+            report.add(destroyed, label, f"deletionTimestamp {a['deletionTimestamp']}{suffix}")
 
 
 def _compare_applications(report: Report, before: dict, after: dict) -> None:
@@ -627,11 +642,25 @@ def diff(before: dict, after: dict) -> Report:
     _compare_identities(
         report, "object", before.get("objects") or {}, after.get("objects") or {}, lambda key: key.split("/")[1] == "Deployment"
     )
+    # Workloads and custom resources: a deletion fails whoever owns it. A
+    # root-managed operator upgrade that deletes yadgar's MariaDB, or the edge
+    # proxy, is foreign by construction and is the damage this exists to catch.
+    # Pods stay softened: a foreign roll replaces pods by design.
     _compare_identities(
-        report, "workload", before.get("workloads") or {}, after.get("workloads") or {}, lambda key: key.startswith("Deployment/")
+        report,
+        "workload",
+        before.get("workloads") or {},
+        after.get("workloads") or {},
+        lambda key: key.startswith("Deployment/"),
+        destruction_fails=True,
     )
     _compare_identities(
-        report, "cr", before.get("custom_resources") or {}, after.get("custom_resources") or {}, lambda _key: False
+        report,
+        "cr",
+        before.get("custom_resources") or {},
+        after.get("custom_resources") or {},
+        lambda _key: False,
+        destruction_fails=True,
     )
     _compare_identities(report, "pod", before.get("pods") or {}, after.get("pods") or {}, lambda _key: False)
     for key in sorted(set(before.get("pods") or {}) & set(after.get("pods") or {})):
