@@ -705,3 +705,138 @@ kubectl --context kind-yadgar delete clusterrolebinding post-merge-verifier
 kubectl --context kind-yadgar delete clusterrole post-merge-verifier
 kubectl --context kind-yadgar delete namespace post-merge-verifier
 ```
+
+## M3 — root adopts `infra`'s five children (retiring `infra`, option A, ADR-0828)
+
+**What the merge does.** It adds `applications/arc.yaml`, `estate-front.yaml`,
+`estate-front-runner.yaml`, `tls.yaml` and `yadgar.yaml`, and
+`manifests/tls/` and `manifests/estate-front/`, byte copies of
+`yadgarhq/deploy`'s `infra/tls/` and `infra/estate-front/` at `05b160b`. Root
+selects the five Applications through its `{applications,applicationsets}/*.yaml`
+include. `manifests/` is outside that include on purpose: Argo's include glob
+lets `*` cross `/`, so a file under `applications/` would be applied by root
+itself as well as by its Application.
+
+Each spec differs from what runs today ONLY by:
+
+- S0's `syncPolicy` on all five: `automated.prune` removed, and
+  `retry: {limit: 6, backoff: {duration: 15s, factor: 2, maxDuration: 5m}}`.
+  On `tls` this replaces deploy's 60-attempt budget (see `applications/tls.yaml`).
+- `tls` and `estate-front`: `source` is this repository's `manifests/<name>`.
+- `yadgar`: two `sources` (the OCI chart, plus `ref: self` on deploy for
+  `$self/infra/yadgar/values.yaml`) became one `source`, the same chart at the
+  same `0.3.13`, with that values file inlined as `valuesObject`.
+- `arc` and `estate-front-runner`: the `helm.values` string became
+  `valuesObject`, parsed-equal.
+
+The render gate, run from the committed files with helm 3.18.4 and the
+cluster's api-versions, found 0 differing objects for all five (arc 10,
+estate-front 2, estate-front-runner 4, tls 5, yadgar 88). So each child stays
+Synced: no child operation runs, and no hook runs. The ONE operation is root's,
+which applies five Application objects. The metadata loses the `Prune=false`
+annotation M1 put on the live objects, by the same three-way merge E3 relied on.
+
+**ORDERING CONTRACT.** Merge only AFTER `yadgarhq/deploy`'s M2 has merged and
+its post-merge checks passed: `infra` OutOfSync with exactly these five
+requiring a prune, each still carrying `Prune=false` and an `infra:`
+tracking-id. Then merge promptly: until this merge the five are unowned.
+
+### Before this merge — read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. M2 has synced. Any other state → STOP.
+for app in arc estate-front estate-front-runner tls yadgar; do
+  kubectl --context kind-yadgar -n argocd get application "$app" \
+    -o jsonpath='{.metadata.name} {.metadata.uid} [{.metadata.annotations.argocd\.argoproj\.io/sync-options}] {.metadata.annotations.argocd\.argoproj\.io/tracking-id} {.status.sync.status}/{.status.health.status} {.status.operationState.startedAt}{"\n"}'
+done
+kubectl --context kind-yadgar -n argocd get application infra -o json \
+  | jq -r '.status.resources[] | select(.requiresPruning == true) | "\(.kind)/\(.name)"' | sort
+
+# 2. The snapshot this merge is checked against. Keep the output.
+kubectl --context kind-yadgar get crd -o jsonpath='{range .items[*]}{.metadata.name}={.metadata.uid}{"\n"}{end}' \
+  | sort | sha256sum | cut -c1-16                      # K6: a8026323ea9d31c2
+kubectl --context kind-yadgar -n argocd get applications --no-headers | wc -l   # K4: 14
+for ns in yadgar arc-systems; do
+  kubectl --context kind-yadgar -n "$ns" get deploy,statefulset \
+    -o jsonpath='{range .items[*]}{.kind}/{.metadata.name} {.metadata.uid} gen={.metadata.generation}{"\n"}{end}'
+done
+kubectl --context kind-yadgar -n yadgar get secret valkey-password nats-auth nats-auth-gateway admin-bootstrap-token iam-keys \
+  -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.creationTimestamp} {.metadata.resourceVersion}{"\n"}{end}'
+```
+
+Expected uids, read 2026-10-01 after M1:
+
+| Application           | uid                                    |
+| --------------------- | -------------------------------------- |
+| `arc`                 | `ff9e2c3a-52ec-41ed-a32f-8138f29f86c3` |
+| `estate-front`        | `521f859e-f888-4c4f-95dc-48728acf11ab` |
+| `estate-front-runner` | `4414811c-f7c9-47b3-b86e-b47a287cfdba` |
+| `tls`                 | `89f9542e-34ae-4d01-9a76-41c7dd58bcf0` |
+| `yadgar`              | `6181bd1c-3d73-4316-a864-b4e188dc6460` |
+
+Each child's last operation started at: `arc` 2026-09-05T12:40:28Z,
+`estate-front` 2026-09-05T12:40:18Z, `estate-front-runner` 2026-09-06T09:37:45Z,
+`tls` 2026-09-27T16:51:07Z, `yadgar` 2026-10-01T08:09:19Z.
+
+### After this merge — read-only
+
+`root` polls git, so allow a few minutes for it to see the merge.
+
+```bash
+# 1. Each of the five: SAME uid as the table, tracking-id
+#    root:argoproj.io/Application:argocd/<name>, NO sync-options annotation,
+#    Synced/Healthy, and operationState.startedAt UNCHANGED (no child operation).
+for app in arc estate-front estate-front-runner tls yadgar; do
+  kubectl --context kind-yadgar -n argocd get application "$app" \
+    -o jsonpath='{.metadata.name} {.metadata.uid} [{.metadata.annotations.argocd\.argoproj\.io/sync-options}] {.metadata.annotations.argocd\.argoproj\.io/tracking-id} {.status.sync.status}/{.status.health.status} {.status.operationState.startedAt}{"\n"}'
+done
+
+# 2. THE OPEN QUESTION: root's client-side apply must REMOVE `spec.sources`
+#    from yadgar now that the file sets `spec.source`. last-applied holds
+#    `sources`, so the three-way merge should delete it. If `sources` survived,
+#    Argo would keep reading it (multi-source wins) and deploy's later deletion
+#    of infra/yadgar/values.yaml would break yadgar. Expect: no `sources`, and
+#    `source.chart` = yadgar.
+kubectl --context kind-yadgar -n argocd get application yadgar -o json \
+  | jq '{sources: .spec.sources, chart: .spec.source.chart, rev: .spec.source.targetRevision}'
+for app in tls estate-front; do
+  kubectl --context kind-yadgar -n argocd get application "$app" \
+    -o jsonpath='{.metadata.name} {.spec.source.repoURL} {.spec.source.path}{"\n"}'
+done
+
+# 3. Workloads untouched: re-run the snapshot of "Before" step 2. Every uid
+#    and generation, K6 a8026323ea9d31c2, K4 14, and each Secret's
+#    creationTimestamp and resourceVersion unchanged.
+
+# 4. infra let go: it lists only itself.
+kubectl --context kind-yadgar -n argocd get application infra -o json \
+  | jq -r '.status.sync.status, (.status.resources[] | "\(.kind)/\(.name)")'
+# expect: Synced, then Application/infra alone.
+
+# 5. The edge still serves. Expect HTTP 405 and ssl_verify_result=0.
+curl -sS -o /dev/null -w '%{http_code} %{ssl_verify_result}\n' \
+  --cacert <(kubectl --context kind-yadgar -n cert-manager get secret yadgar-dev-ca \
+    -o jsonpath='{.data.tls\.crt}' | base64 -d) \
+  --resolve gateway.yadgar.internal:18443:127.0.0.1 https://gateway.yadgar.internal:18443/
+```
+
+K4 IS 14 HERE, NOT 13: argocd#52 added `post-merge-verifier`. M4, which
+deletes `infra` by hand, takes it to 13.
+
+THE POST-MERGE VERIFIER (#52) DOES NOT GATE THIS MERGE. It sees the five as
+newly added Applications (INFO) and does not compare them across the merge, so
+the manual snapshot above ("Before" step 2, re-read in "After" step 3) is M3's
+gate.
+
+If `yadgar.spec.sources` survives (step 2), STOP before deploy deletes
+`infra/yadgar/values.yaml`, and report it.
+
+**Rollback — NOT a plain revert.** `root` runs `automated.prune: true` and the
+copies here carry no `Prune=false`, so reverting this merge makes `root` prune
+the five live Application objects, `yadgar` among them. None carries a
+finalizer, so the workloads would keep running, unowned. Fix forward here. If
+an Application must leave `root`, first put `Prune=false` on its copy in one
+merge, and delete it in a second.

@@ -10,44 +10,33 @@ TWO INDEPENDENT CHECKS, because one tag alone cannot prove either half:
                      ever existed and this check would still pass against IT.
   chart-tag          `chart_tag` equals `"v" + targetRevision`, where
                      `targetRevision` is read from the Application THIS
-                     ORGANISATION actually runs — `yadgarhq/deploy`'s
-                     `infra/yadgar-app.yaml`, `spec.sources[].targetRevision`
-                     of the source with a `chart:` key (the chart pull; the
-                     other source is `ref: self`, which has none). This is the
-                     half that can detect staleness: if the running pin moves
-                     and nobody updates `chart_pin.json`, THIS check reddens
-                     even though `platform-version` above still passes against
-                     the (now wrong) `chart_tag`.
+                     ORGANISATION actually runs — this repository's own
+                     `applications/yadgar.yaml`, `spec.source.targetRevision`
+                     (or, for a `sources` list, the entry with a `chart:` key).
+                     This is the half that can detect staleness: if the
+                     running pin moves and nobody updates `chart_pin.json`,
+                     THIS check reddens even though `platform-version` above
+                     still passes against the (now wrong) `chart_tag`.
 
-OPTION A, AND WHY THIS READ MUST FOLLOW IT. The `yadgar` Application is
-planned to move out of `yadgarhq/deploy` and into `yadgarhq/argocd` itself
-(ADR-0803's option A; see also ADR-0824's handover of the operator
-Applications, the same move for a different set of objects). The day that
-move lands, `DEPLOY_REPO`/`DEPLOY_APPLICATION_PATH` below point at a file this
-repository deleted, and this script starts failing LOUD rather than silently
-reading a stale copy — which is correct, but the fix is to repoint these two
-constants at `applications/yadgar.yaml` (or wherever the moved file lands) in
-the SAME pull request that moves it, not to delete this check.
+OPTION A LANDED, AND THIS READ FOLLOWED IT. The `yadgar` Application moved out
+of `yadgarhq/deploy` (`infra/yadgar-app.yaml`) and into this repository as
+`applications/yadgar.yaml` when `infra` retired (ADR-0828), in the same pull
+request that repointed this read. So the chart-tag half reads a LOCAL file and
+makes no request; `scripts/tests/test_check_chart_pin.py` covers it offline.
 
 WHY THIS IS A SEPARATE CI JOB AND NOT A PRE-COMMIT HOOK. `operator-applications`
 (scripts/tests/test_operator_applications.py) asserts every platform-sourced
 Application's `targetRevision` equals `PLATFORM_VERSION`, which this repository
 now reads from the committed `scripts/chart_pin.json` rather than a literal. That
-gate needs no network and runs on every commit through pre-commit. Neither half
-above can run without a real request, so both live here instead, on pull
-requests only, and the hook stays offline.
+gate needs no network and runs on every commit through pre-commit. The
+platform-version half above cannot run without a real request, so this script
+runs here instead, on pull requests only, and the hook stays offline.
 
-BOTH READS USE A DEFAULT `GITHUB_TOKEN`, NO WIDER PERMISSION. `yadgarhq/chart`
-and `yadgarhq/deploy` are both public repositories (checked by hand,
-`gh api repos/yadgarhq/<repo> --jq .private` → `false` for both), so a
-workflow's default `GITHUB_TOKEN` — scoped read-only to the calling
-repository's own `contents` — reads either one exactly as an unauthenticated
-request would. If `yadgarhq/deploy` (or wherever the Application lives after
-option A) ever turns private, this job needs `contents: read` on THAT
-repository specifically, which a same-organisation `GITHUB_TOKEN` does not
-grant by default; a job calling this script would then need a token minted
-for cross-repository read (e.g. a GitHub App installation token), not a wider
-scope on this repository's own `permissions:` block.
+THE ONE READ USES A DEFAULT `GITHUB_TOKEN`, NO WIDER PERMISSION.
+`yadgarhq/chart` is a public repository (checked by hand,
+`gh api repos/yadgarhq/chart --jq .private` → `false`), so a workflow's default
+`GITHUB_TOKEN` — scoped read-only to the calling repository's own `contents` —
+reads it exactly as an unauthenticated request would.
 
 NO TOKEN REACHES THE LOG. `GITHUB_TOKEN` travels through the environment, is
 read once, and is never interpolated into a printed string, an error message, or
@@ -74,11 +63,9 @@ CHART_PIN = REPOSITORY / "scripts" / "chart_pin.json"
 CHART_REPO = "yadgarhq/chart"
 CHART_PATH = "chart/Chart.yaml"
 
-# SEE "OPTION A" ABOVE. These two name the file this organisation's running
-# `yadgar` Application lives in TODAY. The day it moves into this repository,
-# both need to move with it.
-DEPLOY_REPO = "yadgarhq/deploy"
-DEPLOY_APPLICATION_PATH = "infra/yadgar-app.yaml"
+# SEE "OPTION A" ABOVE. The file this organisation's running `yadgar`
+# Application lives in.
+APPLICATION = REPOSITORY / "applications" / "yadgar.yaml"
 
 API = "https://api.github.com/repos/{repo}/contents/{path}"
 
@@ -118,17 +105,17 @@ def platform_version_at(chart_tag: str) -> str | None:
     return None
 
 
-def running_target_revision() -> str | None:
+def running_target_revision(application: Path = APPLICATION) -> str | None:
     """The chart pull's `targetRevision` from the running `yadgar` Application, or `None`.
 
-    `spec` carries either a single `source` or a list `sources` — this
-    Application uses the list form, with a SECOND entry (`ref: self`, no
-    `chart` key) that feeds the first a values file out of git rather than
-    pulling a chart. The entry THIS FUNCTION WANTS is whichever one carries a
-    `chart` key; reading `sources[0]` unconditionally would silently read the
-    wrong source the day these two are reordered.
+    `spec` carries either a single `source` or a list `sources`. This
+    Application uses the single form since option A. In deploy it used the list
+    form, with a SECOND entry (`ref: self`, no `chart` key) feeding the first a
+    values file. The entry THIS FUNCTION WANTS is whichever one carries a
+    `chart` key, in either form; reading `sources[0]` unconditionally would
+    silently read the wrong source the day a list is reordered.
     """
-    document = yaml.safe_load(fetch_contents(DEPLOY_REPO, DEPLOY_APPLICATION_PATH)) or {}
+    document = yaml.safe_load(application.read_text()) or {}
     spec = document.get("spec") or {}
     sources = spec.get("sources")
     if not isinstance(sources, list):
@@ -166,27 +153,24 @@ def check_platform_version(chart_tag: str, committed_version: str) -> str | None
     return None
 
 
-def check_chart_tag(chart_tag: str) -> str | None:
+def check_chart_tag(chart_tag: str, application: Path = APPLICATION) -> str | None:
     """`None` on a match, else the error line. This is the staleness half (ledger 1206)."""
+    where = application.relative_to(REPOSITORY) if application.is_relative_to(REPOSITORY) else application
     try:
-        revision = running_target_revision()
-    except (urllib.error.URLError, json.JSONDecodeError, yaml.YAMLError, KeyError) as exc:
+        revision = running_target_revision(application)
+    except (OSError, yaml.YAMLError, AttributeError) as exc:
         return (
-            f"could not read the running `targetRevision` from `{DEPLOY_REPO}`'s "
-            f"`{DEPLOY_APPLICATION_PATH}`: {type(exc).__name__}. If the `yadgar` Application "
-            f"has moved (option A, ADR-0803), repoint `DEPLOY_REPO`/`DEPLOY_APPLICATION_PATH` "
-            f"in this script at its new location."
+            f"could not read the running `targetRevision` from `{where}`: "
+            f"{type(exc).__name__}. If the `yadgar` Application has moved, repoint "
+            f"`APPLICATION` in this script at its new location."
         )
     if revision is None:
-        return (
-            f"`{DEPLOY_REPO}`'s `{DEPLOY_APPLICATION_PATH}` carries no chart source with a "
-            f"`targetRevision` any more."
-        )
+        return f"`{where}` carries no chart source with a `targetRevision` any more."
     running_tag = f"v{revision}"
     if chart_tag != running_tag:
         return (
             f"`{CHART_PIN.name}` says `chart_tag` is `{chart_tag}`, but the running `yadgar` "
-            f"Application (`{DEPLOY_REPO}:{DEPLOY_APPLICATION_PATH}`) pins `targetRevision: "
+            f"Application (`{where}`) pins `targetRevision: "
             f"{revision}` — `{running_tag}`. A tag never moves, so this is the check that "
             f"catches a `chart_pin.json` that went stale after the organisation moved to a "
             f"newer chart release. Update `{CHART_PIN.name}`'s `chart_tag` (and re-verify "
@@ -217,7 +201,8 @@ def main() -> int:
 
     print(
         f"{CHART_PIN.name}: platform_version {committed_version} matches {CHART_REPO}@{chart_tag}, "
-        f"and chart_tag matches the running yadgar Application's targetRevision."
+        f"and chart_tag matches the running yadgar Application's targetRevision "
+        f"({APPLICATION.relative_to(REPOSITORY)})."
     )
     return 0
 

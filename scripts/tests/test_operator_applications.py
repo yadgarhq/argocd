@@ -171,7 +171,7 @@ PLATFORM_SOURCE = f"yadgarhq/chart@{CHART_TAG}:chart/Chart.yaml"
 PLATFORM_VERSION = CHART_PIN["platform_version"]
 
 # `chart_tag` is a git tag (`v` prefix); `platform_version` is the OCI chart
-# version `yadgarhq/chart`'s `Chart.yaml` and `yadgar-app.yaml`'s
+# version `yadgarhq/chart`'s `Chart.yaml` and `applications/yadgar.yaml`'s
 # `targetRevision` both write it as (no `v`). `chart_pin_errors` below is the
 # one clause that reads these.
 CHART_TAG_PATTERN = re.compile(r"v\d+\.\d+\.\d+")
@@ -636,7 +636,7 @@ def test_a_chart_tag_missing_the_v_prefix_reddens() -> None:
 
 def test_a_platform_version_carrying_a_v_prefix_reddens() -> None:
     """`platform_version` is the OCI chart version as `Chart.yaml` and
-    `yadgar-app.yaml`'s `targetRevision` both write it: no leading `v`.
+    `applications/yadgar.yaml`'s `targetRevision` both write it: no leading `v`.
     """
     assert chart_pin_errors({**CHART_PIN, "platform_version": "v0.1.21"}) == ["platform_version"]
 
