@@ -116,6 +116,15 @@ PRUNE_FALSE = "Prune=false"
 # `yadgarhq/chart`'s own `example/operators-application.yaml` at its latest
 # release tag, read with `gh-personal api repos/yadgarhq/chart/contents/...`.
 # That example also omits `automated.prune`, which is the other half of S0.
+#
+# PINNED SEPARATELY FROM `CHART_TAG` (`v0.3.13`, ledger 1206), AND DELIBERATELY
+# NOT RE-DERIVED FROM IT. This constant names "the latest tag read for S0's
+# example", `CHART_TAG` names "the tag this organisation runs" (ledger 1206),
+# and the two have no reason to move together. MEASURED 2026-10-01:
+# `example/operators-application.yaml` is byte-identical at `v0.3.13`,
+# `v0.3.14` and `v0.3.15` (`diff` on all three pulled copies, exit 0) — the
+# `retry` block below is the same at `CHART_TAG` too, so there is nothing for
+# this difference to hide today.
 CHART_EXAMPLE_SOURCE = "yadgarhq/chart@v0.3.15:example/operators-application.yaml"
 EXPECTED_RETRY: dict = {
     "limit": 6,
@@ -150,15 +159,24 @@ EXPECTED_RETRY: dict = {
 # platform-sourced Application equals the committed `platform_version`".
 # `test_a_mismatched_chart_pin_reddens` is this gate's red case.
 #
-# THE REVERSE CHECK — that the committed file still describes `yadgarhq/chart`'s
-# actual state — needs a real request, so it runs as its own CI job
-# (`chart-pin` in `.github/workflows/ci.yaml`, `scripts/check_chart_pin.py`),
-# not here and not as a pre-commit hook.
+# THE REVERSE CHECKS — that the committed file still describes `yadgarhq/chart`'s
+# actual state, AND that `chart_tag` itself is still the tag this organisation
+# runs rather than one that merely matched once — each need a real request, so
+# both run as their own CI job (`chart-pin` in `.github/workflows/ci.yaml`,
+# `scripts/check_chart_pin.py`), not here and not as a pre-commit hook.
 CHART_PIN_PATH = REPOSITORY / "scripts" / "chart_pin.json"
 CHART_PIN: dict = json.loads(CHART_PIN_PATH.read_text())
 CHART_TAG = CHART_PIN["chart_tag"]
 PLATFORM_SOURCE = f"yadgarhq/chart@{CHART_TAG}:chart/Chart.yaml"
 PLATFORM_VERSION = CHART_PIN["platform_version"]
+
+# `chart_tag` is a git tag (`v` prefix); `platform_version` is the OCI chart
+# version `yadgarhq/chart`'s `Chart.yaml` and `yadgar-app.yaml`'s
+# `targetRevision` both write it as (no `v`). `chart_pin_errors` below is the
+# one clause that reads these.
+CHART_TAG_PATTERN = re.compile(r"v\d+\.\d+\.\d+")
+PLATFORM_VERSION_PATTERN = re.compile(r"\d+\.\d+\.\d+")
+
 OPERATOR_KEYS = ("argoCd", "certManager", "envoyGateway", "keda", "mariadbOperator", "prometheus")
 
 # Every field of a platform-sourced Application's `spec.syncPolicy`, as deploy's
@@ -512,6 +530,23 @@ def platform_errors(tree: Path) -> list[str]:
     return list(dict.fromkeys(name for name, _ in platform_clause_errors(tree)))
 
 
+def chart_pin_errors(pin: dict) -> list[str]:
+    """Every clause of `chart_pin.json`'s own shape that `pin` fails (ledger 1206).
+
+    `keys` short-circuits the other two: a missing key leaves nothing for
+    either pattern to check, and `pin["chart_tag"]` would raise rather than
+    fail a clause.
+    """
+    if set(pin) != {"chart_tag", "platform_version"}:
+        return ["keys"]
+    errors = []
+    if not CHART_TAG_PATTERN.fullmatch(pin["chart_tag"]):
+        errors.append("chart_tag")
+    if not PLATFORM_VERSION_PATTERN.fullmatch(pin["platform_version"]):
+        errors.append("platform_version")
+    return errors
+
+
 def retired_present(tree: Path) -> list[str]:
     """Every RETIRED name that root's directories still carry, as a file name or as an Application name.
 
@@ -562,16 +597,34 @@ def test_every_platform_sourced_application_is_the_d4_shape() -> None:
 
 
 def test_chart_pin_file_is_well_formed() -> None:
-    """LEDGER 1206. `chart_pin.json` carries exactly the two keys this module reads.
+    """LEDGER 1206. `chart_pin.json` carries exactly the two keys this module reads,
+    each in the shape `scripts/check_chart_pin.py`'s requests expect.
 
-    Nothing else here can distinguish "the file is malformed" from "the file
-    legitimately changed", so this is the one clause for the file's own shape;
-    whether its `platform_version` is still true of `yadgarhq/chart` is
-    `scripts/check_chart_pin.py`'s question, in CI, not this one's.
+    Whether its `platform_version` and `chart_tag` are still true of
+    `yadgarhq/chart` and the running `yadgar` Application is that script's
+    question, in CI, not this one's — this is the one clause for the file's
+    own shape.
     """
-    assert set(CHART_PIN) == {"chart_tag", "platform_version"}
-    assert CHART_PIN["chart_tag"] == CHART_TAG
-    assert CHART_PIN["platform_version"] == PLATFORM_VERSION
+    assert chart_pin_errors(CHART_PIN) == []
+
+
+def test_a_chart_tag_missing_the_v_prefix_reddens() -> None:
+    """The contents API's `ref=` query string takes a git tag, which this
+    organisation always writes with a leading `v` (`git tag` convention); a
+    bare semver string is not one.
+    """
+    assert chart_pin_errors({**CHART_PIN, "chart_tag": "0.3.13"}) == ["chart_tag"]
+
+
+def test_a_platform_version_carrying_a_v_prefix_reddens() -> None:
+    """`platform_version` is the OCI chart version as `Chart.yaml` and
+    `yadgar-app.yaml`'s `targetRevision` both write it: no leading `v`.
+    """
+    assert chart_pin_errors({**CHART_PIN, "platform_version": "v0.1.21"}) == ["platform_version"]
+
+
+def test_an_extra_chart_pin_key_reddens() -> None:
+    assert chart_pin_errors({**CHART_PIN, "extra": "x"}) == ["keys"]
 
 
 def test_a_mismatched_chart_pin_reddens(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -805,6 +858,22 @@ def test_a_dropped_annotation_reddens(copy: Path) -> None:
     path = copy / "applications" / "mariadb-operator.yaml"
     document = yaml.safe_load(path.read_text())
     del document["metadata"]["annotations"]
+    path.write_text(yaml.safe_dump(document))
+    assert platform_clause_errors(copy) == [("mariadb-operator", "annotations")]
+
+
+def test_an_added_annotation_reddens(copy: Path) -> None:
+    """A clause that compared only `sync-wave` would stay green here.
+
+    Both other `annotations` red cases change or remove `sync-wave` itself, so
+    a clause reading only that one key still catches them — a mutant that
+    narrows the comparison to `sync-wave` survives both. An annotation added
+    BESIDE an unchanged `sync-wave` is the case only a full `metadata.annotations`
+    comparison catches.
+    """
+    path = copy / "applications" / "mariadb-operator.yaml"
+    document = yaml.safe_load(path.read_text())
+    document["metadata"]["annotations"]["argocd.argoproj.io/example"] = "x"
     path.write_text(yaml.safe_dump(document))
     assert platform_clause_errors(copy) == [("mariadb-operator", "annotations")]
 

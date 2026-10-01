@@ -1,21 +1,58 @@
 #!/usr/bin/env python3
-"""`scripts/chart_pin.json`'s `platform_version` must equal `platform`'s pin in
-`yadgarhq/chart`'s `chart/Chart.yaml`, at that same file's `chart_tag` (ledger
-1206).
+"""`scripts/chart_pin.json` must still describe a running chart (ledger 1206).
+
+TWO INDEPENDENT CHECKS, because one tag alone cannot prove either half:
+
+  platform-version  `platform_version` equals `platform`'s pin among
+                     `yadgarhq/chart@<chart_tag>`'s `chart/Chart.yaml`
+                     `dependencies`. A git tag never moves, so this check alone
+                     cannot detect staleness: `chart_tag` could be any tag that
+                     ever existed and this check would still pass against IT.
+  chart-tag          `chart_tag` equals `"v" + targetRevision`, where
+                     `targetRevision` is read from the Application THIS
+                     ORGANISATION actually runs — `yadgarhq/deploy`'s
+                     `infra/yadgar-app.yaml`, `spec.sources[].targetRevision`
+                     of the source with a `chart:` key (the chart pull; the
+                     other source is `ref: self`, which has none). This is the
+                     half that can detect staleness: if the running pin moves
+                     and nobody updates `chart_pin.json`, THIS check reddens
+                     even though `platform-version` above still passes against
+                     the (now wrong) `chart_tag`.
+
+OPTION A, AND WHY THIS READ MUST FOLLOW IT. The `yadgar` Application is
+planned to move out of `yadgarhq/deploy` and into `yadgarhq/argocd` itself
+(ADR-0803's option A; see also ADR-0824's handover of the operator
+Applications, the same move for a different set of objects). The day that
+move lands, `DEPLOY_REPO`/`DEPLOY_APPLICATION_PATH` below point at a file this
+repository deleted, and this script starts failing LOUD rather than silently
+reading a stale copy — which is correct, but the fix is to repoint these two
+constants at `applications/yadgar.yaml` (or wherever the moved file lands) in
+the SAME pull request that moves it, not to delete this check.
 
 WHY THIS IS A SEPARATE CI JOB AND NOT A PRE-COMMIT HOOK. `operator-applications`
 (scripts/tests/test_operator_applications.py) asserts every platform-sourced
 Application's `targetRevision` equals `PLATFORM_VERSION`, which this repository
 now reads from the committed `scripts/chart_pin.json` rather than a literal. That
-gate needs no network and runs on every commit through pre-commit. What it
-CANNOT check, without a real request, is whether the committed file itself still
-describes `yadgarhq/chart`'s actual state — so this script makes that one
-request, on pull requests only, and leaves the hook offline.
+gate needs no network and runs on every commit through pre-commit. Neither half
+above can run without a real request, so both live here instead, on pull
+requests only, and the hook stays offline.
+
+BOTH READS USE A DEFAULT `GITHUB_TOKEN`, NO WIDER PERMISSION. `yadgarhq/chart`
+and `yadgarhq/deploy` are both public repositories (checked by hand,
+`gh api repos/yadgarhq/<repo> --jq .private` → `false` for both), so a
+workflow's default `GITHUB_TOKEN` — scoped read-only to the calling
+repository's own `contents` — reads either one exactly as an unauthenticated
+request would. If `yadgarhq/deploy` (or wherever the Application lives after
+option A) ever turns private, this job needs `contents: read` on THAT
+repository specifically, which a same-organisation `GITHUB_TOKEN` does not
+grant by default; a job calling this script would then need a token minted
+for cross-repository read (e.g. a GitHub App installation token), not a wider
+scope on this repository's own `permissions:` block.
 
 NO TOKEN REACHES THE LOG. `GITHUB_TOKEN` travels through the environment, is
 read once, and is never interpolated into a printed string, an error message, or
-a URL. `yadgarhq/chart` is public, so the only thing the token buys here is a
-higher, authenticated rate limit — it is not what makes the read possible.
+a URL. The token is passed only to raise the rate limit — it is not what makes
+either read possible.
 """
 
 from __future__ import annotations
@@ -23,6 +60,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -32,22 +70,35 @@ import yaml
 
 REPOSITORY = Path(__file__).resolve().parent.parent
 CHART_PIN = REPOSITORY / "scripts" / "chart_pin.json"
-API = "https://api.github.com/repos/yadgarhq/chart/contents/chart/Chart.yaml"
+
+CHART_REPO = "yadgarhq/chart"
+CHART_PATH = "chart/Chart.yaml"
+
+# SEE "OPTION A" ABOVE. These two name the file this organisation's running
+# `yadgar` Application lives in TODAY. The day it moves into this repository,
+# both need to move with it.
+DEPLOY_REPO = "yadgarhq/deploy"
+DEPLOY_APPLICATION_PATH = "infra/yadgar-app.yaml"
+
+API = "https://api.github.com/repos/{repo}/contents/{path}"
 
 
 def committed_pin() -> dict:
     return json.loads(CHART_PIN.read_text())
 
 
-def fetch_chart_yaml(chart_tag: str) -> str:
-    """The text of `chart/Chart.yaml` at `chart_tag`, via the contents API.
+def fetch_contents(repo: str, path: str, ref: str | None = None) -> str:
+    """The text of `path` in `repo`, via the contents API, optionally at `ref`.
 
     Raises `urllib.error.HTTPError` / `URLError` on failure, which `main`
     reports without the request's own text — that text could carry the token
     were it ever echoed back, and GitHub does not do that, but the caller does
     not need to trust that to stay safe.
     """
-    request = urllib.request.Request(f"{API}?ref={chart_tag}")
+    url = API.format(repo=repo, path=path)
+    if ref:
+        url = f"{url}?ref={ref}"
+    request = urllib.request.Request(url)
     request.add_header("Accept", "application/vnd.github+json")
     token = os.environ.get("GITHUB_TOKEN", "")
     if token:
@@ -59,11 +110,88 @@ def fetch_chart_yaml(chart_tag: str) -> str:
 
 def platform_version_at(chart_tag: str) -> str | None:
     """`platform`'s pinned `version` among `chart/Chart.yaml`'s `dependencies`, or `None`."""
-    document = yaml.safe_load(fetch_chart_yaml(chart_tag)) or {}
+    document = yaml.safe_load(fetch_contents(CHART_REPO, CHART_PATH, ref=chart_tag)) or {}
     for dependency in document.get("dependencies") or []:
         if isinstance(dependency, dict) and dependency.get("name") == "platform":
             version = dependency.get("version")
             return version if isinstance(version, str) else None
+    return None
+
+
+def running_target_revision() -> str | None:
+    """The chart pull's `targetRevision` from the running `yadgar` Application, or `None`.
+
+    `spec` carries either a single `source` or a list `sources` — this
+    Application uses the list form, with a SECOND entry (`ref: self`, no
+    `chart` key) that feeds the first a values file out of git rather than
+    pulling a chart. The entry THIS FUNCTION WANTS is whichever one carries a
+    `chart` key; reading `sources[0]` unconditionally would silently read the
+    wrong source the day these two are reordered.
+    """
+    document = yaml.safe_load(fetch_contents(DEPLOY_REPO, DEPLOY_APPLICATION_PATH)) or {}
+    spec = document.get("spec") or {}
+    sources = spec.get("sources")
+    if not isinstance(sources, list):
+        single = spec.get("source")
+        sources = [single] if isinstance(single, dict) else []
+    for source in sources:
+        if isinstance(source, dict) and source.get("chart"):
+            revision = source.get("targetRevision")
+            return revision if isinstance(revision, str) else None
+    return None
+
+
+def check_platform_version(chart_tag: str, committed_version: str) -> str | None:
+    """`None` on a match, else the error line."""
+    try:
+        live_version = platform_version_at(chart_tag)
+    except (urllib.error.URLError, json.JSONDecodeError, yaml.YAMLError, KeyError) as exc:
+        return (
+            f"could not read `platform`'s version from `{CHART_REPO}@{chart_tag}`'s "
+            f"`{CHART_PATH}`: {type(exc).__name__}."
+        )
+    if live_version is None:
+        return (
+            f"`{CHART_REPO}@{chart_tag}`'s `{CHART_PATH}` carries no `platform` dependency "
+            f"any more. `{CHART_PIN.name}` needs a new `chart_tag` this organisation actually "
+            f"runs."
+        )
+    if live_version != committed_version:
+        return (
+            f"`{CHART_PIN.name}` says `platform_version` is `{committed_version}`, but "
+            f"`{CHART_REPO}@{chart_tag}`'s `{CHART_PATH}` pins `platform` at `{live_version}`. "
+            f"Update `{CHART_PIN.name}` (and the `targetRevision` of every platform-sourced "
+            f"Application under `applications/` to match) to re-close ledger 1206."
+        )
+    return None
+
+
+def check_chart_tag(chart_tag: str) -> str | None:
+    """`None` on a match, else the error line. This is the staleness half (ledger 1206)."""
+    try:
+        revision = running_target_revision()
+    except (urllib.error.URLError, json.JSONDecodeError, yaml.YAMLError, KeyError) as exc:
+        return (
+            f"could not read the running `targetRevision` from `{DEPLOY_REPO}`'s "
+            f"`{DEPLOY_APPLICATION_PATH}`: {type(exc).__name__}. If the `yadgar` Application "
+            f"has moved (option A, ADR-0803), repoint `DEPLOY_REPO`/`DEPLOY_APPLICATION_PATH` "
+            f"in this script at its new location."
+        )
+    if revision is None:
+        return (
+            f"`{DEPLOY_REPO}`'s `{DEPLOY_APPLICATION_PATH}` carries no chart source with a "
+            f"`targetRevision` any more."
+        )
+    running_tag = f"v{revision}"
+    if chart_tag != running_tag:
+        return (
+            f"`{CHART_PIN.name}` says `chart_tag` is `{chart_tag}`, but the running `yadgar` "
+            f"Application (`{DEPLOY_REPO}:{DEPLOY_APPLICATION_PATH}`) pins `targetRevision: "
+            f"{revision}` — `{running_tag}`. A tag never moves, so this is the check that "
+            f"catches a `chart_pin.json` that went stale after the organisation moved to a "
+            f"newer chart release. Update `{CHART_PIN.name}`'s `chart_tag` (and re-verify "
+            f"`platform_version` against it) to re-close ledger 1206."
+        )
     return None
 
 
@@ -77,34 +205,20 @@ def main() -> int:
         )
         return 1
 
-    try:
-        live_version = platform_version_at(chart_tag)
-    except (urllib.error.URLError, json.JSONDecodeError, yaml.YAMLError, KeyError) as exc:
-        print(
-            f"::error file={CHART_PIN}::could not read `platform`'s version from "
-            f"`yadgarhq/chart@{chart_tag}`'s `chart/Chart.yaml`: {type(exc).__name__}."
-        )
+    errors = [
+        error
+        for error in (check_platform_version(chart_tag, committed_version), check_chart_tag(chart_tag))
+        if error
+    ]
+    for error in errors:
+        print(f"::error file={CHART_PIN}::{error}")
+    if errors:
         return 1
 
-    if live_version is None:
-        print(
-            f"::error file={CHART_PIN}::`yadgarhq/chart@{chart_tag}`'s `chart/Chart.yaml` "
-            f"carries no `platform` dependency any more. `{CHART_PIN.name}` needs a new "
-            f"`chart_tag` this organisation actually runs."
-        )
-        return 1
-
-    if live_version != committed_version:
-        print(
-            f"::error file={CHART_PIN}::`{CHART_PIN.name}` says `platform_version` is "
-            f"`{committed_version}`, but `yadgarhq/chart@{chart_tag}`'s `chart/Chart.yaml` "
-            f"pins `platform` at `{live_version}`. Update `{CHART_PIN.name}` (and the "
-            f"`targetRevision` of every platform-sourced Application under `applications/` "
-            f"to match) to re-close ledger 1206."
-        )
-        return 1
-
-    print(f"{CHART_PIN.name}: platform_version {committed_version} matches yadgarhq/chart@{chart_tag}.")
+    print(
+        f"{CHART_PIN.name}: platform_version {committed_version} matches {CHART_REPO}@{chart_tag}, "
+        f"and chart_tag matches the running yadgar Application's targetRevision."
+    )
     return 0
 
 
