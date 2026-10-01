@@ -50,12 +50,14 @@
 # concurrency cases, and gives scale-to-zero for a module whose plugin is switched
 # off (D1) — one mechanism instead of prometheus-adapter plus special cases.
 #
-# ONE WAVE, NOT TWO, and this is the opposite of mariadb-operator. That chart
-# ships its CRDs SEPARATELY, and landing them at the same wave as the controller
-# made it crash-loop with an error naming an indexer rather than a missing CRD —
-# which is why -12 exists. KEDA's six CRDs render in the SAME release as its
-# controller: `platform` vendors them as its own templates (and sets
-# `keda.crds.install` false), so this Application still needs no separate wave.
+# ONE WAVE, NOT TWO, and since D7.3 mariadb-operator is the same. Its own chart
+# shipped its CRDs SEPARATELY, and landing them at the same wave as the
+# controller made it crash-loop with an error naming an indexer rather than a
+# missing CRD — which is why wave -12 existed. No Application uses -12 any more:
+# `platform` vendors mariadb-operator's 12 CRDs into that operator's own
+# release. KEDA's six CRDs render in the SAME release as its controller too:
+# `platform` vendors them as its own templates (and sets `keda.crds.install`
+# false), so this Application needs no separate wave.
 #
 # Licence and supply chain verified before adoption, per O10: Apache-2.0 from the
 # repository's own LICENSE, CNCF graduated, maintainers across four employers,

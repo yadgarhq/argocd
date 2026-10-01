@@ -88,8 +88,9 @@
 # terminate one TLS listener is not proportionate).
 #
 # IT INSTALLS THE GATEWAY API CRDs ITSELF (`crds.enabled`, default true), so
-# unlike mariadb-operator there is no separate CRD chart and no earlier wave. That
-# is why -12 exists for the database operator and does not exist here.
+# there is no separate CRD chart and no earlier wave. The database operator's
+# CRDs once came from a separate chart at wave -12. Since D7.3 `platform`
+# renders them in the operator's own release, and no Application uses -12.
 #
 # Envoy Gateway 1.9 requires Gateway API v1.6.1 EXACTLY, per its own
 # compatibility matrix, and supports Kubernetes v1.33 through v1.36 — this cluster
