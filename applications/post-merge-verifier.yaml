@@ -1,0 +1,40 @@
+# The read-only identity of the post-merge verifier (`scripts/verify_handover.py`,
+# run by `.github/workflows/post-merge-verify.yaml`). `root` selects this file;
+# this Application syncs `verifier/manifests/`: a Namespace, a ServiceAccount, and a
+# get/list/watch ClusterRole with no Secrets, bound to that ServiceAccount.
+#
+# NO RUNNER HERE, DELIBERATELY. The one ARC scale set on kind-yadgar,
+# `estate-front`, cannot run this: it registers against `yadgarhq/estate`, its
+# namespace's egress policy excludes the API server, and its pod holds the
+# `estate` environment's secrets. MIGRATION_NOTES.md proposes a dedicated scale
+# set in this namespace; it needs a GitHub App Secret created by hand first, so
+# it is not an Application root would create on merge.
+#
+# `verifier/` sits outside root's `{applications,applicationsets}/*.yaml`
+# include, so root applies this Application and only this Application applies
+# the RBAC.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: post-merge-verifier
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/yadgarhq/argocd
+    targetRevision: main
+    path: verifier/manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: post-merge-verifier
+  # The operators' shape (S0, ADR-0824): self-heal, no `prune` key, and the
+  # chart example's finite retry.
+  syncPolicy:
+    automated:
+      selfHeal: true
+    retry:
+      limit: 6
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m

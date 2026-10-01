@@ -1,0 +1,6 @@
+# Home of the post-merge verifier's ServiceAccount, and of the runner scale set
+# MIGRATION_NOTES.md proposes. Synced by `applications/post-merge-verifier.yaml`.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: post-merge-verifier

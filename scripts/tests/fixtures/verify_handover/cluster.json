@@ -1,0 +1,367 @@
+{
+  "_comment": "A fake cluster for scripts/tests/test_verify_handover.py. Each key is the kubectl argument list after `--context <ctx>`, joined by spaces; each value is what kubectl prints. Shapes are trimmed copies of kind-yadgar objects read 2026-10-01. No Secret data appears anywhere: the one Secret call is custom-columns text.",
+  "get namespace kube-system -o json": {
+    "kind": "Namespace",
+    "metadata": { "name": "kube-system", "uid": "cluster-0000" }
+  },
+  "get applications.argoproj.io -n argocd -o json": {
+    "kind": "List",
+    "items": [
+      {
+        "metadata": {
+          "name": "root",
+          "namespace": "argocd",
+          "uid": "app-root",
+          "generation": 41
+        },
+        "spec": {
+          "destination": { "namespace": "argocd" },
+          "syncPolicy": { "automated": { "prune": true, "selfHeal": true } }
+        },
+        "status": {
+          "sync": {
+            "status": "Synced",
+            "revision": "1111111111111111111111111111111111111111"
+          },
+          "health": { "status": "Healthy" },
+          "reconciledAt": "2026-10-01T12:05:00Z",
+          "operationState": {
+            "phase": "Succeeded",
+            "startedAt": "2026-10-01T12:00:00Z",
+            "finishedAt": "2026-10-01T12:00:07Z",
+            "syncResult": {
+              "revision": "1111111111111111111111111111111111111111",
+              "resources": [
+                {
+                  "group": "argoproj.io",
+                  "kind": "Application",
+                  "name": "keda",
+                  "status": "Synced"
+                },
+                {
+                  "group": "argoproj.io",
+                  "kind": "Application",
+                  "name": "old-operator",
+                  "status": "Pruned",
+                  "message": "pruned"
+                }
+              ]
+            }
+          },
+          "resources": [
+            {
+              "group": "argoproj.io",
+              "kind": "Application",
+              "namespace": "argocd",
+              "name": "argocd"
+            },
+            {
+              "group": "argoproj.io",
+              "kind": "Application",
+              "namespace": "argocd",
+              "name": "keda"
+            },
+            {
+              "group": "argoproj.io",
+              "kind": "ApplicationSet",
+              "namespace": "argocd",
+              "name": "yadgar-modules"
+            }
+          ]
+        }
+      },
+      {
+        "metadata": {
+          "name": "argocd",
+          "namespace": "argocd",
+          "uid": "app-argocd",
+          "generation": 7
+        },
+        "spec": { "destination": { "namespace": "argocd" } },
+        "status": {
+          "sync": { "status": "OutOfSync", "revisions": ["8.6.1", "2222"] },
+          "health": { "status": "Healthy" },
+          "reconciledAt": "2026-10-01T12:05:00Z",
+          "resources": [
+            {
+              "group": "apps",
+              "kind": "StatefulSet",
+              "namespace": "argocd",
+              "name": "argocd-application-controller"
+            }
+          ]
+        }
+      },
+      {
+        "metadata": {
+          "name": "keda",
+          "namespace": "argocd",
+          "uid": "app-keda",
+          "generation": 12
+        },
+        "spec": {
+          "destination": { "namespace": "keda" },
+          "syncPolicy": {
+            "automated": { "selfHeal": true },
+            "retry": { "limit": 6 }
+          }
+        },
+        "status": {
+          "sync": { "status": "Synced", "revision": "0.1.21" },
+          "health": { "status": "Healthy" },
+          "reconciledAt": "2026-10-01T12:05:00Z",
+          "operationState": {
+            "phase": "Succeeded",
+            "startedAt": "2026-10-01T11:00:00Z",
+            "finishedAt": "2026-10-01T11:00:30Z",
+            "syncResult": { "revision": "0.1.21", "resources": [] }
+          },
+          "resources": [
+            {
+              "group": "apps",
+              "kind": "Deployment",
+              "namespace": "keda",
+              "name": "keda-operator"
+            },
+            {
+              "group": "apiextensions.k8s.io",
+              "kind": "CustomResourceDefinition",
+              "name": "scaledobjects.keda.sh"
+            },
+            {
+              "kind": "ConfigMap",
+              "namespace": "keda",
+              "name": "keda-cfg"
+            },
+            {
+              "kind": "Secret",
+              "namespace": "keda",
+              "name": "keda-certs"
+            }
+          ]
+        }
+      },
+      {
+        "metadata": {
+          "name": "iam",
+          "namespace": "argocd",
+          "uid": "app-iam",
+          "generation": 3,
+          "ownerReferences": [
+            {
+              "apiVersion": "argoproj.io/v1alpha1",
+              "kind": "ApplicationSet",
+              "name": "yadgar-modules"
+            }
+          ]
+        },
+        "spec": {
+          "destination": { "namespace": "iam-ns" },
+          "syncPolicy": { "automated": { "selfHeal": true } }
+        },
+        "status": {
+          "sync": { "status": "Synced", "revision": "abc" },
+          "health": { "status": "Healthy" },
+          "reconciledAt": "2026-10-01T12:05:00Z",
+          "resources": []
+        }
+      },
+      {
+        "metadata": {
+          "name": "infra",
+          "namespace": "argocd",
+          "uid": "app-infra",
+          "generation": 99
+        },
+        "spec": {
+          "destination": { "namespace": "argocd" },
+          "syncPolicy": { "automated": { "prune": true } }
+        },
+        "status": {
+          "sync": { "status": "OutOfSync" },
+          "health": { "status": "Degraded" },
+          "resources": []
+        }
+      }
+    ]
+  },
+  "get customresourcedefinitions.apiextensions.k8s.io -o json": {
+    "kind": "List",
+    "items": [
+      {
+        "metadata": {
+          "name": "scaledobjects.keda.sh",
+          "uid": "crd-so",
+          "generation": 1
+        }
+      },
+      {
+        "metadata": {
+          "name": "applications.argoproj.io",
+          "uid": "crd-app",
+          "generation": 2
+        }
+      }
+    ]
+  },
+  "get ApplicationSet.argoproj.io -A -o json": {
+    "kind": "List",
+    "items": [
+      {
+        "metadata": {
+          "name": "yadgar-modules",
+          "namespace": "argocd",
+          "uid": "appset-modules",
+          "generation": 4
+        }
+      }
+    ]
+  },
+  "get ConfigMap -A -o json": {
+    "kind": "List",
+    "items": [
+      {
+        "metadata": {
+          "name": "keda-cfg",
+          "namespace": "keda",
+          "uid": "cm-keda"
+        }
+      },
+      {
+        "metadata": {
+          "name": "unrelated",
+          "namespace": "keda",
+          "uid": "cm-unrelated"
+        }
+      }
+    ]
+  },
+  "get Deployment.apps -A -o json": {
+    "kind": "List",
+    "items": [
+      {
+        "metadata": {
+          "name": "keda-operator",
+          "namespace": "keda",
+          "uid": "dep-keda",
+          "generation": 5
+        }
+      }
+    ]
+  },
+  "get StatefulSet.apps -A -o json": {
+    "kind": "List",
+    "items": [
+      {
+        "metadata": {
+          "name": "argocd-application-controller",
+          "namespace": "argocd",
+          "uid": "sts-argocd",
+          "generation": 2
+        }
+      }
+    ]
+  },
+  "get deployments.apps,statefulsets.apps,daemonsets.apps,persistentvolumeclaims,pods -n argocd -o json": {
+    "kind": "List",
+    "items": [
+      {
+        "kind": "StatefulSet",
+        "metadata": {
+          "name": "argocd-application-controller",
+          "namespace": "argocd",
+          "uid": "sts-argocd",
+          "generation": 2
+        }
+      },
+      {
+        "kind": "Pod",
+        "metadata": {
+          "name": "argocd-application-controller-0",
+          "namespace": "argocd",
+          "uid": "pod-argocd-0",
+          "ownerReferences": [
+            { "kind": "StatefulSet", "name": "argocd-application-controller" }
+          ]
+        },
+        "status": {
+          "phase": "Running",
+          "containerStatuses": [{ "restartCount": 1 }]
+        }
+      },
+      {
+        "kind": "Pod",
+        "metadata": {
+          "name": "verifier-runner-abc",
+          "namespace": "argocd",
+          "uid": "pod-runner",
+          "ownerReferences": [{ "kind": "EphemeralRunner", "name": "x" }]
+        },
+        "status": { "phase": "Running" }
+      }
+    ]
+  },
+  "get deployments.apps,statefulsets.apps,daemonsets.apps,persistentvolumeclaims,pods -n keda -o json": {
+    "kind": "List",
+    "items": [
+      {
+        "kind": "Deployment",
+        "metadata": {
+          "name": "keda-operator",
+          "namespace": "keda",
+          "uid": "dep-keda",
+          "generation": 5
+        }
+      },
+      {
+        "kind": "PersistentVolumeClaim",
+        "metadata": {
+          "name": "keda-data",
+          "namespace": "keda",
+          "uid": "pvc-keda"
+        },
+        "spec": { "volumeName": "pv-1" },
+        "status": { "phase": "Bound" }
+      },
+      {
+        "kind": "Pod",
+        "metadata": {
+          "name": "keda-operator-5569f5fbcc-fn6ll",
+          "namespace": "keda",
+          "uid": "pod-keda",
+          "ownerReferences": [
+            { "kind": "ReplicaSet", "name": "keda-operator-5569f5fbcc" }
+          ]
+        },
+        "status": {
+          "phase": "Running",
+          "containerStatuses": [{ "restartCount": 0 }, { "restartCount": 2 }]
+        }
+      },
+      {
+        "kind": "Pod",
+        "metadata": {
+          "name": "keda-hook-xyz",
+          "namespace": "keda",
+          "uid": "pod-hook",
+          "ownerReferences": [{ "kind": "Job", "name": "keda-hook" }]
+        },
+        "status": { "phase": "Running" }
+      },
+      {
+        "kind": "Pod",
+        "metadata": {
+          "name": "keda-done",
+          "namespace": "keda",
+          "uid": "pod-done"
+        },
+        "status": { "phase": "Succeeded" }
+      }
+    ]
+  },
+  "get deployments.apps,statefulsets.apps,daemonsets.apps,persistentvolumeclaims,pods -n iam-ns -o json": {
+    "kind": "List",
+    "items": []
+  },
+  "get secrets -n yadgar -o custom-columns=NAME:.metadata.name,UID:.metadata.uid,RV:.metadata.resourceVersion --no-headers": "iam-keys   sec-iam   100\nyadgar-dev-ca   sec-ca   200\n"
+}

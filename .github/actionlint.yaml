@@ -1,0 +1,16 @@
+# The self-hosted runner labels this repository uses.
+#
+# actionlint knows GitHub's hosted labels and nothing else, so an undeclared
+# self-hosted label reads to it as a typo. Declaring it here keeps the check
+# meaningful: a typo in `runs-on:` still fails, because the typo is not listed.
+#
+# `argocd-verify` is the `runnerScaleSetName` MIGRATION_NOTES.md proposes for
+# the post-merge verifier ("The post-merge verifier"). The two must agree, and
+# neither reports it if they do not.
+#
+# ONLY `post-merge-verify.yaml` MAY NAME THIS LABEL. The runner's pod holds a
+# cluster-read token. A workflow on `pull_request` that named it would run
+# branch code with that token. This file cannot enforce that; review must.
+self-hosted-runner:
+  labels:
+    - argocd-verify

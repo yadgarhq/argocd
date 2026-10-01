@@ -216,3 +216,138 @@ not revert `yadgarhq/deploy`'s E2 after this merge either: `infra` and `root`
 would both declare the six. To undo a bad copy, fix it forward here. If the
 Applications must leave `root`, first put `Prune=false` on the six copies
 in one merge, and delete them in a second merge.
+
+## The post-merge verifier
+
+`scripts/verify_handover.py` replaces the per-merge scratch scripts of the
+operators handover. `.github/workflows/post-merge-verify.yaml` runs it after
+each merge to `main`. README.md, "Post-merge verification", says what it checks.
+
+### What this merge does on its own
+
+`root` creates `Application/post-merge-verifier`, and that Application syncs
+`verifier/manifests/`: Namespace `post-merge-verifier`, ServiceAccount
+`post-merge-verifier`, and ClusterRole and ClusterRoleBinding
+`post-merge-verifier`. The role is get/list/watch, names every group and
+resource, and has no `secrets`. Nothing runs as that ServiceAccount yet.
+
+The workflow is **skipped** on every push until the repository variable
+`POST_MERGE_VERIFY` is `true`. No runner can serve it today.
+
+```bash
+# After the merge, read-only:
+kubectl --context kind-yadgar -n argocd get application post-merge-verifier \
+  -o jsonpath='{.status.sync.status}/{.status.health.status}{"\n"}'
+kubectl --context kind-yadgar auth can-i list secrets \
+  --as=system:serviceaccount:post-merge-verifier:post-merge-verifier -A   # expect: no
+kubectl --context kind-yadgar auth can-i list deployments.apps \
+  --as=system:serviceaccount:post-merge-verifier:post-merge-verifier -A   # expect: yes
+```
+
+### Why the existing ARC runner cannot run it
+
+Read on kind-yadgar, 2026-10-01, with `get` only:
+
+- The only scale set, `estate-front/estate-front`, registers against
+  `https://github.com/yadgarhq/estate`. A workflow in this repository cannot
+  target it.
+- The namespace's `estate-front-egress` NetworkPolicy excludes `10.96.0.0/16`
+  and `10.89.4.0/24`, so it denies the API server at `10.96.0.1:443` and at
+  its endpoint `10.89.4.2:6443`. `yadgarhq/estate`'s `.github/actionlint.yaml`
+  says kindnet enforces no NetworkPolicy, so this is the declared intent, not a
+  measured block.
+- Its pods run as `estate-front-gha-rs-no-permission` and hold the `estate`
+  environment's secrets. Binding cluster read there widens the most sensitive
+  pod in the estate.
+
+### Proposal: a dedicated scale set (needs a person, in this order)
+
+1. **A GitHub App credential for this repository only.** ARC registers a
+   repository-level runner with an App that has Administration read and write
+   and Metadata read on `yadgarhq/argocd`. Do not reuse `yadgarhq-bot`: it holds
+   write on every repository (ADR-0563). Create the Secret by hand:
+
+   ```bash
+   kubectl --context kind-yadgar -n post-merge-verifier create secret generic argocd-verify-github \
+     --from-literal=github_app_id=<APP_ID> \
+     --from-literal=github_app_installation_id=<INSTALLATION_ID> \
+     --from-file=github_app_private_key=<KEY_FILE>
+   ```
+
+2. **The scale set, as `applications/post-merge-verifier-runner.yaml`, in a
+   reviewed PR after step 1.** `template.spec.serviceAccountName` makes the
+   chart use the read-only ServiceAccount instead of creating a
+   no-permission one. Pin the runner image by digest; read the digest off the
+   registry when you write the file.
+
+   ```yaml
+   apiVersion: argoproj.io/v1alpha1
+   kind: Application
+   metadata:
+     name: post-merge-verifier-runner
+     namespace: argocd
+   spec:
+     project: default
+     source:
+       repoURL: ghcr.io/actions/actions-runner-controller-charts
+       chart: gha-runner-scale-set
+       targetRevision: 0.14.2
+       helm:
+         valuesObject:
+           githubConfigUrl: https://github.com/yadgarhq/argocd
+           githubConfigSecret: argocd-verify-github
+           runnerScaleSetName: argocd-verify # = runs-on and .github/actionlint.yaml
+           controllerServiceAccount: # see deploy's estate-front-runner for why
+             namespace: arc-systems
+             name: arc-gha-rs-controller
+           minRunners: 0
+           maxRunners: 1
+           template:
+             spec:
+               serviceAccountName: post-merge-verifier
+               containers:
+                 - name: runner
+                   image: ghcr.io/actions/actions-runner@sha256:<DIGEST>
+                   command: ["/home/runner/run.sh"]
+     destination:
+       server: https://kubernetes.default.svc
+       namespace: post-merge-verifier
+     syncPolicy:
+       automated: { selfHeal: true }
+   ```
+
+   Add an egress NetworkPolicy to `verifier/manifests/` in the same PR: DNS to
+   kube-dns, `10.96.0.1/32:443` and `10.89.4.2/32:6443` for the API server,
+   and `443` to `0.0.0.0/0` except the cluster ranges for GitHub, `dl.k8s.io`
+   and the Python download. The node IP is kind's and moves if the cluster is
+   recreated.
+
+3. **Switch the workflow on** once the scale set's listener is up:
+
+   ```bash
+   gh-personal variable set POST_MERGE_VERIFY --body true --repo yadgarhq/argocd
+   ```
+
+   The first run has no baseline. Its summary says "BASELINE ONLY", and it
+   compares nothing. The second merge after that is the first real check.
+
+### What the label cannot stop
+
+Any workflow in this repository could name `runs-on: argocd-verify`, including
+one on `pull_request`, which runs branch code with the cluster-read token. A
+repository-level runner cannot be limited to one workflow.
+`scripts/tests/test_verify_handover.py` fails when a workflow other than
+`post-merge-verify.yaml` names the label, or when that workflow gains a
+trigger other than push to `main`.
+
+### Rollback
+
+Revert the merge. `root` prunes `Application/post-merge-verifier`, which has no
+finalizer, so the Namespace, ServiceAccount, ClusterRole and ClusterRoleBinding
+stay behind, unowned. Delete them by hand if they must go:
+
+```bash
+kubectl --context kind-yadgar delete clusterrolebinding post-merge-verifier
+kubectl --context kind-yadgar delete clusterrole post-merge-verifier
+kubectl --context kind-yadgar delete namespace post-merge-verifier
+```

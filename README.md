@@ -15,6 +15,8 @@ The cluster and the infrastructure live in
 | `applicationsets/modules.yaml` | discovers module repos across the organisation  |
 | `applications/<operator>.yaml` | the six operator Applications root adopted (E3) |
 | `MIGRATION_NOTES.md`           | what a change here needs from a person          |
+| `scripts/verify_handover.py`   | read-only post-merge verifier (below)           |
+| `verifier/manifests/`          | its read-only ServiceAccount and ClusterRole    |
 
 `applications/` holds single `Application` resources; `applicationsets/` holds
 generators that produce many. Keeping them apart matters because the two are
@@ -90,3 +92,50 @@ kubectl -n argocd create secret generic github-scm \
 
 There is no `argocd` CLI dependency — the server runs in the cluster, and
 `kubectl` on its CRDs does the same job.
+
+## Post-merge verification
+
+`scripts/verify_handover.py` proves a merge recreated nothing. It is read-only:
+every kubectl call goes through one function that requires `--context` (there
+is no default, and the operator's default context is production), allows only
+`get`, and reads a Secret only as metadata columns.
+
+```bash
+S=scripts/verify_handover.py
+python3 $S snapshot --context kind-yadgar --out before.json
+# ... merge ...
+python3 $S wait --context kind-yadgar --app root --revision <merge sha>
+python3 $S wait --context kind-yadgar --settled --since <time root reached the sha>
+python3 $S snapshot --context kind-yadgar --out after.json
+python3 $S diff before.json after.json   # 0 pass, 1 a failure, 2 a refusal
+```
+
+Wait, then settle, then snapshot. A snapshot taken before root syncs the merge
+compares the old state with itself.
+
+**What it reads**, for every Application under `root` (root's own Applications,
+and those its ApplicationSets generate): uid, finalizers, syncPolicy, sync and
+health; every CRD's uid and generation, with the same name=uid hash the
+handover scripts printed; every object those Applications track, except Secrets;
+the Deployments, StatefulSets, DaemonSets, PVCs and pods in their destination
+namespaces; root's prune result. `--secrets-namespace` adds Secret
+name/uid/resourceVersion, and `--edge-url`/`--edge-ca` add a verified-TLS probe
+of the edge. There is no unverified probe.
+
+**`diff` fails** on a changed or vanished uid, a Deployment or CRD generation
+change, any deletionTimestamp, a changed finalizer list, an Application not
+Healthy, an automated one not Synced, a manual one that went Synced to
+OutOfSync (`argocd` is manual and OutOfSync by design), a failed last
+operation, a Secret resourceVersion change, or a wrong edge status. It **warns**
+on a syncPolicy change, a restart, other generation changes and a root prune.
+It **refuses** snapshots from two clusters or with nothing in them.
+
+**In CI**, `.github/workflows/post-merge-verify.yaml` runs the same sequence on
+each push to `main`, as the `post-merge-verifier` ServiceAccount that
+`applications/post-merge-verifier.yaml` syncs from `verifier/manifests/`. Its
+baseline is the previous run's AFTER snapshot, kept as an artifact, so each diff
+covers everything since the last run. It is switched off until a runner exists:
+`MIGRATION_NOTES.md`, "The post-merge verifier", says why the existing ARC
+runner cannot serve it and what a dedicated one needs. In CI the Secret check
+and the edge probe do not run: the role cannot read Secrets, and the edge CA is
+not in the cluster.

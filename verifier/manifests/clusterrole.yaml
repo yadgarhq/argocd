@@ -1,0 +1,51 @@
+# READ-ONLY, AND NO SECRETS. `scripts/verify_handover.py` reads what root's
+# Applications track, and the workloads in their destination namespaces.
+#
+# EVERY GROUP AND RESOURCE IS NAMED. `resources: ["*"]` on the core group, or
+# `apiGroups: ["*"]`, grants Secrets, and RBAC has no "everything except".
+# `list` on Secrets returns their data whatever the client asks for, so the
+# metadata-only Secret check in the script is for the operator's own
+# kubeconfig, never for this role.
+#
+# A TYPE MISSING HERE FAILS LOUDLY. When an Application starts tracking a kind
+# this role does not name, the snapshot stops on Forbidden rather than skipping
+# it. Add the kind here, in a reviewed change.
+#
+# `scripts/tests/test_verify_handover.py` holds this shape: read verbs only, no
+# wildcard, no `secrets`, and every type the script reads on every run.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: post-merge-verifier
+rules:
+  - apiGroups: [""]
+    resources:
+      - namespaces
+      - pods
+      - persistentvolumeclaims
+      - configmaps
+      - services
+      - serviceaccounts
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets]
+    verbs: [get, list, watch]
+  - apiGroups: [apiextensions.k8s.io]
+    resources: [customresourcedefinitions]
+    verbs: [get, list, watch]
+  - apiGroups: [argoproj.io]
+    resources: [applications, applicationsets]
+    verbs: [get, list, watch]
+  - apiGroups: [admissionregistration.k8s.io]
+    resources:
+      - mutatingwebhookconfigurations
+      - validatingwebhookconfigurations
+      - validatingadmissionpolicies
+      - validatingadmissionpolicybindings
+    verbs: [get, list, watch]
+  - apiGroups: [apiregistration.k8s.io]
+    resources: [apiservices]
+    verbs: [get, list, watch]
+  - apiGroups: [rbac.authorization.k8s.io]
+    resources: [clusterroles, clusterrolebindings, roles, rolebindings]
+    verbs: [get, list, watch]
