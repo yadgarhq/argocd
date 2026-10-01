@@ -74,13 +74,19 @@ repos:
         pass_filenames: false
 
       # E3 OF THE OPERATORS HANDOVER (ADR-0824). The six operator Applications
-      # under `applications/` are pinned to the specs `yadgarhq/deploy` released,
-      # and root must select them, adopt them by name and find no `Prune=false`.
-      # A HOOK, for the reason `versions-pinned` gives above: this is what feeds
-      # `ci / passed`. `always_run` because a deleted file is a failure, and
-      # pre-commit never passes a deleted file.
+      # under `applications/` were adopted from the specs `yadgarhq/deploy`
+      # released, and root must select them, adopt them by name and find no
+      # `Prune=false`. A HOOK, for the reason `versions-pinned` gives above:
+      # this is what feeds `ci / passed`. `always_run` because a deleted file is
+      # a failure, and pre-commit never passes a deleted file.
+      #
+      # LEDGER 1211. This hook's name used to end "equal deploy's last copy".
+      # `PINNED_SPECS` (scripts/tests/test_operator_applications.py) is empty
+      # now and all five remaining Applications source `platform` (D4-D7.3), so
+      # nothing here is still compared against deploy's copy — the name was
+      # false. The hook id is unchanged, because nothing references the name.
       - id: operator-applications
-        name: the adopted operator Applications equal deploy's last copy (ADR-0824)
+        name: the adopted operator Applications are the D4+ platform-sourced shape (ADR-0824)
         entry: python -m pytest scripts/tests -q
         language: python
         additional_dependencies: ["pytest==9.1.1", "pyyaml==6.0.3"]
