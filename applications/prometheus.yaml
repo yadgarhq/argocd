@@ -48,10 +48,38 @@
 #
 # 2Gi IS NOT A BOUND. The `standard` StorageClass (rancher.io/local-path) does
 # not enforce the requested size: `df` inside the pod shows the host file
-# system. The only bound on the TSDB is `--storage.tsdb.retention.time=24h`;
-# `retention.size` is unset. Measured 2026-10-01 at today's series count, the
-# upper bound at 15s is about 1.5 to 1.6 GB: blocks about 1.0 GB plus WAL about
-# 0.55 GB.
+# system. Measured 2026-10-01 at today's series count, the upper bound of the
+# TSDB at 15s is about 1.5 to 1.6 GB: blocks about 1.0 GB plus WAL about
+# 0.55 GB. `--storage.tsdb.retention.time=24h` binds first; since ledger 1210
+# `retention.size` is a second bound (below).
+#
+# LEDGER 1210 SIZES THE SERVER, AND THE POD ROLLS ONCE FOR IT. `platform`'s
+# 100m/256Mi request with no limit was deploy's sizing from the 1m interval.
+# Measured read-only 2026-10-01 on kind-yadgar (Prometheus 3.14.0, 88.6k head
+# series): at 1m the RSS ran 430 to 500 MB. The 15s interval reached the
+# server at 12:07 UTC, and in the next three hours the RSS rose to 700 to
+# 730 MB, with a 24h peak of 757 MB (722Mi); the container's working set
+# peaked at 730 MB.
+# - Request 1Gi: the 757 MB peak plus about 40% headroom. The head grows for
+#   3h before it compacts. The peak came at 14:58 UTC, with a full 3h head of
+#   15s data, two minutes before the compaction.
+# - Limit 2Gi on memory only: a restart replays a WAL of about 0.5 GB, and
+#   compaction adds short spikes, so the limit sits well above the steady
+#   peak. An OOM kill is a full monitoring outage, so the limit is generous.
+#   Prometheus 3 sets GOMEMLIMIT to 0.9 of the cgroup limit (live flag
+#   `auto-gomemlimit` true, ratio 0.9), so the GC tightens near 1.8Gi.
+#   No CPU limit: throttling would delay scrapes and rule evaluation.
+# - `retentionSize: 1700MB`. Prometheus counts it in powers of 2 (MiB), and
+#   counts the WAL and the head chunks in the total, but deletes only whole
+#   blocks. 1700 MiB (1.78 GB) is above the 1.5 to 1.6 GB 24h upper bound, so
+#   time still binds and the 24h window that `BootstrapTokenAccepted` reads
+#   stays whole. It is 83% of the nominal 2Gi, inside Prometheus' 80-85%
+#   advice for compaction headroom. It bounds a series explosion, which time
+#   retention alone does not.
+#
+# The changed pod template rolls the pod once. Strategy Recreate stops the old
+# pod before the new one starts, so monitoring is down until the WAL replays
+# (KEDA's prometheus queries fail for that time). The PVC and its TSDB stay.
 #
 # EACH OPERATOR KEY IS WRITTEN, NOT LEFT UNSET. `platform` resolves an unset
 # `operators.<op>.create` through `operators.create`, so an unset key is a
@@ -71,8 +99,10 @@
 #   on a custom resource reads `null` as "delete this key".
 # - `serverFiles."alerting_rules.yml"`. deploy's rules, verbatim. `platform`
 #   carries none.
-# deploy's server sizing (100m/256Mi), `retention: 24h` and the four disabled
-# components are `platform`'s own defaults, so they are not repeated here.
+# - `server.resources` and `server.retentionSize`. Not deploy's: ledger 1210,
+#   above. They replace `platform`'s 100m/256Mi and add a size bound.
+# `retention: 24h` and the four disabled components are `platform`'s own
+# defaults, so they are not repeated here.
 #
 # `syncPolicy` is S0 of the operators handover (ADR-0824): `automated.prune` is
 # omitted, and `retry` is copied from `yadgarhq/chart@v0.3.15`'s
@@ -81,13 +111,15 @@
 #
 # WHAT IS GATED, AND WHAT IS ONLY MEASURED.
 # scripts/tests/test_operator_applications.py pins this Application's shape:
-# the source, the platform version, every operator key, the PVC and reloader
-# values, a digest of the alerting rules, the `helm.values` form, the absent
-# `releaseName`, and every field outside `source`. It does not render anything.
-# The 7-object render equivalence, the one scrape-interval difference, the
-# equal PVC, the absent hooks, and the live facts above are a 2026-10-01
-# measurement, recorded in the pull request that made this change, and no
-# check re-runs them.
+# the source, the platform version, every operator key, the PVC, server sizing,
+# retention size and reloader values, a digest of the alerting rules, the
+# `helm.values` form, the absent `releaseName`, and every field outside
+# `source`. It does not render anything. The 7-object render equivalence, the
+# one scrape-interval difference, the equal PVC, the absent hooks, ledger
+# 1210's render diff (the server container's resources and one
+# `--storage.tsdb.retention.size` argument), its memory and disk figures, and
+# the live facts above are 2026-10-01 measurements, recorded in the pull
+# requests that made these changes, and no check re-runs them.
 #
 # Prometheus, and it is here for ONE reason: D68's autoscaler needs somewhere to
 # read D67's metrics from. KEDA's prometheus scaler queries a server; the services
@@ -142,6 +174,18 @@ spec:
             persistentVolume:
               enabled: true
               size: 2Gi
+            # Ledger 1210, not deploy's. Measured 2026-10-01 at the 15s
+            # interval: RSS peak 757 MB. `platform`'s 100m/256Mi sat below
+            # that with no limit. The header has the arithmetic.
+            resources:
+              requests:
+                cpu: 100m
+                memory: 1Gi
+              limits:
+                memory: 2Gi
+            # Powers of 2 (MiB). Above the measured 24h upper bound, so
+            # `retention: 24h` still binds; under 85% of the nominal 2Gi.
+            retentionSize: 1700MB
           # `null`, not `{}`: it deletes `platform`'s 10m/32Mi requests, so the
           # pod template stays as deploy rendered it and nothing rolls.
           configmapReload:

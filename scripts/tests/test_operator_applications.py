@@ -158,7 +158,8 @@ PLATFORM_SYNC_POLICY: dict = {
 #              written out here. `carried` holds every other key.
 #   carried    required when `values` is set. Exactly what sits under
 #              `values`, less `digests`: deploy's
-#              copy, moved under that key. Measured 2026-10-01: without a row's sizing blocks
+#              copy, moved under that key, plus any value set since D4 (the
+#              row's comment names it: prometheus's ledger-1210 sizing). Measured 2026-10-01: without a row's sizing blocks
 #              the render's pod templates change and the Deployments roll.
 #              cert-manager's `crds` block changes nothing in today's render,
 #              because `platform` and cert-manager v1.21.1 already default to
@@ -229,8 +230,21 @@ PLATFORM_SOURCED: dict[str, dict] = {
         # `platform`'s 10m/32Mi requests. Measured 2026-10-01: without either the
         # pod template changes and the pod rolls; without the PVC the TSDB is
         # empty. An empty map `{}` does not delete the requests.
+        #
+        # `server.resources` and `server.retentionSize` are NOT deploy's: ledger
+        # 1210 set them after D4, and the pod rolls once for them. Measured
+        # 2026-10-01 at the 15s scrape interval: RSS peak 757 MB (24h max), so
+        # the request covers it and the limit leaves room for WAL replay. The
+        # TSDB's 24h upper bound is about 1.5 to 1.6 GB, so 1700MB (MiB: helm
+        # passes it to Prometheus, which counts in powers of 2) keeps
+        # `retention: 24h` the bound that binds and stays under 85% of the
+        # nominal 2Gi. A drop or a change of any of them reddens `carried`.
         "carried": {
-            "server": {"persistentVolume": {"enabled": True, "size": "2Gi"}},
+            "server": {
+                "persistentVolume": {"enabled": True, "size": "2Gi"},
+                "resources": {"requests": {"cpu": "100m", "memory": "1Gi"}, "limits": {"memory": "2Gi"}},
+                "retentionSize": "1700MB",
+            },
             "configmapReload": {"prometheus": {"resources": None}},
         },
         "unchanged": {
@@ -884,6 +898,38 @@ def test_prometheus_reloader_resources_empty_map_reddens(copy: Path) -> None:
 
 def test_prometheus_reloader_resources_dropped_reddens(copy: Path) -> None:
     mutate_prometheus_values(copy, lambda values: values["prometheus"].pop("configmapReload"))
+    assert platform_clause_errors(copy) == [("prometheus", "carried")]
+
+
+def test_prometheus_memory_limit_dropped_reddens(copy: Path) -> None:
+    """Ledger 1210: with no limit, the server's growth has no bound but the node's memory."""
+    mutate_prometheus_values(copy, lambda values: values["prometheus"]["server"]["resources"].pop("limits"))
+    assert platform_clause_errors(copy) == [("prometheus", "carried")]
+
+
+def test_prometheus_memory_request_lowered_reddens(copy: Path) -> None:
+    """`platform`'s 256Mi is below the measured 757 MB peak, which is what ledger 1210 corrected."""
+    mutate_prometheus_values(
+        copy, lambda values: values["prometheus"]["server"]["resources"]["requests"].update(memory="256Mi")
+    )
+    assert platform_clause_errors(copy) == [("prometheus", "carried")]
+
+
+def test_prometheus_server_resources_dropped_reddens(copy: Path) -> None:
+    """Without the block, `platform`'s 100m/256Mi with no limit comes back, and the pod rolls."""
+    mutate_prometheus_values(copy, lambda values: values["prometheus"]["server"].pop("resources"))
+    assert platform_clause_errors(copy) == [("prometheus", "carried")]
+
+
+def test_prometheus_retention_size_dropped_reddens(copy: Path) -> None:
+    """local-path does not enforce the PVC's 2Gi, so without it nothing bounds the TSDB's size."""
+    mutate_prometheus_values(copy, lambda values: values["prometheus"]["server"].pop("retentionSize"))
+    assert platform_clause_errors(copy) == [("prometheus", "carried")]
+
+
+def test_prometheus_retention_size_below_the_24h_bound_reddens(copy: Path) -> None:
+    """1500MB sits inside the measured 24h upper bound, so size, not time, would cut the window."""
+    mutate_prometheus_values(copy, lambda values: values["prometheus"]["server"].update(retentionSize="1500MB"))
     assert platform_clause_errors(copy) == [("prometheus", "carried")]
 
 
