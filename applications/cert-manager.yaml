@@ -1,8 +1,10 @@
 # ADOPTED FROM yadgarhq/deploy AT E3 OF THE OPERATORS HANDOVER (ADR-0824).
-# `spec` is byte-identical to deploy's infra/cert-manager.yaml at fa7ccb5, and
-# scripts/tests/test_operator_applications.py pins it. Root adopts the live
-# Application by name, keeping its uid. No `Prune=false` here: root's apply
-# removes the one E1 left on the live object.
+# `spec` equals deploy's infra/cert-manager.yaml at fa7ccb5, except S0 of the
+# operators handover (ADR-0824): `automated.prune` is omitted, and `retry` is
+# copied from `yadgarhq/chart@v0.3.15`'s `example/operators-application.yaml`.
+# scripts/tests/test_operator_applications.py pins it, those two exceptions
+# included. Root adopts the live Application by name, keeping its uid. No
+# `Prune=false` here: root's apply removes the one E1 left on the live object.
 #
 # cert-manager — here to sign the development TLS certificate the gateway serves,
 # and nothing else yet.

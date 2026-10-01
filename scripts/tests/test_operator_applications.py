@@ -108,22 +108,21 @@ def normalize_for_pin(text: str) -> str | None:
     deploy-era shape (prune present, no retry), or that has anything other
     than the chart's own retry block appended, or that has extra content
     after the retry block, is treated as drift rather than silently accepted.
+
+    Each `automated` literal below must occur EXACTLY ONCE to be acted on. A
+    text carrying it twice is ambiguous about which copy is the real
+    `syncPolicy.automated`, so it is refused (None) rather than resolved by
+    blindly replacing whichever occurrence comes first.
     """
     if not text.endswith(RETRY_BLOCK_SUFFIX):
         return None
     text = text[: -len(RETRY_BLOCK_TEXT)]
-    if "    automated: { selfHeal: true }" in text:
-        return text.replace(
-            "    automated: { selfHeal: true }",
-            "    automated: { prune: true, selfHeal: true }",
-            1,
-        )
-    if "    automated:\n      selfHeal: true\n" in text:
-        return text.replace(
-            "    automated:\n      selfHeal: true\n",
-            "    automated:\n      prune: true\n      selfHeal: true\n",
-            1,
-        )
+    inline = "    automated: { selfHeal: true }"
+    block = "    automated:\n      selfHeal: true\n"
+    if text.count(inline) == 1:
+        return text.replace(inline, "    automated: { prune: true, selfHeal: true }", 1)
+    if text.count(block) == 1:
+        return text.replace(block, "    automated:\n      prune: true\n      selfHeal: true\n", 1)
     return None
 
 
@@ -368,3 +367,33 @@ def test_content_appended_after_retry_reddens(copy: Path) -> None:
     assert text.endswith(RETRY_BLOCK_SUFFIX)
     path.write_text(text + "  ignoreDifferences: []\n")
     assert spec_drift(copy) == ["prometheus"]
+
+
+def test_normalize_for_pin_refuses_a_repeated_automated_literal() -> None:
+    """A text with the flow-style `automated` literal twice must not pick the first match.
+
+    `normalize_for_pin` used to call `text.replace(literal, replacement, 1)` as
+    soon as the literal appeared `in text` at all, silently acting on whichever
+    copy comes first. A text carrying it twice is ambiguous and must come back
+    `None` (drift) rather than a guess.
+    """
+    text = (
+        "spec:\n"
+        "  syncPolicy:\n"
+        "    automated: { selfHeal: true }\n"
+        "    automated: { selfHeal: true }\n"  # deliberately ambiguous duplicate
+    ) + RETRY_BLOCK_TEXT
+    assert normalize_for_pin(text) is None
+
+
+def test_normalize_for_pin_refuses_a_repeated_block_style_literal() -> None:
+    """Same fail-closed requirement for the block-style `automated` form."""
+    text = (
+        "spec:\n"
+        "  syncPolicy:\n"
+        "    automated:\n"
+        "      selfHeal: true\n"
+        "    automated:\n"
+        "      selfHeal: true\n"  # deliberately ambiguous duplicate
+    ) + RETRY_BLOCK_TEXT
+    assert normalize_for_pin(text) is None
