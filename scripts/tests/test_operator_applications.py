@@ -1,13 +1,15 @@
-"""The six operator Applications root adopts at E3 are the ones `deploy` released.
+"""The operator Applications root adopted at E3 are the ones `deploy` released.
 
-E3 OF THE OPERATORS HANDOVER (ADR-0824). The six operator Applications —
+E3 OF THE OPERATORS HANDOVER (ADR-0824). Six operator Applications —
 `cert-manager`, `keda`, `mariadb-operator`, `mariadb-operator-crds`,
 `envoy-gateway` and `prometheus` — were declared in `yadgarhq/deploy`'s
 `infra/`. E1 (`deploy#76`) put `argocd.argoproj.io/sync-options: Prune=false`
 on each live object, and E2 deleted the six files, so the live objects run
 unowned. This repository's `root` Application now declares them under
 `applications/`. Root adopts each live object by its identity — group, kind,
-namespace and name — so the uid does not change.
+namespace and name — so the uid does not change. D7.1 later deleted
+`mariadb-operator-crds` (check 9), so five remain: `cert-manager`, `keda`,
+`mariadb-operator`, `envoy-gateway` and `prometheus`.
 
 WHAT IS ASSERTED, and each has a red case below:
 
@@ -40,6 +42,13 @@ WHAT IS ASSERTED, and each has a red case below:
      pinned unchanged, so the release instance label and every immutable
      selector stay as they are. PLATFORM_SOURCED holds one row per operator.
      Checks 2 to 7 still cover all four.
+  9. D7.1 OF THE OPERATORS HANDOVER (ADR-0824): `mariadb-operator-crds` is
+     retired. No file under `applications/` or `applicationsets/` is named for
+     it, and no manifest there declares an Application with its name. Its 12
+     CRDs stay in the cluster, untracked, until D7.3 swaps `mariadb-operator` to
+     `platform`, which renders them. A revived Application would apply the same
+     CRDs beside that one, as the same server-side apply manager. RETIRED holds
+     the name.
 """
 
 from __future__ import annotations
@@ -68,10 +77,19 @@ SOURCE = "yadgarhq/deploy@fa7ccb529fd12911a7ccca1dc53f10490063f446"
 # cert-manager f402c7c04defb9ba09118f243357d16dc2df91eff35ea47f5e52dd0b19d579cb,
 # envoy-gateway 1d8b30ab563c10c623bd0e0bebd502273c8a8fab833d9c58661b82d6aa0059b4 and
 # prometheus c03d2900b2f5f23f76e20c4252f98243984aeb0dfd156aa43913949bb5204a79.
+# `mariadb-operator-crds` left it at D7.1 (ADR-0824), when its file was deleted
+# (RETIRED below). Its deploy-era hash was
+# bd68b4915105319e1fdf3dcc10f7d6651955cf9b546db944ce4172be9d90536e.
 PINNED_SPECS: dict[str, str] = {
     "mariadb-operator": "485a08bcc620570e35ea6c216872e0d64c757d47ea43cc6479de9edf407c65be",
-    "mariadb-operator-crds": "bd68b4915105319e1fdf3dcc10f7d6651955cf9b546db944ce4172be9d90536e",
 }
+
+# D7.1 OF THE OPERATORS HANDOVER (ADR-0824). Applications this repository
+# deleted and must not declare again. `mariadb-operator-crds` managed the 12
+# `k8s.mariadb.com` CRDs. After D7.3 `mariadb-operator` renders them from
+# `platform`, so a revived copy would apply the same CRDs from a second
+# Application.
+RETIRED: tuple[str, ...] = ("mariadb-operator-crds",)
 
 SYNC_OPTIONS = "argocd.argoproj.io/sync-options"
 PRUNE_FALSE = "Prune=false"
@@ -360,15 +378,21 @@ def outside_root(tree: Path) -> list[str]:
 
 
 def manifests_with_prune_false(tree: Path) -> tuple[list[str], int]:
-    """Every `applications/*.yaml` carrying `Prune=false`, and how many files were read."""
+    """Every `applications/**/*.yaml` carrying `Prune=false`, and how many files were read.
+
+    Recursive, because root sets `directory.recurse` and Argo's include glob
+    lets `*` cross `/`: root applies a nested file too. Each hit is named by its
+    path relative to `applications/`.
+    """
     found, read = [], 0
-    for path in sorted((tree / "applications").glob("*.yaml")):
+    applications = tree / "applications"
+    for path in sorted(applications.rglob("*.yaml")):
         read += 1
         for document in yaml.safe_load_all(path.read_text()):
             annotations = ((document or {}).get("metadata") or {}).get("annotations") or {}
             options = [o.strip() for o in str(annotations.get(SYNC_OPTIONS, "")).split(",")]
             if PRUNE_FALSE in options:
-                found.append(path.name)
+                found.append(path.relative_to(applications).as_posix())
     return found, read
 
 
@@ -461,6 +485,27 @@ def platform_errors(tree: Path) -> list[str]:
     return list(dict.fromkeys(name for name, _ in platform_clause_errors(tree)))
 
 
+def retired_present(tree: Path) -> list[str]:
+    """Every RETIRED name that root's directories still carry, as a file name or as an Application name.
+
+    Both, because a revival need not keep the old file name: an Application
+    `mariadb-operator-crds` declared in `applications/mariadb-crds.yaml` is the
+    same live object. Recursive, because root sets `directory.recurse` and
+    Argo's include glob lets `*` cross `/`, so root selects a nested file too.
+    """
+    found = set()
+    for directory in ("applications", "applicationsets"):
+        for path in sorted((tree / directory).rglob("*.yaml")):
+            if path.stem in RETIRED:
+                found.add(path.stem)
+            for document in yaml.safe_load_all(path.read_text()):
+                document = document or {}
+                name = (document.get("metadata") or {}).get("name")
+                if document.get("kind") == "Application" and name in RETIRED:
+                    found.add(name)
+    return sorted(found)
+
+
 @pytest.fixture
 def copy(tmp_path: Path) -> Path:
     """A writable copy of the two directories these gates read."""
@@ -481,6 +526,11 @@ def test_every_platform_sourced_application_is_the_d4_shape() -> None:
         f" {PLATFORM_VERSION} from {PLATFORM_SOURCE}"
     )
     assert platform_errors(REPOSITORY) == []
+
+
+def test_no_retired_application_is_declared() -> None:
+    print(f"[D7.1] {len(RETIRED)} retired Application(s) ({', '.join(RETIRED)}) must be absent")
+    assert retired_present(REPOSITORY) == []
 
 
 def test_every_file_is_the_application_root_adopts_by_name() -> None:
@@ -524,6 +574,40 @@ def test_a_missing_file_reddens(copy: Path) -> None:
     assert spec_drift(copy) == ["mariadb-operator"]
 
 
+RETIRED_APPLICATION = """apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: mariadb-operator-crds
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://helm.mariadb.com/mariadb-operator
+    chart: mariadb-operator-crds
+    targetRevision: 26.6.0
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: mariadb-system
+"""
+
+
+def test_a_retired_application_in_a_subdirectory_reddens(copy: Path) -> None:
+    """Root recurses, and Argo's include glob lets `*` cross `/`, so root selects a nested file."""
+    (copy / "applications" / "sub").mkdir()
+    (copy / "applications" / "sub" / "x.yaml").write_text(RETIRED_APPLICATION)
+    assert retired_present(copy) == ["mariadb-operator-crds"]
+
+
+def test_a_restored_retired_file_reddens(copy: Path) -> None:
+    (copy / "applications" / "mariadb-operator-crds.yaml").write_text(RETIRED_APPLICATION)
+    assert retired_present(copy) == ["mariadb-operator-crds"]
+
+
+def test_a_retired_application_under_another_file_name_reddens(copy: Path) -> None:
+    (copy / "applications" / "mariadb-crds.yaml").write_text(RETIRED_APPLICATION)
+    assert retired_present(copy) == ["mariadb-operator-crds"]
+
+
 def test_a_renamed_application_reddens(copy: Path) -> None:
     path = copy / "applications" / "envoy-gateway.yaml"
     text = path.read_text()
@@ -548,6 +632,19 @@ def test_prune_false_on_one_copy_reddens(copy: Path) -> None:
     path.write_text(text.replace(anchor, anchor + "    argocd.argoproj.io/sync-options: Prune=false\n", 1))
     found, _ = manifests_with_prune_false(copy)
     assert found == ["cert-manager.yaml"]
+
+
+def test_prune_false_in_a_subdirectory_reddens(copy: Path) -> None:
+    """Root recurses, and Argo's include glob lets `*` cross `/`, so root applies a nested file."""
+    text = (copy / "applications" / "cert-manager.yaml").read_text()
+    anchor = '    argocd.argoproj.io/sync-wave: "-10"\n'
+    assert anchor in text
+    (copy / "applications" / "sub").mkdir()
+    (copy / "applications" / "sub" / "x.yaml").write_text(
+        text.replace(anchor, anchor + "    argocd.argoproj.io/sync-options: Prune=false\n", 1)
+    )
+    found, _ = manifests_with_prune_false(copy)
+    assert found == ["sub/x.yaml"]
 
 
 def test_a_finalizer_reddens(copy: Path) -> None:
