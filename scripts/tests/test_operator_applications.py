@@ -121,14 +121,19 @@ PLATFORM_SYNC_POLICY: dict = {
 }
 
 # One row per Application that sources `platform` (D4, ADR-0824). The next swap
-# adds a row; `platform_errors` reads nothing else.
+# adds a row. `platform_clause_errors` reads these rows, OPERATOR_KEYS and
+# PLATFORM_VERSION, and nothing else.
 #
 #   toggle     the `operators.<toggle>.create` key that is true. Every other
 #              key in OPERATOR_KEYS is written false.
 #   values     the `platform` subchart key that carries deploy's values over.
 #   carried    exactly what sits under `values`: deploy's copy, moved under
-#              that key. Measured 2026-10-01 for each row: without it the
-#              render's pod templates change and the Deployments roll.
+#              that key. Measured 2026-10-01: without a row's sizing blocks
+#              the render's pod templates change and the Deployments roll.
+#              cert-manager's `crds` block changes nothing in today's render,
+#              because `platform` and cert-manager v1.21.1 already default to
+#              `enabled: true` and `keep: true`. It is pinned as a defence
+#              against a later change to either default.
 #   unchanged  every field of `spec` other than `source`, as deploy's copy
 #              declared it with S0's two changes. A change here is a change to
 #              the release.
@@ -153,8 +158,9 @@ PLATFORM_SOURCED: dict[str, dict] = {
         "toggle": "certManager",
         "values": "cert-manager",
         # `crds.enabled` and `crds.keep`, and the development sizing (D55),
-        # deploy's copy. `keep` is what stops an uninstall deleting every
-        # Certificate in the cluster with the CRDs.
+        # deploy's copy. `keep` renders `helm.sh/resource-policy: keep` on the
+        # six CRDs, which stops a helm uninstall deleting them and every
+        # Certificate with them. Both `crds` keys equal today's defaults.
         "carried": {
             "crds": {"enabled": True, "keep": True},
             "resources": {"requests": {"cpu": "10m", "memory": "64Mi"}},
@@ -629,10 +635,16 @@ def cert_manager_values(tree: Path) -> tuple[Path, dict]:
     return path, document
 
 
-def test_dropped_cert_manager_crds_keep_reddens(copy: Path) -> None:
-    """Without `crds.keep`, an uninstall deletes the CRDs and every Certificate with them."""
+def test_cert_manager_crds_keep_false_reddens(copy: Path) -> None:
+    """`crds.keep: false` takes `helm.sh/resource-policy: keep` off all six CRDs.
+
+    Measured 2026-10-01: that is the only change in the render. Without the
+    annotation a helm uninstall deletes the CRDs and every Certificate with
+    them. Dropping the key changes nothing today, because cert-manager v1.21.1
+    defaults it to true, so the mutation writes false.
+    """
     path, document = cert_manager_values(copy)
-    del document["spec"]["source"]["helm"]["valuesObject"]["cert-manager"]["crds"]["keep"]
+    document["spec"]["source"]["helm"]["valuesObject"]["cert-manager"]["crds"]["keep"] = False
     path.write_text(yaml.safe_dump(document))
     assert platform_clause_errors(copy) == [("cert-manager", "carried")]
 
