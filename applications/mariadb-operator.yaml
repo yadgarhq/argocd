@@ -95,10 +95,13 @@ metadata:
     # ONE WAVE, NOT TWO. The CRDs used to sync at -12 from their own
     # Application, because landing them at the same wave as the controller made
     # it crash-loop with an error naming an indexer rather than a missing CRD.
-    # Since D7.3 they render in this Application, and within one Application
-    # Argo applies CustomResourceDefinitions before other kinds in the same
-    # wave. That ordering is REASONED from Argo's kind order, not measured here:
-    # the CRDs already exist live, so this sync does not exercise a cold install.
+    # Since D7.3 they render in this Application, and within one wave Argo
+    # applies CustomResourceDefinitions before the RBAC and workload kinds this
+    # chart renders (ClusterRole, Deployment, ValidatingWebhookConfiguration).
+    # Namespace, ServiceAccount and ConfigMap still come before them, and none
+    # of those needs a mariadb CRD. That ordering is REASONED from Argo's kind
+    # order, not measured here: the CRDs already exist live, so this sync does
+    # not exercise a cold install.
     argocd.argoproj.io/sync-wave: "-10"
 spec:
   project: default
@@ -131,9 +134,11 @@ spec:
       selfHeal: true
     syncOptions:
       - CreateNamespace=true
-      # The CRDs are large enough to exceed the last-applied-configuration
-      # annotation limit, which is a kubectl apply failure rather than a
-      # mariadb-operator one.
+      # SSA keeps the CRDs' existing `argocd-controller/Apply` field
+      # ownership. It is NOT forced by size at 26.6.0: the largest CRD,
+      # `mariadbs.k8s.mariadb.com`, is 204,646 B as compact JSON (measured
+      # 2026-10-01), under the 262,144 B annotation limit that client-side
+      # apply's last-applied-configuration hits. The headroom is about 57 KB.
       - ServerSideApply=true
     retry:
       limit: 6
