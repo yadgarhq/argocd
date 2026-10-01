@@ -1,13 +1,15 @@
-"""The six operator Applications root adopts at E3 are the ones `deploy` released.
+"""The operator Applications root adopted at E3 are the ones `deploy` released.
 
-E3 OF THE OPERATORS HANDOVER (ADR-0824). The six operator Applications —
+E3 OF THE OPERATORS HANDOVER (ADR-0824). Six operator Applications —
 `cert-manager`, `keda`, `mariadb-operator`, `mariadb-operator-crds`,
 `envoy-gateway` and `prometheus` — were declared in `yadgarhq/deploy`'s
 `infra/`. E1 (`deploy#76`) put `argocd.argoproj.io/sync-options: Prune=false`
 on each live object, and E2 deleted the six files, so the live objects run
 unowned. This repository's `root` Application now declares them under
 `applications/`. Root adopts each live object by its identity — group, kind,
-namespace and name — so the uid does not change.
+namespace and name — so the uid does not change. D7.1 later deleted
+`mariadb-operator-crds` (check 9), so five remain: `cert-manager`, `keda`,
+`mariadb-operator`, `envoy-gateway` and `prometheus`.
 
 WHAT IS ASSERTED, and each has a red case below:
 
@@ -376,15 +378,21 @@ def outside_root(tree: Path) -> list[str]:
 
 
 def manifests_with_prune_false(tree: Path) -> tuple[list[str], int]:
-    """Every `applications/*.yaml` carrying `Prune=false`, and how many files were read."""
+    """Every `applications/**/*.yaml` carrying `Prune=false`, and how many files were read.
+
+    Recursive, because root sets `directory.recurse` and Argo's include glob
+    lets `*` cross `/`: root applies a nested file too. Each hit is named by its
+    path relative to `applications/`.
+    """
     found, read = [], 0
-    for path in sorted((tree / "applications").glob("*.yaml")):
+    applications = tree / "applications"
+    for path in sorted(applications.rglob("*.yaml")):
         read += 1
         for document in yaml.safe_load_all(path.read_text()):
             annotations = ((document or {}).get("metadata") or {}).get("annotations") or {}
             options = [o.strip() for o in str(annotations.get(SYNC_OPTIONS, "")).split(",")]
             if PRUNE_FALSE in options:
-                found.append(path.name)
+                found.append(path.relative_to(applications).as_posix())
     return found, read
 
 
@@ -482,11 +490,12 @@ def retired_present(tree: Path) -> list[str]:
 
     Both, because a revival need not keep the old file name: an Application
     `mariadb-operator-crds` declared in `applications/mariadb-crds.yaml` is the
-    same live object.
+    same live object. Recursive, because root sets `directory.recurse` and
+    Argo's include glob lets `*` cross `/`, so root selects a nested file too.
     """
     found = set()
     for directory in ("applications", "applicationsets"):
-        for path in sorted((tree / directory).glob("*.yaml")):
+        for path in sorted((tree / directory).rglob("*.yaml")):
             if path.stem in RETIRED:
                 found.add(path.stem)
             for document in yaml.safe_load_all(path.read_text()):
@@ -582,6 +591,13 @@ spec:
 """
 
 
+def test_a_retired_application_in_a_subdirectory_reddens(copy: Path) -> None:
+    """Root recurses, and Argo's include glob lets `*` cross `/`, so root selects a nested file."""
+    (copy / "applications" / "sub").mkdir()
+    (copy / "applications" / "sub" / "x.yaml").write_text(RETIRED_APPLICATION)
+    assert retired_present(copy) == ["mariadb-operator-crds"]
+
+
 def test_a_restored_retired_file_reddens(copy: Path) -> None:
     (copy / "applications" / "mariadb-operator-crds.yaml").write_text(RETIRED_APPLICATION)
     assert retired_present(copy) == ["mariadb-operator-crds"]
@@ -616,6 +632,19 @@ def test_prune_false_on_one_copy_reddens(copy: Path) -> None:
     path.write_text(text.replace(anchor, anchor + "    argocd.argoproj.io/sync-options: Prune=false\n", 1))
     found, _ = manifests_with_prune_false(copy)
     assert found == ["cert-manager.yaml"]
+
+
+def test_prune_false_in_a_subdirectory_reddens(copy: Path) -> None:
+    """Root recurses, and Argo's include glob lets `*` cross `/`, so root applies a nested file."""
+    text = (copy / "applications" / "cert-manager.yaml").read_text()
+    anchor = '    argocd.argoproj.io/sync-wave: "-10"\n'
+    assert anchor in text
+    (copy / "applications" / "sub").mkdir()
+    (copy / "applications" / "sub" / "x.yaml").write_text(
+        text.replace(anchor, anchor + "    argocd.argoproj.io/sync-options: Prune=false\n", 1)
+    )
+    found, _ = manifests_with_prune_false(copy)
+    assert found == ["sub/x.yaml"]
 
 
 def test_a_finalizer_reddens(copy: Path) -> None:

@@ -37,11 +37,11 @@ exception, because it has nowhere else to live.
 **The operators are the second exception, and the first step of retiring
 `deploy`.** ADR-0803 moves what this organisation still needs from
 `yadgarhq/deploy` to here, and ADR-0824 keeps one Application per operator:
-`cert-manager`, `keda`, `mariadb-operator`, `mariadb-operator-crds`,
-`envoy-gateway` and `prometheus`. E2 deleted them from `deploy`'s `infra/`.
-E3 declares the same specs under `applications/`, and `root` adopts each live
-object by name, so every uid is kept. `scripts/tests/test_operator_applications.py`
-pins each spec to `deploy`'s last copy. D7.1 deleted `mariadb-operator-crds`.
+`cert-manager`, `keda`, `mariadb-operator`, `envoy-gateway` and `prometheus`.
+E2 deleted them, and `mariadb-operator-crds`, from `deploy`'s `infra/`. E3
+declared the same six specs under `applications/`, and `root` adopted each live
+object by name, so every uid was kept. `scripts/tests/test_operator_applications.py`
+pins each spec. D7.1 deleted `mariadb-operator-crds`.
 Its 12 CRDs stay in the cluster, untracked, until D7.3 sources
 `mariadb-operator` from `platform`, which renders them. The same test holds the
 deleted Application absent.
