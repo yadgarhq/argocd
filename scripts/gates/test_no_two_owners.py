@@ -2088,3 +2088,24 @@ def test_a_pinned_nodeport_on_the_probe_envoyproxy_reddens(working_tree: Path) -
     container["args"][0] = pinned
     problems = probe_violations(rendered)
     assert any("pins a nodePort" in p for p in problems), problems
+
+
+def test_a_cluster_scoped_copy_from_another_namespace_reddens(tmp_path: Path) -> None:
+    """Red case for the CLUSTER-SCOPED admission, which the port's mutation check found idle.
+
+    Every other red case above restores a copy under an Application whose
+    destination is `yadgar`, so a gate that dropped the cluster-scoped half of
+    its admission still passed them all. `estate-front` installs into
+    `estate-front`: a `GatewayClass/eg` in its directory is admitted ONLY
+    because a GatewayClass is cluster-scoped, and the parent renders `eg`.
+    """
+    tree = a_copy_of_the_tree(tmp_path)
+    (tree / "manifests" / "estate-front" / "gatewayclass.yaml").write_text(
+        "apiVersion: gateway.networking.k8s.io/v1\nkind: GatewayClass\nmetadata:\n  name: eg\n"
+    )
+    failures, examined = two_owners(tree)
+    assert {failure.tuple for failure in failures} == {
+        ("gateway.networking.k8s.io", "GatewayClass", "eg"),
+    }, render(failures, examined)
+    assert all("estate-front" in failure.d_owner for failure in failures), render(failures, examined)
+    assert examined == EXPECTED_D_TUPLES + 1, render(failures, examined)

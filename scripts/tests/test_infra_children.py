@@ -532,3 +532,19 @@ def test_a_runner_pointed_at_another_controller_reddens(copy: Path) -> None:
         lambda d: d["spec"]["source"]["helm"]["valuesObject"]["controllerServiceAccount"].update(namespace="arc"),
     )
     assert release_coupling_errors(copy) == ["estate-front-runner"]
+
+
+def test_sources_beside_source_reddens(copy: Path) -> None:
+    """Argo reads `sources` when both are set, so a `sources` left beside `source` wins."""
+    mutate(
+        copy,
+        "yadgar",
+        lambda d: d["spec"].update(sources=[{"repoURL": THIS_REPOSITORY, "targetRevision": "main", "ref": "self"}]),
+    )
+    assert child_clause_errors(copy) == [("yadgar", "source")]
+
+
+def test_a_release_name_on_the_runner_reddens(copy: Path) -> None:
+    """A `releaseName` moves every object the chart names after its release."""
+    mutate(copy, "estate-front-runner", lambda d: d["spec"]["source"]["helm"].update(releaseName="runner"))
+    assert child_clause_errors(copy) == [("estate-front-runner", "source")]
