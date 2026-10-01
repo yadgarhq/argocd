@@ -41,10 +41,11 @@ exception, because it has nowhere else to live.
 E2 deleted them, and `mariadb-operator-crds`, from `deploy`'s `infra/`. E3
 declared the same six specs under `applications/`, and `root` adopted each live
 object by name, so every uid was kept. `scripts/tests/test_operator_applications.py`
-pins each spec. D7.1 deleted `mariadb-operator-crds`.
-Its 12 CRDs stay in the cluster, untracked, until D7.3 sources
-`mariadb-operator` from `platform`, which renders them. The same test holds the
-deleted Application absent.
+pinned each spec. D4 and D7.3 moved all five to the `platform` chart, and the
+same test now pins that shape. D7.1 deleted `mariadb-operator-crds`. Its 12
+CRDs stayed in the cluster, untracked, until D7.3 sourced `mariadb-operator`
+from `platform`, which renders them. The same test holds the deleted
+Application absent.
 | `applications/argocd.yaml` | Argo managing Argo — what makes `install/values.yaml` actually apply |
 
 ## Argo manages Argo

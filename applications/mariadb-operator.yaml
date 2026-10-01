@@ -1,10 +1,65 @@
-# ADOPTED FROM yadgarhq/deploy AT E3 OF THE OPERATORS HANDOVER (ADR-0824).
-# `spec` equals deploy's infra/mariadb-operator.yaml at fa7ccb5, except S0 of
-# the operators handover (ADR-0824): `automated.prune` is omitted, and `retry`
-# is copied from `yadgarhq/chart@v0.3.15`'s `example/operators-application.yaml`.
-# scripts/tests/test_operator_applications.py pins it, those two exceptions
-# included. Root adopts the live Application by name, keeping its uid. No
-# `Prune=false` here: root's apply removes the one E1 left on the live object.
+# ADOPTED FROM yadgarhq/deploy AT E3 OF THE OPERATORS HANDOVER (ADR-0824), and
+# SOURCED FROM yadgarhq's `platform` CHART SINCE D7.3. Root adopts the live
+# Application by name, keeping its uid.
+#
+# WHAT D7.3 CHANGED, AND ONLY THIS: `source`. It was the operator's own chart,
+# `mariadb-operator` 26.6.0 from helm.mariadb.com. It is now `platform` at the
+# version `yadgarhq/chart@v0.3.15` embeds, with
+# `operators.mariadbOperator.create` true and every other operator explicitly
+# false. `platform` 0.1.21 carries the same `mariadb-operator` 26.6.0 as a
+# subchart, so the image tags and the chart label do not move.
+#
+# THE 12 CRDs NOW RIDE WITH THE OPERATOR. They used to come from a second
+# Application, `mariadb-operator-crds` (chart `mariadb-operator-crds` 26.6.0).
+# D7.1 deleted that Application and left the CRDs live and untracked.
+# `platform` vendors the same 12 as its own templates behind
+# `operators.mariadbOperator.create`, and keeps the subchart's own
+# `crds.enabled` false, so this one release renders each CRD once.
+#
+# WHAT D7.3 KEPT, so that the handover adopts in place: the Application name,
+# the destination namespace `mariadb-system`, `syncPolicy` (ServerSideApply
+# included), and no `releaseName`. Argo uses the Application name as the helm
+# release name, so the release stays `mariadb-operator`,
+# `app.kubernetes.io/instance` stays `mariadb-operator`, and no immutable
+# Deployment selector changes.
+#
+# NO SUBCHART VALUES. deploy's copy set none, so the values hold `operators`
+# alone. EACH OPERATOR KEY IS WRITTEN, NOT LEFT UNSET: `platform` resolves an
+# unset `operators.<op>.create` through `operators.create`, so an unset key is a
+# second place that decides what this Application installs.
+#
+# `syncPolicy` is S0 of the operators handover (ADR-0824): `automated.prune` is
+# omitted, and `retry` is copied from `yadgarhq/chart@v0.3.15`'s
+# `example/operators-application.yaml`. No `Prune=false` here: root's apply
+# removes the one E1 left on the live object.
+#
+# WHAT IS GATED, AND WHAT IS ONLY MEASURED.
+# scripts/tests/test_operator_applications.py pins this Application's shape:
+# the source, the platform version, every operator key, the absence of any
+# other values key, the absent `releaseName`, and every field outside `source`.
+# It does not render anything. The following are a 2026-10-01 measurement,
+# recorded in the pull request that made this change, and no check re-runs
+# them:
+# - THE 32-OBJECT EQUIVALENCE. Rendered as release `mariadb-operator` in
+#   namespace `mariadb-system`, `platform` gives 32 objects: the 20 that
+#   `mariadb-operator` 26.6.0 rendered, byte-identical, and the 12 CRDs that
+#   `mariadb-operator-crds` 26.6.0 rendered. The CRDs have an equal `spec` and
+#   gain two annotations, `helm.sh/resource-policy: keep` and
+#   `argocd.argoproj.io/sync-options: Prune=false`. Nothing else differs. The
+#   three Deployments' selectors and pod templates are equal, so nothing rolls.
+#   Neither source renders a helm hook, and the render holds no custom resource
+#   of a `k8s.mariadb.com` kind.
+# - THE CRD ADOPTION. The 12 live CRDs are already managed by server-side apply
+#   as `argocd-controller`, the manager this Application also applies as, and
+#   the new render is a superset of the old one. So this sync adds the two
+#   annotations and removes no field. The CRDs carry no
+#   `argocd.argoproj.io/tracking-id`, and this sync is not expected to add one:
+#   none of the 52 CRDs on this cluster carries a tracking-id, KEDA's,
+#   cert-manager's and Envoy Gateway's included, although Argo applies them.
+#   That is OBSERVED. Its cause is not established.
+# - THE KEDA PRECEDENT. D4's swap of `keda` to `platform` added the same two
+#   annotations to KEDA's six CRDs. Their uid and generation (1) did not change,
+#   read before and after, and `keda`'s `status.resources` lists all six.
 #
 # THE OPERATOR IS CLUSTER INFRASTRUCTURE, NOT A YADGAR RESOURCE, and so it lives
 # in its own namespace while the MariaDB instances it creates land in `yadgar`.
@@ -29,25 +84,57 @@
 # walks into: a chart generating a password with a `lookup` guard regenerates it
 # on every Argo sync, because `lookup` returns empty under template-only
 # rendering.
+# Since D7.3 Argo fetches the chart inside `platform` from ghcr.io/yadgarhq/charts,
+# not from helm.mariadb.com. The images are unchanged.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: mariadb-operator
   namespace: argocd
   annotations:
+    # ONE WAVE, NOT TWO. The CRDs used to sync at -12 from their own
+    # Application, because landing them at the same wave as the controller made
+    # it crash-loop with an error naming an indexer rather than a missing CRD.
+    # Since D7.3 they render in this Application, and within one Application
+    # Argo applies CustomResourceDefinitions before other kinds in the same
+    # wave. That ordering is REASONED from Argo's kind order, not measured here:
+    # the CRDs already exist live, so this sync does not exercise a cold install.
     argocd.argoproj.io/sync-wave: "-10"
 spec:
   project: default
   source:
-    repoURL: https://helm.mariadb.com/mariadb-operator
-    chart: mariadb-operator
-    targetRevision: 26.6.0
+    # SCHEME-LESS `repoURL` WITH `chart:`, the same form as the chart's own
+    # `example/operators-application.yaml`.
+    repoURL: ghcr.io/yadgarhq/charts
+    chart: platform
+    targetRevision: 0.1.21
+    helm:
+      valuesObject:
+        operators:
+          mariadbOperator:
+            create: true
+          argoCd:
+            create: false
+          certManager:
+            create: false
+          envoyGateway:
+            create: false
+          keda:
+            create: false
+          prometheus:
+            create: false
   destination:
     server: https://kubernetes.default.svc
     namespace: mariadb-system
   syncPolicy:
-    automated: { selfHeal: true }
-    syncOptions: [CreateNamespace=true, ServerSideApply=true]
+    automated:
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      # The CRDs are large enough to exceed the last-applied-configuration
+      # annotation limit, which is a kubectl apply failure rather than a
+      # mariadb-operator one.
+      - ServerSideApply=true
     retry:
       limit: 6
       backoff:

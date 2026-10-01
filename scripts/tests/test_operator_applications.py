@@ -9,17 +9,17 @@ unowned. This repository's `root` Application now declares them under
 `applications/`. Root adopts each live object by its identity — group, kind,
 namespace and name — so the uid does not change. D7.1 later deleted
 `mariadb-operator-crds` (check 9), so five remain: `cert-manager`, `keda`,
-`mariadb-operator`, `envoy-gateway` and `prometheus`.
+`mariadb-operator`, `envoy-gateway` and `prometheus`. Since D7.3 all five
+source `platform` (check 8).
 
 WHAT IS ASSERTED, and each has a red case below:
 
-  1. Each `spec` is identical to deploy's last copy, with two named
-     exceptions (S0 of the operators handover, ADR-0824): `automated.prune`
-     is absent, and `retry` equals the chart's own example at the tag named
-     by CHART_EXAMPLE_SOURCE below. Everything else is hashed and pinned to
-     `yadgarhq/deploy` at `fa7ccb5`, the E1 merge and the last commit that
-     declared them. A changed spec is a changed operator, which a handover
-     must not carry.
+  1. No `spec` is pinned to deploy's copy any more. E3 hashed each spec
+     against `yadgarhq/deploy` at `fa7ccb5`, the E1 merge and the last commit
+     that declared them. D4 moved four Applications to check 8, D7.1 deleted
+     a fifth, and D7.3 moved the last, `mariadb-operator`, to check 8. So
+     PINNED_SPECS is empty, and the test asserts that it is empty rather than
+     iterating it: a gate over an empty set passes while checking nothing.
   2. Each file is `argoproj.io/Application`, named `<name>`, in namespace
      `argocd`. A different name or namespace is a new object, not an adoption.
   3. Each file is inside root's own source: `projects/root.yaml`'s `path` and
@@ -34,21 +34,24 @@ WHAT IS ASSERTED, and each has a red case below:
   7. Each `retry` block has a finite, positive `limit` and matches the
      chart's own example byte-for-byte once parsed.
   8. D4 OF THE OPERATORS HANDOVER (ADR-0824): `keda`, `cert-manager`,
-     `envoy-gateway` and `prometheus` no longer pin to deploy's copy. Each sources `yadgarhq`'s `platform` chart at
-     the version embedded at `yadgarhq/chart` v0.3.15, with its own
-     `operators.<op>.create` true and every other operator, Argo CD included,
-     explicitly false. Deploy's values are carried over under the operator's
-     subchart key. Each name, destination, `syncPolicy` and release name is
-     pinned unchanged, so the release instance label and every immutable
-     selector stay as they are. PLATFORM_SOURCED holds one row per operator.
-     Checks 2 to 7 still cover all four.
+     `envoy-gateway` and `prometheus` no longer pin to deploy's copy, and
+     since D7.3 neither does `mariadb-operator`. Each sources `yadgarhq`'s
+     `platform` chart at the version embedded at `yadgarhq/chart` v0.3.15,
+     with its own `operators.<op>.create` true and every other operator, Argo
+     CD included, explicitly false. Deploy's values, where it had any, are
+     carried over under the operator's subchart key; `mariadb-operator` had
+     none, so its values hold `operators` alone. Each name, destination,
+     `syncPolicy` and release name is pinned unchanged, so the release
+     instance label and every immutable selector stay as they are.
+     PLATFORM_SOURCED holds one row per operator. Checks 2 to 7 cover all
+     five.
   9. D7.1 OF THE OPERATORS HANDOVER (ADR-0824): `mariadb-operator-crds` is
      retired. No file under `applications/` or `applicationsets/` is named for
      it, and no manifest there declares an Application with its name. Its 12
-     CRDs stay in the cluster, untracked, until D7.3 swaps `mariadb-operator` to
-     `platform`, which renders them. A revived Application would apply the same
-     CRDs beside that one, as the same server-side apply manager. RETIRED holds
-     the name.
+     CRDs stayed in the cluster, untracked, until D7.3 swapped
+     `mariadb-operator` to `platform`, which renders them. A revived
+     Application would apply the same CRDs beside that one, as the same
+     server-side apply manager. RETIRED holds the name.
 """
 
 from __future__ import annotations
@@ -67,8 +70,10 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 ROOT = REPOSITORY / "projects" / "root.yaml"
 APPLICATIONS = REPOSITORY / "applications"
 
-# sha256 of each file's text from the `spec:` line to the end, taken from
-# `git -C deploy show fa7ccb5:infra/<name>.yaml | sed -n '/^spec:/,$p' | sha256sum`.
+# E3 pinned each spec to the sha256 of its file's text from the `spec:` line
+# to the end, taken from
+# `git -C deploy show fa7ccb5:infra/<name>.yaml | sed -n '/^spec:/,$p' | sha256sum`,
+# after undoing S0's two `syncPolicy` changes.
 SOURCE = "yadgarhq/deploy@fa7ccb529fd12911a7ccca1dc53f10490063f446"
 # `keda`, `cert-manager`, `envoy-gateway` and `prometheus` left this table at
 # D4 (ADR-0824): each now sources `platform`, which PLATFORM_SOURCED below
@@ -80,13 +85,19 @@ SOURCE = "yadgarhq/deploy@fa7ccb529fd12911a7ccca1dc53f10490063f446"
 # `mariadb-operator-crds` left it at D7.1 (ADR-0824), when its file was deleted
 # (RETIRED below). Its deploy-era hash was
 # bd68b4915105319e1fdf3dcc10f7d6651955cf9b546db944ce4172be9d90536e.
-PINNED_SPECS: dict[str, str] = {
-    "mariadb-operator": "485a08bcc620570e35ea6c216872e0d64c757d47ea43cc6479de9edf407c65be",
-}
+# `mariadb-operator` left it at D7.3 (ADR-0824): it now sources `platform`.
+# Its deploy-era hash was
+# 485a08bcc620570e35ea6c216872e0d64c757d47ea43cc6479de9edf407c65be.
+#
+# E3'S PIN ROLE ENDED AT D7.3. The table is empty, and the test asserts that
+# it is empty. The hashing code went with the last row: a hash gate over an
+# empty table passes while checking nothing. A spec that ever needs pinning to
+# deploy's copy again needs that gate restored, not a row added here.
+PINNED_SPECS: dict[str, str] = {}
 
 # D7.1 OF THE OPERATORS HANDOVER (ADR-0824). Applications this repository
 # deleted and must not declare again. `mariadb-operator-crds` managed the 12
-# `k8s.mariadb.com` CRDs. After D7.3 `mariadb-operator` renders them from
+# `k8s.mariadb.com` CRDs. Since D7.3 `mariadb-operator` renders them from
 # `platform`, so a revived copy would apply the same CRDs from a second
 # Application.
 RETIRED: tuple[str, ...] = ("mariadb-operator-crds",)
@@ -107,20 +118,6 @@ EXPECTED_RETRY: dict = {
         "maxDuration": "5m",
     },
 }
-
-# The literal `retry:` block S0 appends at the end of each file (nothing
-# follows it there). Anchored to end-of-file ON PURPOSE: a file is required to
-# end with exactly this text, so anything appended after it, or any deviation
-# inside it, fails the match below rather than being silently discarded.
-RETRY_BLOCK_TEXT = (
-    "    retry:\n"
-    "      limit: 6\n"
-    "      backoff:\n"
-    "        duration: 15s\n"
-    "        factor: 2\n"
-    "        maxDuration: 5m\n"
-)
-RETRY_BLOCK_SUFFIX = "\n" + RETRY_BLOCK_TEXT
 
 # D4 OF THE OPERATORS HANDOVER (ADR-0824). Each Application here sources the
 # `platform` chart with exactly one operator on. The version is the `platform`
@@ -146,7 +143,11 @@ PLATFORM_SYNC_POLICY: dict = {
 #
 #   toggle     the `operators.<toggle>.create` key that is true. Every other
 #              key in OPERATOR_KEYS is written false.
-#   values     the `platform` subchart key that carries deploy's values over.
+#   values     optional. The `platform` subchart key that carries deploy's
+#              values over. A row without it has no deploy values to carry:
+#              its values hold `operators` alone, and `carried` and
+#              `carried-digest` are not evaluated for it, rather than passing
+#              on an empty set. Only `mariadb-operator` has none.
 #   form       optional. The `helm` key that holds the values: `valuesObject`
 #              when absent, or `values`, the YAML string, which is parsed.
 #              Only `prometheus` uses `values`, because its `null` must reach
@@ -155,7 +156,8 @@ PLATFORM_SYNC_POLICY: dict = {
 #   digests    optional. Keys under `values` pinned by the sha256 of their
 #              canonical JSON (`json.dumps(..., sort_keys=True)`) rather than
 #              written out here. `carried` holds every other key.
-#   carried    exactly what sits under `values`, less `digests`: deploy's
+#   carried    required when `values` is set. Exactly what sits under
+#              `values`, less `digests`: deploy's
 #              copy, moved under that key. Measured 2026-10-01: without a row's sizing blocks
 #              the render's pod templates change and the Deployments roll.
 #              cert-manager's `crds` block changes nothing in today's render,
@@ -238,57 +240,26 @@ PLATFORM_SOURCED: dict[str, dict] = {
             "syncPolicy": {**PLATFORM_SYNC_POLICY, "syncOptions": ["CreateNamespace=true"]},
         },
     },
+    # D7.3 (ADR-0824). deploy's copy set no values, so there is nothing to
+    # carry and no `mariadb-operator:` subchart key. `platform` vendors the 12
+    # `k8s.mariadb.com` CRDs as its own templates behind
+    # `operators.mariadbOperator.create`, and sets the subchart's own
+    # `crds.enabled` false. Measured 2026-10-01: with `operators` alone the
+    # render is deploy's 20 objects plus the 12 CRDs, which differ from the
+    # deleted `mariadb-operator-crds` Application's copies only by
+    # `helm.sh/resource-policy: keep` and `argocd.argoproj.io/sync-options:
+    # Prune=false`.
+    "mariadb-operator": {
+        "toggle": "mariadbOperator",
+        "unchanged": {
+            "project": "default",
+            "destination": {"server": "https://kubernetes.default.svc", "namespace": "mariadb-system"},
+            "syncPolicy": PLATFORM_SYNC_POLICY,
+        },
+    },
 }
 
 ADOPTED: tuple[str, ...] = (*PINNED_SPECS, *PLATFORM_SOURCED)
-
-
-def spec_text(path: Path) -> str:
-    """The file's text from the `spec:` line to the end, exactly as stored."""
-    text = path.read_text()
-    match = re.search(r"^spec:\n", text, flags=re.MULTILINE)
-    return text[match.start() :] if match else ""
-
-
-def normalize_for_pin(text: str) -> str | None:
-    """Undo S0's two `syncPolicy` changes (ADR-0824) so the rest still pins to deploy's copy.
-
-    Returns None — a guaranteed mismatch below — unless `text` ends with
-    EXACTLY `RETRY_BLOCK_TEXT` and `automated` carries no `prune` key: S0's
-    shape is required, not merely tolerated, so a file that still has the
-    deploy-era shape (prune present, no retry), or that has anything other
-    than the chart's own retry block appended, or that has extra content
-    after the retry block, is treated as drift rather than silently accepted.
-
-    Each `automated` literal below must occur EXACTLY ONCE to be acted on. A
-    text carrying it twice is ambiguous about which copy is the real
-    `syncPolicy.automated`, so it is refused (None) rather than resolved by
-    blindly replacing whichever occurrence comes first.
-    """
-    if not text.endswith(RETRY_BLOCK_SUFFIX):
-        return None
-    text = text[: -len(RETRY_BLOCK_TEXT)]
-    inline = "    automated: { selfHeal: true }"
-    block = "    automated:\n      selfHeal: true\n"
-    if text.count(inline) == 1:
-        return text.replace(inline, "    automated: { prune: true, selfHeal: true }", 1)
-    if text.count(block) == 1:
-        return text.replace(block, "    automated:\n      prune: true\n      selfHeal: true\n", 1)
-    return None
-
-
-def spec_drift(tree: Path) -> list[str]:
-    """Every pinned name whose file is missing or whose normalized spec hash differs."""
-    drift = []
-    for name, expected in PINNED_SPECS.items():
-        path = tree / "applications" / f"{name}.yaml"
-        if not path.is_file():
-            drift.append(name)
-            continue
-        normalized = normalize_for_pin(spec_text(path))
-        if normalized is None or hashlib.sha256(normalized.encode()).hexdigest() != expected:
-            drift.append(name)
-    return drift
 
 
 def automated_blocks(tree: Path) -> dict[str, dict]:
@@ -438,10 +409,12 @@ def platform_clause_errors(tree: Path) -> list[tuple[str, str]]:
       others-off       every other key in OPERATOR_KEYS is written, as false
       operator-keys    `operators` holds OPERATOR_KEYS and nothing else, so no
                        `operators.create`
-      value-keys       the values hold `operators` and the row's subchart key only
+      value-keys       the values hold `operators` and the row's subchart key
+                       only; `operators` alone for a row without `values`
       carried          the row's subchart key, less `digests`, holds exactly
-                       `carried`
-      carried-digest   each key in the row's `digests` hashes to its value
+                       `carried`. Only for a row with `values`.
+      carried-digest   each key in the row's `digests` hashes to its value.
+                       Only for a row with `values`.
       unchanged        every field of `spec` outside `source` equals `unchanged`
     """
     errors = []
@@ -454,7 +427,8 @@ def platform_clause_errors(tree: Path) -> list[tuple[str, str]]:
         form = row.get("form", "valuesObject")
         values = parsed_values(helm.get(form)) if form == "values" else helm.get(form)
         values = values if isinstance(values, dict) else {}
-        subchart = values.get(row["values"])
+        subchart_key = row.get("values")
+        subchart = values.get(subchart_key) if subchart_key else None
         subchart = subchart if isinstance(subchart, dict) else {}
         digests = row.get("digests", {})
         operators = values.get("operators") or {}
@@ -468,14 +442,16 @@ def platform_clause_errors(tree: Path) -> list[tuple[str, str]]:
             "toggle-on": operators.get(row["toggle"]) == {"create": True},
             "others-off": all(operators.get(key) == {"create": False} for key in OPERATOR_KEYS if key != row["toggle"]),
             "operator-keys": set(operators) == set(OPERATOR_KEYS),
-            "value-keys": set(values) == {"operators", row["values"]},
-            "carried": row["values"] in values
-            and {key: value for key, value in subchart.items() if key not in digests} == row["carried"],
-            "carried-digest": all(
-                key in subchart and canonical_digest(subchart[key]) == digest for key, digest in digests.items()
-            ),
-            "unchanged": rest == row["unchanged"],
+            "value-keys": set(values) == ({"operators", subchart_key} if subchart_key else {"operators"}),
         }
+        if subchart_key:
+            checks["carried"] = subchart_key in values and {
+                key: value for key, value in subchart.items() if key not in digests
+            } == row["carried"]
+            checks["carried-digest"] = all(
+                key in subchart and canonical_digest(subchart[key]) == digest for key, digest in digests.items()
+            )
+        checks["unchanged"] = rest == row["unchanged"]
         errors.extend((name, clause) for clause, passed in checks.items() if not passed)
     return errors
 
@@ -515,9 +491,15 @@ def copy(tmp_path: Path) -> Path:
     return tree
 
 
-def test_every_spec_equals_deploys_last_copy() -> None:
-    print(f"[E3] {len(PINNED_SPECS)} spec(s) compared against {SOURCE}")
-    assert spec_drift(REPOSITORY) == []
+def test_no_spec_is_pinned_to_deploy_any_more() -> None:
+    """E3's pin role ended at D7.3: every adopted Application is platform-sourced.
+
+    Asserted directly, because a gate iterating an empty table passes while
+    checking nothing.
+    """
+    print(f"[E3] {len(PINNED_SPECS)} spec(s) pinned to {SOURCE}; {len(PLATFORM_SOURCED)} platform-sourced")
+    assert PINNED_SPECS == {}
+    assert set(ADOPTED) == {"cert-manager", "keda", "mariadb-operator", "envoy-gateway", "prometheus"}
 
 
 def test_every_platform_sourced_application_is_the_d4_shape() -> None:
@@ -566,12 +548,12 @@ def test_a_changed_spec_reddens(copy: Path) -> None:
     text = path.read_text()
     assert "selfHeal: true" in text
     path.write_text(text.replace("selfHeal: true", "selfHeal: false", 1))
-    assert spec_drift(copy) == ["mariadb-operator"]
+    assert platform_clause_errors(copy) == [("mariadb-operator", "unchanged")]
 
 
 def test_a_missing_file_reddens(copy: Path) -> None:
     (copy / "applications" / "mariadb-operator.yaml").unlink()
-    assert spec_drift(copy) == ["mariadb-operator"]
+    assert platform_errors(copy) == ["mariadb-operator"]
 
 
 RETIRED_APPLICATION = """apiVersion: argoproj.io/v1alpha1
@@ -677,42 +659,12 @@ def test_a_negative_retry_limit_reddens(copy: Path) -> None:
 
 
 def test_content_appended_after_retry_reddens(copy: Path) -> None:
-    """A line appended after the retry block must not vanish from the pinned hash."""
+    """A `spec` key appended after the retry block is a field outside `source`, and `unchanged` names it."""
     path = copy / "applications" / "mariadb-operator.yaml"
     text = path.read_text()
-    assert text.endswith(RETRY_BLOCK_SUFFIX)
+    assert text.endswith("        maxDuration: 5m\n")
     path.write_text(text + "  ignoreDifferences: []\n")
-    assert spec_drift(copy) == ["mariadb-operator"]
-
-
-def test_normalize_for_pin_refuses_a_repeated_automated_literal() -> None:
-    """A text with the flow-style `automated` literal twice must not pick the first match.
-
-    `normalize_for_pin` used to call `text.replace(literal, replacement, 1)` as
-    soon as the literal appeared `in text` at all, silently acting on whichever
-    copy comes first. A text carrying it twice is ambiguous and must come back
-    `None` (drift) rather than a guess.
-    """
-    text = (
-        "spec:\n"
-        "  syncPolicy:\n"
-        "    automated: { selfHeal: true }\n"
-        "    automated: { selfHeal: true }\n"  # deliberately ambiguous duplicate
-    ) + RETRY_BLOCK_TEXT
-    assert normalize_for_pin(text) is None
-
-
-def test_normalize_for_pin_refuses_a_repeated_block_style_literal() -> None:
-    """Same fail-closed requirement for the block-style `automated` form."""
-    text = (
-        "spec:\n"
-        "  syncPolicy:\n"
-        "    automated:\n"
-        "      selfHeal: true\n"
-        "    automated:\n"
-        "      selfHeal: true\n"  # deliberately ambiguous duplicate
-    ) + RETRY_BLOCK_TEXT
-    assert normalize_for_pin(text) is None
+    assert platform_clause_errors(copy) == [("mariadb-operator", "unchanged")]
 
 
 def test_keda_turned_off_reddens(copy: Path) -> None:
@@ -961,3 +913,45 @@ def test_prometheus_values_as_value_object_reddens(copy: Path) -> None:
     helm["valuesObject"] = yaml.safe_load(helm.pop("values"))
     path.write_text(yaml.safe_dump(document))
     assert ("prometheus", "helm") in platform_clause_errors(copy)
+
+
+def mariadb_operator_values(tree: Path) -> tuple[Path, dict]:
+    path = tree / "applications" / "mariadb-operator.yaml"
+    document = yaml.safe_load(path.read_text())
+    return path, document
+
+
+def test_mariadb_operator_turned_off_reddens(copy: Path) -> None:
+    path, document = mariadb_operator_values(copy)
+    document["spec"]["source"]["helm"]["valuesObject"]["operators"]["mariadbOperator"]["create"] = False
+    path.write_text(yaml.safe_dump(document))
+    assert platform_clause_errors(copy) == [("mariadb-operator", "toggle-on")]
+
+
+def test_a_second_operator_on_mariadb_operator_reddens(copy: Path) -> None:
+    """KEDA on beside mariadb-operator installs a second KEDA into `mariadb-system`."""
+    path, document = mariadb_operator_values(copy)
+    document["spec"]["source"]["helm"]["valuesObject"]["operators"]["keda"]["create"] = True
+    path.write_text(yaml.safe_dump(document))
+    assert platform_clause_errors(copy) == [("mariadb-operator", "others-off")]
+
+
+def test_operators_create_on_mariadb_operator_reddens(copy: Path) -> None:
+    """`operators.create` is the fallback for an unset key; with every key written it must be absent."""
+    path, document = mariadb_operator_values(copy)
+    document["spec"]["source"]["helm"]["valuesObject"]["operators"]["create"] = False
+    path.write_text(yaml.safe_dump(document))
+    assert platform_clause_errors(copy) == [("mariadb-operator", "operator-keys")]
+
+
+def test_a_mariadb_operator_subchart_key_reddens(copy: Path) -> None:
+    """deploy's copy set no values, so the values hold `operators` and nothing else.
+
+    A `mariadb-operator:` block reaches the subchart's own values, where
+    `crds.enabled: true` would render the 12 CRDs a second time without
+    `keep`. The row has no `values`, so `value-keys` is the clause that names it.
+    """
+    path, document = mariadb_operator_values(copy)
+    document["spec"]["source"]["helm"]["valuesObject"]["mariadb-operator"] = {"crds": {"enabled": True}}
+    path.write_text(yaml.safe_dump(document))
+    assert platform_clause_errors(copy) == [("mariadb-operator", "value-keys")]
