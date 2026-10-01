@@ -100,3 +100,119 @@ Already refused by `applications/argocd.yaml`'s own comment and by
 `bootstrap-automation.md`. With `selfHeal` on, the `checksum/cm` mechanism turns
 every edit to this file into an unattended restart of the component that would
 have to fix itself.
+
+## E3 — root adopts the six operator Applications (ADR-0824)
+
+**What the merge does.** It adds `applications/cert-manager.yaml`,
+`keda.yaml`, `mariadb-operator.yaml`, `mariadb-operator-crds.yaml`,
+`envoy-gateway.yaml` and `prometheus.yaml`. Each `spec` is byte-identical to
+`yadgarhq/deploy`'s `infra/<name>.yaml` at `fa7ccb5`. The only metadata change
+is that E1's `Prune=false` annotation is absent. `root` selects the files through
+its `{applications,applicationsets}/*.yaml` include and auto-syncs them.
+
+**How the adoption works.** `root` applies each Application to the live object
+with the same name in `argocd`. The apply keeps the uid and writes root's
+tracking-id, `root:argoproj.io/Application:argocd/<name>`. The live objects
+were last applied client-side by `infra`, and their
+`kubectl.kubernetes.io/last-applied-configuration` holds
+`argocd.argoproj.io/sync-options: Prune=false` (read 2026-10-01). So root's
+three-way merge deletes the annotation, because the new copy does not declare
+it.
+
+**ORDERING CONTRACT.** Merge only AFTER `yadgarhq/deploy`'s E2 has merged and
+its post-merge checks passed. Then merge promptly. Between the two merges the
+six Applications are unowned, and only `Prune=false` protects them. If E3 merged
+while `infra` still declared the six, both Applications would claim them and
+overwrite each other's tracking-id on every sync.
+
+### Before this merge — read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. E2 has synced: each of the six still exists, still carries Prune=false,
+#    and its tracking-id still names infra. infra is OutOfSync with exactly
+#    these six requiring a prune. Any other state → STOP.
+for app in cert-manager keda mariadb-operator mariadb-operator-crds envoy-gateway prometheus; do
+  kubectl --context kind-yadgar -n argocd get application "$app" \
+    -o jsonpath='{.metadata.name} {.metadata.uid} {.metadata.annotations.argocd\.argoproj\.io/sync-options} {.metadata.annotations.argocd\.argoproj\.io/tracking-id}{"\n"}'
+done
+kubectl --context kind-yadgar -n argocd get application infra -o json \
+  | jq -r '.status.resources[] | select(.requiresPruning == true) | "\(.kind)/\(.name)"' | sort
+
+# 2. root Synced/Healthy, sourcing yadgarhq/argocd main, prune on.
+kubectl --context kind-yadgar -n argocd get application root \
+  -o jsonpath='{.status.sync.status}/{.status.health.status} {.status.sync.revision} {.spec.source.repoURL}@{.spec.source.targetRevision} prune={.spec.syncPolicy.automated.prune}{"\n"}'
+```
+
+Expected uids, recorded at E1 and unchanged since:
+
+| Application             | uid                                    |
+| ----------------------- | -------------------------------------- |
+| `cert-manager`          | `803a0a98-29a9-4ef0-b556-3a1a3754a7ea` |
+| `keda`                  | `1ffb7cc6-cb58-4185-90b0-7eb00d854e89` |
+| `mariadb-operator`      | `6e907a55-222c-45b7-8aa4-4ce5a2102bc6` |
+| `mariadb-operator-crds` | `47326d8d-6b64-45c7-92c2-05e170a32631` |
+| `envoy-gateway`         | `c997c5d8-220b-481f-b23f-e01dbbad549d` |
+| `prometheus`            | `97638c3b-9b12-431f-a2f3-4e96f8ae7a7b` |
+
+Read 2026-10-01, before E2: `root` was `Synced`/`Healthy` at `819d5f8`, with
+`automated: {prune: true, selfHeal: true}` and two resources,
+`Application/argocd` and `ApplicationSet/yadgar-modules`. It does not track the
+six yet, so its prune cannot touch them in the window.
+
+### After this merge — read-only
+
+`root` polls git, so allow a few minutes for it to see the merge.
+
+```bash
+# 1. root synced the merge: Synced/Healthy at the merge sha, eight resources.
+kubectl --context kind-yadgar -n argocd get application root \
+  -o jsonpath='{.status.sync.status}/{.status.health.status} {.status.sync.revision}{"\n"}'
+kubectl --context kind-yadgar -n argocd get application root -o json \
+  | jq -r '.status.resources[] | "\(.kind)/\(.name) \(.status)"'
+# expect: Application/argocd, ApplicationSet/yadgar-modules and the six
+#         Applications, each Synced.
+
+# 2. Each of the six: SAME uid as the table, tracking-id now
+#    root:argoproj.io/Application:argocd/<name>, NO sync-options annotation,
+#    and the Application itself Synced/Healthy.
+for app in cert-manager keda mariadb-operator mariadb-operator-crds envoy-gateway prometheus; do
+  kubectl --context kind-yadgar -n argocd get application "$app" \
+    -o jsonpath='{.metadata.name} {.metadata.uid} [{.metadata.annotations.argocd\.argoproj\.io/sync-options}] {.metadata.annotations.argocd\.argoproj\.io/tracking-id} {.status.sync.status}/{.status.health.status}{"\n"}'
+done
+
+# 3. infra let go: Synced again, nothing requiring a prune.
+kubectl --context kind-yadgar -n argocd get application infra \
+  -o jsonpath='{.status.sync.status}/{.status.health.status}{"\n"}'
+kubectl --context kind-yadgar -n argocd get application infra -o json \
+  | jq -r '.status.resources[] | select(.requiresPruning == true) | "\(.kind)/\(.name)"'
+# expect: Synced/Healthy and no line from the second command.
+
+# 4. No SharedResourceWarning on root or infra.
+for a in root infra; do
+  kubectl --context kind-yadgar -n argocd get application "$a" \
+    -o jsonpath='{.metadata.name} {.status.conditions[*].type}{"\n"}'
+done
+
+# 5. K4: still 14 Applications in argocd.
+kubectl --context kind-yadgar -n argocd get applications --no-headers | wc -l
+```
+
+Also re-run reads 4 and 5 of `yadgarhq/deploy`'s `## E2` notes: K6 still 52
+CRDs with the same hash, and every operator Deployment's uid and generation
+unchanged.
+
+If the `sync-options` annotation survives on a live object, STOP. Do not add
+`Prune=false` to the copy here, because a later step must be able to prune the
+old Application. Report it instead.
+
+**Rollback — NOT a plain revert.** `root` runs `automated.prune: true`, and the
+copies here carry no `Prune=false`. Reverting this merge makes `root` prune the
+six live `Application` objects, which loses their uids. Their operators keep
+running, because no Application carries a finalizer, but they run unowned. Do
+not revert `yadgarhq/deploy`'s E2 after this merge either: `infra` and `root`
+would both declare the six. To undo a bad copy, fix it forward here. If the
+Applications must leave `root`, first put `Prune=false` on the six copies
+in one merge, and delete them in a second merge.

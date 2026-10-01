@@ -72,3 +72,17 @@ repos:
         # deleted one, which is exactly the case this gate exists to catch.
         always_run: true
         pass_filenames: false
+
+      # E3 OF THE OPERATORS HANDOVER (ADR-0824). The six operator Applications
+      # under `applications/` are pinned to the specs `yadgarhq/deploy` released,
+      # and root must select them, adopt them by name and find no `Prune=false`.
+      # A HOOK, for the reason `versions-pinned` gives above: this is what feeds
+      # `ci / passed`. `always_run` because a deleted file is a failure, and
+      # pre-commit never passes a deleted file.
+      - id: operator-applications
+        name: the adopted operator Applications equal deploy's last copy (ADR-0824)
+        entry: python -m pytest scripts/tests -q
+        language: python
+        additional_dependencies: ["pytest==9.1.1", "pyyaml==6.0.3"]
+        always_run: true
+        pass_filenames: false

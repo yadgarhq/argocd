@@ -3,3 +3,7 @@
 # that cover exists on one machine and reaches no other clone, no CI, and no
 # other contributor.
 .local-review/
+
+# scripts/tests/ runs under pytest, which writes bytecode and a cache beside it.
+__pycache__/
+.pytest_cache/
