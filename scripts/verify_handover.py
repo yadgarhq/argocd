@@ -86,6 +86,12 @@ UNLISTED_INSTANCE_CRDS = frozenset(
         "orders.acme.cert-manager.io",
         "challenges.acme.cert-manager.io",
         "applications.argoproj.io",
+        # ARC's per-job objects. Once the runner Application lands under root,
+        # the controller creates and deletes these on every poll; their uids
+        # always change. The AutoscalingRunnerSet itself stays compared.
+        "ephemeralrunners.actions.github.com",
+        "ephemeralrunnersets.actions.github.com",
+        "autoscalinglisteners.actions.github.com",
     }
 )
 
@@ -171,7 +177,12 @@ def _check_args(context: str | None, args: list[str]) -> None:
 
 
 def kubectl(context: str | None, args: list[str], *, runner: Callable = subprocess.run) -> str:
-    """Run `kubectl --context CONTEXT <args>` and return stdout. Refuses before running anything."""
+    """Run `kubectl --context CONTEXT <args>` and return stdout. Refuses before running anything.
+
+    THE GATE CHECKS ARGV ONLY. The environment kubectl inherits (KUBECONFIG,
+    PATH, and so which `kubectl` binary runs) is the caller's: in CI the
+    workflow writes it, and on a workstation the operator owns it.
+    """
     _check_args(context, list(args))
     cmd = ["kubectl", "--context", context, *args]
     proc = runner(cmd, capture_output=True, text=True, check=False)

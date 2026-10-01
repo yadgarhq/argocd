@@ -1005,3 +1005,22 @@ def test_require_ancestry_refuses_before_any_kubectl_call(tmp_path, capsys, monk
     )
     assert code == 2
     assert "ancestry" in capsys.readouterr().err
+
+
+# --- ARC's churning instances --------------------------------------------------
+
+ARC_CHURN = ("ephemeralrunners.actions.github.com", "ephemeralrunnersets.actions.github.com", "autoscalinglisteners.actions.github.com")
+
+
+def test_arc_runner_instances_are_never_listed(responses) -> None:
+    """When the runner Application lands under root, these churn on every poll; a uid diff there is noise."""
+    apps = responses["get applications.argoproj.io -n argocd -o json"]["items"]
+    keda = next(a for a in apps if a["metadata"]["name"] == "keda")
+    crd_list = responses["get customresourcedefinitions.apiextensions.k8s.io -o json"]["items"]
+    for name in ARC_CHURN:
+        keda["status"]["resources"].append({"group": "apiextensions.k8s.io", "kind": "CustomResourceDefinition", "name": name})
+        crd_list.append({"metadata": {"name": name, "uid": f"crd-{name}", "generation": 1}})
+    runner = FakeRunner(responses)
+    vh.collect(vh.Cluster(CONTEXT, runner=runner))
+    listed = {c[4] for c in runner.calls}
+    assert not listed & set(ARC_CHURN)
