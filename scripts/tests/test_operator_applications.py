@@ -31,13 +31,15 @@ WHAT IS ASSERTED, and each has a red case below:
      rather than writing `prune: false`, matching the chart's own example.
   7. Each `retry` block has a finite, positive `limit` and matches the
      chart's own example byte-for-byte once parsed.
-  8. D4 OF THE OPERATORS HANDOVER (ADR-0824): `keda` no longer pins to
-     deploy's copy. It sources `yadgarhq`'s `platform` chart at the version
-     embedded at `yadgarhq/chart` v0.3.15, with `operators.keda.create` true and
-     every other operator, Argo CD included, explicitly false. Its name,
-     destination, `syncPolicy` and release name are pinned unchanged, so the
-     release instance label and every immutable selector stay as they are.
-     Checks 2 to 7 still cover `keda`.
+  8. D4 OF THE OPERATORS HANDOVER (ADR-0824): `keda` and `cert-manager` no
+     longer pin to deploy's copy. Each sources `yadgarhq`'s `platform` chart at
+     the version embedded at `yadgarhq/chart` v0.3.15, with its own
+     `operators.<op>.create` true and every other operator, Argo CD included,
+     explicitly false. Deploy's values are carried over under the operator's
+     subchart key. Each name, destination, `syncPolicy` and release name is
+     pinned unchanged, so the release instance label and every immutable
+     selector stay as they are. PLATFORM_SOURCED holds one row per operator.
+     Checks 2 to 7 still cover both.
 """
 
 from __future__ import annotations
@@ -58,11 +60,11 @@ APPLICATIONS = REPOSITORY / "applications"
 # sha256 of each file's text from the `spec:` line to the end, taken from
 # `git -C deploy show fa7ccb5:infra/<name>.yaml | sed -n '/^spec:/,$p' | sha256sum`.
 SOURCE = "yadgarhq/deploy@fa7ccb529fd12911a7ccca1dc53f10490063f446"
-# `keda` left this table at D4 (ADR-0824): it now sources `platform`, which
-# PLATFORM_SOURCED below pins. Its deploy-era hash was
-# 19e6856ba5ebc99ba0f24702cc5840b1d94f19a5f0e0d38115b0d280f666f6b6.
+# `keda` and `cert-manager` left this table at D4 (ADR-0824): each now sources
+# `platform`, which PLATFORM_SOURCED below pins. Their deploy-era hashes were
+# keda 19e6856ba5ebc99ba0f24702cc5840b1d94f19a5f0e0d38115b0d280f666f6b6 and
+# cert-manager f402c7c04defb9ba09118f243357d16dc2df91eff35ea47f5e52dd0b19d579cb.
 PINNED_SPECS: dict[str, str] = {
-    "cert-manager": "f402c7c04defb9ba09118f243357d16dc2df91eff35ea47f5e52dd0b19d579cb",
     "mariadb-operator": "485a08bcc620570e35ea6c216872e0d64c757d47ea43cc6479de9edf407c65be",
     "mariadb-operator-crds": "bd68b4915105319e1fdf3dcc10f7d6651955cf9b546db944ce4172be9d90536e",
     "envoy-gateway": "1d8b30ab563c10c623bd0e0bebd502273c8a8fab833d9c58661b82d6aa0059b4",
@@ -110,28 +112,68 @@ PLATFORM_SOURCE = "yadgarhq/chart@v0.3.15:chart/Chart.yaml"
 PLATFORM_VERSION = "0.1.21"
 OPERATOR_KEYS = ("argoCd", "certManager", "envoyGateway", "keda", "mariadbOperator", "prometheus")
 
-# The development sizing deploy's copy passed to KEDA's own chart (D55), now
-# under `platform`'s `keda:` subchart key. Measured 2026-10-01: without it the
-# render's `keda-operator` and `keda-operator-metrics-apiserver` pod templates
-# fall back to KEDA's defaults and both Deployments roll.
-KEDA_RESOURCES: dict = {
-    "operator": {"requests": {"cpu": "50m", "memory": "128Mi"}},
-    "metricServer": {"requests": {"cpu": "50m", "memory": "128Mi"}},
+# Every field of a platform-sourced Application's `spec.syncPolicy`, as deploy's
+# copy declared it with S0's two changes. The same for every operator.
+PLATFORM_SYNC_POLICY: dict = {
+    "automated": {"selfHeal": True},
+    "syncOptions": ["CreateNamespace=true", "ServerSideApply=true"],
+    "retry": EXPECTED_RETRY,
 }
 
-# Every field of the `keda` Application other than `source`, as deploy's copy
-# declared it with S0's two changes. A change here is a change to the release.
-KEDA_UNCHANGED: dict = {
-    "project": "default",
-    "destination": {"server": "https://kubernetes.default.svc", "namespace": "keda"},
-    "syncPolicy": {
-        "automated": {"selfHeal": True},
-        "syncOptions": ["CreateNamespace=true", "ServerSideApply=true"],
-        "retry": EXPECTED_RETRY,
+# One row per Application that sources `platform` (D4, ADR-0824). The next swap
+# adds a row. `platform_clause_errors` reads these rows, OPERATOR_KEYS and
+# PLATFORM_VERSION, and nothing else.
+#
+#   toggle     the `operators.<toggle>.create` key that is true. Every other
+#              key in OPERATOR_KEYS is written false.
+#   values     the `platform` subchart key that carries deploy's values over.
+#   carried    exactly what sits under `values`: deploy's copy, moved under
+#              that key. Measured 2026-10-01: without a row's sizing blocks
+#              the render's pod templates change and the Deployments roll.
+#              cert-manager's `crds` block changes nothing in today's render,
+#              because `platform` and cert-manager v1.21.1 already default to
+#              `enabled: true` and `keep: true`. It is pinned as a defence
+#              against a later change to either default.
+#   unchanged  every field of `spec` other than `source`, as deploy's copy
+#              declared it with S0's two changes. A change here is a change to
+#              the release.
+PLATFORM_SOURCED: dict[str, dict] = {
+    "keda": {
+        "toggle": "keda",
+        "values": "keda",
+        # Development sizing (D55), deploy's copy.
+        "carried": {
+            "resources": {
+                "operator": {"requests": {"cpu": "50m", "memory": "128Mi"}},
+                "metricServer": {"requests": {"cpu": "50m", "memory": "128Mi"}},
+            },
+        },
+        "unchanged": {
+            "project": "default",
+            "destination": {"server": "https://kubernetes.default.svc", "namespace": "keda"},
+            "syncPolicy": PLATFORM_SYNC_POLICY,
+        },
+    },
+    "cert-manager": {
+        "toggle": "certManager",
+        "values": "cert-manager",
+        # `crds.enabled` and `crds.keep`, and the development sizing (D55),
+        # deploy's copy. `keep` renders `helm.sh/resource-policy: keep` on the
+        # six CRDs, which stops a helm uninstall deleting them and every
+        # Certificate with them. Both `crds` keys equal today's defaults.
+        "carried": {
+            "crds": {"enabled": True, "keep": True},
+            "resources": {"requests": {"cpu": "10m", "memory": "64Mi"}},
+            "webhook": {"resources": {"requests": {"cpu": "10m", "memory": "32Mi"}}},
+            "cainjector": {"resources": {"requests": {"cpu": "10m", "memory": "64Mi"}}},
+        },
+        "unchanged": {
+            "project": "default",
+            "destination": {"server": "https://kubernetes.default.svc", "namespace": "cert-manager"},
+            "syncPolicy": PLATFORM_SYNC_POLICY,
+        },
     },
 }
-
-PLATFORM_SOURCED: dict[str, str] = {"keda": "keda"}
 
 ADOPTED: tuple[str, ...] = (*PINNED_SPECS, *PLATFORM_SOURCED)
 
@@ -294,17 +336,27 @@ def finalized(tree: Path) -> list[str]:
     return names
 
 
-def platform_errors(tree: Path) -> list[str]:
-    """Every platform-sourced name whose Application is not the D4 shape (ADR-0824).
+def platform_clause_errors(tree: Path) -> list[tuple[str, str]]:
+    """Every (name, clause) where a platform-sourced Application is not the D4 shape (ADR-0824).
 
-    Required: `source` is `platform` at PLATFORM_VERSION from
-    `ghcr.io/yadgarhq/charts`, no `releaseName` (so the release keeps the
-    Application's name), `operators.<op>.create` true for the one operator and
-    explicitly false for every other key in OPERATOR_KEYS, no
-    `operators.create`, and every field outside `source` unchanged.
+    One clause per requirement, so a red case can name the clause it breaks:
+
+      repo-url         `source.repoURL` is `ghcr.io/yadgarhq/charts`
+      chart            `source.chart` is `platform`
+      target-revision  `source.targetRevision` is PLATFORM_VERSION
+      source-keys      `source` holds those three and `helm`, nothing else
+      helm             `helm` holds `valuesObject` only: no `releaseName`, so the
+                       release keeps the Application's name
+      toggle-on        `operators.<toggle>.create` is true
+      others-off       every other key in OPERATOR_KEYS is written, as false
+      operator-keys    `operators` holds OPERATOR_KEYS and nothing else, so no
+                       `operators.create`
+      value-keys       the values hold `operators` and the row's subchart key only
+      carried          the row's subchart key holds exactly `carried`
+      unchanged        every field of `spec` outside `source` equals `unchanged`
     """
     errors = []
-    for name, operator in PLATFORM_SOURCED.items():
+    for name, row in PLATFORM_SOURCED.items():
         path = tree / "applications" / f"{name}.yaml"
         document = (yaml.safe_load(path.read_text()) if path.is_file() else None) or {}
         spec = document.get("spec") or {}
@@ -312,21 +364,27 @@ def platform_errors(tree: Path) -> list[str]:
         helm = source.get("helm") or {}
         values = helm.get("valuesObject") or {}
         operators = values.get("operators") or {}
-        expected_operators = {key: {"create": key == operator} for key in OPERATOR_KEYS}
         rest = {key: value for key, value in spec.items() if key != "source"}
-        if (
-            source.get("repoURL") != "ghcr.io/yadgarhq/charts"
-            or source.get("chart") != "platform"
-            or source.get("targetRevision") != PLATFORM_VERSION
-            or set(source) != {"repoURL", "chart", "targetRevision", "helm"}
-            or set(helm) != {"valuesObject"}
-            or operators != expected_operators
-            or rest != KEDA_UNCHANGED
-            or values.get("keda") != {"resources": KEDA_RESOURCES}
-            or set(values) != {"operators", "keda"}
-        ):
-            errors.append(name)
+        checks = {
+            "repo-url": source.get("repoURL") == "ghcr.io/yadgarhq/charts",
+            "chart": source.get("chart") == "platform",
+            "target-revision": source.get("targetRevision") == PLATFORM_VERSION,
+            "source-keys": set(source) == {"repoURL", "chart", "targetRevision", "helm"},
+            "helm": set(helm) == {"valuesObject"},
+            "toggle-on": operators.get(row["toggle"]) == {"create": True},
+            "others-off": all(operators.get(key) == {"create": False} for key in OPERATOR_KEYS if key != row["toggle"]),
+            "operator-keys": set(operators) == set(OPERATOR_KEYS),
+            "value-keys": set(values) == {"operators", row["values"]},
+            "carried": values.get(row["values"]) == row["carried"],
+            "unchanged": rest == row["unchanged"],
+        }
+        errors.extend((name, clause) for clause, passed in checks.items() if not passed)
     return errors
+
+
+def platform_errors(tree: Path) -> list[str]:
+    """Every platform-sourced name with at least one clause of `platform_clause_errors` failing."""
+    return list(dict.fromkeys(name for name, _ in platform_clause_errors(tree)))
 
 
 @pytest.fixture
@@ -344,7 +402,10 @@ def test_every_spec_equals_deploys_last_copy() -> None:
 
 
 def test_every_platform_sourced_application_is_the_d4_shape() -> None:
-    print(f"[D4] {len(PLATFORM_SOURCED)} Application(s) pinned to platform {PLATFORM_VERSION} from {PLATFORM_SOURCE}")
+    print(
+        f"[D4] {len(PLATFORM_SOURCED)} Application(s) ({', '.join(PLATFORM_SOURCED)}) pinned to platform"
+        f" {PLATFORM_VERSION} from {PLATFORM_SOURCE}"
+    )
     assert platform_errors(REPOSITORY) == []
 
 
@@ -566,3 +627,54 @@ def test_an_extra_source_key_reddens(copy: Path) -> None:
     document["spec"]["source"]["path"] = "chart"
     path.write_text(yaml.safe_dump(document))
     assert platform_errors(copy) == ["keda"]
+
+
+def cert_manager_values(tree: Path) -> tuple[Path, dict]:
+    path = tree / "applications" / "cert-manager.yaml"
+    document = yaml.safe_load(path.read_text())
+    return path, document
+
+
+def test_cert_manager_crds_keep_false_reddens(copy: Path) -> None:
+    """`crds.keep: false` takes `helm.sh/resource-policy: keep` off all six CRDs.
+
+    Measured 2026-10-01: that is the only change in the render. Without the
+    annotation a helm uninstall deletes the CRDs and every Certificate with
+    them. Dropping the key changes nothing today, because cert-manager v1.21.1
+    defaults it to true, so the mutation writes false.
+    """
+    path, document = cert_manager_values(copy)
+    document["spec"]["source"]["helm"]["valuesObject"]["cert-manager"]["crds"]["keep"] = False
+    path.write_text(yaml.safe_dump(document))
+    assert platform_clause_errors(copy) == [("cert-manager", "carried")]
+
+
+def test_dropped_cert_manager_webhook_resources_reddens(copy: Path) -> None:
+    """Without the webhook's sizing, its pod template changes and the Deployment rolls."""
+    path, document = cert_manager_values(copy)
+    del document["spec"]["source"]["helm"]["valuesObject"]["cert-manager"]["webhook"]["resources"]
+    path.write_text(yaml.safe_dump(document))
+    assert platform_clause_errors(copy) == [("cert-manager", "carried")]
+
+
+def test_cert_manager_turned_off_reddens(copy: Path) -> None:
+    path, document = cert_manager_values(copy)
+    document["spec"]["source"]["helm"]["valuesObject"]["operators"]["certManager"]["create"] = False
+    path.write_text(yaml.safe_dump(document))
+    assert platform_clause_errors(copy) == [("cert-manager", "toggle-on")]
+
+
+def test_a_second_operator_on_cert_manager_reddens(copy: Path) -> None:
+    """KEDA on beside cert-manager installs a second KEDA into `cert-manager`."""
+    path, document = cert_manager_values(copy)
+    document["spec"]["source"]["helm"]["valuesObject"]["operators"]["keda"]["create"] = True
+    path.write_text(yaml.safe_dump(document))
+    assert platform_clause_errors(copy) == [("cert-manager", "others-off")]
+
+
+def test_operators_create_on_cert_manager_reddens(copy: Path) -> None:
+    """`operators.create` is the fallback for an unset key; with every key written it must be absent."""
+    path, document = cert_manager_values(copy)
+    document["spec"]["source"]["helm"]["valuesObject"]["operators"]["create"] = False
+    path.write_text(yaml.safe_dump(document))
+    assert platform_clause_errors(copy) == [("cert-manager", "operator-keys")]
