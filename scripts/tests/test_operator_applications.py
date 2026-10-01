@@ -77,9 +77,19 @@ EXPECTED_RETRY: dict = {
     },
 }
 
-# Matches the finite `retry:` block S0 appends at the end of each file (nothing
-# follows it), so this safely spans from the key to end-of-file.
-RETRY_BLOCK_RE = re.compile(r"\n {4}retry:\n.*\Z", re.DOTALL)
+# The literal `retry:` block S0 appends at the end of each file (nothing
+# follows it there). Anchored to end-of-file ON PURPOSE: a file is required to
+# end with exactly this text, so anything appended after it, or any deviation
+# inside it, fails the match below rather than being silently discarded.
+RETRY_BLOCK_TEXT = (
+    "    retry:\n"
+    "      limit: 6\n"
+    "      backoff:\n"
+    "        duration: 15s\n"
+    "        factor: 2\n"
+    "        maxDuration: 5m\n"
+)
+RETRY_BLOCK_SUFFIX = "\n" + RETRY_BLOCK_TEXT
 
 
 def spec_text(path: Path) -> str:
@@ -89,23 +99,32 @@ def spec_text(path: Path) -> str:
     return text[match.start() :] if match else ""
 
 
-def normalize_for_pin(text: str) -> str:
+def normalize_for_pin(text: str) -> str | None:
     """Undo S0's two `syncPolicy` changes (ADR-0824) so the rest still pins to deploy's copy.
 
-    S0 drops `automated.prune` and appends a `retry` block sourced from the
-    chart's own example (CHART_EXAMPLE_SOURCE). Both are restored to their
-    deploy-era shape here so hashing still catches drift in anything else.
+    Returns None — a guaranteed mismatch below — unless `text` ends with
+    EXACTLY `RETRY_BLOCK_TEXT` and `automated` carries no `prune` key: S0's
+    shape is required, not merely tolerated, so a file that still has the
+    deploy-era shape (prune present, no retry), or that has anything other
+    than the chart's own retry block appended, or that has extra content
+    after the retry block, is treated as drift rather than silently accepted.
     """
-    text = RETRY_BLOCK_RE.sub("\n", text)
-    text = text.replace(
-        "    automated: { selfHeal: true }",
-        "    automated: { prune: true, selfHeal: true }",
-    )
-    text = text.replace(
-        "    automated:\n      selfHeal: true\n",
-        "    automated:\n      prune: true\n      selfHeal: true\n",
-    )
-    return text
+    if not text.endswith(RETRY_BLOCK_SUFFIX):
+        return None
+    text = text[: -len(RETRY_BLOCK_TEXT)]
+    if "    automated: { selfHeal: true }" in text:
+        return text.replace(
+            "    automated: { selfHeal: true }",
+            "    automated: { prune: true, selfHeal: true }",
+            1,
+        )
+    if "    automated:\n      selfHeal: true\n" in text:
+        return text.replace(
+            "    automated:\n      selfHeal: true\n",
+            "    automated:\n      prune: true\n      selfHeal: true\n",
+            1,
+        )
+    return None
 
 
 def spec_drift(tree: Path) -> list[str]:
@@ -117,7 +136,7 @@ def spec_drift(tree: Path) -> list[str]:
             drift.append(name)
             continue
         normalized = normalize_for_pin(spec_text(path))
-        if hashlib.sha256(normalized.encode()).hexdigest() != expected:
+        if normalized is None or hashlib.sha256(normalized.encode()).hexdigest() != expected:
             drift.append(name)
     return drift
 
@@ -340,3 +359,12 @@ def test_a_negative_retry_limit_reddens(copy: Path) -> None:
     assert anchor in text
     path.write_text(text.replace(anchor, "      limit: -1\n", 1))
     assert retry_errors(copy) == ["cert-manager"]
+
+
+def test_content_appended_after_retry_reddens(copy: Path) -> None:
+    """A line appended after the retry block must not vanish from the pinned hash."""
+    path = copy / "applications" / "prometheus.yaml"
+    text = path.read_text()
+    assert text.endswith(RETRY_BLOCK_SUFFIX)
+    path.write_text(text + "  ignoreDifferences: []\n")
+    assert spec_drift(copy) == ["prometheus"]
