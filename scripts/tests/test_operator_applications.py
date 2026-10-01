@@ -31,21 +31,22 @@ WHAT IS ASSERTED, and each has a red case below:
      rather than writing `prune: false`, matching the chart's own example.
   7. Each `retry` block has a finite, positive `limit` and matches the
      chart's own example byte-for-byte once parsed.
-  8. D4 OF THE OPERATORS HANDOVER (ADR-0824): `keda`, `cert-manager` and
-     `envoy-gateway` no longer pin to deploy's copy. Each sources `yadgarhq`'s `platform` chart at
+  8. D4 OF THE OPERATORS HANDOVER (ADR-0824): `keda`, `cert-manager`,
+     `envoy-gateway` and `prometheus` no longer pin to deploy's copy. Each sources `yadgarhq`'s `platform` chart at
      the version embedded at `yadgarhq/chart` v0.3.15, with its own
      `operators.<op>.create` true and every other operator, Argo CD included,
      explicitly false. Deploy's values are carried over under the operator's
      subchart key. Each name, destination, `syncPolicy` and release name is
      pinned unchanged, so the release instance label and every immutable
      selector stay as they are. PLATFORM_SOURCED holds one row per operator.
-     Checks 2 to 7 still cover all three.
+     Checks 2 to 7 still cover all four.
 """
 
 from __future__ import annotations
 
 import fnmatch
 import hashlib
+import json
 import re
 import shutil
 from pathlib import Path
@@ -60,16 +61,16 @@ APPLICATIONS = REPOSITORY / "applications"
 # sha256 of each file's text from the `spec:` line to the end, taken from
 # `git -C deploy show fa7ccb5:infra/<name>.yaml | sed -n '/^spec:/,$p' | sha256sum`.
 SOURCE = "yadgarhq/deploy@fa7ccb529fd12911a7ccca1dc53f10490063f446"
-# `keda`, `cert-manager` and `envoy-gateway` left this table at D4 (ADR-0824):
-# each now sources `platform`, which PLATFORM_SOURCED below pins. Their
-# deploy-era hashes were
+# `keda`, `cert-manager`, `envoy-gateway` and `prometheus` left this table at
+# D4 (ADR-0824): each now sources `platform`, which PLATFORM_SOURCED below
+# pins. Their deploy-era hashes were
 # keda 19e6856ba5ebc99ba0f24702cc5840b1d94f19a5f0e0d38115b0d280f666f6b6,
-# cert-manager f402c7c04defb9ba09118f243357d16dc2df91eff35ea47f5e52dd0b19d579cb and
-# envoy-gateway 1d8b30ab563c10c623bd0e0bebd502273c8a8fab833d9c58661b82d6aa0059b4.
+# cert-manager f402c7c04defb9ba09118f243357d16dc2df91eff35ea47f5e52dd0b19d579cb,
+# envoy-gateway 1d8b30ab563c10c623bd0e0bebd502273c8a8fab833d9c58661b82d6aa0059b4 and
+# prometheus c03d2900b2f5f23f76e20c4252f98243984aeb0dfd156aa43913949bb5204a79.
 PINNED_SPECS: dict[str, str] = {
     "mariadb-operator": "485a08bcc620570e35ea6c216872e0d64c757d47ea43cc6479de9edf407c65be",
     "mariadb-operator-crds": "bd68b4915105319e1fdf3dcc10f7d6651955cf9b546db944ce4172be9d90536e",
-    "prometheus": "c03d2900b2f5f23f76e20c4252f98243984aeb0dfd156aa43913949bb5204a79",
 }
 
 SYNC_OPTIONS = "argocd.argoproj.io/sync-options"
@@ -128,8 +129,15 @@ PLATFORM_SYNC_POLICY: dict = {
 #   toggle     the `operators.<toggle>.create` key that is true. Every other
 #              key in OPERATOR_KEYS is written false.
 #   values     the `platform` subchart key that carries deploy's values over.
-#   carried    exactly what sits under `values`: deploy's copy, moved under
-#              that key. Measured 2026-10-01: without a row's sizing blocks
+#   form       optional. The `helm` key that holds the values: `valuesObject`
+#              when absent, or `values`, the YAML string, which is parsed.
+#              Only `prometheus` uses `values`, because its `null` must reach
+#              helm and a `null` inside `valuesObject` can be dropped on apply.
+#   digests    optional. Keys under `values` pinned by the sha256 of their
+#              canonical JSON (`json.dumps(..., sort_keys=True)`) rather than
+#              written out here. `carried` holds every other key.
+#   carried    exactly what sits under `values`, less `digests`: deploy's
+#              copy, moved under that key. Measured 2026-10-01: without a row's sizing blocks
 #              the render's pod templates change and the Deployments roll.
 #              cert-manager's `crds` block changes nothing in today's render,
 #              because `platform` and cert-manager v1.21.1 already default to
@@ -186,6 +194,29 @@ PLATFORM_SOURCED: dict[str, dict] = {
             "project": "default",
             "destination": {"server": "https://kubernetes.default.svc", "namespace": "envoy-gateway-system"},
             "syncPolicy": PLATFORM_SYNC_POLICY,
+        },
+    },
+    "prometheus": {
+        "toggle": "prometheus",
+        "values": "prometheus",
+        "form": "values",
+        # deploy's alerting rules, verbatim: `serverFiles` parsed from deploy's
+        # copy at SOURCE equals this file's. `platform` carries no rules.
+        "digests": {"serverFiles": "fc7255aec26edb02827487ecb30f4780343d67504390ba5c3f55fc7948b35435"},
+        # deploy's PVC (`platform` defaults `enabled` to false, which renders an
+        # emptyDir), and `null` on the reload sidecar's resources, which deletes
+        # `platform`'s 10m/32Mi requests. Measured 2026-10-01: without either the
+        # pod template changes and the pod rolls; without the PVC the TSDB is
+        # empty. An empty map `{}` does not delete the requests.
+        "carried": {
+            "server": {"persistentVolume": {"enabled": True, "size": "2Gi"}},
+            "configmapReload": {"prometheus": {"resources": None}},
+        },
+        "unchanged": {
+            "project": "default",
+            "destination": {"server": "https://kubernetes.default.svc", "namespace": "observability"},
+            # deploy declared no `ServerSideApply=true` for prometheus.
+            "syncPolicy": {**PLATFORM_SYNC_POLICY, "syncOptions": ["CreateNamespace=true"]},
         },
     },
 }
@@ -351,6 +382,21 @@ def finalized(tree: Path) -> list[str]:
     return names
 
 
+def parsed_values(text: object) -> object:
+    """A `helm.values` string parsed as YAML; None when it is not a string or does not parse."""
+    if not isinstance(text, str):
+        return None
+    try:
+        return yaml.safe_load(text)
+    except yaml.YAMLError:
+        return None
+
+
+def canonical_digest(value: object) -> str:
+    """sha256 of `value` as canonical JSON, so formatting and comments do not count."""
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
 def platform_clause_errors(tree: Path) -> list[tuple[str, str]]:
     """Every (name, clause) where a platform-sourced Application is not the D4 shape (ADR-0824).
 
@@ -360,14 +406,17 @@ def platform_clause_errors(tree: Path) -> list[tuple[str, str]]:
       chart            `source.chart` is `platform`
       target-revision  `source.targetRevision` is PLATFORM_VERSION
       source-keys      `source` holds those three and `helm`, nothing else
-      helm             `helm` holds `valuesObject` only: no `releaseName`, so the
-                       release keeps the Application's name
+      helm             `helm` holds the row's `form` only (`valuesObject` by
+                       default): no `releaseName`, so the release keeps the
+                       Application's name
       toggle-on        `operators.<toggle>.create` is true
       others-off       every other key in OPERATOR_KEYS is written, as false
       operator-keys    `operators` holds OPERATOR_KEYS and nothing else, so no
                        `operators.create`
       value-keys       the values hold `operators` and the row's subchart key only
-      carried          the row's subchart key holds exactly `carried`
+      carried          the row's subchart key, less `digests`, holds exactly
+                       `carried`
+      carried-digest   each key in the row's `digests` hashes to its value
       unchanged        every field of `spec` outside `source` equals `unchanged`
     """
     errors = []
@@ -377,7 +426,12 @@ def platform_clause_errors(tree: Path) -> list[tuple[str, str]]:
         spec = document.get("spec") or {}
         source = spec.get("source") or {}
         helm = source.get("helm") or {}
-        values = helm.get("valuesObject") or {}
+        form = row.get("form", "valuesObject")
+        values = parsed_values(helm.get(form)) if form == "values" else helm.get(form)
+        values = values if isinstance(values, dict) else {}
+        subchart = values.get(row["values"])
+        subchart = subchart if isinstance(subchart, dict) else {}
+        digests = row.get("digests", {})
         operators = values.get("operators") or {}
         rest = {key: value for key, value in spec.items() if key != "source"}
         checks = {
@@ -385,12 +439,16 @@ def platform_clause_errors(tree: Path) -> list[tuple[str, str]]:
             "chart": source.get("chart") == "platform",
             "target-revision": source.get("targetRevision") == PLATFORM_VERSION,
             "source-keys": set(source) == {"repoURL", "chart", "targetRevision", "helm"},
-            "helm": set(helm) == {"valuesObject"},
+            "helm": set(helm) == {form},
             "toggle-on": operators.get(row["toggle"]) == {"create": True},
             "others-off": all(operators.get(key) == {"create": False} for key in OPERATOR_KEYS if key != row["toggle"]),
             "operator-keys": set(operators) == set(OPERATOR_KEYS),
             "value-keys": set(values) == {"operators", row["values"]},
-            "carried": values.get(row["values"]) == row["carried"],
+            "carried": row["values"] in values
+            and {key: value for key, value in subchart.items() if key not in digests} == row["carried"],
+            "carried-digest": all(
+                key in subchart and canonical_digest(subchart[key]) == digest for key, digest in digests.items()
+            ),
             "unchanged": rest == row["unchanged"],
         }
         errors.extend((name, clause) for clause, passed in checks.items() if not passed)
@@ -461,8 +519,8 @@ def test_a_changed_spec_reddens(copy: Path) -> None:
 
 
 def test_a_missing_file_reddens(copy: Path) -> None:
-    (copy / "applications" / "prometheus.yaml").unlink()
-    assert spec_drift(copy) == ["prometheus"]
+    (copy / "applications" / "mariadb-operator-crds.yaml").unlink()
+    assert spec_drift(copy) == ["mariadb-operator-crds"]
 
 
 def test_a_renamed_application_reddens(copy: Path) -> None:
@@ -522,11 +580,11 @@ def test_a_negative_retry_limit_reddens(copy: Path) -> None:
 
 def test_content_appended_after_retry_reddens(copy: Path) -> None:
     """A line appended after the retry block must not vanish from the pinned hash."""
-    path = copy / "applications" / "prometheus.yaml"
+    path = copy / "applications" / "mariadb-operator-crds.yaml"
     text = path.read_text()
     assert text.endswith(RETRY_BLOCK_SUFFIX)
     path.write_text(text + "  ignoreDifferences: []\n")
-    assert spec_drift(copy) == ["prometheus"]
+    assert spec_drift(copy) == ["mariadb-operator-crds"]
 
 
 def test_normalize_for_pin_refuses_a_repeated_automated_literal() -> None:
@@ -725,3 +783,76 @@ def test_a_second_operator_on_envoy_gateway_reddens(copy: Path) -> None:
     document["spec"]["source"]["helm"]["valuesObject"]["operators"]["certManager"]["create"] = True
     path.write_text(yaml.safe_dump(document))
     assert platform_clause_errors(copy) == [("envoy-gateway", "others-off")]
+
+
+def mutate_prometheus_values(tree: Path, change) -> None:
+    """Parse prometheus's `helm.values` string, apply `change` to it, and write it back as a string."""
+    path = tree / "applications" / "prometheus.yaml"
+    document = yaml.safe_load(path.read_text())
+    helm = document["spec"]["source"]["helm"]
+    values = yaml.safe_load(helm["values"])
+    change(values)
+    helm["values"] = yaml.safe_dump(values)
+    path.write_text(yaml.safe_dump(document))
+
+
+def test_prometheus_values_round_trip_is_green(copy: Path) -> None:
+    """The mutation helper itself changes nothing a clause reads, so each red case below is its own change."""
+    mutate_prometheus_values(copy, lambda values: None)
+    assert platform_clause_errors(copy) == []
+
+
+def test_prometheus_pvc_disabled_reddens(copy: Path) -> None:
+    """`enabled: false` renders an emptyDir: the pod rolls onto an empty TSDB and the PVC is pruned later."""
+    mutate_prometheus_values(
+        copy, lambda values: values["prometheus"]["server"]["persistentVolume"].update(enabled=False)
+    )
+    assert platform_clause_errors(copy) == [("prometheus", "carried")]
+
+
+def test_prometheus_rules_dropped_reddens(copy: Path) -> None:
+    """Without `serverFiles`, `platform` renders no alerting rules at all."""
+    mutate_prometheus_values(copy, lambda values: values["prometheus"].pop("serverFiles"))
+    assert platform_clause_errors(copy) == [("prometheus", "carried-digest")]
+
+
+def test_prometheus_one_rule_dropped_reddens(copy: Path) -> None:
+    def drop_first_rule(values: dict) -> None:
+        values["prometheus"]["serverFiles"]["alerting_rules.yml"]["groups"][0]["rules"].pop(0)
+
+    mutate_prometheus_values(copy, drop_first_rule)
+    assert platform_clause_errors(copy) == [("prometheus", "carried-digest")]
+
+
+def test_prometheus_reloader_resources_empty_map_reddens(copy: Path) -> None:
+    """`{}` merges with `platform`'s 10m/32Mi instead of deleting them, so the pod rolls."""
+    mutate_prometheus_values(
+        copy, lambda values: values["prometheus"]["configmapReload"]["prometheus"].update(resources={})
+    )
+    assert platform_clause_errors(copy) == [("prometheus", "carried")]
+
+
+def test_prometheus_reloader_resources_dropped_reddens(copy: Path) -> None:
+    mutate_prometheus_values(copy, lambda values: values["prometheus"].pop("configmapReload"))
+    assert platform_clause_errors(copy) == [("prometheus", "carried")]
+
+
+def test_prometheus_turned_off_reddens(copy: Path) -> None:
+    mutate_prometheus_values(copy, lambda values: values["operators"]["prometheus"].update(create=False))
+    assert platform_clause_errors(copy) == [("prometheus", "toggle-on")]
+
+
+def test_a_second_operator_on_prometheus_reddens(copy: Path) -> None:
+    """KEDA on beside prometheus installs a second KEDA into `observability`."""
+    mutate_prometheus_values(copy, lambda values: values["operators"]["keda"].update(create=True))
+    assert platform_clause_errors(copy) == [("prometheus", "others-off")]
+
+
+def test_prometheus_values_as_value_object_reddens(copy: Path) -> None:
+    """`valuesObject` in place of the `values` string: the `null` it carries can be dropped on apply."""
+    path = copy / "applications" / "prometheus.yaml"
+    document = yaml.safe_load(path.read_text())
+    helm = document["spec"]["source"]["helm"]
+    helm["valuesObject"] = yaml.safe_load(helm.pop("values"))
+    path.write_text(yaml.safe_dump(document))
+    assert ("prometheus", "helm") in platform_clause_errors(copy)
