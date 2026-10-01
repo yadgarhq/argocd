@@ -242,9 +242,29 @@ def test_collect_records_instances_of_every_tracked_crd(snap) -> None:
 def test_collect_never_lists_issuance_records_or_absent_crds(responses) -> None:
     runner = FakeRunner(responses)
     vh.collect(vh.Cluster(CONTEXT, runner=runner))
-    listed = [" ".join(c[3:]) for c in runner.calls]
-    assert "get scaledobjects.keda.sh -A -o json" in listed
-    assert not any("certificaterequests" in c or "absent.example.com" in c for c in listed)
+    resources = [c[4] for c in runner.calls]
+    assert "scaledobjects.keda.sh" in resources
+    assert "certificaterequests.cert-manager.io" not in resources
+    assert "absent.example.com" not in resources
+
+
+def test_the_edge_probe_refuses_tls_below_1_2(monkeypatch) -> None:
+    """Set explicitly, not inherited: whatever floor the platform default carries, the probe's is 1.2."""
+    import ssl
+    import types
+
+    handed = types.SimpleNamespace(minimum_version="platform default")
+    monkeypatch.setattr(vh.ssl, "create_default_context", lambda cafile=None: handed)
+    assert vh.tls_context(None) is handed
+    assert handed.minimum_version == ssl.TLSVersion.TLSv1_2
+
+
+def test_the_edge_probe_context_verifies() -> None:
+    import ssl
+
+    context = vh.tls_context(None)
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname is True
 
 
 def test_collect_reads_secret_metadata_only_when_asked(snap) -> None:

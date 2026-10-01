@@ -390,6 +390,13 @@ def collect(
     }
 
 
+def tls_context(cafile: str | None) -> ssl.SSLContext:
+    """Verifying client context: hostname checked, certificate required, TLS 1.2 or newer."""
+    context = ssl.create_default_context(cafile=cafile)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    return context
+
+
 def probe_edge(url: str, cafile: str, connect: str | None = None, timeout: float = 10.0) -> dict:
     """GET `url` over TLS verified against `cafile`, optionally dialling `connect` (HOST:PORT) instead.
 
@@ -399,7 +406,7 @@ def probe_edge(url: str, cafile: str, connect: str | None = None, timeout: float
     parts = urlsplit(url)
     host, port = parts.hostname or "", parts.port or 443
     address = (connect.rsplit(":", 1)[0], int(connect.rsplit(":", 1)[1])) if connect else (host, port)
-    context = ssl.create_default_context(cafile=cafile)
+    context = tls_context(cafile)
     try:
         raw = socket.create_connection(address, timeout=timeout)
         conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=context)
