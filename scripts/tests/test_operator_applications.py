@@ -31,15 +31,15 @@ WHAT IS ASSERTED, and each has a red case below:
      rather than writing `prune: false`, matching the chart's own example.
   7. Each `retry` block has a finite, positive `limit` and matches the
      chart's own example byte-for-byte once parsed.
-  8. D4 OF THE OPERATORS HANDOVER (ADR-0824): `keda` and `cert-manager` no
-     longer pin to deploy's copy. Each sources `yadgarhq`'s `platform` chart at
+  8. D4 OF THE OPERATORS HANDOVER (ADR-0824): `keda`, `cert-manager` and
+     `envoy-gateway` no longer pin to deploy's copy. Each sources `yadgarhq`'s `platform` chart at
      the version embedded at `yadgarhq/chart` v0.3.15, with its own
      `operators.<op>.create` true and every other operator, Argo CD included,
      explicitly false. Deploy's values are carried over under the operator's
      subchart key. Each name, destination, `syncPolicy` and release name is
      pinned unchanged, so the release instance label and every immutable
      selector stay as they are. PLATFORM_SOURCED holds one row per operator.
-     Checks 2 to 7 still cover both.
+     Checks 2 to 7 still cover all three.
 """
 
 from __future__ import annotations
@@ -60,14 +60,15 @@ APPLICATIONS = REPOSITORY / "applications"
 # sha256 of each file's text from the `spec:` line to the end, taken from
 # `git -C deploy show fa7ccb5:infra/<name>.yaml | sed -n '/^spec:/,$p' | sha256sum`.
 SOURCE = "yadgarhq/deploy@fa7ccb529fd12911a7ccca1dc53f10490063f446"
-# `keda` and `cert-manager` left this table at D4 (ADR-0824): each now sources
-# `platform`, which PLATFORM_SOURCED below pins. Their deploy-era hashes were
-# keda 19e6856ba5ebc99ba0f24702cc5840b1d94f19a5f0e0d38115b0d280f666f6b6 and
-# cert-manager f402c7c04defb9ba09118f243357d16dc2df91eff35ea47f5e52dd0b19d579cb.
+# `keda`, `cert-manager` and `envoy-gateway` left this table at D4 (ADR-0824):
+# each now sources `platform`, which PLATFORM_SOURCED below pins. Their
+# deploy-era hashes were
+# keda 19e6856ba5ebc99ba0f24702cc5840b1d94f19a5f0e0d38115b0d280f666f6b6,
+# cert-manager f402c7c04defb9ba09118f243357d16dc2df91eff35ea47f5e52dd0b19d579cb and
+# envoy-gateway 1d8b30ab563c10c623bd0e0bebd502273c8a8fab833d9c58661b82d6aa0059b4.
 PINNED_SPECS: dict[str, str] = {
     "mariadb-operator": "485a08bcc620570e35ea6c216872e0d64c757d47ea43cc6479de9edf407c65be",
     "mariadb-operator-crds": "bd68b4915105319e1fdf3dcc10f7d6651955cf9b546db944ce4172be9d90536e",
-    "envoy-gateway": "1d8b30ab563c10c623bd0e0bebd502273c8a8fab833d9c58661b82d6aa0059b4",
     "prometheus": "c03d2900b2f5f23f76e20c4252f98243984aeb0dfd156aa43913949bb5204a79",
 }
 
@@ -170,6 +171,20 @@ PLATFORM_SOURCED: dict[str, dict] = {
         "unchanged": {
             "project": "default",
             "destination": {"server": "https://kubernetes.default.svc", "namespace": "cert-manager"},
+            "syncPolicy": PLATFORM_SYNC_POLICY,
+        },
+    },
+    "envoy-gateway": {
+        "toggle": "envoyGateway",
+        "values": "gateway-helm",
+        # Development sizing (D55), deploy's copy. Without it the envoy-gateway
+        # Deployment's pod template changes and it rolls.
+        "carried": {
+            "deployment": {"envoyGateway": {"resources": {"requests": {"cpu": "50m", "memory": "128Mi"}}}},
+        },
+        "unchanged": {
+            "project": "default",
+            "destination": {"server": "https://kubernetes.default.svc", "namespace": "envoy-gateway-system"},
             "syncPolicy": PLATFORM_SYNC_POLICY,
         },
     },
@@ -678,3 +693,35 @@ def test_operators_create_on_cert_manager_reddens(copy: Path) -> None:
     document["spec"]["source"]["helm"]["valuesObject"]["operators"]["create"] = False
     path.write_text(yaml.safe_dump(document))
     assert platform_clause_errors(copy) == [("cert-manager", "operator-keys")]
+
+
+def envoy_gateway_values(tree: Path) -> tuple[Path, dict]:
+    path = tree / "applications" / "envoy-gateway.yaml"
+    document = yaml.safe_load(path.read_text())
+    return path, document
+
+
+def test_dropped_envoy_gateway_resources_reddens(copy: Path) -> None:
+    """Without the sizing, the envoy-gateway Deployment's pod template changes and it rolls.
+
+    The `gateway-helm:` key stays, so only the carried clause can catch this.
+    """
+    path, document = envoy_gateway_values(copy)
+    del document["spec"]["source"]["helm"]["valuesObject"]["gateway-helm"]["deployment"]["envoyGateway"]["resources"]
+    path.write_text(yaml.safe_dump(document))
+    assert platform_clause_errors(copy) == [("envoy-gateway", "carried")]
+
+
+def test_envoy_gateway_turned_off_reddens(copy: Path) -> None:
+    path, document = envoy_gateway_values(copy)
+    document["spec"]["source"]["helm"]["valuesObject"]["operators"]["envoyGateway"]["create"] = False
+    path.write_text(yaml.safe_dump(document))
+    assert platform_clause_errors(copy) == [("envoy-gateway", "toggle-on")]
+
+
+def test_a_second_operator_on_envoy_gateway_reddens(copy: Path) -> None:
+    """cert-manager on beside envoy-gateway installs a second cert-manager into `envoy-gateway-system`."""
+    path, document = envoy_gateway_values(copy)
+    document["spec"]["source"]["helm"]["valuesObject"]["operators"]["certManager"]["create"] = True
+    path.write_text(yaml.safe_dump(document))
+    assert platform_clause_errors(copy) == [("envoy-gateway", "others-off")]
