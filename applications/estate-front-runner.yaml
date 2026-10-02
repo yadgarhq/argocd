@@ -75,7 +75,8 @@
 #
 # `githubConfigSecret` is a NAME. The Secret is created out of band by an
 # operator and is deliberately not in git — see "The estate-front runner" in
-# yadgarhq/deploy's MIGRATION_NOTES.md for the exact command.
+# this repository's own MIGRATION_NOTES.md (moved here from yadgarhq/deploy,
+# argocd#59) for the exact command.
 #
 # A MISSING OR WRONG SECRET IS A QUIET FAILURE, NOT A LOUD ONE, and an earlier
 # revision of this comment claimed the opposite. It said the Application goes
@@ -182,9 +183,10 @@ spec:
           spec:
             # THE EDGE, BY THE NAME A REAL CLIENT USES. This is the whole of the
             # in-cluster DNS answer, and it is deliberately not a CoreDNS
-            # rewrite — see "Resolving gateway.yadgar.internal" in
-            # yadgarhq/deploy's MIGRATION_NOTES.md for why that would be the nix repo's object to
-            # own under ADR-0480, and why this is not.
+            # rewrite — see "Resolving gateway.yadgar.internal" in this
+            # repository's own MIGRATION_NOTES.md (moved here from
+            # yadgarhq/deploy, argocd#59) for why that would be the nix repo's
+            # object to own under ADR-0480, and why this is not.
             #
             # 10.96.0.100 is the pinned ClusterIP of `yadgar-edge`, declared in
             # manifests/estate-front/edge-service.yaml, which explains the pin.

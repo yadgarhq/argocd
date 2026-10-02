@@ -25,9 +25,11 @@
 # retries into place. Both of those land at -10.
 #
 # EXPECT THIS APPLICATION TO BE UNHEALTHY UNTIL STEP 3 OF "THE DEVELOPMENT TLS
-# EDGE" IN yadgarhq/deploy's MIGRATION_NOTES.md HAS RUN. There is a second
-# step 3, in "Move the development domain to yadgar.internal"; that one is not
-# this one.
+# EDGE" IN THIS REPOSITORY'S OWN MIGRATION_NOTES.md HAS RUN (moved here from
+# yadgarhq/deploy, argocd#59). There is a second step 3, in "Move the
+# development domain to yadgar.internal", in yadgarhq/deploy's
+# MIGRATION_NOTES.md (not moved — deploy still runs that one); that one is
+# not this one.
 # The ClusterIssuer references a secret holding the CA private key, which is
 # created by hand from 1Password and is deliberately not in git. Until it exists
 # the issuer reports NotReady and the Certificate stays unissued. That is the
