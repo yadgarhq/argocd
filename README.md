@@ -4,12 +4,15 @@ Argo CD's own configuration. **Argo manages Argo:** the chart is applied once by
 hand to bootstrap, and from then on every change here arrives the same way every
 other change does.
 
-The cluster and the infrastructure live in
-[`yadgarhq/deploy`](https://github.com/yadgarhq/deploy). Decisions are in
+The cluster lives in the nix repo. `make bootstrap` and `make secrets` — the
+one-time Argo CD install and the secrets it needs before anything else can
+sync — live here too (ADR-0803; moved from
+[`yadgarhq/deploy`](https://github.com/yadgarhq/deploy)). Decisions are in
 [`yadgarhq/docs`](https://github.com/yadgarhq/docs) — D54 especially.
 
 | Path                           |                                                 |
 | ------------------------------ | ----------------------------------------------- |
+| `Makefile`                     | `make bootstrap`/`make secrets` (ADR-0803)      |
 | `install/values.yaml`          | Helm values for the `argo-cd` chart             |
 | `projects/root.yaml`           | app-of-apps root, applied once during bootstrap |
 | `applicationsets/modules.yaml` | discovers module repos across the organisation  |
@@ -67,10 +70,9 @@ gates, which need helm and run in CI's `two-owners` job.
 
 ## Argo manages Argo
 
-`install/values.yaml` is not read by the bootstrap. `make bootstrap` in
-`yadgarhq/deploy` passes only the few `--set` flags needed to _reach_ the
-server; the real values arrive through `applicationsets/argocd-self.yaml`, one
-sync later.
+`install/values.yaml` is not read by the bootstrap. `make bootstrap`, here,
+passes only the few `--set` flags needed to _reach_ the server; the real
+values arrive through `applicationsets/argocd-self.yaml`, one sync later.
 
 Without that Application the values file would apply to nothing while looking
 authoritative, which is worse than not having it.
