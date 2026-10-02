@@ -980,3 +980,100 @@ kubectl --context kind-yadgar -n argocd exec argocd-application-controller-0 \
 ```
 
 Then revert the commit here, so that git does not hold a value the cluster does not run.
+
+## The sync timeout is raised to 25200 s (ledger 1224)
+
+`install/values.yaml` raises `controller.sync.timeout.seconds` from `24000` to
+`25200` under `configs.params`. `yadgarhq/platform#24` is open, not merged, and
+adds `activeDeadlineSeconds` to the four estate hook Jobs; its arithmetic
+raises this repo's own floor to 24255 s
+(`scripts/tests/test_install_values.py`). ADR-0830 holds ONE value across this
+org and `yadgarhq/chart`'s kind installs, whose own floor is 24755 s, so 25200 s
+clears both. The value is raised now, ahead of platform#24 merging, because
+platform#24's release lands as a pin straight to `yadgarhq/chart` main with no
+PR CI (`parent_bump.py`).
+
+**`Application/argocd` is still not `automated`.** This value is already live
+through a manual sync of the whole Application, not the ledger-1208 targeted
+ConfigMap patch above: the live `argocd-cmd-params-cm` already carries
+`"24000"` (measured 2026-10-02), this Application's `status.sync.status` is
+`Synced`, its `status.operationState.phase` is `Succeeded`, started
+`06:51:46Z`, and its four workload pods (below) all started about 30 minutes
+before that measurement. So the targeted-patch procedure is superseded: **an
+operator applies this by syncing `Application/argocd` by hand** (UI, or
+`argocd app sync argocd --context kind-yadgar` if the CLI is logged in through
+the port-forward in `deploy/Makefile`). There is no kubectl-only equivalent
+once the Application carries other drift, because a sync reconciles all of it,
+not only this key. 3 of its 39 resources read OutOfSync (measured 2026-10-02)
+— read the diff before syncing, and do not sync to land only this key if the
+other drift is not also wanted.
+
+**The sync restarts four pods, not one.** The `argocd-cmd-params-cm` change
+flips the `checksum/cmd-params` annotation on every workload that mounts it:
+`argocd-application-controller` (StatefulSet), `argocd-repo-server`,
+`argocd-server` and `argocd-applicationset-controller` (Deployments) — all four
+carry the same `checksum/cmd-params` hash (measured 2026-10-02). `argocd-redis`
+carries no such annotation and is not touched. This is the same four-pod
+recreation the ledger-1208 sync already produced.
+
+**Do NOT run this sync.** This note documents the step for the operator; it is
+not applied by this change.
+
+### Before — read-only
+
+```bash
+# 1. The live value. Expect: 24000
+kubectl --context kind-yadgar -n argocd get configmap argocd-cmd-params-cm \
+  -o jsonpath='{.data.controller\.sync\.timeout\.seconds}'; echo
+
+# 2. No operation in flight. Expect: no rows. Any row → STOP.
+kubectl --context kind-yadgar get applications -A -o json \
+  | jq -r '.items[] | select(.status.operationState.phase == "Running" or .status.operationState.phase == "Terminating")
+           | [.metadata.name, .status.operationState.phase, .status.operationState.startedAt] | @tsv'
+
+# 3. What else is OutOfSync on this Application, so the operator knows what the
+#    sync will also apply. Compare against the diff before syncing.
+kubectl --context kind-yadgar -n argocd get application argocd -o json \
+  | jq -r '.status.resources[] | select(.status != "Synced") | "\(.kind)/\(.name) \(.status)"'
+
+# 4. The four pods, to compare ages after the sync. argocd-redis is excluded on
+#    purpose: it does not read this ConfigMap.
+kubectl --context kind-yadgar -n argocd get pods \
+  -l 'app.kubernetes.io/name in (argocd-application-controller,argocd-repo-server,argocd-server,argocd-applicationset-controller)' \
+  -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.uid} {.status.startTime}{"\n"}{end}'
+```
+
+### Apply
+
+Sync `Application/argocd` by hand: the UI's "SYNC" button, or
+`argocd app sync argocd --context kind-yadgar`.
+
+### After — verify
+
+```bash
+# 1. The ConfigMap holds the value. Expect: 25200
+kubectl --context kind-yadgar -n argocd get configmap argocd-cmd-params-cm \
+  -o jsonpath='{.data.controller\.sync\.timeout\.seconds}'; echo
+
+# 2. The four pods are new: uid and startTime differ from "Before" step 4.
+kubectl --context kind-yadgar -n argocd get pods \
+  -l 'app.kubernetes.io/name in (argocd-application-controller,argocd-repo-server,argocd-server,argocd-applicationset-controller)' \
+  -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.uid} {.status.startTime}{"\n"}{end}'
+
+# 3. argocd-redis is unchanged: same uid and startTime as before the sync.
+kubectl --context kind-yadgar -n argocd get pod -l app.kubernetes.io/name=argocd-redis \
+  -o jsonpath='{.items[0].metadata.uid} {.items[0].status.startTime}{"\n"}'
+
+# 4. The process has the value. Expect: 25200. This is an exec, but it only reads.
+kubectl --context kind-yadgar -n argocd exec argocd-application-controller-0 \
+  -c application-controller -- printenv ARGOCD_APPLICATION_CONTROLLER_SYNC_TIMEOUT
+
+# 5. The Application itself: Synced/Healthy.
+kubectl --context kind-yadgar -n argocd get application argocd \
+  -o jsonpath='{.status.sync.status}/{.status.health.status}{"\n"}'
+```
+
+### Rollback
+
+Revert the commit here, then sync `Application/argocd` again and re-run the
+"After" checks against `"24000"`.
