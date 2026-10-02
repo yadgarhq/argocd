@@ -7,8 +7,8 @@ throwaway kubeconfig minified to the `kind-yadgar` context with its namespace
 set to `argocd` (`argocd app sync argocd --core --kube-context kind-yadgar`;
 the form in "The sync timeout is raised to 25200 s" § "Apply" below), but that
 does not make later changes land on their own: the Application stays manual,
-so every change here
-still needs an operator to sync it by hand. Each section below says what it
+so every change here still needs an operator to sync it by hand. Each section
+below says what it
 needs that sync for; the ruling on when to run it belongs to the operator and
 is argued in `plans/argocd-adoption-sync.md` in `yadgarhq/docs`.
 
@@ -26,8 +26,8 @@ below describe. Both landed with that first sync, since this key predates it.
 The pod restart already happened too: the 2026-10-02 06:51Z sync (above)
 recreated `argocd-application-controller`, `argocd-repo-server`,
 `argocd-server` and `argocd-applicationset-controller`, and kept
-`argocd-redis`. The ledger-1224
-sync that lands 25200 (below) recreates the same four, the same way — through
+`argocd-redis`. The ledger-1224 sync that lands 25200 (below) recreates the
+same four, the same way — through
 `checksum/cmd-params`, which all four carry (measured 2026-10-02) and
 `argocd-redis` does not.
 
@@ -37,23 +37,24 @@ exercises, is narrower: only `argocd-server`, `argocd-repo-server` and
 the adoption brief measured, and it applies to **every** `configs.cm` edit, not
 to this one specially. `argocd-applicationset-controller` carries no
 `checksum/cm` annotation, so an isolated `configs.cm` edit would not have
-rolled it; this sync rolled it anyway because `configs.params` changed at the
-same time.
+rolled it. The first sync recreated it anyway. Which pod-template difference
+caused that was not isolated. It was not a `configs.params` data change: the
+ConfigMap already matched git after the 2026-10-01 patch.
 
 ### Verify the rule
 
 `argocd admin settings resource-overrides health` evaluates the rule exactly as
-the controller would, against a file. It may start cluster informers against
-whatever context is current, even when every input named below is a local file
-— measured 2026-10-02 — so every invocation here carries `--kube-context
-kind-yadgar` regardless, to keep that off this host's default (production)
-context. It does not NEED the cluster, though: the same command against a
-kubeconfig holding no clusters at all returns the identical `STATUS`/`MESSAGE`
-for the healthy case below, and `Progressing` for a `status.phase: Pending`
-input (both measured 2026-10-02). INFERRED, not measured, that it applies
-nothing: the informers it starts are read-only in every run observed, but no
-log line proves it writes nothing. Run this anyway — it is the check that
-turns "the Lua looks right" into "the Lua returns what I expect".
+the controller would, against a file. It logs informer startup in every run,
+but against a kubeconfig whose only server is unreachable it returns the same
+verdict with no connection error (measured 2026-10-02), so it does not contact
+the cluster; every invocation here carries `--kube-context kind-yadgar`
+anyway. The same command against a kubeconfig holding no clusters at all also
+returns the identical `STATUS`/`MESSAGE` for the healthy case below, and
+`Progressing` for a `status.phase: Pending` input (both measured 2026-10-02).
+INFERRED, not measured, that it applies nothing: no log line proves it writes
+nothing, though never contacting the cluster makes that more likely. Run this
+anyway — it is the check that turns "the Lua looks right" into "the Lua
+returns what I expect".
 
 ```bash
 # The rule, as a ConfigMap the CLI can read. Rendering it is what proves the
@@ -66,8 +67,8 @@ helm template argocd argo-cd --repo https://argoproj.github.io/argo-helm \
 # The live scale set, read-only.
 kubectl --context kind-yadgar -n estate-front get autoscalingrunnerset estate-front -o yaml > /tmp/ars.yaml
 
-# Takes the two files above; may start informers against the context too
-# (see above), though it does not need them — pinned anyway.
+# Takes the two files above; does not contact the cluster (see above) —
+# pinned anyway.
 argocd admin settings resource-overrides health /tmp/ars.yaml \
   --argocd-cm-path /tmp/argocd-cm.yaml --kube-context kind-yadgar
 # STATUS: Healthy

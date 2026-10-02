@@ -24,7 +24,7 @@
 configs:
   params:
     # NOTHING TERMINATES TLS IN FRONT OF ARGO'S OWN CONSOLE. It is reached by
-    # `kubectl --context kind-yadgar port-forward svc/argocd-server`
+    # `kubectl --context kind-yadgar -n argocd port-forward svc/argocd-server`
     # (deploy/Makefile) and by no other route: the kind node publishes
     # 18080/18443 for the yadgar edge only, and Argo has no Ingress and no
     # Gateway route. The earlier text here named a k3d loadbalancer; k3d was
@@ -90,10 +90,10 @@ configs:
     # namespace.
     #
     # IT READS `.status.phase` AND NOT THE `STATE` COLUMN, and that distinction
-    # is the whole trap. `kubectl --context kind-yadgar get autoscalingrunnersets`
-    # prints a `STATE` column, which is a PRINTER COLUMN reading `.status.state`
-    # — a field that does not exist. It is absent from the CRD's own status
-    # schema (which
+    # is the whole trap. `kubectl --context kind-yadgar -n estate-front get
+    # autoscalingrunnersets` prints a `STATE` column, which is a PRINTER COLUMN
+    # reading `.status.state` — a field that does not exist. It is absent from
+    # the CRD's own status schema (which
     # declares `currentRunners`, `failedEphemeralRunners`,
     # `pendingEphemeralRunners`, `phase`, `runningEphemeralRunners` and nothing
     # else) and absent from `AutoscalingRunnerSetStatus` in ARC 0.14.2's Go
