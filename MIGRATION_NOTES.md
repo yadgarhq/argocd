@@ -2,45 +2,75 @@
 
 Steps this repository needs from a person. Argo manages Argo, so a change here
 is not live when it merges — `applications/argocd.yaml` is deliberately not
-`automated`, and its adoption sync has never been run. Anything below that says
-"after the sync" is waiting on that one ruling, which belongs to the operator
-and is argued in `plans/argocd-adoption-sync.md` in `yadgarhq/docs`.
+`automated`. Its first sync ran once, 2026-10-02 06:51Z, by hand under a
+throwaway kubeconfig minified to the `kind-yadgar` context with its namespace
+set to `argocd` (`argocd app sync argocd --core --kube-context kind-yadgar`;
+the form in "The sync timeout is raised to 25200 s" § "Apply" below), but that
+does not make later changes land on their own: the Application stays manual,
+so every change here still needs an operator to sync it by hand. Each section
+below says what it
+needs that sync for; the ruling on when to run it belongs to the operator and
+is argued in `plans/argocd-adoption-sync.md` in `yadgarhq/docs`.
 
 ## The ARC scale-set health rule (ledger 745)
 
 `install/values.yaml` gained
 `resource.customizations.health.actions.github.com_AutoscalingRunnerSet` under
-`configs.cm`. **It is inert today**, and that is not a defect in this change —
-it is the state the adoption brief describes and the reason that brief exists.
-Nothing in the cluster behaves differently until `argocd app sync argocd` is
-run, and `Application/estate-front-runner` keeps reading Synced and Healthy with
-a scale set Argo has no opinion about until then.
+`configs.cm`, in #22 (`afc5c08`) — well before `Application/argocd`'s first
+sync (above). **It is live, not inert.** MEASURED 2026-10-02: the live
+`argocd-cm` already carries the Lua for this key, not empty, and
+`Application/estate-front-runner`'s `AutoscalingRunnerSet` resource already
+reads `Healthy` with a message — the pass this section's own "Verify" steps
+below describe. Both landed with that first sync, since this key predates it.
 
-Landing this rolls `argocd-server`, `argocd-repo-server` and
-`argocd-application-controller`, because each carries a `checksum/cm` annotation
-over the rendered `argocd-cm`. That is the mechanism the adoption brief measured,
-and it applies to **every** `configs.cm` edit forever, not to this one specially.
-It does not roll `argocd-redis` or the ApplicationSet controller.
+The pod restart already happened too: the 2026-10-02 06:51Z sync (above)
+recreated `argocd-application-controller`, `argocd-repo-server`,
+`argocd-server` and `argocd-applicationset-controller`, and kept
+`argocd-redis`. The ledger-1224 sync that lands 25200 (below) recreates the
+same four, the same way — through
+`checksum/cmd-params`, which all four carry (measured 2026-10-02) and
+`argocd-redis` does not.
 
-### Verify the rule before syncing anything
+`checksum/cm`, the mechanism a `configs.cm` edit like this one actually
+exercises, is narrower: only `argocd-server`, `argocd-repo-server` and
+`argocd-application-controller` carry it (measured 2026-10-02) — that is what
+the adoption brief measured, and it applies to **every** `configs.cm` edit, not
+to this one specially. `argocd-applicationset-controller` carries no
+`checksum/cm` annotation, so an isolated `configs.cm` edit would not have
+rolled it. The first sync recreated it anyway. Which pod-template difference
+caused that was not isolated. It was not a `configs.params` data change: the
+ConfigMap already matched git after the 2026-10-01 patch.
+
+### Verify the rule
 
 `argocd admin settings resource-overrides health` evaluates the rule exactly as
-the controller would, against a file, with no cluster contact and nothing
-applied. Do this first — it is the check that turns "the Lua looks right" into
-"the Lua returns what I expect".
+the controller would, against a file. It logs informer startup in every run,
+but against a kubeconfig whose only server is unreachable it returns the same
+verdict with no connection error (measured 2026-10-02), so it does not contact
+the cluster; every invocation here carries `--kube-context kind-yadgar`
+anyway. The same command against a kubeconfig holding no clusters at all also
+returns the identical `STATUS`/`MESSAGE` for the healthy case below, and
+`Progressing` for a `status.phase: Pending` input (both measured 2026-10-02).
+INFERRED, not measured, that it applies nothing: no log line proves it writes
+nothing, though never contacting the cluster makes that more likely. Run this
+anyway — it is the check that turns "the Lua looks right" into "the Lua
+returns what I expect".
 
 ```bash
 # The rule, as a ConfigMap the CLI can read. Rendering it is what proves the
-# chart puts the key where Argo looks for it.
+# chart puts the key where Argo looks for it. Purely local, but pinned anyway:
+# `helm template` takes `--kube-context` too.
 helm template argocd argo-cd --repo https://argoproj.github.io/argo-helm \
-  --version 8.6.1 -n argocd -f install/values.yaml \
+  --version 8.6.1 -n argocd -f install/values.yaml --kube-context kind-yadgar \
   | yq 'select(.kind == "ConfigMap" and .metadata.name == "argocd-cm")' > /tmp/argocd-cm.yaml
 
 # The live scale set, read-only.
-kubectl -n estate-front get autoscalingrunnerset estate-front -o yaml > /tmp/ars.yaml
+kubectl --context kind-yadgar -n estate-front get autoscalingrunnerset estate-front -o yaml > /tmp/ars.yaml
 
+# Takes the two files above; does not contact the cluster (see above) —
+# pinned anyway.
 argocd admin settings resource-overrides health /tmp/ars.yaml \
-  --argocd-cm-path /tmp/argocd-cm.yaml
+  --argocd-cm-path /tmp/argocd-cm.yaml --kube-context kind-yadgar
 # STATUS: Healthy
 # MESSAGE: phase Running: the listener exists and 0 runner(s) are up. Zero is
 #          the correct idle state under minRunners: 0.
@@ -52,25 +82,44 @@ a message naming the phase. A rule that reports Healthy for both is a rule that
 has not been installed; check the key name, which is one string with dots in the
 group and a single underscore before the kind.
 
-`argocd` is not installed on the machine this change was written on, so the
-command above has **not** been run. What was run instead: the Lua was extracted
-back out of `install/values.yaml` and evaluated with a stock Lua interpreter
-against the real live object's JSON and six mutations of it. That proves the
-logic and the phase values; it does not prove Argo loads the key, because only
-Argo can prove that. The command above is the step that closes the gap, and it
-costs nothing.
+`argocd` IS installed on this host now (v3.4.6), and the command above WAS run
+this session (2026-10-02): `STATUS: Healthy` / `MESSAGE: phase Running: the
+listener exists and 0 runner(s) are up. Zero is the correct idle state under
+minRunners: 0.` — matching the expected output above exactly. That result came
+from the `--argocd-cm-path` file: the same command against a kubeconfig with
+no clusters returns the identical output (measured 2026-10-02). Earlier, when
+this section was first written, `argocd` was not installed, and
+what was run instead was the Lua extracted back out of `install/values.yaml`
+and evaluated with a stock Lua interpreter against the real live object's JSON
+and six mutations of it. That proved the logic and the phase values; it did
+not prove Argo loads the key, because only Argo can prove that — which the
+command above, now run for real, does.
 
-### After the sync
+### Checks after any sync
 
 ```bash
 # The key reached the live ConfigMap.
-kubectl -n argocd get cm argocd-cm \
+kubectl --context kind-yadgar -n argocd get cm argocd-cm \
   -o jsonpath='{.data.resource\.customizations\.health\.actions\.github\.com_AutoscalingRunnerSet}'
 # the Lua, not empty
 
 # The scale set now carries a health status. It carried NONE before this.
-kubectl -n argocd get application estate-front-runner \
-  -o jsonpath='{range .status.resources[?(@.kind=="AutoscalingRunnerSet")]}{.health.status}{" — "}{.health.message}{"\n"}{end}'
+# NOT a kubectl read of `.status.resources[].health`: Argo v3 does not persist
+# per-resource health onto the Application CR by default
+# (`controller.resource.health.persist` is unset here, measured 2026-10-02),
+# so that field reads empty whether the rule loaded or not — a kubectl read of
+# it would report a working rule as broken. `argocd app get --core` computes
+# health live instead of reading the persisted (here, absent) field.
+(
+  set -eu
+  TMPKC=$(mktemp)
+  trap 'rm -f "$TMPKC"' EXIT
+  kubectl config view --minify --flatten --context kind-yadgar > "$TMPKC"
+  [ -s "$TMPKC" ] || exit 1
+  kubectl --kubeconfig "$TMPKC" config set-context kind-yadgar --namespace argocd
+  KUBECONFIG="$TMPKC" argocd app get estate-front-runner --core --kube-context kind-yadgar -o json \
+    | jq -r '.status.resources[] | select(.kind=="AutoscalingRunnerSet") | .health | "\(.status) — \(.message)"'
+)
 # Healthy — phase Running: the listener exists and 0 runner(s) are up. …
 ```
 
@@ -843,6 +892,14 @@ merge, and delete it in a second.
 
 ## The sync timeout (ledger 1208)
 
+**HISTORICAL, SUPERSEDED.** This section records the hand `kubectl patch` plus
+controller restart that landed `"24000"`, run while `Application/argocd` was
+still unsynced. The Application has since been adopted: its first sync ran
+2026-10-02, right after argocd#56 (`f4da219`) merged (see "The sync timeout is
+raised to 25200 s" below). The "Do not sync it" guidance a few lines down no
+longer holds — syncing the Application is now the normal way to land a change
+here, not an exception to avoid.
+
 `install/values.yaml` gained `controller.sync.timeout.seconds: "24000"` under
 `configs.params`. **Apply this only after M3 has moved `Application/tls` here
 with its limit-6 retry.** The tls Application on the cluster before M3 retries 60
@@ -980,3 +1037,149 @@ kubectl --context kind-yadgar -n argocd exec argocd-application-controller-0 \
 ```
 
 Then revert the commit here, so that git does not hold a value the cluster does not run.
+
+## The sync timeout is raised to 25200 s (ledger 1224)
+
+`install/values.yaml` raises `controller.sync.timeout.seconds` from `24000` to
+`25200` under `configs.params`. `yadgarhq/platform#24` is open, not merged, and
+adds `activeDeadlineSeconds` to the four estate hook Jobs; its arithmetic
+raises this repo's own floor to 24255 s
+(`scripts/tests/test_install_values.py`). ADR-0830 holds ONE value across this
+org and `yadgarhq/chart`'s kind installs, whose own floor is 24755 s, so 25200 s
+clears both. The value is raised now, ahead of platform#24 merging, because
+platform#24's release lands as a pin straight to `yadgarhq/chart` main with no
+PR CI (`parent_bump.py`).
+
+**`Application/argocd` is still not `automated`.** `"24000"` reached the live
+`argocd-cmd-params-cm` on 2026-10-01 by the hand `kubectl patch` plus
+controller restart above (ledger 1208) — the Application was not yet adopted
+then. Its FIRST sync ran 2026-10-02 06:51:46Z, right after argocd#56
+(`f4da219`) merged: by hand, `argocd app sync argocd --core --kube-context
+kind-yadgar` under a throwaway kubeconfig minified to the `kind-yadgar` context
+with its namespace set to `argocd` (the form in "Apply" below). It Succeeded
+and recreated `argocd-application-controller`, `argocd-repo-server`,
+`argocd-server` and `argocd-applicationset-controller`; `argocd-redis` was
+untouched. So the Application IS adopted now, and the ledger-1208 "do not sync
+it" guidance no longer holds: **an operator applies this by syncing
+`Application/argocd`**, pinned to `kind-yadgar` (below) — not by repeating the
+hand patch. A patch would still land the one key, but it would leave the other three
+workloads' (`argocd-repo-server`, `argocd-server`,
+`argocd-applicationset-controller`) `checksum/cmd-params` annotation drifted,
+since the ledger-1208 steps restart only the controller's StatefulSet; sync
+instead and let Argo restart all four together. 3 of its 39 resources carry no
+sync status at all (measured 2026-10-02): `ServiceAccount`/`Role`/`RoleBinding`
+`argocd-redis-secret-init`, each `requiresPruning: true`. They are the
+`argocd-redis-secret-init` PreSync hook's own objects (helm
+`before-hook-creation`): each sync deletes and recreates them, and they keep
+reading `requiresPruning: true` with no sync status. A sync does not prune
+them — there is no prune option here, no `--prune` passed. Read the diff
+before syncing regardless, since a sync reconciles anything else that has
+since drifted.
+
+**The sync restarts four pods, not one.** The `argocd-cmd-params-cm` change
+flips the `checksum/cmd-params` annotation on every workload that mounts it:
+`argocd-application-controller` (StatefulSet), `argocd-repo-server`,
+`argocd-server` and `argocd-applicationset-controller` (Deployments) — all four
+carry the same `checksum/cmd-params` hash (measured 2026-10-02). `argocd-redis`
+carries no such annotation and is not touched. This is the same four-pod
+recreation the Application's first sync (above) already produced.
+
+**Do NOT run this sync.** This note documents the step for the operator; it is
+not applied by this change.
+
+### Before — read-only
+
+```bash
+# 1. The live value. Expect: 24000
+kubectl --context kind-yadgar -n argocd get configmap argocd-cmd-params-cm \
+  -o jsonpath='{.data.controller\.sync\.timeout\.seconds}'; echo
+
+# 2. No operation in flight. Expect: no rows. Any row → STOP.
+kubectl --context kind-yadgar get applications -A -o json \
+  | jq -r '.items[] | select(.status.operationState.phase == "Running" or .status.operationState.phase == "Terminating")
+           | [.metadata.name, .status.operationState.phase, .status.operationState.startedAt] | @tsv'
+
+# 3. Anything else not reading Synced, so the operator knows what the sync
+#    will also touch (the redis-secret-init PreSync hook's own objects
+#    included: they carry no status field at all and are not pruned by a
+#    sync). Compare against the diff before syncing.
+kubectl --context kind-yadgar -n argocd get application argocd -o json \
+  | jq -r '.status.resources[] | select(.status != "Synced") | "\(.kind)/\(.name) \(.status // "no-status, requiresPruning=" + (.requiresPruning | tostring))"'
+
+# 4. The four pods, to compare ages after the sync. argocd-redis is excluded on
+#    purpose: it does not read this ConfigMap.
+kubectl --context kind-yadgar -n argocd get pods \
+  -l 'app.kubernetes.io/name in (argocd-application-controller,argocd-repo-server,argocd-server,argocd-applicationset-controller)' \
+  -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.uid} {.status.startTime}{"\n"}{end}'
+```
+
+### Apply
+
+`--core` DOES take `--kube-context`, but that alone is not enough here: `argocd
+app get argocd --core --kube-context kind-yadgar` (read-only, measured)
+fails with `configmap "argocd-cm" not found`, because `--core` looks up the
+control-plane `argocd-cm` in whatever namespace the kubeconfig CONTEXT itself
+names, not `-N`/`--app-namespace` (that flag only scopes which namespace to
+look up the Application, and adding it does not fix the failure, measured) and
+not the `ARGOCD_NAMESPACE` env var (tried too, same failure, measured).
+`kind-yadgar`'s context names namespace `yadgar`, not `argocd`
+(`kubectl config get-contexts`). The default context on this host is a
+production cluster, so an unpinned command here is a hazard.
+
+Measured working form: a throwaway kubeconfig, minified to just the
+`kind-yadgar` context, with that one field changed. It touches no file outside
+`/tmp` and leaves the real kubeconfig alone. The whole body runs in a
+subshell, `( set -eu; … )`, so `set -eu`, `exit` and the `EXIT` trap are all
+scoped to that subshell: pasted into an interactive shell, a failure here ends
+only the subshell, never the paster's own session. `[ -s "$TMPKC" ]` sits
+directly after the line that can leave it empty.
+
+```bash
+(
+  set -eu
+  TMPKC=$(mktemp)
+  trap 'rm -f "$TMPKC"' EXIT
+  kubectl config view --minify --flatten --context kind-yadgar > "$TMPKC"
+  [ -s "$TMPKC" ] || exit 1
+  kubectl --kubeconfig "$TMPKC" config set-context kind-yadgar --namespace argocd
+  KUBECONFIG="$TMPKC" argocd app sync argocd --core --kube-context kind-yadgar
+)
+```
+
+Verified (2026-10-02): pasting this block, with `kind-yadgar` swapped for a
+nonexistent context, into an interactive `bash -i` session — `kubectl config
+view` fails loud, `set -e` ends the subshell there (the `[ -s ]` line is never
+reached), the parent shell's next prompt comes back normally, and the `EXIT`
+trap still ran: the temp file it reported was gone afterward. A `bash -c`
+invocation would not have caught this class of bug, because `-c` already runs
+the whole block in its own process.
+
+### After — verify
+
+```bash
+# 1. The ConfigMap holds the value. Expect: 25200
+kubectl --context kind-yadgar -n argocd get configmap argocd-cmd-params-cm \
+  -o jsonpath='{.data.controller\.sync\.timeout\.seconds}'; echo
+
+# 2. The four pods are new: uid and startTime differ from "Before" step 4.
+kubectl --context kind-yadgar -n argocd get pods \
+  -l 'app.kubernetes.io/name in (argocd-application-controller,argocd-repo-server,argocd-server,argocd-applicationset-controller)' \
+  -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.uid} {.status.startTime}{"\n"}{end}'
+
+# 3. argocd-redis is unchanged: same uid and startTime as before the sync.
+kubectl --context kind-yadgar -n argocd get pod -l app.kubernetes.io/name=argocd-redis \
+  -o jsonpath='{.items[0].metadata.uid} {.items[0].status.startTime}{"\n"}'
+
+# 4. The process has the value. Expect: 25200. This is an exec, but it only reads.
+kubectl --context kind-yadgar -n argocd exec argocd-application-controller-0 \
+  -c application-controller -- printenv ARGOCD_APPLICATION_CONTROLLER_SYNC_TIMEOUT
+
+# 5. The Application itself: Synced/Healthy.
+kubectl --context kind-yadgar -n argocd get application argocd \
+  -o jsonpath='{.status.sync.status}/{.status.health.status}{"\n"}'
+```
+
+### Rollback
+
+Revert the commit here, then run the same throwaway-kubeconfig sync from
+"Apply" again and re-run the "After" checks against `"24000"`.

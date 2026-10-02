@@ -88,37 +88,52 @@ MEASURED_MARGIN = 3
 
 # ─── yadgar: chart 0.3.13, which embeds `platform` 0.1.21 ─────────────────────
 #
-# Rendered with `applications/yadgar.yaml`'s `valuesObject`, every attempt runs
-# four hook Jobs from the platform subchart, none with `activeDeadlineSeconds`.
-# The preflight and the probe carry the ceilings `yadgarhq/platform@v0.1.21
-# chart/values.yaml` documents. They are DOCUMENTED CEILINGS, NOT BOUNDS: each
-# loop is bounded, but every `request()` in both scripts is a curl with no
-# `--max-time`, so request time is unbounded.
+# FORWARD-LOOKING (ledger 1224, ADR-0830). `yadgarhq/platform#24` is open, not
+# merged: today's render still carries no `activeDeadlineSeconds` on these
+# hooks, and the OLD documented-ceiling arithmetic (3225 s/attempt) is smaller
+# than the numbers below. Once platform#24 merges, `parent_bump.py` pins the
+# new `platform` release straight to `yadgarhq/chart` main with no PR CI, so
+# this value is raised BEFORE that merge rather than after it. The numbers
+# below are #24's own (`chart/templates/_preflight.tpl`,
+# `preflight.yaml`, `envoy-gateway-probe.yaml`, `bootstrap-secrets.yaml`),
+# hand-typed from platform#24 @2d86082; nothing re-reads them.
 #
-#   preflight (PreSync, hook-weight -7). `timeoutSeconds: 120` (L857). "worst
-#     case with every probe on is eight 120s loops plus the same 300s margin"
-#     (L1035-1036); this cluster runs all four operators.
-PREFLIGHT_SECONDS = 8 * 120 + 300
-#   envoy-gateway-probe (PostSync, hook-weight -7). `timeoutSeconds: 300`
-#     (L1043). The values say three loops (L1026-1030): "the composed bound is
-#     900s, and the documented `--timeout 25m` leaves 600s over it for
-#     scheduling, image pull and request time" (L1033-1035). The script
-#     (`chart/templates/envoy-gateway-probe.yaml`) runs FOUR: `remove` of the
-#     Gateway, `create` of the EnvoyProxy (which calls `remove` first), `create`
-#     of the Gateway (which calls `remove` of the Gateway again), and `await`.
-#     The fourth is the second `remove` of a Gateway the first one already
-#     deleted, so on the legitimate path it returns at once (~0 s). The values'
-#     900 + 600 is kept.
-PROBE_SECONDS = 3 * 300 + 600
-#   bootstrap-secrets and admin-bootstrap-token (PreSync, both hook-weight -5).
-#     They run IN PARALLEL: same weight, and the live Jobs both started at
-#     2026-10-01 08:09:39 and completed at 08:09:42 (3 s). bootstrap-secrets
-#     makes three requests (valkey-password, nats-auth, nats-auth-gateway),
-#     admin-bootstrap-token its own; the measured 3 s covers all of them. No
-#     curl has a timeout, each Job has `backoffLimit: 4` and no deadline, so the
-#     allowance is the Job's own pod backoff (10 + 20 + 40 + 80 s) plus 5
-#     attempts of the measured 3 s, times MEASURED_MARGIN. The two Jobs share it.
-BOOTSTRAP_JOB_SECONDS = (10 + 20 + 40 + 80) + 5 * 3 * MEASURED_MARGIN
+# Rendered with `applications/yadgar.yaml`'s `valuesObject` (`iamKeys.create:
+# false` in this org), every attempt runs four hook Jobs from the platform
+# subchart.
+#
+#   preflight (PreSync, hook-weight -7). #24 bounds the Job itself:
+#     `activeDeadlineSeconds` = bounded loops x `timeoutSeconds` (120) + a 300 s
+#     margin. This cluster runs all four operators: cert-manager (4 loops),
+#     keda (3), mariadb-operator (0), prometheus (1) = 8 loops, 1260 s.
+#     `terminationGracePeriodSeconds` lets the TERM trap finish the request in
+#     flight (35 s) and one 5 s cleanup DELETE per object the probes left
+#     (cert-manager 3, keda 2 = 5 objects): 35 + 5*5 = 60 s. INFERRED: a Job
+#     reads Failed only after its pod terminates (Kubernetes >= 1.31; kind is
+#     1.36), so the grace period counts toward the attempt.
+PREFLIGHT_DEADLINE = 8 * 120 + 300
+PREFLIGHT_GRACE = 35 + 5 * 5
+PREFLIGHT_SECONDS = PREFLIGHT_DEADLINE + PREFLIGHT_GRACE
+#   envoy-gateway-probe (PostSync, hook-weight -7). Same shape: `activeDeadlineSeconds`
+#     = loops (3) x `timeoutSeconds` (300) + 300 s margin = 1200 s.
+#     `terminationGracePeriodSeconds` = 35 s request-in-flight + 2 objects
+#     (Gateway, EnvoyProxy) x 5 s cleanup = 45 s.
+PROBE_DEADLINE = 3 * 300 + 300
+PROBE_GRACE = 35 + 2 * 5
+PROBE_SECONDS = PROBE_DEADLINE + PROBE_GRACE
+#   bootstrap-secrets and admin-bootstrap-token (PreSync, both hook-weight -5,
+#     run IN PARALLEL). #24 gives each its own `activeDeadlineSeconds`: the Job
+#     controller's own pod backoff (10 + 20 + 40 + 80 = 150 s, `backoffLimit: 4`)
+#     plus 5 attempts of (a 30 s scheduling/start allowance + its requests x a
+#     10 s `--max-time` each). bootstrap-secrets makes 3 requests with
+#     `iamKeys.create: false` (valkey-password, nats-auth, nats-auth-gateway),
+#     so its attempt is 30 + 3*10 = 60 s and its deadline 150 + 5*60 = 450 s;
+#     admin-bootstrap-token makes 1 and is smaller. The two Jobs share the
+#     larger deadline. Neither sets `terminationGracePeriodSeconds`, so
+#     Kubernetes' pod default, 30 s, applies.
+BOOTSTRAP_DEADLINE = (10 + 20 + 40 + 80) + 5 * (30 + 3 * 10)
+BOOTSTRAP_GRACE = 30
+BOOTSTRAP_JOB_SECONDS = BOOTSTRAP_DEADLINE + BOOTSTRAP_GRACE
 #   SYNC-PHASE HEALTH. yadgar's sync is multi-step (it has Pre- and PostSync
 #     hooks; gitops-engine `pkg/sync/sync_tasks.go:274`), so each attempt also
 #     waits for its Sync-phase resources to be Healthy before PostSync runs
@@ -127,7 +142,7 @@ BOOTSTRAP_JOB_SECONDS = (10 + 20 + 40 + 80) + 5 * 3 * MEASURED_MARGIN
 #     and the nats StatefulSet and the MariaDBs have no deadline at all.
 #     MEASURED, NOT BOUNDED: the v0.3.15 VM run's attempt 0 finished its
 #     preflight at 09:53:55 and failed at 09:55:31 still "waiting for healthy
-#     state of apps/Deployment/iam-db", so at least 90 s.
+#     state of apps/Deployment/iam-db", so at least 90 s. #24 does not touch this.
 SYNC_HEALTH_SECONDS = 90 * MEASURED_MARGIN
 YADGAR_ATTEMPT_SECONDS = PREFLIGHT_SECONDS + PROBE_SECONDS + BOOTSTRAP_JOB_SECONDS + SYNC_HEALTH_SECONDS
 
@@ -144,9 +159,9 @@ YADGAR_ATTEMPT_SECONDS = PREFLIGHT_SECONDS + PROBE_SECONDS + BOOTSTRAP_JOB_SECON
 ATTEMPT_ALLOWANCE = {
     "yadgar": (
         YADGAR_ATTEMPT_SECONDS,
-        "documented ceiling (request time unbounded: request() curls have no --max-time): "
-        "preflight 8x120+300, probe 3x300+600 (platform 0.1.21); "
-        "measured+job-backoff, not bounded: the two parallel bootstrap Jobs; "
+        "bounded: activeDeadlineSeconds + grace, platform#24 (forward-looking): "
+        "preflight 1260+60, probe 1200+45, bootstrap deadline 450+30 (iamKeys off "
+        "in this org); "
         "measured, not bounded: Sync-phase health, 90 s",
     ),
     # The CA preflight Job's `activeDeadlineSeconds: 300` (`manifests/tls/ca-preflight.yaml`).
@@ -297,13 +312,16 @@ def test_the_retry_waits_are_the_measured_sequence() -> None:
 
 
 def test_yadgar_per_attempt_is_the_documented_bounds() -> None:
-    assert (PREFLIGHT_SECONDS, PROBE_SECONDS, BOOTSTRAP_JOB_SECONDS, SYNC_HEALTH_SECONDS) == (1260, 1500, 195, 270)
-    assert YADGAR_ATTEMPT_SECONDS == 3225
+    assert (PREFLIGHT_DEADLINE, PREFLIGHT_GRACE) == (1260, 60)
+    assert (PROBE_DEADLINE, PROBE_GRACE) == (1200, 45)
+    assert (BOOTSTRAP_DEADLINE, BOOTSTRAP_GRACE) == (450, 30)
+    assert (PREFLIGHT_SECONDS, PROBE_SECONDS, BOOTSTRAP_JOB_SECONDS, SYNC_HEALTH_SECONDS) == (1320, 1245, 480, 270)
+    assert YADGAR_ATTEMPT_SECONDS == 3315
 
 
 def test_the_floor_is_yadgars_chain() -> None:
-    # 1050 s of backoff plus 7 attempts of 3225 s.
-    assert sync_timeout_floor() == 1050 + 7 * 3225 == 23625
+    # 1050 s of backoff plus 7 attempts of 3315 s.
+    assert sync_timeout_floor() == 1050 + 7 * 3315 == 24255
 
 
 def test_every_automated_application_is_read() -> None:
@@ -365,7 +383,7 @@ def test_a_new_manual_application_needs_no_row(copy: Path) -> None:
             }
         )
     )
-    assert sync_timeout_floor(copy) == 23625
+    assert sync_timeout_floor(copy) == 24255
 
 
 @pytest.mark.parametrize("limit", [0, -1], ids=["zero", "forever"])
@@ -383,8 +401,8 @@ def test_a_dropped_retry_block_falls_back_to_the_implicit_one(copy: Path) -> Non
     document = yaml.safe_load(path.read_text())
     del document["spec"]["syncPolicy"]["retry"]
     path.write_text(yaml.safe_dump(document))
-    # 310 s of implicit backoff plus 6 attempts of 3225 s.
-    assert sync_timeout_floor(copy) == 310 + 6 * 3225
+    # 310 s of implicit backoff plus 6 attempts of 3315 s.
+    assert sync_timeout_floor(copy) == 310 + 6 * 3315
 
 
 @pytest.mark.parametrize(
@@ -395,13 +413,26 @@ def test_a_dropped_retry_block_falls_back_to_the_implicit_one(copy: Path) -> Non
         ("900", "below"),
         ("4200", "below"),
         ("22200", "below"),
-        ("23624", "below"),
+        ("24000", "below"),
+        ("24254", "below"),
         ("2147483648", "MaxInt32"),
         ("3000000000", "MaxInt32"),
-        (24000, "not a quoted"),
+        (25200, "not a quoted"),
         ("6h", "not a quoted"),
     ],
-    ids=["missing", "zero", "900", "old-4200", "old-22200", "one-under-floor", "maxint32-plus-1", "3e9", "unquoted", "go-duration"],
+    ids=[
+        "missing",
+        "zero",
+        "900",
+        "old-4200",
+        "old-22200",
+        "old-24000",
+        "one-under-floor",
+        "maxint32-plus-1",
+        "3e9",
+        "unquoted",
+        "go-duration",
+    ],
 )
 def test_a_bad_sync_timeout_reddens(value: object, named: str) -> None:
     document = yaml.safe_load(yaml.safe_dump(values()))
