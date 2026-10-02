@@ -96,8 +96,7 @@ MEASURED_MARGIN = 3
 # this value is raised BEFORE that merge rather than after it. The numbers
 # below are #24's own (`chart/templates/_preflight.tpl`,
 # `preflight.yaml`, `envoy-gateway-probe.yaml`, `bootstrap-secrets.yaml`),
-# re-derived here rather than copied, so they outlast both the pre-#24 render
-# and the post-#24 one.
+# hand-typed from platform#24 @2d86082; nothing re-reads them.
 #
 # Rendered with `applications/yadgar.yaml`'s `valuesObject` (`iamKeys.create:
 # false` in this org), every attempt runs four hook Jobs from the platform

@@ -4,8 +4,10 @@
 #
 # ADOPTED, 2026-10-02. `applications/argocd.yaml` is deliberately not
 # `automated`, but its FIRST sync has now run: by hand, `argocd app sync
-# argocd --core`, right after argocd#56 (`f4da219`) merged. It Succeeded and
-# recreated `argocd-application-controller`, `argocd-repo-server`,
+# argocd --core` under a throwaway kubeconfig minified to the `kind-yadgar`
+# context with its namespace set to `argocd` (the form in MIGRATION_NOTES.md's
+# ledger-1224 "Apply" step), right after argocd#56 (`f4da219`) merged. It
+# Succeeded and recreated `argocd-application-controller`, `argocd-repo-server`,
 # `argocd-server` and `argocd-applicationset-controller`; `argocd-redis` was
 # untouched. Before that sync (measured 2026-09-06), all 33 of the
 # Application's resources read OutOfSync, and the live `argocd-cm` still
