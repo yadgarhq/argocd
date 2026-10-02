@@ -993,20 +993,27 @@ clears both. The value is raised now, ahead of platform#24 merging, because
 platform#24's release lands as a pin straight to `yadgarhq/chart` main with no
 PR CI (`parent_bump.py`).
 
-**`Application/argocd` is still not `automated`.** This value is already live
-through a manual sync of the whole Application, not the ledger-1208 targeted
-ConfigMap patch above: the live `argocd-cmd-params-cm` already carries
-`"24000"` (measured 2026-10-02), this Application's `status.sync.status` is
-`Synced`, its `status.operationState.phase` is `Succeeded`, started
-`06:51:46Z`, and its four workload pods (below) all started about 30 minutes
-before that measurement. So the targeted-patch procedure is superseded: **an
-operator applies this by syncing `Application/argocd` by hand** (UI, or
-`argocd app sync argocd --context kind-yadgar` if the CLI is logged in through
-the port-forward in `deploy/Makefile`). There is no kubectl-only equivalent
-once the Application carries other drift, because a sync reconciles all of it,
-not only this key. 3 of its 39 resources read OutOfSync (measured 2026-10-02)
-— read the diff before syncing, and do not sync to land only this key if the
-other drift is not also wanted.
+**`Application/argocd` is still not `automated`.** MEASURED 2026-10-02: the
+live `argocd-cmd-params-cm` already carries `"24000"`; this Application's
+`status.sync.status` is `Synced`, its `status.operationState.phase` is
+`Succeeded`, started `06:51:46Z`; and its four workload pods (below) all
+started about 30 minutes before that measurement. INFERRED from that: a
+manual sync of the whole Application is what landed `"24000"`, not the
+ledger-1208 targeted ConfigMap patch above — the Application carries no
+`automated` block, so only an operator-triggered sync produces this state, but
+`status.operationState.operation.initiatedBy` is empty and `status.history` is
+absent, so neither the actor nor the tool is recorded. So the targeted-patch
+procedure is superseded: **an operator applies this by syncing
+`Application/argocd` by hand** (UI, or `argocd app sync argocd --context
+kind-yadgar` if the CLI is logged in through the port-forward in
+`deploy/Makefile`). There is no kubectl-only equivalent once the Application
+carries un-pruned hook resources, because a sync reconciles those too, not
+only this key. 3 of its 39 resources carry no sync status at all (measured
+2026-10-02): `ServiceAccount`/`Role`/`RoleBinding` `argocd-redis-secret-init`,
+a PreSync hook's resources, each `requiresPruning: true`. They are leftover
+hook objects awaiting prune, not drifted live config — but read the diff
+before syncing regardless, since a sync prunes them and reconciles anything
+else that has since drifted.
 
 **The sync restarts four pods, not one.** The `argocd-cmd-params-cm` change
 flips the `checksum/cmd-params` annotation on every workload that mounts it:
@@ -1031,10 +1038,11 @@ kubectl --context kind-yadgar get applications -A -o json \
   | jq -r '.items[] | select(.status.operationState.phase == "Running" or .status.operationState.phase == "Terminating")
            | [.metadata.name, .status.operationState.phase, .status.operationState.startedAt] | @tsv'
 
-# 3. What else is OutOfSync on this Application, so the operator knows what the
-#    sync will also apply. Compare against the diff before syncing.
+# 3. Anything else not reading Synced, so the operator knows what the sync
+#    will also touch (hook resources awaiting prune included: they carry no
+#    status field at all). Compare against the diff before syncing.
 kubectl --context kind-yadgar -n argocd get application argocd -o json \
-  | jq -r '.status.resources[] | select(.status != "Synced") | "\(.kind)/\(.name) \(.status)"'
+  | jq -r '.status.resources[] | select(.status != "Synced") | "\(.kind)/\(.name) \(.status // "no-status, requiresPruning=" + (.requiresPruning | tostring))"'
 
 # 4. The four pods, to compare ages after the sync. argocd-redis is excluded on
 #    purpose: it does not read this ConfigMap.
