@@ -212,12 +212,28 @@ jobs:
   # and `valuesObject` (E3), and its render equals the committed per-object
   # digests (K3).
   #
-  # NOT A PRE-COMMIT HOOK. Both need helm and the registry (`helm pull` of the
-  # pinned parent), and the example is read from `yadgarhq/chart` at the pinned
-  # tag. That is why they live in `scripts/gates/`, outside the path the
-  # offline `operator-applications` hook runs (`scripts/tests`).
+  # LEDGER 1217 ADDED A THIRD: `scripts/gates/test_crd_no_silent_drop.py`.
+  # Argo CD v3.1.8 never tracks a CustomResourceDefinition (`repository.go:1584`,
+  # `!IsCRD`), so it never prunes one either — a chart-pin bump, a values
+  # change, or a deleted Application that drops a CRD leaves it (and any custom
+  # resource it still admits) in the cluster silently. The gate renders every
+  # in-scope `applications/*.yaml` chart source with `helm template
+  # --include-crds` at this pull request's BASE commit and again at HEAD
+  # (reading the base side through the GitHub contents API at `PR_BASE_SHA`,
+  # the same shape `scripts/check_chart_pin.py` uses, because CI clones at
+  # depth 1 and has no base commit to `git show`), and fails on any CRD the
+  # base side rendered that the head side does not, unless
+  # `scripts/crd_removals_ack.json` names it.
   #
-  # A MERGE GATE THROUGH `ci`'s `needs:` (above). PULL REQUESTS ONLY.
+  # NOT A PRE-COMMIT HOOK. All three need helm and the registry (`helm pull` of
+  # the pinned parent and of every in-scope operator Application), and the
+  # example is read from `yadgarhq/chart` at the pinned tag. That is why they
+  # live in `scripts/gates/`, outside the path the offline
+  # `operator-applications` hook runs (`scripts/tests`).
+  #
+  # A MERGE GATE THROUGH `ci`'s `needs:` (above). PULL REQUESTS ONLY — which is
+  # also why `PR_BASE_SHA` below is always set when this step runs; nothing
+  # here needs to tolerate its absence.
   two-owners:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -246,5 +262,16 @@ jobs:
           # renders the parent with.
           version: v3.18.4
 
-      - name: no object in namespace yadgar has two owners, and yadgar is the example
+      # `GITHUB_TOKEN` ONLY RAISES THE RATE LIMIT, same argument as `chart-pin`
+      # above: this repository is public (checked by hand,
+      # `gh api repos/yadgarhq/argocd --jq .private` → `false`), so the
+      # contents-API reads `test_crd_no_silent_drop.py` makes at `PR_BASE_SHA`
+      # work anonymously too. `PR_BASE_SHA` is through the environment rather
+      # than interpolated into the command, for the reason `ci-pr.yaml`'s own
+      # injection notes give at length — this value is the pull request's base
+      # sha, not attacker-shaped text, but the discipline is cheap and uniform.
+      - name: no object in namespace yadgar has two owners, yadgar is the example, and a chart bump does not silently drop a CRD
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: python3 -m pytest scripts/gates -q
