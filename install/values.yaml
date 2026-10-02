@@ -4,10 +4,11 @@
 #
 # ADOPTED, 2026-10-02. `applications/argocd.yaml` is deliberately not
 # `automated`, but its FIRST sync has now run: by hand, `argocd app sync
-# argocd --core` under a throwaway kubeconfig minified to the `kind-yadgar`
-# context with its namespace set to `argocd` (the form in MIGRATION_NOTES.md's
-# ledger-1224 "Apply" step), right after argocd#56 (`f4da219`) merged. It
-# Succeeded and recreated `argocd-application-controller`, `argocd-repo-server`,
+# argocd --core --kube-context kind-yadgar` under a throwaway kubeconfig
+# minified to the `kind-yadgar` context with its namespace set to `argocd`
+# (the form in MIGRATION_NOTES.md's ledger-1224 "Apply" step), right after
+# argocd#56 (`f4da219`) merged. It Succeeded and recreated
+# `argocd-application-controller`, `argocd-repo-server`,
 # `argocd-server` and `argocd-applicationset-controller`; `argocd-redis` was
 # untouched. Before that sync (measured 2026-09-06), all 33 of the
 # Application's resources read OutOfSync, and the live `argocd-cm` still
@@ -23,11 +24,12 @@
 configs:
   params:
     # NOTHING TERMINATES TLS IN FRONT OF ARGO'S OWN CONSOLE. It is reached by
-    # `kubectl port-forward svc/argocd-server` (deploy/Makefile) and by no other
-    # route: the kind node publishes 18080/18443 for the yadgar edge only, and
-    # Argo has no Ingress and no Gateway route. The earlier text here named a
-    # k3d loadbalancer; k3d was abandoned before this cluster was built — see
-    # `deploy/Makefile`'s header — so it terminated nothing.
+    # `kubectl --context kind-yadgar port-forward svc/argocd-server`
+    # (deploy/Makefile) and by no other route: the kind node publishes
+    # 18080/18443 for the yadgar edge only, and Argo has no Ingress and no
+    # Gateway route. The earlier text here named a k3d loadbalancer; k3d was
+    # abandoned before this cluster was built — see `deploy/Makefile`'s
+    # header — so it terminated nothing.
     server.insecure: true
     # END A SYNC THAT NEVER ENDS (ledger 1208). v3.1.8's default, "0", never
     # times out, so a PreSync hook Job whose image cannot be pulled holds its
@@ -88,9 +90,10 @@ configs:
     # namespace.
     #
     # IT READS `.status.phase` AND NOT THE `STATE` COLUMN, and that distinction
-    # is the whole trap. `kubectl get autoscalingrunnersets` prints a `STATE`
-    # column, which is a PRINTER COLUMN reading `.status.state` — a field that
-    # does not exist. It is absent from the CRD's own status schema (which
+    # is the whole trap. `kubectl --context kind-yadgar get autoscalingrunnersets`
+    # prints a `STATE` column, which is a PRINTER COLUMN reading `.status.state`
+    # — a field that does not exist. It is absent from the CRD's own status
+    # schema (which
     # declares `currentRunners`, `failedEphemeralRunners`,
     # `pendingEphemeralRunners`, `phase`, `runningEphemeralRunners` and nothing
     # else) and absent from `AutoscalingRunnerSetStatus` in ARC 0.14.2's Go
