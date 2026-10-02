@@ -1190,6 +1190,25 @@ sections by name in its own error messages, and a citation into a file this
 repository does not carry resolves nowhere. `deploy`'s copy of these three
 sections is unchanged by this move.
 
+**The paths these three sections name are unchanged by the move, and some
+no longer exist.** They describe `deploy`'s layout as it stood before the
+`infra` retirement (ADR-0828, M1–M5), and the byte-faithful copy keeps that
+wording rather than editing it in place — "The `estate-front` runner" in
+particular still reads `infra/arc.yaml`, `infra/estate-front-app.yaml`,
+`infra/estate-front-runner.yaml` and `infra/estate-front/`. Translate:
+
+| Path this section names          | Where it lives now                      |
+| -------------------------------- | --------------------------------------- |
+| `infra/arc.yaml`                 | `applications/arc.yaml`                 |
+| `infra/estate-front-app.yaml`    | `applications/estate-front.yaml`        |
+| `infra/estate-front-runner.yaml` | `applications/estate-front-runner.yaml` |
+| `infra/estate-front/`            | `manifests/estate-front/`               |
+| `infra/tls/`                     | `manifests/tls/`                        |
+
+All five right-hand paths exist in this repository today. `make secrets`
+and `make bootstrap`, wherever this section's prose says `deploy`, now mean
+this repository's own `Makefile`.
+
 ## The identity encryption keys (ledger 452)
 
 `iam` encrypts stored names with AES-256-GCM and looks usernames up by an
