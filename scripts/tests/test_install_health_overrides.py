@@ -24,7 +24,8 @@ prettier (`key: |` against `key:\\n  |`) does not move it.
 THE SOURCE IS NOT `chart_pin.json`'s `chart_tag`. That tag follows the `yadgar`
 Application's `targetRevision` (v0.3.13 today), and v0.3.13's
 `bootstrap/argocd-values.yaml` holds neither override. Both overrides first
-appear together at v0.3.18.
+appear together, with these bytes, at v0.3.16; the fixture pins v0.3.18, the
+newest tag, whose bytes are identical.
 
 TO MOVE THE PIN: copy the new scripts from the chart at a newer tag, then
 update the tag, the commit and both digests in the fixture together.
