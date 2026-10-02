@@ -843,6 +843,14 @@ merge, and delete it in a second.
 
 ## The sync timeout (ledger 1208)
 
+**HISTORICAL, SUPERSEDED.** This section records the hand `kubectl patch` plus
+controller restart that landed `"24000"`, run while `Application/argocd` was
+still unsynced. The Application has since been adopted: its first sync ran
+2026-10-02, right after argocd#56 (`f4da219`) merged (see "The sync timeout is
+raised to 25200 s" below). The "Do not sync it" guidance a few lines down no
+longer holds — syncing the Application is now the normal way to land a change
+here, not an exception to avoid.
+
 `install/values.yaml` gained `controller.sync.timeout.seconds: "24000"` under
 `configs.params`. **Apply this only after M3 has moved `Application/tls` here
 with its limit-6 retry.** The tls Application on the cluster before M3 retries 60
@@ -993,27 +1001,27 @@ clears both. The value is raised now, ahead of platform#24 merging, because
 platform#24's release lands as a pin straight to `yadgarhq/chart` main with no
 PR CI (`parent_bump.py`).
 
-**`Application/argocd` is still not `automated`.** MEASURED 2026-10-02: the
-live `argocd-cmd-params-cm` already carries `"24000"`; this Application's
-`status.sync.status` is `Synced`, its `status.operationState.phase` is
-`Succeeded`, started `06:51:46Z`; and its four workload pods (below) all
-started about 30 minutes before that measurement. INFERRED from that: a
-manual sync of the whole Application is what landed `"24000"`, not the
-ledger-1208 targeted ConfigMap patch above — the Application carries no
-`automated` block, so only an operator-triggered sync produces this state, but
-`status.operationState.operation.initiatedBy` is empty and `status.history` is
-absent, so neither the actor nor the tool is recorded. So the targeted-patch
-procedure is superseded: **an operator applies this by syncing
-`Application/argocd` by hand** (UI, or `argocd app sync argocd --context
-kind-yadgar` if the CLI is logged in through the port-forward in
-`deploy/Makefile`). There is no kubectl-only equivalent once the Application
-carries un-pruned hook resources, because a sync reconciles those too, not
-only this key. 3 of its 39 resources carry no sync status at all (measured
-2026-10-02): `ServiceAccount`/`Role`/`RoleBinding` `argocd-redis-secret-init`,
-a PreSync hook's resources, each `requiresPruning: true`. They are leftover
-hook objects awaiting prune, not drifted live config — but read the diff
-before syncing regardless, since a sync prunes them and reconciles anything
-else that has since drifted.
+**`Application/argocd` is still not `automated`.** `"24000"` reached the live
+`argocd-cmd-params-cm` on 2026-10-01 by the hand `kubectl patch` plus
+controller restart above (ledger 1208) — the Application was not yet adopted
+then. Its FIRST sync ran 2026-10-02 06:51:46Z, right after argocd#56
+(`f4da219`) merged: by hand, `argocd app sync argocd --core`. It Succeeded and
+recreated `argocd-application-controller`, `argocd-repo-server`,
+`argocd-server` and `argocd-applicationset-controller`; `argocd-redis` was
+untouched. So the Application IS adopted now, and the ledger-1208 "do not sync
+it" guidance no longer holds: **an operator applies this by syncing
+`Application/argocd`**, the same way the first sync ran — `argocd app sync
+argocd --core`, with a kind-only kubeconfig — not by repeating the hand patch.
+A patch would still land the one key, but it would leave the other three
+workloads' (`argocd-repo-server`, `argocd-server`,
+`argocd-applicationset-controller`) `checksum/cmd-params` annotation drifted,
+since the ledger-1208 steps restart only the controller's StatefulSet; sync
+instead and let Argo restart all four together. 3 of its 39 resources carry no
+sync status at all (measured 2026-10-02): `ServiceAccount`/`Role`/`RoleBinding`
+`argocd-redis-secret-init`, a PreSync hook's resources, each
+`requiresPruning: true`. They are leftover hook objects awaiting prune, not
+drifted live config — but read the diff before syncing regardless, since a
+sync prunes them and reconciles anything else that has since drifted.
 
 **The sync restarts four pods, not one.** The `argocd-cmd-params-cm` change
 flips the `checksum/cmd-params` annotation on every workload that mounts it:
@@ -1021,7 +1029,7 @@ flips the `checksum/cmd-params` annotation on every workload that mounts it:
 `argocd-server` and `argocd-applicationset-controller` (Deployments) — all four
 carry the same `checksum/cmd-params` hash (measured 2026-10-02). `argocd-redis`
 carries no such annotation and is not touched. This is the same four-pod
-recreation the ledger-1208 sync already produced.
+recreation the Application's first sync (above) already produced.
 
 **Do NOT run this sync.** This note documents the step for the operator; it is
 not applied by this change.
@@ -1053,8 +1061,14 @@ kubectl --context kind-yadgar -n argocd get pods \
 
 ### Apply
 
-Sync `Application/argocd` by hand: the UI's "SYNC" button, or
-`argocd app sync argocd --context kind-yadgar`.
+Point your kubeconfig at `kind-yadgar` and nothing else first — `--core` has
+no `--context` flag of its own, so check `kubectl config current-context` and
+STOP if it is not `kind-yadgar`. The default context on this host is a
+production cluster.
+
+```bash
+argocd app sync argocd --core
+```
 
 ### After — verify
 
@@ -1083,5 +1097,5 @@ kubectl --context kind-yadgar -n argocd get application argocd \
 
 ### Rollback
 
-Revert the commit here, then sync `Application/argocd` again and re-run the
-"After" checks against `"24000"`.
+Revert the commit here, then `argocd app sync argocd --core` again (same
+kind-only kubeconfig check) and re-run the "After" checks against `"24000"`.

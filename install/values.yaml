@@ -2,13 +2,18 @@
 # hand to bootstrap, then an Application in projects/ points back here so every
 # subsequent change arrives the same way as everything else.
 #
-# NOT YET APPLIED, and a reader must know that before trusting a line below.
-# `applications/argocd.yaml` is deliberately not `automated` and its adoption
-# sync has never been run: measured 2026-09-06, all 33 of the Application's
-# resources read OutOfSync and the live `argocd-cm` still carries the chart's
-# own `timeout.reconciliation: 180s` against the `60s` set here. So a value
-# added to this file changes nothing until an operator syncs that one
-# Application. The ruling on whether to run that sync is
+# ADOPTED, 2026-10-02. `applications/argocd.yaml` is deliberately not
+# `automated`, but its FIRST sync has now run: by hand, `argocd app sync
+# argocd --core`, right after argocd#56 (`f4da219`) merged. It Succeeded and
+# recreated `argocd-application-controller`, `argocd-repo-server`,
+# `argocd-server` and `argocd-applicationset-controller`; `argocd-redis` was
+# untouched. Before that sync (measured 2026-09-06), all 33 of the
+# Application's resources read OutOfSync, and the live `argocd-cm` still
+# carried the chart's own `timeout.reconciliation: 180s` against the `60s` set
+# here — a value added to this file changed nothing on its own. It does now:
+# this Application is adopted, and a value reaches the cluster the next time
+# an operator syncs it (MIGRATION_NOTES.md holds that step for each value).
+# The ruling that led to running the first sync is
 # `plans/argocd-adoption-sync.md` in yadgarhq/docs.
 #
 # Chart: argo-cd from https://argoproj.github.io/argo-helm
@@ -47,8 +52,11 @@ configs:
     # treats a larger one as 0.
     # `scripts/tests/test_install_values.py` derives the floor.
     #
-    # SET ON THE LIVE CLUSTER BY A MANUAL SYNC OF `Application/argocd`, not a
-    # targeted patch: MIGRATION_NOTES.md, ledger 1208.
+    # 24000 REACHED THE LIVE CLUSTER BY A HAND `kubectl patch` OF
+    # `argocd-cmd-params-cm` PLUS A CONTROLLER RESTART (ledger 1208,
+    # 2026-10-01) — `Application/argocd` was not yet adopted then. It is
+    # adopted now (see the header), so 25200 is set by syncing that
+    # Application instead: MIGRATION_NOTES.md, ledger 1224.
     controller.sync.timeout.seconds: "25200"
   cm:
     # HOW ARGO MARKS WHAT IT OWNS — the `argocd.argoproj.io/tracking-id`
