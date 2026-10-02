@@ -25,15 +25,20 @@ rest), rendered with `helm template --include-crds` at this pull request's
 BASE commit and again at HEAD, UNIONED across every such Application rather
 than compared one at a time — a CRD that moves from one Application to
 another between base and head is not a false positive this way. Measured
-2026-10-02 at head: the five operator Applications (`cert-manager.yaml`,
-`envoy-gateway.yaml`, `keda.yaml`, `mariadb-operator.yaml`,
-`prometheus.yaml`) each source the SAME `platform` chart from
-`ghcr.io/yadgarhq/charts` with a different `operators.<name>.create: true`,
-so the operators' CRDs are real wherever the chart renders them — NOT, as an
-earlier framing of this ledger item assumed, vendored inside
-`yadgarhq/platform` alone; `yadgarhq/platform` publishes the chart, this
-repository is what actually turns it on, per Application, at a pin this
-repository owns.
+2026-10-02 at head: 9 chart sources per side (`arc.yaml`, `argocd.yaml`,
+`cert-manager.yaml`, `envoy-gateway.yaml`, `estate-front-runner.yaml`,
+`keda.yaml`, `mariadb-operator.yaml`, `prometheus.yaml`, `yadgar.yaml`), 52
+CRDs in the union, from six of them: `cert-manager.yaml` (6),
+`envoy-gateway.yaml` (21), `keda.yaml` (6) and `mariadb-operator.yaml` (12)
+each source the SAME `platform` chart from `ghcr.io/yadgarhq/charts` with a
+different `operators.<name>.create: true`; `arc.yaml` sources
+`gha-runner-scale-set-controller` (4); `argocd.yaml` sources `argo-cd` (3).
+`prometheus.yaml` sources `platform` too, but renders 0 CRDs at its values,
+as do `estate-front-runner.yaml` and `yadgar.yaml`. So the operators' CRDs
+are real wherever the chart renders them — NOT, as an earlier framing of
+this ledger item assumed, vendored inside `yadgarhq/platform` alone;
+`yadgarhq/platform` publishes the chart, this repository is what actually
+turns it on, per Application, at a pin this repository owns.
 
 A CHART SOURCE'S `helm` BLOCK IS FAIL-CLOSED, NOT BEST-EFFORT. `MODELLED_HELM_KEYS`
 is the allowlist (`valuesObject`, `values`, `releaseName`, `skipCrds`), plus a
@@ -61,7 +66,11 @@ rather than hardcoding `oci://`. Its `helm.valueFiles: ["$self/install/values.ya
 is the one `valueFiles` shape this gate models: `self_value_file_path` resolves
 it, and `self_value_file_content` reads `install/values.yaml` from this
 working tree for HEAD and through the GitHub contents API at `PR_BASE_SHA` for
-BASE, passed to `helm template` as a second `--values` file. Measured
+BASE. It is passed to `helm template` in ARGO'S OWN ORDER (v3.1.8
+`util/helm/cmd.go:414-418`): the `valueFiles` `--values` FIRST, the inline
+`valuesObject`/`values` block LAST, so inline values override the file. When
+both inline forms are set, `valuesObject` REPLACES `values` outright (Argo's
+`ValuesYAML()`, `values.go:40`) — `values_of` does the same. Measured
 2026-10-02: this adds Argo CD's own 3 CRDs (`applications.argoproj.io`,
 `applicationsets.argoproj.io`, `appprojects.argoproj.io`) to the base-side
 union. Its second source (`ref: self`, no `chart` key) contributes nothing —
@@ -108,8 +117,37 @@ forbids it outright, and the step that runs this suite
 (`.github/workflows/ci.yaml`'s `two-owners` job) only ever executes on
 `pull_request`, so `PR_BASE_SHA` is always set when this module runs in CI. A
 local run without it fails loudly with a `KeyError` rather than silently
-skipping — the discipline this gate exists to apply to a chart bump applies to
-itself (ADR-0645: an audit over nothing must not report green).
+skipping. A run with it set to anything but a full hex commit sha — the EMPTY
+string above all, which the contents API reads as `?ref=`, i.e. the default
+branch, and which an earlier version of this gate measurably passed on — fails
+`gate()`'s `BASE_SHA` check. The discipline this gate exists to apply to a
+chart bump applies to itself (ADR-0645: an audit over nothing must not report
+green). For the same reason `gate()` prints `crd-gate: base=<n> head=<m> CRDs
+over <k> Applications` before its verdict, and CI runs pytest with `-rP` so
+that line is in the job log on a PASS too: a green check states what it
+compared.
+
+RENDER INPUTS NOT MODELLED, STATED AS GAPS. Argo's own `helm template` call
+differs from this gate's in ways no test here pins:
+- `--kube-version`: Argo passes the destination cluster's version
+  (`util/helm/cmd.go:402`); this gate passes none, so helm's built-in default
+  applies. A chart gating a CRD on `.Capabilities.KubeVersion` could render
+  differently here than in Argo.
+- `--api-versions`: this gate passes `test_no_two_owners.API_VERSIONS`, a fixed
+  list, not the cluster's real API set; no test pins that the flags reach helm.
+- namespace: taken from `spec.destination.namespace`, but no test pins that it
+  reaches helm.
+- release name: modelled (`release_name_of`) and now exercised through `gate()`,
+  but no fixture chart keys a CRD on `.Release.Name`.
+Today the gate's 52-CRD head set equals the 52 CRDs on the kind-yadgar
+cluster Argo actually synced (measured 2026-10-02), so none of these differs
+in practice yet; a chart that starts to depend on one is not caught.
+
+A CONTENTS-API ERROR OTHER THAN 404 FAILS THE GATE. `base_application` and
+`base_application_filenames` read 404 as "absent at base" and re-raise every
+other `HTTPError`: a swallowed 500 on one file would silently remove that
+Application's base CRDs from the comparison, which the whole-gate floor
+cannot see while any other Application still renders one.
 
 THE LIVE PRODUCTION PATH (`gate`) IS WIRING-TESTED, NOT ONLY LOGIC-TESTED.
 `test_a_chart_bump_or_values_change_does_not_silently_drop_a_crd` runs
@@ -122,7 +160,11 @@ request, because the real render passes either way. The four
 `base_application_filenames` / `base_application` / `crds_rendered` to feed
 `gate()` a fabricated toggle-off pair, an empty base, a deleted Application,
 and a stale acknowledgement, and assert it raises in each case — every one of
-those four mutations above is caught by at least one of them.
+those four mutations above is caught by at least one of them. Below the
+`crds_rendered` seam, a toggled fixture chart (a CRD under `templates/` behind
+`.Values.enabled`) proves the values themselves reach `helm template`, and a
+patched `github_request` proves the base side reads a `$self` values file at
+the BASE ref, not from the working tree.
 
 Helm invocations below were exercised locally on helm v4.3.0 AND on v3.18.4
 (installed at the exact version CI's `two-owners` job pins, the version Argo
@@ -160,6 +202,11 @@ REQUIRED_ACK_FIELDS = ("name", "reason", "cleanup")
 MODELLED_HELM_KEYS = frozenset({"valuesObject", "values", "releaseName", "skipCrds"})
 
 SELF_VALUE_FILE = re.compile(r"^\$self/(?P<path>.+)$")
+
+# A full commit sha (SHA-1, or SHA-256 for a sha256 repository). Anything else
+# — above all the EMPTY string, which the contents API reads as `?ref=`, i.e.
+# the DEFAULT BRANCH (measured) — would compare head against the wrong base.
+BASE_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 # So a test in this file can monkeypatch this module's own top-level names
 # (`base_application_filenames`, `base_application`, `crds_rendered`,
@@ -333,18 +380,22 @@ def crds_of_chart(
 
     No network: `path` is already on disk, either a fixture (the tests below)
     or an already-`helm pull --untar`red real chart (`crds_rendered`).
-    `extra_values_text`, when given, is a SECOND `--values` file — the
-    resolved content of a `$self/<path>` `valueFiles` entry, applied after
-    (so it can override) `values`.
+    `extra_values_text`, when given, is the resolved content of a
+    `$self/<path>` `valueFiles` entry. ARGO'S OWN ORDER (v3.1.8
+    `util/helm/cmd.go:414-418`): every `valueFiles` entry is passed as
+    `--values` FIRST, and the inline `valuesObject`/`values` block
+    (`opts.ExtraValues`) LAST — so helm lets the INLINE values override the
+    value file, never the reverse. This function passes them in that order.
     """
     with tempfile.TemporaryDirectory() as scratch:
-        values_file = Path(scratch) / "values.yaml"
-        values_file.write_text(yaml.safe_dump(values))
-        value_flags = ["--values", str(values_file)]
+        value_flags: list[str] = []
         if extra_values_text is not None:
-            extra_file = Path(scratch) / "self-values.yaml"
-            extra_file.write_text(extra_values_text)
-            value_flags += ["--values", str(extra_file)]
+            value_file = Path(scratch) / "self-values.yaml"
+            value_file.write_text(extra_values_text)
+            value_flags += ["--values", str(value_file)]
+        inline_file = Path(scratch) / "values.yaml"
+        inline_file.write_text(yaml.safe_dump(values))
+        value_flags += ["--values", str(inline_file)]
         rendered = helm(
             "template",
             release,
@@ -434,8 +485,7 @@ def crds_at(side: str, base_ref: str) -> tuple[set[str], dict[str, set[str]]]:
             extra_values_text = self_value_file_content(self_path, side, base_ref)
 
         found = crds_rendered(release, source, namespace, extra_values_text)
-        if found:
-            per_file[filename] = found
+        per_file[filename] = found  # zero CRDs included: this map also counts Applications examined
         names |= found
     return names, per_file
 
@@ -492,9 +542,23 @@ def gate(base_ref: str) -> None:
     `base_application_filenames` / `base_application` / `crds_rendered`
     monkeypatched and prove the WIRING works, not only the pure
     `unacknowledged_drops` / `stale_acknowledgements` logic in isolation.
+
+    Prints `crd-gate: base=<n> head=<m> CRDs over <k> Applications` BEFORE any
+    assertion, so green and red runs alike show what was compared (ADR-0645).
+    `<n>`/`<m>` are the sizes of the base/head CRD unions; `<k>` is the number
+    of distinct `applications/*.yaml` files carrying an in-scope chart source on
+    EITHER side, zero-CRD ones included. CI runs pytest with `-rP` so this
+    line reaches the job log on a pass.
     """
+    assert BASE_SHA.fullmatch(base_ref), (
+        f"PR_BASE_SHA={base_ref!r} is not a full commit sha. An empty one reads the base side "
+        "at GitHub's DEFAULT BRANCH, not this pull request's base — refusing rather than "
+        "comparing against the wrong commit."
+    )
     base_crds, base_by_file = crds_at("base", base_ref)
-    head_crds, _ = crds_at("head", base_ref)
+    head_crds, head_by_file = crds_at("head", base_ref)
+    applications_examined = len(set(base_by_file) | set(head_by_file))
+    print(f"crd-gate: base={len(base_crds)} head={len(head_crds)} CRDs over {applications_examined} Applications")
 
     # ADR-0645: an audit that examined no CRD anywhere must not report green.
     assert base_crds, (
@@ -605,6 +669,56 @@ def fake_application(
             "destination": {"namespace": namespace},
         },
     }
+
+
+# A well-formed base sha for the `gate()` wiring tests: `gate` refuses anything
+# that is not a full hex commit sha (see `BASE_SHA`).
+FAKE_BASE_SHA = "0123456789abcdef0123456789abcdef01234567"
+
+TOGGLED_CRD_NAME = "toggles.fixture.yadgarhq.io"
+
+# A CRD under `templates/`, NOT `crds/`, behind a values toggle — the shape a
+# real chart uses for `crds.enabled` / `crds.install` (cert-manager, argo-cd).
+# `crds/` is static and ignores values, so only a templated CRD can prove the
+# VALUES actually reach `helm template`.
+TOGGLED_CRD_TEMPLATE = """\
+{{- if .Values.enabled }}
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: toggles.fixture.yadgarhq.io
+spec:
+  group: fixture.yadgarhq.io
+  names:
+    kind: Toggle
+    plural: toggles
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+{{- end }}
+"""
+
+
+def write_toggled_fixture_chart(root: Path) -> Path:
+    """A minimal helm chart whose only CRD renders iff `.Values.enabled` is true (default: off)."""
+    (root / "templates").mkdir(parents=True)
+    (root / "Chart.yaml").write_text(FIXTURE_CHART_YAML)
+    (root / "templates" / "crd.yaml").write_text(TOGGLED_CRD_TEMPLATE)
+    return root
+
+
+def http_error(url: str, code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(url, code, f"HTTP {code}", None, None)  # type: ignore[arg-type]
+
+
+def encoded(text: str) -> dict:
+    """A GitHub contents-API file payload carrying `text`."""
+    return {"content": base64.b64encode(text.encode()).decode()}
 
 
 # ── TDD: the fixture pair, red / green / ack / no-removal / stale-ack ──────
@@ -866,7 +980,7 @@ def test_the_production_path_reddens_when_an_application_drops_a_crd(
     monkeypatch.setattr(THIS_MODULE, "crds_rendered", fake_crds_rendered)
 
     with pytest.raises(AssertionError, match="widget.fake.io"):
-        gate("fake-ref")
+        gate(FAKE_BASE_SHA)
 
 
 def test_the_production_path_reddens_when_the_base_side_renders_nothing(
@@ -884,7 +998,7 @@ def test_the_production_path_reddens_when_the_base_side_renders_nothing(
     monkeypatch.setattr(THIS_MODULE, "crds_rendered", lambda release, source, namespace, extra=None: set())
 
     with pytest.raises(AssertionError, match="zero CRDs"):
-        gate("fake-ref")
+        gate(FAKE_BASE_SHA)
 
 
 def test_the_production_path_sees_a_deleted_applications_crds_as_dropped(
@@ -901,7 +1015,7 @@ def test_the_production_path_sees_a_deleted_applications_crds_as_dropped(
     monkeypatch.setattr(THIS_MODULE, "crds_rendered", lambda release, source, namespace, extra=None: {"widget.fake.io"})
 
     with pytest.raises(AssertionError, match="widget.fake.io"):
-        gate("fake-ref")
+        gate(FAKE_BASE_SHA)
 
 
 def test_the_production_path_reddens_on_a_stale_acknowledgement(
@@ -923,7 +1037,269 @@ def test_the_production_path_reddens_on_a_stale_acknowledgement(
     monkeypatch.setattr(THIS_MODULE, "crds_rendered", lambda release, source, namespace, extra=None: {"widget.fake.io"})
 
     with pytest.raises(AssertionError, match="widget.fake.io"):
-        gate("fake-ref")
+        gate(FAKE_BASE_SHA)
+
+
+# ── TDD, round 2 (a): the gate prints what it examined (ADR-0645) ──────────
+
+
+def test_the_gate_prints_its_examined_counts_next_to_the_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A green `85 passed` says nothing about how much was compared; this line does.
+
+    Base renders 2 CRDs, head 1, over 1 Application — the counts are pinned
+    exactly, so printing the wrong side's count dies too, not only a deleted print.
+    The line is emitted BEFORE any assertion, so a red run carries it as well.
+    """
+    apps_dir = tmp_path / "applications"
+    apps_dir.mkdir()
+    head_document = fake_application(helm_block={"valuesObject": {"enabled": False}})
+    base_document = fake_application(helm_block={"valuesObject": {"enabled": True}})
+    (apps_dir / "fake.yaml").write_text(yaml.safe_dump(head_document))
+
+    def fake_crds_rendered(_release: str, source: dict, _namespace: str, _extra: str | None = None) -> set[str]:
+        return {"widget.fake.io", "gadget.fake.io"} if values_of(source).get("enabled") else {"gadget.fake.io"}
+
+    monkeypatch.setattr(THIS_MODULE, "REPOSITORY", tmp_path)
+    monkeypatch.setattr(THIS_MODULE, "base_application_filenames", lambda ref: {"fake.yaml"})
+    monkeypatch.setattr(THIS_MODULE, "base_application", lambda filename, ref: base_document)
+    monkeypatch.setattr(THIS_MODULE, "crds_rendered", fake_crds_rendered)
+
+    with pytest.raises(AssertionError, match="widget.fake.io"):
+        gate(FAKE_BASE_SHA)
+    assert "crd-gate: base=2 head=1 CRDs over 1 Applications" in capsys.readouterr().out
+
+
+def test_the_application_count_includes_an_application_rendering_zero_crds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`k` counts every in-scope chart source rendered, not only the CRD-bearing ones."""
+    apps_dir = tmp_path / "applications"
+    apps_dir.mkdir()
+    for name in ("a", "b"):
+        (apps_dir / f"{name}.yaml").write_text(yaml.safe_dump(fake_application(name=name)))
+
+    def fake_crds_rendered(release: str, _source: dict, _namespace: str, _extra: str | None = None) -> set[str]:
+        return {"widget.fake.io"} if release == "a" else set()
+
+    monkeypatch.setattr(THIS_MODULE, "REPOSITORY", tmp_path)
+    monkeypatch.setattr(THIS_MODULE, "base_application_filenames", lambda ref: {"a.yaml", "b.yaml"})
+    monkeypatch.setattr(
+        THIS_MODULE, "base_application", lambda filename, ref: fake_application(name=filename.removesuffix(".yaml"))
+    )
+    monkeypatch.setattr(THIS_MODULE, "crds_rendered", fake_crds_rendered)
+
+    gate(FAKE_BASE_SHA)
+    assert "crd-gate: base=1 head=1 CRDs over 2 Applications" in capsys.readouterr().out
+
+
+# ── TDD, round 2 (b): values actually reach `helm template` ────────────────
+
+
+def test_a_templated_crd_follows_its_values_toggle(tmp_path: Path) -> None:
+    """Kills W (`crds_of_chart` writing `{}` instead of `values`): the toggle must reach helm."""
+    chart = write_toggled_fixture_chart(tmp_path / "chart")
+    assert crds_of_chart(chart, {"enabled": True}) == {TOGGLED_CRD_NAME}
+    assert crds_of_chart(chart, {"enabled": False}) == set()
+    assert crds_of_chart(chart, {}) == set()
+
+
+def test_crds_rendered_passes_the_sources_own_values_to_helm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Kills V (`crds_rendered` passing `{}` rather than `values_of(source)`).
+
+    The real `crds_rendered` → `crds_of_chart` → `helm template` path, with only
+    the network pull replaced by the local toggled fixture.
+    """
+    chart = write_toggled_fixture_chart(tmp_path / "chart")
+    monkeypatch.setattr(THIS_MODULE, "pull_chart", lambda source, scratch: chart)
+    on = fake_application(helm_block={"valuesObject": {"enabled": True}})["spec"]["source"]
+    off = fake_application(helm_block={"valuesObject": {"enabled": False}})["spec"]["source"]
+    as_string = fake_application(helm_block={"values": "enabled: true\n"})["spec"]["source"]
+    assert crds_rendered("fake", on, "fake") == {TOGGLED_CRD_NAME}
+    assert crds_rendered("fake", off, "fake") == set()
+    assert crds_rendered("fake", as_string, "fake") == {TOGGLED_CRD_NAME}
+
+
+def test_values_object_replaces_values_when_both_are_set() -> None:
+    """Argo v3.1.8 `ValuesYAML()` (values.go:40): `valuesObject` wins outright, no merge with `values`."""
+    source = {"helm": {"values": "enabled: true\nother: 1\n", "valuesObject": {"enabled": False}}}
+    assert values_of(source) == {"enabled": False}
+
+
+# ── TDD, round 2 (c): only ONE `$self/<path>` valueFiles shape is modelled ─
+
+
+@pytest.mark.parametrize(
+    "value_files",
+    [
+        ["$values/x.yaml"],
+        ["$self/a.yaml", "$self/b.yaml"],
+        ["foo.yaml"],
+    ],
+    ids=["values-ref", "two-self-entries", "chart-relative-path"],
+)
+def test_crds_at_refuses_every_other_value_files_shape(
+    value_files: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Kills S (any `valueFiles` accepted). `crds_rendered` is stubbed so only the refusal can raise."""
+    apps_dir = tmp_path / "applications"
+    apps_dir.mkdir()
+    document = fake_application(helm_block={"valuesObject": {}, "valueFiles": value_files})
+    (apps_dir / "fake.yaml").write_text(yaml.safe_dump(document))
+    monkeypatch.setattr(THIS_MODULE, "REPOSITORY", tmp_path)
+    monkeypatch.setattr(THIS_MODULE, "base_application_filenames", lambda ref: set())
+    monkeypatch.setattr(THIS_MODULE, "crds_rendered", lambda release, source, namespace, extra=None: set())
+    with pytest.raises(AssertionError, match="valueFiles"):
+        crds_at("head", FAKE_BASE_SHA)
+
+
+# ── TDD, round 2 (d): a `$self` values file is read at the RIGHT ref ───────
+
+
+def self_values_scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, requested: list[str]) -> None:
+    """One Application whose only toggle lives in `$self/install/values.yaml`.
+
+    BASE's copy (served by the patched contents API, at `FAKE_BASE_SHA` only)
+    turns the templated CRD ON; HEAD's working-tree copy turns it OFF. So a
+    base side that drops the self file (J) or reads it from the working tree
+    (L) renders nothing on base, and the drop disappears.
+    """
+    chart = write_toggled_fixture_chart(tmp_path / "chart")
+    document = fake_application(helm_block={"valueFiles": ["$self/install/values.yaml"]})
+    tree = tmp_path / "tree"
+    (tree / "applications").mkdir(parents=True)
+    (tree / "applications" / "fake.yaml").write_text(yaml.safe_dump(document))
+    (tree / "install").mkdir()
+    (tree / "install" / "values.yaml").write_text("enabled: false\n")
+
+    def fake_github_request(url: str):
+        requested.append(url)
+        assert url.endswith(f"?ref={FAKE_BASE_SHA}"), url
+        if "/contents/applications?" in url:
+            return [{"name": "fake.yaml"}]
+        if "/contents/applications/fake.yaml?" in url:
+            return encoded(yaml.safe_dump(document))
+        if "/contents/install/values.yaml?" in url:
+            return encoded("enabled: true\n")
+        raise http_error(url, 404)
+
+    monkeypatch.setattr(THIS_MODULE, "REPOSITORY", tree)
+    monkeypatch.setattr(THIS_MODULE, "github_request", fake_github_request)
+    monkeypatch.setattr(THIS_MODULE, "pull_chart", lambda source, scratch: chart)
+
+
+def test_the_base_side_renders_its_self_values_file_at_the_base_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Kills J (self values dropped) and L (base side reading the working tree)."""
+    requested: list[str] = []
+    self_values_scenario(tmp_path, monkeypatch, requested)
+    base, _ = crds_at("base", FAKE_BASE_SHA)
+    head, _ = crds_at("head", FAKE_BASE_SHA)
+    assert base == {TOGGLED_CRD_NAME}
+    assert head == set()
+    assert any("/contents/install/values.yaml?" in url for url in requested)
+
+
+def test_the_production_path_reddens_when_a_self_values_file_turns_a_crd_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The argocd.yaml shape end to end: `crds.install: false` landing in `install/values.yaml` at head."""
+    self_values_scenario(tmp_path, monkeypatch, [])
+    with pytest.raises(AssertionError, match=re.escape(TOGGLED_CRD_NAME)):
+        gate(FAKE_BASE_SHA)
+
+
+# ── TDD, round 2 (e): Argo's own values precedence ─────────────────────────
+
+
+def test_inline_values_override_a_conflicting_value_file(tmp_path: Path) -> None:
+    """Kills K. Argo v3.1.8 util/helm/cmd.go:414-418: every `valueFiles` `--values` first, inline values LAST.
+
+    So with a conflicting toggle, the INLINE value wins — in both directions.
+    """
+    chart = write_toggled_fixture_chart(tmp_path / "chart")
+    assert crds_of_chart(chart, {"enabled": False}, extra_values_text="enabled: true\n") == set()
+    assert crds_of_chart(chart, {"enabled": True}, extra_values_text="enabled: false\n") == {TOGGLED_CRD_NAME}
+
+
+def test_a_value_file_alone_still_applies(tmp_path: Path) -> None:
+    """Empty inline values must not mask the value file (Argo skips an empty inline block)."""
+    chart = write_toggled_fixture_chart(tmp_path / "chart")
+    assert crds_of_chart(chart, {}, extra_values_text="enabled: true\n") == {TOGGLED_CRD_NAME}
+
+
+# ── TDD, round 2 (f): a non-404 contents-API error fails the gate ──────────
+
+
+def two_application_scenario(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_url_fragment: str
+) -> None:
+    """Two Applications, `a` and `b`, each rendering its own CRD, identical on both sides.
+
+    The contents API answers 500 for whichever URL carries `failing_url_fragment`.
+    Two Applications, so the whole-gate floor cannot mask a swallowed error on one.
+    """
+    tree = tmp_path / "tree"
+    (tree / "applications").mkdir(parents=True)
+    documents = {name: fake_application(name=name) for name in ("a", "b")}
+    for name, document in documents.items():
+        (tree / "applications" / f"{name}.yaml").write_text(yaml.safe_dump(document))
+
+    def fake_github_request(url: str):
+        if failing_url_fragment in url:
+            raise http_error(url, 500)
+        if "/contents/applications?" in url:
+            return [{"name": "a.yaml"}, {"name": "b.yaml"}]
+        for name, document in documents.items():
+            if f"/contents/applications/{name}.yaml?" in url:
+                return encoded(yaml.safe_dump(document))
+        raise http_error(url, 404)
+
+    monkeypatch.setattr(THIS_MODULE, "REPOSITORY", tree)
+    monkeypatch.setattr(THIS_MODULE, "github_request", fake_github_request)
+    monkeypatch.setattr(
+        THIS_MODULE, "crds_rendered", lambda release, source, namespace, extra=None: {f"{release}.fake.io"}
+    )
+
+
+def test_the_two_application_scenario_is_green_without_an_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for the two tests below: with no failing URL, the scenario passes."""
+    two_application_scenario(tmp_path, monkeypatch, "never-matches")
+    gate(FAKE_BASE_SHA)
+
+
+def test_a_500_on_one_base_application_file_fails_the_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Kills P: swallowing a 5xx as "absent at base" would hide `b`'s base CRDs and render green."""
+    two_application_scenario(tmp_path, monkeypatch, "/contents/applications/b.yaml?")
+    with pytest.raises(urllib.error.HTTPError):
+        gate(FAKE_BASE_SHA)
+
+
+def test_a_500_on_the_base_directory_listing_fails_the_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Kills Q: swallowing a 5xx on the listing as "no applications/ at base" must not render green."""
+    two_application_scenario(tmp_path, monkeypatch, "/contents/applications?")
+    with pytest.raises(urllib.error.HTTPError):
+        gate(FAKE_BASE_SHA)
+
+
+# ── TDD, round 2 (g): an empty or malformed base ref fails loudly ──────────
+
+
+@pytest.mark.parametrize("base_ref", ["", "main", "0123abc", "g" * 40], ids=["empty", "branch", "short", "non-hex"])
+def test_gate_refuses_a_base_ref_that_is_not_a_full_commit_sha(base_ref: str) -> None:
+    """An empty `PR_BASE_SHA` became `?ref=` — GitHub's DEFAULT BRANCH — and the gate passed. Measured."""
+    with pytest.raises(AssertionError, match="PR_BASE_SHA"):
+        gate(base_ref)
 
 
 # ── the live gate: this organisation's real Applications, base vs head ─────

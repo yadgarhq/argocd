@@ -270,8 +270,12 @@ jobs:
       # than interpolated into the command, for the reason `ci-pr.yaml`'s own
       # injection notes give at length — this value is the pull request's base
       # sha, not attacker-shaped text, but the discipline is cheap and uniform.
+      #
+      # `-rP` PRINTS PASSING TESTS' OUTPUT. The CRD gate prints `crd-gate:
+      # base=<n> head=<m> CRDs over <k> Applications`; without `-rP` a green run
+      # would show only `N passed`, never how much it compared (ADR-0645).
       - name: no object in namespace yadgar has two owners, yadgar is the example, and a chart bump does not silently drop a CRD
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: python3 -m pytest scripts/gates -q
+        run: python3 -m pytest scripts/gates -q -rP
