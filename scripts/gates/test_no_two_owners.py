@@ -1915,8 +1915,29 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # 2026-10-01: 80 objects on both sides, 79 byte-identical. The old pin is a
 # constant rather than read out of git, for the depth-1 reason the valkey
 # constants above give. The next pin bump re-measures this, which is the point.
+#
+# RE-MEASURED AT THE NEXT BUMP, 0.3.13 → 0.3.38 (ledger 1266), with the same
+# shape: the previous pin against the current one, preflight off on both sides.
+# 80 objects on both sides, 13 fields in 8 objects. Six module images (task's
+# is unchanged); the three `-db` Deployments gain
+# `DB_MIGRATION_LOCK_TIMEOUT_SECONDS` (ledger 814); and both bootstrap Jobs
+# gain `activeDeadlineSeconds` and a bounded script (platform#24).
+# `PIN_BEFORE_B9` stays 0.3.7: `test_the_old_pin_names_both_probe_defects`
+# needs a pin whose probes are defective.
 PIN_BEFORE_B9 = "0.3.7"
-B9_PIN_CHANGES = {("Deployment", "gateway", "spec.template.spec.containers[0].image")}
+PREVIOUS_PIN = "0.3.13"
+PIN_CHANGES = {
+    *(
+        ("Deployment", module, "spec.template.spec.containers[0].image")
+        for module in ("gateway", "iam", "iam-db", "project", "project-db", "task-db")
+    ),
+    *(("Deployment", module, "spec.template.spec.containers[0].env") for module in ("iam-db", "project-db", "task-db")),
+    *(
+        ("Job", job, field)
+        for job in ("bootstrap-secrets", "admin-bootstrap-token")
+        for field in ("spec.activeDeadlineSeconds", "spec.template.spec.containers[0].args[0]")
+    ),
+}
 
 # THE FLIP ALONE, at the current pin: exactly these eight hook objects appear
 # and no field of the other 80 moves. `preflight` runs as PreSync and
@@ -1993,20 +2014,20 @@ def probe_violations(documents: list) -> list[str]:
     return problems
 
 
-def test_the_pin_alone_changes_only_the_gateway_image(tmp_path: Path) -> None:
-    """K3 of B9's pin: 0.3.7 against the current pin, preflight off on both sides."""
+def test_the_pin_alone_changes_only_the_named_fields(tmp_path: Path) -> None:
+    """K3 of the last pin bump: the previous pin against the current one, preflight off on both sides."""
     tree = a_copy_of_the_tree(tmp_path)
     application = tree / "applications" / "yadgar.yaml"
     text = application.read_text()
     pinned = re.findall(r"^\s*targetRevision: (\d+\.\d+\.\d+)\s*$", text, re.MULTILINE)
     assert len(pinned) == 1, pinned
-    application.write_text(text.replace(f"targetRevision: {pinned[0]}", f"targetRevision: {PIN_BEFORE_B9}"))
+    application.write_text(text.replace(f"targetRevision: {pinned[0]}", f"targetRevision: {PREVIOUS_PIN}"))
     before = parent_render(tree, PREFLIGHT_OFF)
     after = parent_render(REPOSITORY, PREFLIGHT_OFF)
     changes = field_changes(before, after)
-    print(f"[K3 B9 pin] {PIN_BEFORE_B9} -> {pinned[0]}: {len(before)} -> {len(after)} object(s), {len(changes)} change(s)")
+    print(f"[K3 pin] {PREVIOUS_PIN} -> {pinned[0]}: {len(before)} -> {len(after)} object(s), {len(changes)} change(s)")
     assert len(before) > 0 and len(before) == len(after), (len(before), len(after))
-    assert changes == B9_PIN_CHANGES, sorted(changes)
+    assert changes == PIN_CHANGES, sorted(changes)
 
 
 def test_the_flip_adds_the_eight_probe_hooks_and_changes_nothing_else(working_tree: Path) -> None:
