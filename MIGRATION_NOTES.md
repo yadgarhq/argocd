@@ -7,9 +7,9 @@ throwaway kubeconfig minified to the `kind-yadgar` context with its namespace
 set to `argocd` (`argocd app sync argocd --core`; the form in "The sync
 timeout is raised to 25200 s" § "Apply" below), but that does not make later
 changes land on their own: the Application stays manual, so every change here
-still needs an operator to sync it by hand. Anything below that says "after
-the sync" is waiting on that step, which belongs to the operator and is argued
-in `plans/argocd-adoption-sync.md` in `yadgarhq/docs`.
+still needs an operator to sync it by hand. Each section below says what it
+needs that sync for; the ruling on when to run it belongs to the operator and
+is argued in `plans/argocd-adoption-sync.md` in `yadgarhq/docs`.
 
 ## The ARC scale-set health rule (ledger 745)
 
@@ -22,11 +22,22 @@ sync (above). **It is live, not inert.** MEASURED 2026-10-02: the live
 reads `Healthy` with a message — the pass this section's own "Verify" steps
 below describe. Both landed with that first sync, since this key predates it.
 
-Landing this rolls `argocd-server`, `argocd-repo-server` and
-`argocd-application-controller`, because each carries a `checksum/cm` annotation
-over the rendered `argocd-cm`. That is the mechanism the adoption brief measured,
-and it applies to **every** `configs.cm` edit forever, not to this one specially.
-It does not roll `argocd-redis` or the ApplicationSet controller.
+The pod restart already happened too: the 2026-10-02 06:51Z sync (above)
+recreated `argocd-application-controller`, `argocd-repo-server`,
+`argocd-server` and `argocd-applicationset-controller`, and kept
+`argocd-redis`. The ledger-1224
+sync that lands 25200 (below) recreates the same four, the same way — through
+`checksum/cmd-params`, which all four carry (measured 2026-10-02) and
+`argocd-redis` does not.
+
+`checksum/cm`, the mechanism a `configs.cm` edit like this one actually
+exercises, is narrower: only `argocd-server`, `argocd-repo-server` and
+`argocd-application-controller` carry it (measured 2026-10-02) — that is what
+the adoption brief measured, and it applies to **every** `configs.cm` edit, not
+to this one specially. `argocd-applicationset-controller` carries no
+`checksum/cm` annotation, so an isolated `configs.cm` edit would not have
+rolled it; this sync rolled it anyway because `configs.params` changed at the
+same time.
 
 ### Verify the rule
 
