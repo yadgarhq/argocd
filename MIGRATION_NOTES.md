@@ -1010,9 +1010,8 @@ recreated `argocd-application-controller`, `argocd-repo-server`,
 `argocd-server` and `argocd-applicationset-controller`; `argocd-redis` was
 untouched. So the Application IS adopted now, and the ledger-1208 "do not sync
 it" guidance no longer holds: **an operator applies this by syncing
-`Application/argocd`**, the same way the first sync ran — `argocd app sync
-argocd --core`, with a kind-only kubeconfig — not by repeating the hand patch.
-A patch would still land the one key, but it would leave the other three
+`Application/argocd`**, pinned to `kind-yadgar` (below) — not by repeating the
+hand patch. A patch would still land the one key, but it would leave the other three
 workloads' (`argocd-repo-server`, `argocd-server`,
 `argocd-applicationset-controller`) `checksum/cmd-params` annotation drifted,
 since the ledger-1208 steps restart only the controller's StatefulSet; sync
@@ -1061,13 +1060,27 @@ kubectl --context kind-yadgar -n argocd get pods \
 
 ### Apply
 
-Point your kubeconfig at `kind-yadgar` and nothing else first — `--core` has
-no `--context` flag of its own, so check `kubectl config current-context` and
-STOP if it is not `kind-yadgar`. The default context on this host is a
-production cluster.
+`--core` DOES take `--kube-context`, but that alone is not enough here: `argocd
+app get argocd --core --kube-context kind-yadgar` (read-only, measured)
+fails with `configmap "argocd-cm" not found`, because `--core` looks up the
+control-plane `argocd-cm` in whatever namespace the kubeconfig CONTEXT itself
+names, not `-N`/`--app-namespace` (that flag only scopes which namespace to
+look up the Application, and adding it does not fix the failure, measured) and
+not the `ARGOCD_NAMESPACE` env var (tried too, same failure, measured).
+`kind-yadgar`'s context names namespace `yadgar`, not `argocd`
+(`kubectl config get-contexts`). The default context on this host is a
+production cluster, so an unpinned command here is a hazard.
+
+Measured working form: a throwaway kubeconfig, minified to just the
+`kind-yadgar` context, with that one field changed. It touches no file outside
+`/tmp` and leaves the real kubeconfig alone.
 
 ```bash
-argocd app sync argocd --core
+TMPKC=$(mktemp)
+kubectl config view --minify --flatten --context kind-yadgar \
+  | sed 's/namespace: yadgar/namespace: argocd/' > "$TMPKC"
+KUBECONFIG="$TMPKC" argocd app sync argocd --core
+rm -f "$TMPKC"
 ```
 
 ### After — verify
@@ -1097,5 +1110,5 @@ kubectl --context kind-yadgar -n argocd get application argocd \
 
 ### Rollback
 
-Revert the commit here, then `argocd app sync argocd --core` again (same
-kind-only kubeconfig check) and re-run the "After" checks against `"24000"`.
+Revert the commit here, then run the same throwaway-kubeconfig sync from
+"Apply" again and re-run the "After" checks against `"24000"`.
