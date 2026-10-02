@@ -2,20 +2,23 @@
 
 Steps this repository needs from a person. Argo manages Argo, so a change here
 is not live when it merges — `applications/argocd.yaml` is deliberately not
-`automated`, and its adoption sync has never been run. Anything below that says
-"after the sync" is waiting on that one ruling, which belongs to the operator
-and is argued in `plans/argocd-adoption-sync.md` in `yadgarhq/docs`.
+`automated`. Its first sync ran once, 2026-10-02 06:51Z (`argocd app sync
+argocd --core`; see "The sync timeout is raised to 25200 s" below), but that
+does not make later changes land on their own: the Application stays manual,
+so every change here still needs an operator to sync it by hand. Anything
+below that says "after the sync" is waiting on that step, which belongs to the
+operator and is argued in `plans/argocd-adoption-sync.md` in `yadgarhq/docs`.
 
 ## The ARC scale-set health rule (ledger 745)
 
 `install/values.yaml` gained
 `resource.customizations.health.actions.github.com_AutoscalingRunnerSet` under
-`configs.cm`. **It is inert today**, and that is not a defect in this change —
-it is the state the adoption brief describes and the reason that brief exists.
-Nothing in the cluster behaves differently until `Application/argocd` is
-synced against `kind-yadgar`, and `Application/estate-front-runner` keeps
-reading Synced and Healthy with a scale set Argo has no opinion about until
-then.
+`configs.cm`, in #22 (`afc5c08`) — well before `Application/argocd`'s first
+sync (above). **It is live, not inert.** MEASURED 2026-10-02: the live
+`argocd-cm` already carries the Lua for this key, not empty, and
+`Application/estate-front-runner`'s `AutoscalingRunnerSet` resource already
+reads `Healthy` with a message — the pass this section's own "Verify" steps
+below describe. Both landed with that first sync, since this key predates it.
 
 Landing this rolls `argocd-server`, `argocd-repo-server` and
 `argocd-application-controller`, because each carries a `checksum/cm` annotation
@@ -26,9 +29,13 @@ It does not roll `argocd-redis` or the ApplicationSet controller.
 ### Verify the rule before syncing anything
 
 `argocd admin settings resource-overrides health` evaluates the rule exactly as
-the controller would, against a file, with no cluster contact and nothing
-applied. Do this first — it is the check that turns "the Lua looks right" into
-"the Lua returns what I expect".
+the controller would, against a file. **It does contact the cluster anyway**
+— measured 2026-10-02: it starts configmap/secret and cluster-cache informers
+against whatever context is current even when every input named below is a
+local file, so every invocation here carries `--kube-context kind-yadgar` to
+keep it off this host's default (production) context. It applies nothing. Do
+this first — it is the check that turns "the Lua looks right" into "the Lua
+returns what I expect".
 
 ```bash
 # The rule, as a ConfigMap the CLI can read. Rendering it is what proves the
@@ -41,7 +48,7 @@ helm template argocd argo-cd --repo https://argoproj.github.io/argo-helm \
 # The live scale set, read-only.
 kubectl --context kind-yadgar -n estate-front get autoscalingrunnerset estate-front -o yaml > /tmp/ars.yaml
 
-# Reads the two files above only; pinned anyway since the flag exists.
+# Takes the two files above, but contacts the cluster too (see above) — pinned.
 argocd admin settings resource-overrides health /tmp/ars.yaml \
   --argocd-cm-path /tmp/argocd-cm.yaml --kube-context kind-yadgar
 # STATUS: Healthy
@@ -55,13 +62,19 @@ a message naming the phase. A rule that reports Healthy for both is a rule that
 has not been installed; check the key name, which is one string with dots in the
 group and a single underscore before the kind.
 
-`argocd` is not installed on the machine this change was written on, so the
-command above has **not** been run. What was run instead: the Lua was extracted
-back out of `install/values.yaml` and evaluated with a stock Lua interpreter
-against the real live object's JSON and six mutations of it. That proves the
-logic and the phase values; it does not prove Argo loads the key, because only
-Argo can prove that. The command above is the step that closes the gap, and it
-costs nothing.
+`argocd` IS installed on this host now (v3.4.6), and the command above WAS run
+this session (2026-10-02): `STATUS: Healthy` / `MESSAGE: phase Running: the
+listener exists and 0 runner(s) are up. Zero is the correct idle state under
+minRunners: 0.` — matching the expected output above exactly. It cannot
+distinguish whether that came from the `--argocd-cm-path` file or from the
+live cluster's `argocd-cm`, though: both carry the identical rule (measured
+above), and the command contacts the cluster regardless of its file inputs.
+Earlier, when this section was first written, `argocd` was not installed, and
+what was run instead was the Lua extracted back out of `install/values.yaml`
+and evaluated with a stock Lua interpreter against the real live object's JSON
+and six mutations of it. That proved the logic and the phase values; it did
+not prove Argo loads the key, because only Argo can prove that — which the
+command above, now run for real, does.
 
 ### After the sync
 
@@ -1082,18 +1095,31 @@ production cluster, so an unpinned command here is a hazard.
 
 Measured working form: a throwaway kubeconfig, minified to just the
 `kind-yadgar` context, with that one field changed. It touches no file outside
-`/tmp` and leaves the real kubeconfig alone. `set -eu` plus the trap mean a
-failed or empty `mktemp` stops the script instead of silently falling back to
-`KUBECONFIG=""` — which resolves to `~/.kube/config`, whose current context on
-this host is a production cluster.
+`/tmp` and leaves the real kubeconfig alone. The whole body runs in a
+subshell, `( set -eu; … )`, so `set -eu`, `exit` and the `EXIT` trap are all
+scoped to that subshell: pasted into an interactive shell, a failure here ends
+only the subshell, never the paster's own session. `[ -s "$TMPKC" ]` sits
+directly after the line that can leave it empty.
 
 ```bash
-set -eu; TMPKC=$(mktemp); trap 'rm -f "$TMPKC"' EXIT
-kubectl config view --minify --flatten --context kind-yadgar > "$TMPKC"
-kubectl --kubeconfig "$TMPKC" config set-context kind-yadgar --namespace argocd
-[ -s "$TMPKC" ] || exit 1
-KUBECONFIG="$TMPKC" argocd app sync argocd --core --kube-context kind-yadgar
+(
+  set -eu
+  TMPKC=$(mktemp)
+  trap 'rm -f "$TMPKC"' EXIT
+  kubectl config view --minify --flatten --context kind-yadgar > "$TMPKC"
+  [ -s "$TMPKC" ] || exit 1
+  kubectl --kubeconfig "$TMPKC" config set-context kind-yadgar --namespace argocd
+  KUBECONFIG="$TMPKC" argocd app sync argocd --core --kube-context kind-yadgar
+)
 ```
+
+Verified (2026-10-02): pasting this block, with `kind-yadgar` swapped for a
+nonexistent context, into an interactive `bash -i` session — `kubectl config
+view` fails loud, `set -e` ends the subshell there (the `[ -s ]` line is never
+reached), the parent shell's next prompt comes back normally, and the `EXIT`
+trap still ran: the temp file it reported was gone afterward. A `bash -c`
+invocation would not have caught this class of bug, because `-c` already runs
+the whole block in its own process.
 
 ### After — verify
 
