@@ -145,20 +145,9 @@ CHILDREN: dict[str, dict] = {
         "annotations": {},
         # `valuesObject` is the K3 gate's subject (`scripts/gates/`), not this row's.
         "source": {"repoURL": "ghcr.io/yadgarhq/charts", "chart": "yadgar"},
-        "unchanged": {
-            "project": "default",
-            "destination": {"server": DESTINATION, "namespace": "yadgar"},
-            "ignoreDifferences": [
-                {
-                    "group": "k8s.mariadb.com",
-                    "kind": "MariaDB",
-                    "jsonPointers": [
-                        "/spec/rootPasswordSecretKeyRef/generate",
-                        "/spec/passwordSecretKeyRef/generate",
-                    ],
-                }
-            ],
-        },
+        # NO `ignoreDifferences` (ledger 1266, chart#27). C1 measured that the
+        # MariaDB entry masked no divergence, so a returning entry reddens.
+        "unchanged": {"project": "default", "destination": {"server": DESTINATION, "namespace": "yadgar"}},
         "sync_policy": s0("CreateNamespace=true"),
     },
 }
@@ -445,9 +434,14 @@ def test_yadgar_with_a_value_file_beside_the_object_reddens(copy: Path) -> None:
     assert child_clause_errors(copy) == [("yadgar", "source")]
 
 
-def test_yadgar_without_ignore_differences_reddens(copy: Path) -> None:
-    """Without it the operator's writeback reads as drift, and selfHeal loops against it."""
-    mutate(copy, "yadgar", lambda d: d["spec"].pop("ignoreDifferences"))
+def test_yadgar_with_an_ignore_differences_entry_reddens(copy: Path) -> None:
+    """The MariaDB entry masked nothing (ledger 1266 C1), and an ignore rule hides the divergence it covers."""
+    entry = {
+        "group": "k8s.mariadb.com",
+        "kind": "MariaDB",
+        "jsonPointers": ["/spec/rootPasswordSecretKeyRef/generate", "/spec/passwordSecretKeyRef/generate"],
+    }
+    mutate(copy, "yadgar", lambda d: d["spec"].update(ignoreDifferences=[entry]))
     assert child_clause_errors(copy) == [("yadgar", "unchanged")]
 
 

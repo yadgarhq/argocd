@@ -23,6 +23,9 @@ CI job, never in the offline pre-commit hook.
       `infra/yadgar/values.yaml` at 05b160b with the same flags — "this
       organisation's render, before and after the move of its values:
       byte-identical, 0 differing objects". A difference is named by object.
+      Re-measured 2026-10-03 at 0.3.38 (ledger 1266): still 88 objects, none
+      added or removed, 10 changed (six module Deployments and four platform
+      hook Jobs).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
@@ -120,9 +123,16 @@ def test_the_application_is_the_example_outside_sync_policy_and_values(example: 
     assert example_differences(document, example) == []
 
 
-def test_a_dropped_ignore_differences_reddens(example: dict) -> None:
+def test_an_added_ignore_differences_reddens(example: dict) -> None:
+    """chart#27 dropped the MariaDB entry from the example (ledger 1266); a copy that keeps one is not the example."""
     document = committed()
-    del document["spec"]["ignoreDifferences"]
+    document["spec"]["ignoreDifferences"] = [
+        {
+            "group": "k8s.mariadb.com",
+            "kind": "MariaDB",
+            "jsonPointers": ["/spec/rootPasswordSecretKeyRef/generate", "/spec/passwordSecretKeyRef/generate"],
+        }
+    ]
     assert example_differences(document, example) == ["spec.ignoreDifferences"]
 
 

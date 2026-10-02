@@ -86,17 +86,19 @@ IMPLICIT_RETRY = {"limit": 5, "backoff": {"duration": "5s", "factor": 2, "maxDur
 # THE MARGIN ON A MEASURED, UNBOUNDED DURATION.
 MEASURED_MARGIN = 3
 
-# ─── yadgar: chart 0.3.13, which embeds `platform` 0.1.21 ─────────────────────
+# ─── yadgar: chart 0.3.38, which embeds `platform` 0.1.26 ─────────────────────
 #
-# FORWARD-LOOKING (ledger 1224, ADR-0830). `yadgarhq/platform#24` is open, not
-# merged: today's render still carries no `activeDeadlineSeconds` on these
-# hooks, and the OLD documented-ceiling arithmetic (3225 s/attempt) is smaller
-# than the numbers below. Once platform#24 merges, `parent_bump.py` pins the
-# new `platform` release straight to `yadgarhq/chart` main with no PR CI, so
-# this value is raised BEFORE that merge rather than after it. The numbers
-# below are #24's own (`chart/templates/_preflight.tpl`,
-# `preflight.yaml`, `envoy-gateway-probe.yaml`, `bootstrap-secrets.yaml`),
-# hand-typed from platform#24 @2d86082; nothing re-reads them.
+# WRITTEN FORWARD-LOOKING (ledger 1224, ADR-0830), NOW THE PIN. The numbers
+# below were hand-typed from `yadgarhq/platform#24` @2d86082
+# (`chart/templates/_preflight.tpl`, `preflight.yaml`,
+# `envoy-gateway-probe.yaml`, `bootstrap-secrets.yaml`) before #24 merged.
+# #24 merged as `platform` cf2dd99 and reached this cluster's pin with parent
+# 0.3.38 (ledger 1266). Measured 2026-10-03 on that render at
+# `applications/yadgar.yaml`'s `valuesObject`: `activeDeadlineSeconds` is
+# preflight 1260, envoy-gateway-probe 1200, bootstrap-secrets 450 and
+# admin-bootstrap-token 350; `terminationGracePeriodSeconds` is preflight 60
+# and envoy-gateway-probe 45. Each equals the arithmetic below. Nothing
+# re-reads them.
 #
 # Rendered with `applications/yadgar.yaml`'s `valuesObject` (`iamKeys.create:
 # false` in this org), every attempt runs four hook Jobs from the platform
