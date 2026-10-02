@@ -2,12 +2,14 @@
 
 Steps this repository needs from a person. Argo manages Argo, so a change here
 is not live when it merges — `applications/argocd.yaml` is deliberately not
-`automated`. Its first sync ran once, 2026-10-02 06:51Z (`argocd app sync
-argocd --core`; see "The sync timeout is raised to 25200 s" below), but that
-does not make later changes land on their own: the Application stays manual,
-so every change here still needs an operator to sync it by hand. Anything
-below that says "after the sync" is waiting on that step, which belongs to the
-operator and is argued in `plans/argocd-adoption-sync.md` in `yadgarhq/docs`.
+`automated`. Its first sync ran once, 2026-10-02 06:51Z, by hand under a
+throwaway kubeconfig minified to the `kind-yadgar` context with its namespace
+set to `argocd` (`argocd app sync argocd --core`; the form in "The sync
+timeout is raised to 25200 s" § "Apply" below), but that does not make later
+changes land on their own: the Application stays manual, so every change here
+still needs an operator to sync it by hand. Anything below that says "after
+the sync" is waiting on that step, which belongs to the operator and is argued
+in `plans/argocd-adoption-sync.md` in `yadgarhq/docs`.
 
 ## The ARC scale-set health rule (ledger 745)
 
@@ -26,16 +28,18 @@ over the rendered `argocd-cm`. That is the mechanism the adoption brief measured
 and it applies to **every** `configs.cm` edit forever, not to this one specially.
 It does not roll `argocd-redis` or the ApplicationSet controller.
 
-### Verify the rule before syncing anything
+### Verify the rule
 
 `argocd admin settings resource-overrides health` evaluates the rule exactly as
 the controller would, against a file. **It does contact the cluster anyway**
 — measured 2026-10-02: it starts configmap/secret and cluster-cache informers
 against whatever context is current even when every input named below is a
 local file, so every invocation here carries `--kube-context kind-yadgar` to
-keep it off this host's default (production) context. It applies nothing. Do
-this first — it is the check that turns "the Lua looks right" into "the Lua
-returns what I expect".
+keep it off this host's default (production) context. INFERRED, not measured,
+that it applies nothing: the informers it starts are read-only in every run
+observed, but no log line proves it writes nothing. Run this anyway — it is
+the check that turns "the Lua looks right" into "the Lua returns what I
+expect".
 
 ```bash
 # The rule, as a ConfigMap the CLI can read. Rendering it is what proves the
@@ -76,7 +80,7 @@ and six mutations of it. That proved the logic and the phase values; it did
 not prove Argo loads the key, because only Argo can prove that — which the
 command above, now run for real, does.
 
-### After the sync
+### Checks after any sync
 
 ```bash
 # The key reached the live ConfigMap.
