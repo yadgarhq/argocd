@@ -30,17 +30,19 @@ read differently — one names a thing, the other names a rule.
 
 ## What lives where
 
-|                       |                                                             |
-| --------------------- | ----------------------------------------------------------- |
-| **this repo**         | Argo itself, and how Argo discovers work                    |
-| **`yadgarhq/deploy`** | what Argo deploys that is not a module — the infrastructure |
-| **module repos**      | each carries its own `chart/`, found by the ApplicationSet  |
+|                  |                                                                                       |
+| ---------------- | ------------------------------------------------------------------------------------- |
+| **this repo**    | Argo itself, every Application this organisation runs, and how Argo discovers modules |
+| **module repos** | each carries its own `chart/`, found by the ApplicationSet                            |
 
-Infrastructure `Application` resources live in `deploy` beside the manifests and
-values they point at, rather than being centralised here. That is the same
-argument D54 makes against an umbrella chart: a single place listing everything
-becomes the thing every change has to touch. Argo's own configuration is the one
-exception, because it has nowhere else to live.
+Infrastructure `Application` resources used to live in `deploy`, beside the
+manifests and values they pointed at, rather than being centralised here —
+the same argument D54 makes against an umbrella chart: a single place
+listing everything becomes the thing every change has to touch. Argo's own
+configuration was the one exception, because it had nowhere else to live.
+Both exceptions below ran their course: `deploy` owns no Application any
+more (ADR-0803, ADR-0828), and every Application this organisation runs is
+declared here instead.
 
 **The operators are the second exception, and the first step of retiring
 `deploy`.** ADR-0803 moves what this organisation still needs from
@@ -72,7 +74,7 @@ gates, which need helm and run in CI's `two-owners` job.
 
 `install/values.yaml` is not read by the bootstrap. `make bootstrap`, here,
 passes only the few `--set` flags needed to _reach_ the server; the real
-values arrive through `applicationsets/argocd-self.yaml`, one sync later.
+values arrive through `applications/argocd.yaml`, one sync later.
 
 Without that Application the values file would apply to nothing while looking
 authoritative, which is worse than not having it.

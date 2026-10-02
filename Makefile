@@ -12,8 +12,8 @@
 #   kubectl config current-context  # kind-yadgar
 #
 # kind with the podman provider, on the existing ROOTLESS podman session. No
-# DOCKER_HOST, no docker socket, no rootful bridge — see README for why k3d was
-# abandoned.
+# DOCKER_HOST, no docker socket, no rootful bridge — why k3d was abandoned is
+# in yadgarhq/deploy's README at commit cbe0d8e (deploy#85 retires that repo).
 # /bin/bash does not exist on NixOS — /bin holds only sh. env resolves bash
 # from PATH instead of assuming a filesystem layout.
 SHELL := /usr/bin/env bash
