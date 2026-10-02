@@ -147,6 +147,151 @@ configs:
       hs.message = "unrecognised .status.phase " .. tostring(obj.status.phase) .. ": this rule knows Running, Pending and Outdated. Not Healthy, deliberately -- an unknown phase is the case the rule cannot judge."
       return hs
 
+    # THE CHART'S TWO HEALTH OVERRIDES, COPIED, NOT WRITTEN HERE (ledger 1221).
+    # `yadgarhq/chart`'s kind bootstrap (`bootstrap/argocd-values.yaml`)
+    # replaces two of Argo CD v3.1.8's built-in health scripts. This Argo syncs
+    # the same Applications, so it needs the same two scripts. Both are copied
+    # byte for byte from `yadgarhq/chart` v0.3.18. The reasoning, the upstream
+    # digests and the Lua cases live there, in `bootstrap/argocd-values.yaml`
+    # and `scripts/tests/test_argocd_values.py`. Do not edit either script
+    # here: copy it again from the chart.
+    # `scripts/tests/test_install_health_overrides.py` pins both scripts to the
+    # chart's digests (`scripts/tests/fixtures/chart_health_overrides.json`).
+    #
+    # CRD (chart#21, ledger 1197). gitops-engine fails a running sync task
+    # whose live object is Degraded. v3.1.8 reads a new CRD as Degraded, "CRD is
+    # not established", in two states: `Established=False, reason=Installing`,
+    # and conditions that hold no `Established` entry yet (the gateway-api CRDs
+    # get `KubernetesAPIApprovalPolicyConformant` about 2 s first). This is
+    # upstream's fixed script plus three hunks named `hasEstablishedCondition`:
+    # both states read Progressing. Delete the key when the Argo CD here ships
+    # a built-in script that reads both states as Progressing.
+    resource.customizations.health.apiextensions.k8s.io_CustomResourceDefinition:
+      |
+      local hs = {}
+
+      -- Check if CRD is terminating
+      if obj.metadata.deletionTimestamp ~= nil then
+          hs.status = "Progressing"
+          hs.message = "CRD is terminating"
+          return hs
+      end
+
+      if obj.status.conditions == nil then
+          hs.status = "Progressing"
+          hs.message = "Status conditions not found"
+          return hs
+      end
+
+      if #obj.status.conditions == 0 then
+          hs.status = "Progressing"
+          hs.message = "Status conditions not found"
+          return hs
+      end
+
+      local isEstablished
+      -- NOT UPSTREAM (yadgarhq/chart, ledger 1197; argoproj/argo-cd#26346): a CRD
+      -- whose conditions hold no Established entry yet reads Progressing, not
+      -- Degraded. gateway-api CRDs get KubernetesAPIApprovalPolicyConformant first.
+      local hasEstablishedCondition = false
+      local conditionMsg = ""
+
+      for _, condition in pairs(obj.status.conditions) do
+
+          -- Check if CRD is terminating
+          if condition.type == "Terminating" and condition.status == "True" then
+              hs.status = "Progressing"
+              hs.message = "CRD is terminating: " .. condition.message
+              return hs
+          end
+
+          -- Check if K8s has accepted names for this CRD
+          if condition.type == "NamesAccepted" and condition.status == "False" then
+              hs.status = "Degraded"
+              hs.message = "CRD names have not been accepted: " .. condition.message
+              return hs
+          end
+
+          -- Checking if CRD has violations
+          if condition.type == "NonStructuralSchema" and condition.status == "True" then
+              hs.status = "Degraded"
+              hs.message = "Schema violations found: " .. condition.message
+              return hs
+          end
+
+          -- Checking if CRD is established
+          if condition.type == "Established" then
+              hasEstablishedCondition = true
+              if condition.status == "True" then
+                  isEstablished = true
+                  conditionMsg = condition.message
+              elseif condition.reason == "Installing" then
+                  hs.status = "Progressing"
+                  hs.message = "CRD is being installed"
+                  return hs
+              end
+          end
+      end
+
+      if not isEstablished then
+          if not hasEstablishedCondition then
+              hs.status = "Progressing"
+              hs.message = "CRD is being installed"
+              return hs
+          end
+          hs.status = "Degraded"
+          hs.message = "CRD is not established"
+          return hs
+      end
+
+      hs.status = "Healthy"
+      hs.message = "CRD is healthy"
+      return hs
+    # MariaDB (chart#22, ledger 1205). mariadb-operator 26.6.0 creates the
+    # `<name>-mariadb-sys-global-priv` Grant and reads it back at once from a
+    # cache that can lag the create. The NotFound becomes `Ready=False,
+    # reason=Failed`, which v3.1.8 reads as Degraded, and the running sync
+    # fails. This is upstream's script plus one hunk, marked NOT UPSTREAM:
+    # exactly that message, for this MariaDB's own Grant, reads Progressing.
+    # Every other `reason=Failed` stays Degraded. Delete the key when the
+    # operator reads that Grant uncached or wraps the error with `%w`.
+    resource.customizations.health.k8s.mariadb.com_MariaDB: |
+      local health_status = {}
+
+      if obj.status ~= nil and obj.status.conditions ~= nil then
+
+          for i, condition in ipairs(obj.status.conditions) do
+
+              health_status.message = condition.message
+
+              if condition.status == "False" then
+                  if condition.reason == "Failed" then
+                      -- NOT UPSTREAM (yadgarhq/chart, ledger 1205): mariadb-operator 26.6.0
+                      -- reads the mariadb.sys Grant it has just created from a lagging cache.
+                      -- That one NotFound, for this MariaDB's own Grant, reads Progressing.
+                      if condition.type == "Ready" and obj.metadata ~= nil and obj.metadata.name ~= nil
+                          and condition.message ==
+                          'Error reconciling SQL: error getting mariadb.sys Grant: Grant.k8s.mariadb.com "'
+                          .. obj.metadata.name .. '-mariadb-sys-global-priv" not found' then
+                          health_status.status = "Progressing"
+                          return health_status
+                      end
+                      health_status.status = "Degraded"
+                      return health_status
+                  end
+                  health_status.status = "Progressing"
+                  return health_status
+              end
+          end
+
+          health_status.status = "Healthy"
+          return health_status
+      end
+
+      health_status.status = "Progressing"
+      health_status.message = "No status info available"
+      return health_status
+
 controller:
   # One replica in development. Production sizing is a values override, not a
   # different manifest.
