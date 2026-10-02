@@ -1,0 +1,10 @@
+{
+  "repository": "yadgarhq/chart",
+  "tag": "v0.3.18",
+  "commit": "450b435388034a3f12e40405424441ad22539550",
+  "path": "bootstrap/argocd-values.yaml",
+  "sha256": {
+    "resource.customizations.health.apiextensions.k8s.io_CustomResourceDefinition": "8068309e805a854cff23a2ea6dbde011b3d257ff33430fe46ee6c9d5423d7adf",
+    "resource.customizations.health.k8s.mariadb.com_MariaDB": "bfb8b75f83de320c71f42f36b78dbcef318e4662d78c536f7d13239d79643d3c"
+  }
+}
