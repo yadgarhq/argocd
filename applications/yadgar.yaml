@@ -73,10 +73,10 @@ spec:
         # reason `infra/databases/` holds manifests that only the `databases` Application
         # reads. A values file directly in `infra/` would be applied as a manifest.
         #
-        # DERIVED FROM EACH MODULE CHART'S OWN DEFAULTS, never copied from the
-        # `yadgar-modules` ApplicationSet's values block (ADR-0751, ADR-0619). Every key
-        # below turns ON something the chart ships OFF, so an omission PRUNES a live
-        # object rather than leaving it alone.
+        # DERIVED FROM EACH MODULE CHART'S OWN VALUES AND SCHEMA (ADR-0751, ADR-0619),
+        # never copied from another Application's values. A key below either turns ON
+        # something the chart ships OFF, so an omission PRUNES a live object, or states
+        # a setting the chart requires and does not default (ADR-0845).
         #
         # MEASURED 2026-09-26 against the published `yadgar:0.2.38`, the version
         # `infra/yadgar-app.yaml` pins rather than the newest published one (digest
@@ -128,9 +128,11 @@ spec:
           hostname: gateway.yadgar.internal
 
         # ── GATEWAY ──────────────────────────────────────────────────────────────────
-        # Gateway has no TLS listener; its edge is cleartext behind Envoy.
-        # The keys below control whether gateway speaks TLS TO other modules (DIALS to
-        # iam, task, project). These values override the module chart defaults.
+        # GATEWAY HAS NO TLS LISTENER of its own: Envoy terminates the edge's TLS and
+        # forwards to gateway in cleartext, so the chart reads no `gateway.tls`.
+        # `iam.tls.enabled`, `task.tls.enabled` and `project.tls.enabled` below are
+        # DIALS — whether gateway speaks TLS TO that module. Each is stated here
+        # rather than left to a chart default (ADR-0845).
         #
         # `networkPolicy` IS THE EDGE'S INGRESS ALLOW-LIST, AS OF STEP 8 of
         # `plans/retiring-the-deploy-copies.md` (ADR-0685's recorded alternative: a
