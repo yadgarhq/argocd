@@ -128,9 +128,9 @@ spec:
           hostname: gateway.yadgar.internal
 
         # ── GATEWAY ──────────────────────────────────────────────────────────────────
-        # `tls.enabled` is gateway's OWN listener. `gateway.iam.tls.enabled` and its two
-        # siblings are DIALS — whether gateway speaks TLS TO that module. Two different
-        # questions on keys one character apart.
+        # Gateway has no TLS listener; its edge is cleartext behind Envoy.
+        # The keys below control whether gateway speaks TLS TO other modules (DIALS to
+        # iam, task, project). These values override the module chart defaults.
         #
         # `networkPolicy` IS THE EDGE'S INGRESS ALLOW-LIST, AS OF STEP 8 of
         # `plans/retiring-the-deploy-copies.md` (ADR-0685's recorded alternative: a
@@ -151,7 +151,6 @@ spec:
           autoscaling: { enabled: true }
           sourceAddress: { trustedProxyHops: "" }
           adminBootstrap: { tokenSecret: admin-bootstrap-token }
-          tls: { enabled: true } # gateway's own listener
           gateway: { enabled: true } # the HTTPRoute
           iam: { tls: { enabled: true } } # DIAL to iam
           task: { tls: { enabled: true } } # DIAL to task
