@@ -43,6 +43,7 @@ import datetime as dt
 import importlib.util
 import io
 import json
+import re
 import subprocess
 import sys
 import zipfile
@@ -601,6 +602,58 @@ def test_the_judge_cli_refuses_a_short_sha(tmp_path: Path) -> None:
         assert sg.main(["judge", "--sha", S, "--trial-sha", bad, "--context", CONTEXT, "--out-dir", str(tmp_path)]) == 2
 
 
+# ── the verdict schema estate reads (yadgarhq/estate `scripts/verdict.py` `read_verdict`) ──
+
+HEX40 = re.compile(r"[0-9a-f]{40}")
+HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def estate_accepts(verdict: dict) -> bool:
+    """Estate's own predicate, restated: S and A 40 hex, K 64 hex, P a string, result green|red, clause when red."""
+    return (
+        isinstance(verdict.get("K"), str) and bool(HEX64.fullmatch(verdict["K"]))
+        and isinstance(verdict.get("A"), str) and bool(HEX40.fullmatch(verdict["A"]))
+        and isinstance(verdict.get("S"), str) and bool(HEX40.fullmatch(verdict["S"]))
+        and isinstance(verdict.get("P"), str)
+        and verdict.get("result") in ("green", "red")
+        and (verdict["result"] == "green" or isinstance(verdict.get("clause"), str))
+    )
+
+
+def test_a_green_verdict_carries_estates_schema(estate: Estate, tmp_path: Path) -> None:
+    run(estate, tmp_path)
+    written = json.loads((tmp_path / "settled-verdict" / "verdict.json").read_text())
+    assert estate_accepts(written), written
+    assert (written["S"], written["A"], written["K"], written["P"]) == (S, S, "e" * 64, P)
+
+
+def test_a_red_verdict_names_its_clauses_for_estate(estate: Estate, tmp_path: Path) -> None:
+    estate.yadgar["status"]["health"]["status"] = "Degraded"
+    estate.pods_of("task")[0]["status"]["containerStatuses"][0]["imageID"] = "ghcr.io/yadgarhq/task@" + digest("0")
+    run(estate, tmp_path, now=AFTER_DEADLINE)
+    written = json.loads((tmp_path / "settled-verdict" / "verdict.json").read_text())
+    assert estate_accepts(written), written
+    assert written["clause"].startswith("Clause A, Clause B: ")
+
+
+def test_a_red_derivation_verdict_names_the_derivation(estate: Estate, tmp_path: Path) -> None:
+    red = derivation()
+    red.update(outcome="red", problems=["scripts/chart_pin.json chart_tag is v0.3.37, but applications/yadgar.yaml pins 0.3.38"])
+    run(estate, tmp_path, data_derivation=red)
+    written = json.loads((tmp_path / "settled-verdict" / "verdict.json").read_text())
+    assert estate_accepts(written), written
+    assert written["clause"].startswith("derivation: scripts/chart_pin.json")
+
+
+def test_find_verdict_matches_on_k_and_a(estate: Estate) -> None:
+    """The fields estate matches on, not a nested copy."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("verdict.json", json.dumps({"epoch": EPOCH, "result": "green"}))
+    github = github_with([artifact(1, "2026-10-03T10:00:00Z")], {10: workflow_run(10)}, {1: buffer.getvalue()})
+    assert find(github) is None
+
+
 # ── 6. find-verdict ──────────────────────────────────────────────────────────
 
 SELF_ID = 1001
@@ -638,7 +691,10 @@ class FakeGitHub:
 def verdict_zip(epoch: dict, result: str = "green") -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
-        archive.writestr("verdict.json", json.dumps({"epoch": epoch, "result": result}))
+        verdict = {"S": S, "A": epoch["anchor"], "K": epoch["key"], "P": P, "result": result}
+        if result == "red":
+            verdict["clause"] = "Clause A: Deployment gateway"
+        archive.writestr("verdict.json", json.dumps(verdict))
     return buffer.getvalue()
 
 

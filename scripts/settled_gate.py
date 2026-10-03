@@ -78,6 +78,10 @@ no cluster read. Then every clause is evaluated and every problem reported:
             (ADR-0851: FLAGGED, not tolerated). A Synced Application with
             hook objects marked `requiresPruning` (measured live) is not failed.
 
+  A verdict carries what estate's verdict job reads: `S`, `A`, `K`, `P`,
+  `result` (green or red) and, when red, `clause` (the failed clauses and the
+  first problem), beside the digests, deadline and read time.
+
   green    every clause held: the verdict goes to `<out-dir>/settled-verdict/`.
   pending  a clause is false and the deadline has not passed: NOTHING written.
   red      a clause is false after the deadline, or the derivation is red:
@@ -795,6 +799,11 @@ def judge(derived: dict, cluster, *, root_sha: str, now: dt.datetime, trial: boo
     deadline as passed, so a not-settled read is red, not pending.
     """
     verdict = {
+        # Estate's verdict job reads S, A, K, P, result and (when red) clause.
+        "S": root_sha,
+        "A": derived["anchor"],
+        "K": derived["key"],
+        "P": derived["pin"],
         "sha": root_sha,
         "data_sha": derived["sha"],
         "trial": trial,
@@ -814,7 +823,7 @@ def judge(derived: dict, cluster, *, root_sha: str, now: dt.datetime, trial: boo
         "not_counted": [],
     }
     if derived["outcome"] == "red":
-        return {**verdict, "result": "red", "problems": list(derived["problems"])}
+        return {**verdict, "result": "red", "problems": list(derived["problems"]), "clause": clause_of(derived["problems"], "derivation")}
     verify_handover = handover()
     try:
         root = cluster.json("get", "application", "root", "-n", "argocd")
@@ -829,7 +838,17 @@ def judge(derived: dict, cluster, *, root_sha: str, now: dt.datetime, trial: boo
     if not problems:
         return {**verdict, "result": "green"}
     expired = trial or now > utc(derived["deadline"])
-    return {**verdict, "result": "red" if expired else "pending"}
+    if not expired:
+        return {**verdict, "result": "pending"}
+    return {**verdict, "result": "red", "clause": clause_of(problems, "judge")}
+
+
+def clause_of(problems: list[str], fallback: str) -> str:
+    """The `clause` estate shows for a red: the clauses that failed, then the first problem."""
+    labels = sorted({p.split(":", 1)[0] for p in problems if p.startswith("Clause ")})
+    if not labels:
+        return f"{fallback}: {problems[0]}"
+    return f"{', '.join(labels)}: {problems[0].split(': ', 1)[-1]}"
 
 
 def run_judge(
@@ -938,7 +957,7 @@ def _read_verdict(archive: bytes) -> dict:
 
 
 def find_verdict(github, repository: str, workflow_path: str, epoch: dict, *, exclude_run_id: int | None = None) -> dict | None:
-    """The newest `settled-verdict` whose recorded epoch is `epoch`, or None.
+    """The newest `settled-verdict` whose recorded `K` and `A` are `epoch`'s, or None.
 
     The same filters `verify.yaml` applies to its baseline: this repository and
     head repository, the default branch, this workflow's path, a `schedule` or
@@ -972,7 +991,7 @@ def find_verdict(github, repository: str, workflow_path: str, epoch: dict, *, ex
         ):
             continue
         verdict = _read_verdict(github.download(candidate["archive_download_url"]))
-        if verdict.get("epoch") == epoch:
+        if (verdict.get("K"), verdict.get("A")) == (epoch["key"], epoch["anchor"]):
             return {"found": True, "artifact_id": candidate["id"], "run_id": run["id"], "created_at": candidate["created_at"], "verdict": verdict}
     return None
 
