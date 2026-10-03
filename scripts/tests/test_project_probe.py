@@ -374,11 +374,47 @@ def test_a_trial_where_unresolvable_rose_is_invalid() -> None:
     assert run(Fake([BEFORE, both]), "--trial", "unregistered-personal") == pp.EXIT_TRIAL_INVALID
 
 
-def test_the_no_token_trial_sends_no_authorization_and_fails_on_401() -> None:
-    fake = Fake([BEFORE], call=(401, {"jsonrpc": "2.0", "id": 1, "error": {"code": -32001, "message": "x"}}))
-    assert run(fake, "--trial", "no-token") == 1
+UNAUTHENTICATED = (401, {"jsonrpc": "2.0", "id": 1, "error": {"code": -32001, "message": "x"}})
+
+
+def test_the_no_token_trial_is_valid_on_a_401_with_no_counter_moved(capsys) -> None:
+    fake = Fake([BEFORE], call=UNAUTHENTICATED)
+    assert run(fake, "--trial", "no-token") == pp.EXIT_TRIAL_RED
     assert [p[0] for p in fake.posts] == ["/"]
     assert "authorization" not in fake.posts[0][1]
+    assert "trial: VALID" in capsys.readouterr().out
+
+
+def test_the_no_token_trial_on_a_500_is_invalid() -> None:
+    fake = Fake([BEFORE], call=(500, {"error": "x"}))
+    assert run(fake, "--trial", "no-token") == pp.EXIT_TRIAL_INVALID
+
+
+def test_the_no_token_trial_with_a_counter_rise_is_invalid() -> None:
+    assert run(Fake([BEFORE, ROSE_U], call=UNAUTHENTICATED), "--trial", "no-token") == pp.EXIT_TRIAL_INVALID
+    assert run(Fake([BEFORE, ROSE_P], call=UNAUTHENTICATED), "--trial", "no-token") == pp.EXIT_TRIAL_INVALID
+
+
+def test_the_no_token_trial_with_a_reset_or_vanished_pod_is_invalid() -> None:
+    before = vector({"a": 1, "b": 1}, {("a", U): 5})
+    reset = vector({"a": 1, "b": 1}, {("a", U): 1})
+    gone = vector({"a": 1}, {("a", U): 5})
+    assert run(Fake([before, reset], call=UNAUTHENTICATED), "--trial", "no-token") == pp.EXIT_TRIAL_INVALID
+    assert run(Fake([before, gone], call=UNAUTHENTICATED), "--trial", "no-token") == pp.EXIT_TRIAL_INVALID
+
+
+def test_the_no_token_trial_with_prometheus_down_is_never_valid() -> None:
+    assert run(Fake([BEFORE], call=UNAUTHENTICATED, prom_down=True), "--trial", "no-token") in (
+        pp.EXIT_FAIL,
+        pp.EXIT_TRIAL_INVALID,
+    )
+
+
+def test_an_inconclusive_reset_is_a_workflow_warning(capsys) -> None:
+    before = vector({"a": 1, "b": 1}, {("a", U): 5})
+    reset = vector({"a": 1, "b": 1}, {("a", U): 1})
+    assert run(Fake([before, reset])) == 0
+    assert "::warning::project-probe inconclusive:" in capsys.readouterr().out
 
 
 # --- the runner's egress policy -----------------------------------------------
@@ -429,9 +465,59 @@ def test_every_egress_rule_names_a_destination_and_a_port() -> None:
         assert rule.get("ports"), rule
 
 
+# THE SHARED PEERS ARE DERIVED, NOT RETYPED. kube-dns, the edge's envoy pods
+# and the cluster ranges are what `estate-front-egress` already selects and
+# excepts, and `yadgar-edge`'s address is pinned in its Service. A second copy
+# typed here would drift from the first unnoticed.
+ESTATE_POLICY = REPOSITORY / "manifests" / "estate-front" / "networkpolicy.yaml"
+EDGE_SERVICE = REPOSITORY / "manifests" / "estate-front" / "edge-service.yaml"
+
+# MEASURED on kind-yadgar, 2026-10-03: the labels on pod
+# `observability/prometheus-server-*`, the same three the Service selects
+# less `instance`. Pinned exactly: one label too many matches no pod, and the
+# probe then times out against Prometheus.
+PROMETHEUS_PODS = {"app.kubernetes.io/name": "prometheus", "app.kubernetes.io/component": "server"}
+
+
+def peers(doc_rules: list[dict], namespace: str) -> list[tuple[dict, list[int]]]:
+    return [
+        (peer, sorted(port["port"] for port in rule.get("ports", [])))
+        for rule in doc_rules
+        for peer in rule.get("to", [])
+        if peer.get("namespaceSelector", {}).get("matchLabels", {}).get("kubernetes.io/metadata.name") == namespace
+    ]
+
+
+def estate_rules() -> list[dict]:
+    return yaml.safe_load(ESTATE_POLICY.read_text())["spec"]["egress"]
+
+
+def edge_address() -> str:
+    for doc in yaml.safe_load_all(EDGE_SERVICE.read_text()):
+        if doc and doc.get("kind") == "Service" and doc["metadata"]["name"] == "yadgar-edge":
+            return doc["spec"]["clusterIP"]
+    raise AssertionError("no Service yadgar-edge")
+
+
 def test_the_api_server_prometheus_and_the_edge_are_allowed_before_and_after_dnat() -> None:
-    assert {("10.96.0.1/32", 443), ("10.89.4.2/32", 6443), ("10.96.63.35/32", 80), ("10.96.0.100/32", 443)} <= allowed_blocks()
+    # 6443 on every node: only the control plane listens there, so a rebuild
+    # that renumbers nodes inside the /24 does not cut the verifier.
+    expected = {("10.96.0.1/32", 443), ("10.89.4.0/24", 6443), ("10.96.63.35/32", 80), (f"{edge_address()}/32", 443)}
+    assert expected <= allowed_blocks()
     assert {("kube-system", 53), ("observability", 9090), ("envoy-gateway-system", 10443)} <= allowed_selectors()
+
+
+@pytest.mark.parametrize("namespace", ["kube-system", "envoy-gateway-system"])
+def test_kube_dns_and_the_edge_are_the_peers_estate_front_egress_selects(namespace) -> None:
+    ours, theirs = peers(egress_rules(), namespace), peers(estate_rules(), namespace)
+    assert len(ours) == 1 and len(theirs) == 1
+    assert ours[0] == theirs[0]
+
+
+def test_prometheus_is_selected_by_exactly_the_measured_labels() -> None:
+    (peer, ports), = peers(egress_rules(), "observability")
+    assert peer["podSelector"] == {"matchLabels": PROMETHEUS_PODS}
+    assert ports == [9090]
 
 
 def test_nothing_in_namespace_yadgar_is_reachable() -> None:
@@ -449,4 +535,5 @@ def test_the_internet_rule_is_443_only_and_excepts_every_cluster_range() -> None
     assert len(wide) == 1
     block, ports = wide[0]
     assert ports == [443]
-    assert set(block["except"]) == {"10.244.0.0/16", "10.96.0.0/16", "10.89.4.0/24"}
+    (theirs,) = [peer["ipBlock"] for rule in estate_rules() for peer in rule["to"] if peer.get("ipBlock", {}).get("cidr") == "0.0.0.0/0"]
+    assert sorted(block["except"]) == sorted(theirs["except"])

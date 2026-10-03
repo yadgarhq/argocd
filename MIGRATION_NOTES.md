@@ -301,7 +301,8 @@ Read on kind-yadgar, 2026-10-01, with `get` only:
   `https://github.com/yadgarhq/estate`. A workflow elsewhere cannot target it.
 - Its namespace's `estate-front-egress` policy excludes `10.96.0.0/16` and
   `10.89.4.0/24`, so it denies the API server at `10.96.0.1:443` and
-  `10.89.4.2:6443`. That is the declared intent only (see "The verifier egress policy" below).
+  `10.89.4.2:6443`. kindnet enforces it (ADR-0688; see "The verifier egress
+  policy" below).
 - Its pods hold the `estate` environment's secrets. Binding cluster read there
   widens the most sensitive pod in the estate.
 
@@ -451,10 +452,11 @@ commit on `main`.
 `verifier/manifests/networkpolicy.yaml` declares `post-merge-verifier-egress`
 (ledger 785, ADR-0841; yadgarhq/docs `plans/settled-state-smoke-gate.md`
 stage 6). It is egress only, over every pod in `post-merge-verifier`. It allows
-kube-dns on 53, the API server (`10.96.0.1/32:443` and the endpoint
-`10.89.4.2/32:6443`), Prometheus (`10.96.63.35/32:80` and the server pods on
-9090), the edge (`10.96.0.100/32:443` and the envoy pods on 10443), and `443`
-to `0.0.0.0/0` except the pod, Service and node ranges. The addresses were
+kube-dns on 53, the API server (`10.96.0.1/32:443`, and `10.89.4.0/24:6443`:
+every node, where only the control plane listens), Prometheus
+(`10.96.63.35/32:80` and the server pods on 9090), the edge
+(`10.96.0.100/32:443` and the envoy pods on 10443), and `443` to `0.0.0.0/0`
+except the pod, Service and node ranges. The addresses were
 measured on 2026-10-03 and move when the cluster is rebuilt.
 
 **This section used to say the policy is "not a control yet" because kindnet
@@ -488,7 +490,7 @@ steps, verdicts and exit codes) is what `project-probe.yaml` in argocd-verify
 runs, as `python3 argocd/scripts/project_probe.py --edge-ca <estate ca/root.pem>`
 with `ESTATE_PROBE_PASSWORD` and `GITHUB_TOKEN` in its environment. The two
 red trials of stage 6 are `--trial unregistered-personal` (exit 3 when valid)
-and `--trial no-token` (exit 1 on the 401).
+and `--trial no-token` (exit 3 when valid: a 401 and no counter moved).
 
 **The live proof, in the first `project-probe.yaml` trial run** (A-U13). From
 the runner pod, in one run, so the binary and the resolver are constants:
@@ -501,17 +503,20 @@ the runner pod, in one run, so the binary and the resolver are constants:
    deadline. **This arm alone proves nothing about this policy:**
    `iam-ingress` admits only `app=gateway` on 50052, so it times out with no
    egress policy at all.
-4. The discriminating arm: a destination in a namespace with no ingress policy,
-   on a port this policy does not list, must also time out at 4 s. Use kube-dns
-   metrics, `nc -z -w 4 <kube-dns pod IP> 9153`, or the Prometheus pod's
-   `8080`. Both namespaces had no NetworkPolicy on 2026-10-03.
+4. The discriminating arm: kube-dns metrics,
+   `nc -z -w 4 <kube-dns pod IP> 9153`, must also time out at 4 s.
+   `kube-system` had no NetworkPolicy on 2026-10-03, and this policy does not
+   list 9153. Record in the same run, as
+   the control that the port is live, Prometheus answering
+   `up{instance=~".*:9153"} == 1` for every kube-dns pod. Prometheus scrapes
+   that port and this runner cannot reach it, so the timeout is this policy.
 
 `nc` and `nslookup` may be absent from the runner image. The same arms in
 Python, which `setup-python` provides:
 
 ```bash
 python3 - <<'PY'
-import socket, time
+import socket, time, urllib.parse, urllib.request
 print(sorted({a[4][0] for a in socket.getaddrinfo("iam.yadgar.svc.cluster.local", 50052)}))
 for host, port in [("prometheus-server.observability.svc", 80), ("10.96.0.100", 443),
                    ("iam.yadgar.svc.cluster.local", 50052), ("kube-dns.kube-system.svc", 9153)]:
@@ -521,6 +526,8 @@ for host, port in [("prometheus-server.observability.svc", 80), ("10.96.0.100", 
     except OSError as e:
         r = type(e).__name__
     print(f"{host}:{port} {r} {time.monotonic() - t:.1f}s")
+q = urllib.parse.urlencode({"query": 'up{instance=~".*:9153"}'})
+print(urllib.request.urlopen(f"http://prometheus-server.observability.svc/api/v1/query?{q}", timeout=10).read().decode())
 PY
 ```
 

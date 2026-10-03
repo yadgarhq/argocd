@@ -57,8 +57,10 @@ THE TRIALS (stage 6 acceptance 2 and 3):
       `PROJECT_UNREGISTERED_PERSONAL` rose and `PROJECT_UNRESOLVABLE` did not:
       exit 3 (red, as designed). Anything else is exit 2 (the trial proved
       nothing). A trial where neither series moved proves nothing.
-  --trial no-token sends the call with no bearer token. It must get 401 and
-      fail (exit 1) with no counter moved; the reads are printed to show it.
+  --trial no-token sends the call with no bearer token. The trial is VALID
+      only when the call answered 401 AND every reason's rise is 0 with no
+      reset, unknown or vanished pod: exit 3 (red, as designed). Any other
+      status, or any counter movement, is exit 2. A read that fails is exit 1.
 
 NEVER PRINTED: the password and the bearer token.
 
@@ -420,6 +422,14 @@ def run(
         end = now()
         say("deltas: " + "; ".join(f"{r} +{d.rise:g} resets={d.resets} unknown={d.unknown} missing={d.missing}" for r, d in deltas.items()))
 
+        if args.trial == "no-token":
+            still = all(d.rise == 0 and not (d.resets or d.unknown or d.missing) for d in deltas.values())
+            if status == 401 and still:
+                say("trial: VALID — no token got HTTP 401 and no counter moved")
+                return EXIT_TRIAL_RED
+            say(f"trial: INVALID — needs HTTP 401 and no counter movement; got HTTP {status}, moved: {moved(deltas)}")
+            return EXIT_TRIAL_INVALID
+
         if not call_ok:
             say(f"FAIL: the call answered HTTP {status} ({detail}); moved: {moved(deltas)}")
             return EXIT_FAIL
@@ -434,6 +444,9 @@ def run(
 
     verdict = evaluate(UNRESOLVABLE, deltas)
     say(f"{verdict.kind}: {verdict.message}")
+    if verdict.kind == INCONCLUSIVE:
+        # A reset or a vanished pod: green, but visible on the run's summary.
+        print(f"::warning::project-probe {verdict.message}", flush=True)
     if args.trial == "unregistered-personal":
         if trial_valid(deltas):
             say(f"trial: VALID — the assertion is red as designed; {PERSONAL} moved and {UNRESOLVABLE} did not")

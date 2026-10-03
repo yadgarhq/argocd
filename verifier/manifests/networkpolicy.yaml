@@ -66,9 +66,12 @@ spec:
       ports:
         - protocol: TCP
           port: 443
+    # Every node on 6443; only the control-plane listens there, so a kind
+    # rebuild that renumbers nodes inside the /24 (as .8 -> .2 did) does not
+    # cut the verifier.
     - to:
         - ipBlock:
-            cidr: 10.89.4.2/32
+            cidr: 10.89.4.0/24
       ports:
         - protocol: TCP
           port: 6443
