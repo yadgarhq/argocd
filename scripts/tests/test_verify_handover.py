@@ -850,6 +850,10 @@ REQUIRED = {
     ("rbac.authorization.k8s.io", "roles"),
     ("rbac.authorization.k8s.io", "rolebindings"),
     ("argoproj.io", "appprojects"),
+    ("networking.k8s.io", "networkpolicies"),
+    ("policy", "poddisruptionbudgets"),
+    ("batch", "jobs"),
+    ("actions.github.com", "autoscalingrunnersets"),
 }
 # Every CRD root's Applications tracked on kind-yadgar on 2026-10-01, less the
 # issuance records and Applications `collect` never lists. `collect` lists each

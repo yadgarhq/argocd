@@ -54,9 +54,24 @@ rules:
   - apiGroups: [rbac.authorization.k8s.io]
     resources: [clusterroles, clusterrolebindings, roles, rolebindings]
     verbs: [get, list, watch]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [get, list, watch]
+  - apiGroups: [policy]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list, watch]
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, list, watch]
   # Custom resources: one rule per group, every plural named.
   - apiGroups: [cert-manager.io]
     resources: [certificates, clusterissuers, issuers]
+    verbs: [get, list, watch]
+  # The one ARC kind an Application tracks (estate-front-runner and the
+  # post-merge-verifier runner App); controller-created children are tracked
+  # by no Application and `collect` never lists them.
+  - apiGroups: [actions.github.com]
+    resources: [autoscalingrunnersets]
     verbs: [get, list, watch]
   - apiGroups: [eventing.keda.sh]
     resources: [cloudeventsources, clustercloudeventsources]
