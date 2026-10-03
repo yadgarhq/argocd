@@ -27,8 +27,8 @@ WHAT IS ASSERTED, and each has a red case below:
      Deployment, is red; valkey is recorded as tag-pinned.
   4. An infrastructure failure (data missing or unparseable at S, helm
      failing) writes no output at all: it is a failed run, not a verdict.
-  5. `stale`: estate smoke's newest run 44 days old passes; 46 days fails;
-     no runs fails; an API error fails.
+  5. `stale`: estate main's newest commit 44 days old passes; 46 days fails,
+     even beside a smoke run minutes old; no commit fails; an API error fails.
 """
 
 from __future__ import annotations
@@ -670,38 +670,63 @@ def test_the_default_render_is_the_gates_own_functions() -> None:
 # ── 5. stale ─────────────────────────────────────────────────────────────────
 
 NOW = dt.datetime(2026, 10, 3, 12, 0, 0, tzinfo=dt.timezone.utc)
+COMMITS_URL = "https://api.github.com/repos/yadgarhq/estate/commits?sha=main&per_page=1"
+RUNS_URL = "https://api.github.com/repos/yadgarhq/estate/actions/workflows/smoke.yaml/runs?per_page=1"
 
 
-def runs(days_ago: float | None) -> dict:
-    if days_ago is None:
-        return {"total_count": 0, "workflow_runs": []}
-    created = (NOW - dt.timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return {"total_count": 1, "workflow_runs": [{"id": 1, "created_at": created, "html_url": "https://example/1"}]}
+def stamp(days_ago: float) -> str:
+    return (NOW - dt.timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def estate_api(commit_days_ago: float | None, run_minutes_ago: float = 5):
+    """Answers both questions a guard could ask; only the commit date may decide."""
+
+    def fetch(url: str):
+        if url == COMMITS_URL:
+            if commit_days_ago is None:
+                return []
+            return [{"sha": "c" * 40, "html_url": "https://example/commit", "commit": {"committer": {"date": stamp(commit_days_ago)}}}]
+        if url == RUNS_URL:
+            fresh = (NOW - dt.timedelta(minutes=run_minutes_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            return {"total_count": 1, "workflow_runs": [{"id": 1, "created_at": fresh}]}
+        raise sg.InfrastructureError(f"GET {url}: HTTP 404")
+
+    return fetch
+
+
+def test_stale_reads_estate_mains_newest_commit() -> None:
+    assert sg.ESTATE_MAIN_COMMITS == COMMITS_URL
+
+
+def test_a_fresh_smoke_run_does_not_hide_a_stale_main() -> None:
+    """Smoke runs every 15 minutes, so run age never grows until GitHub disables the schedule. Commits decide."""
+    problem = sg.stale_problem(estate_api(46, run_minutes_ago=5), NOW)
+    assert problem is not None and "46 days old" in problem
 
 
 def test_stale_passes_at_44_days() -> None:
-    assert sg.stale_problem(lambda: runs(44), NOW) is None
+    assert sg.stale_problem(estate_api(44), NOW) is None
 
 
 def test_stale_fails_at_46_days() -> None:
-    problem = sg.stale_problem(lambda: runs(46), NOW)
-    assert problem is not None and "46" in problem
+    problem = sg.stale_problem(estate_api(46), NOW)
+    assert problem is not None
+    assert "estate main's newest commit (https://example/commit" in problem and "past 45" in problem
 
 
-def test_stale_fails_with_no_runs() -> None:
-    problem = sg.stale_problem(lambda: runs(None), NOW)
-    assert problem is not None and "no" in problem
+def test_stale_fails_with_no_commit() -> None:
+    assert sg.stale_problem(estate_api(None), NOW) == "estate main lists no commit"
 
 
 def test_stale_fails_on_an_api_error() -> None:
-    def broken():
-        raise sg.InfrastructureError("GET .../runs: HTTP 403")
+    def broken(_url):
+        raise sg.InfrastructureError("GET .../commits: HTTP 403")
 
     problem = sg.stale_problem(broken, NOW)
     assert problem is not None and "403" in problem
 
 
 def test_stale_cli_exit_codes() -> None:
-    assert sg.main(["stale"], fetch=lambda: runs(44), now=NOW) == 0
-    assert sg.main(["stale"], fetch=lambda: runs(46), now=NOW) == 1
-    assert sg.main(["stale"], fetch=lambda: runs(None), now=NOW) == 1
+    assert sg.main(["stale"], fetch=estate_api(44), now=NOW) == 0
+    assert sg.main(["stale"], fetch=estate_api(46), now=NOW) == 1
+    assert sg.main(["stale"], fetch=estate_api(None), now=NOW) == 1

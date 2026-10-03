@@ -53,10 +53,12 @@ parsing at S, an unknown sha, git or helm failing: `derive` raises
 `InfrastructureError`, the CLI exits 3 and writes NO output file, and the next
 poll retries. A red is a finding about the estate; a registry blip is not.
 
-`stale` FAILS when estate's newest `smoke.yaml` run is older than 45 days, or
-when there is none, or when the API cannot answer. GitHub disables a public
-repository's scheduled workflows after 60 days without activity, and nothing
-else would notice smoke going silent.
+`stale` FAILS when estate main's newest commit is older than 45 days, or when
+main lists none, or when the API cannot answer. GitHub disables a public
+repository's scheduled workflows after 60 days without activity; it does not
+define activity, and smoke's own runs are reported not to count. Smoke runs
+every 15 minutes, so the age of its newest run never grows until the schedule
+is already off: only the commit date can warn in time.
 
 Exit codes: 0 derived (or fresh), 1 red (or stale), 2 usage, 3 infrastructure.
 Standard library plus PyYAML; `derive`'s default render also needs pytest
@@ -98,7 +100,7 @@ FORBIDDEN_SOURCE_KEYS = ("path", "kustomize", "plugin")
 BUDGET_SECONDS = 3900
 
 STALE_DAYS = 45
-ESTATE_SMOKE_RUNS = "https://api.github.com/repos/yadgarhq/estate/actions/workflows/smoke.yaml/runs?per_page=1"
+ESTATE_MAIN_COMMITS = "https://api.github.com/repos/yadgarhq/estate/commits?sha=main&per_page=1"
 
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
 DIGEST_IMAGE = re.compile(r"(?P<repository>[^@\s]+)@(?P<digest>sha256:[0-9a-f]{64})")
@@ -497,9 +499,9 @@ def derive(
 # ── stale ────────────────────────────────────────────────────────────────────
 
 
-def fetch_estate_runs() -> dict:
-    """Estate's newest `smoke.yaml` run. Estate is public; a token, when present, only lifts the rate limit."""
-    request = urllib.request.Request(ESTATE_SMOKE_RUNS, headers={"Accept": "application/vnd.github+json"})
+def fetch_github(url: str):
+    """GET one public GitHub API URL. Estate is public; a token, when present, only lifts the rate limit."""
+    request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
     token = os.environ.get("GITHUB_TOKEN")
     if token:
         request.add_header("Authorization", f"Bearer {token}")
@@ -507,28 +509,34 @@ def fetch_estate_runs() -> dict:
         with urllib.request.urlopen(request, timeout=30) as response:  # a fixed https URL
             return json.loads(response.read())
     except urllib.error.HTTPError as error:
-        raise InfrastructureError(f"GET {ESTATE_SMOKE_RUNS}: HTTP {error.code}") from error
+        raise InfrastructureError(f"GET {url}: HTTP {error.code}") from error
     except (urllib.error.URLError, TimeoutError, ValueError) as error:
-        raise InfrastructureError(f"GET {ESTATE_SMOKE_RUNS}: {error}") from error
+        raise InfrastructureError(f"GET {url}: {error}") from error
 
 
-def stale_problem(fetch: Callable[[], dict], now: dt.datetime, max_days: int = STALE_DAYS) -> str | None:
-    """Why estate smoke counts as stale, or None. No runs and an API error are both stale: neither proves life."""
+def stale_problem(fetch: Callable[[str], object], now: dt.datetime, max_days: int = STALE_DAYS) -> str | None:
+    """Why estate counts as idle, or None. Measured on estate main's newest COMMIT, never on smoke's runs.
+
+    Smoke runs every 15 minutes, so the newest run is always minutes old until
+    the day GitHub disables the schedule; a run-age guard could never fire in
+    time. No commit and an API error are both failures: neither proves activity.
+    """
     try:
-        listed = fetch()
+        commits = fetch(ESTATE_MAIN_COMMITS)
     except InfrastructureError as error:
-        return f"cannot read estate's smoke runs, so their age is unknown: {error}"
-    runs = listed.get("workflow_runs") if isinstance(listed, dict) else None
-    if not runs:
-        return "estate has no smoke.yaml run at all"
-    newest = runs[0]
-    age = now - utc(newest["created_at"])
+        return f"cannot read estate main's commits, so its activity is unknown: {error}"
+    if not isinstance(commits, list) or not commits:
+        return "estate main lists no commit"
+    newest = commits[0]
+    committed = newest["commit"]["committer"]["date"]
+    age = now - utc(committed)
     if age > dt.timedelta(days=max_days):
         return (
-            f"estate's newest smoke.yaml run ({newest.get('html_url')}, {newest['created_at']}) is {age.days} days old,"
-            f" past {max_days}: GitHub disables a public repository's schedules after 60 idle days"
+            f"estate main's newest commit ({newest.get('html_url')}, {committed}) is {age.days} days old, past {max_days}:"
+            " GitHub does not define 'repository activity' and smoke's own runs are reported not to count;"
+            " a public repository's schedules are disabled after 60 days without it"
         )
-    print(f"estate's newest smoke.yaml run is {age.days} days old ({newest['created_at']}); the limit is {max_days}")
+    print(f"estate main's newest commit is {age.days} days old ({committed}); the limit is {max_days}")
     return None
 
 
@@ -548,7 +556,7 @@ def _parser() -> argparse.ArgumentParser:
     derived.add_argument("--repo", type=Path, default=REPOSITORY, help="the argocd checkout holding the sha")
     derived.add_argument("--sha", type=_full_sha, required=True, help="full 40-hex commit sha of the data")
     derived.add_argument("--out", type=Path, required=True, help="where the derivation (or the red) is written")
-    sub.add_parser("stale", help=f"fail when estate's newest smoke.yaml run is older than {STALE_DAYS} days")
+    sub.add_parser("stale", help=f"fail when estate main's newest commit is older than {STALE_DAYS} days")
     return parser
 
 
@@ -557,7 +565,7 @@ def main(
     *,
     render: Callable[[bytes], list] | None = None,
     runner: Callable = subprocess.run,
-    fetch: Callable[[], dict] | None = None,
+    fetch: Callable[[str], object] | None = None,
     now: dt.datetime | None = None,
 ) -> int:
     try:
@@ -565,7 +573,7 @@ def main(
     except SystemExit as exit_:
         return 2 if exit_.code else 0
     if args.command == "stale":
-        problem = stale_problem(fetch or fetch_estate_runs, now or dt.datetime.now(dt.timezone.utc))
+        problem = stale_problem(fetch or fetch_github, now or dt.datetime.now(dt.timezone.utc))
         if problem:
             print(f"FAIL: {problem}", file=sys.stderr)
             return 1
