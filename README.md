@@ -22,7 +22,8 @@ sync — live here too (ADR-0803; moved from
 | `scripts/gates/`               | gates that need helm or the network (CI only)   |
 | `MIGRATION_NOTES.md`           | what a change here needs from a person          |
 | `scripts/verify_handover.py`   | read-only post-merge verifier (below)           |
-| `verifier/manifests/`          | its read-only ServiceAccount and ClusterRole    |
+| `scripts/project_probe.py`     | the 785 refusal-counter probe (ADR-0841)        |
+| `verifier/manifests/`          | their identity, ClusterRole and egress policy   |
 
 `applications/` holds single `Application` resources; `applicationsets/` holds
 generators that produce many. Keeping them apart matters because the two are

@@ -182,7 +182,8 @@ ATTEMPT_ALLOWANCE = {
     "estate-front": (11 * MEASURED_MARGIN, "measured, not bounded: no hook, sync 11 s"),
     # gha-runner-scale-set 0.14.2 templates no Job.
     "estate-front-runner": (1 * MEASURED_MARGIN, "measured, not bounded: no hook, sync 1 s"),
-    # `verifier/manifests`: a Namespace, a ServiceAccount, a ClusterRole and a binding.
+    # `verifier/manifests`: a Namespace, a ServiceAccount, a ClusterRole, a binding
+    # and (ledger 785) an egress NetworkPolicy. The 0 s was measured before the policy.
     "post-merge-verifier": (1 * MEASURED_MARGIN, "measured, not bounded: no hook, sync 0 s"),
     # A directory of Application manifests; no hook.
     "root": (12 * MEASURED_MARGIN, "measured, not bounded: no hook, sync 12 s"),

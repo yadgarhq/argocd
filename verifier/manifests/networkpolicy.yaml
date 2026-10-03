@@ -1,0 +1,132 @@
+# The egress of the argocd-verify runner pods (ADR-0840 host): what
+# `verify.yaml` and the 785 probe (`scripts/project_probe.py`, ADR-0841) reach,
+# and nothing else inside the cluster. Plan: yadgarhq/docs
+# `plans/settled-state-smoke-gate.md`, stage 6, "Egress".
+#
+# THE CNI ENFORCES THIS. kindnet `v20260528-9350166c` runs the
+# kube-network-policies controller (ledger 684, ADR-0688), and ledger 511
+# watched it drop. So a wrong allow-list here is an outage of the verifier, and
+# it shows as a TIMEOUT, never a refusal: a dropped packet answers nothing.
+#
+# `podSelector: {}` IS EVERY POD IN `post-merge-verifier`, which is the
+# ephemeral runner pods and nothing else. ARC's listener runs in the
+# controller's namespace (`arc-systems`), not here. Measured 2026-10-03: the
+# namespace holds two ServiceAccounts and no pod, so merging this changes no
+# running traffic.
+#
+# EGRESS ONLY. Nothing dials a runner pod, and no ingress rule is needed for the
+# probe; ingress is left to a separate change.
+#
+# EACH ClusterIP DESTINATION BUT DNS IS WRITTEN TWICE: as the pods behind it (a CNI that
+# sees the packet after DNAT) and as the Service address (one that sees it
+# before). `estate-front-egress` rules (b) and (c) make the same argument. Rule
+# (e) excepts the Service, pod and node ranges, so without the pair a
+# destination would be reachable on one kind of CNI only. DNS is the selector
+# alone, as in `estate-front-egress` (a), whose runners resolve names today.
+#
+# THE ADDRESSES WERE MEASURED on kind-yadgar, 2026-10-03, and a cluster rebuild
+# can move them: `kubernetes` 10.96.0.1 -> endpoint 10.89.4.2:6443 (the
+# control-plane node); `prometheus-server` 10.96.63.35:80 -> pod port 9090;
+# `yadgar-edge` 10.96.0.100:443 (pinned in manifests/estate-front/
+# edge-service.yaml) -> envoy pods on 10443; pods 10.244.0.0/16, Services
+# 10.96.0.0/16, nodes 10.89.4.0/24 (10.89.4.2, .3, .4).
+#
+# ROLLBACK IS BY HAND. `post-merge-verifier` has `selfHeal: true` and no
+# `prune`, so a git revert leaves this object in the cluster. MIGRATION_NOTES.md,
+# "The verifier egress policy", has the delete.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: post-merge-verifier-egress
+  namespace: post-merge-verifier
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    # (a) Name resolution: GitHub, the Prometheus Service name, the API server.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # (b) The API server: `kubernetes.default.svc` (verify.yaml's kubeconfig)
+    # and the endpoint behind it.
+    - to:
+        - ipBlock:
+            cidr: 10.96.0.1/32
+      ports:
+        - protocol: TCP
+          port: 443
+    # Every node on 6443; only the control-plane listens there, so a kind
+    # rebuild that renumbers nodes inside the /24 (as .8 -> .2 did) does not
+    # cut the verifier.
+    - to:
+        - ipBlock:
+            cidr: 10.89.4.0/24
+      ports:
+        - protocol: TCP
+          port: 6443
+
+    # (c) Prometheus, read directly: the probe never goes through the API
+    # server's Service proxy (plan M10).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+              app.kubernetes.io/component: server
+      ports:
+        - protocol: TCP
+          port: 9090
+    - to:
+        - ipBlock:
+            cidr: 10.96.63.35/32
+      ports:
+        - protocol: TCP
+          port: 80
+
+    # (d) The edge, where the probe logs in and makes its one call. The same
+    # selector and port `estate-front-egress` (b) uses.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: envoy-gateway-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: envoy
+              gateway.envoyproxy.io/owning-gateway-name: edge
+              gateway.envoyproxy.io/owning-gateway-namespace: yadgar
+      ports:
+        - protocol: TCP
+          port: 10443
+    - to:
+        - ipBlock:
+            cidr: 10.96.0.100/32
+      ports:
+        - protocol: TCP
+          port: 443
+
+    # (e) GitHub, ghcr.io, dl.k8s.io and the Python and helm downloads, said as
+    # "443 anywhere outside the cluster" because NetworkPolicy has no FQDN rule.
+    # Coarser than GitHub, and it says so.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.244.0.0/16
+              - 10.96.0.0/16
+              - 10.89.4.0/24
+      ports:
+        - protocol: TCP
+          port: 443
