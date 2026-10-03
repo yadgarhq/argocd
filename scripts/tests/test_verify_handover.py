@@ -817,9 +817,8 @@ def test_cli_diff_exit_codes(snap, tmp_path) -> None:
 # `verifier/manifests/` is what `applications/post-merge-verifier.yaml` syncs. The
 # ClusterRole is read-only, never names Secrets, never wildcards a group or a
 # resource (a wildcard on the core group grants Secrets), and covers every type
-# `collect` reads unconditionally. A type an Application starts tracking later
-# is not listed here; `collect` then fails loudly as Forbidden, which is the
-# intended signal to add it.
+# `collect` reads unconditionally and every type root's Applications track; a
+# newly tracked type fails loudly as Forbidden until added here.
 
 import yaml  # noqa: E402  (PyYAML: the hook installs it)
 
@@ -853,12 +852,12 @@ REQUIRED = {
     ("networking.k8s.io", "networkpolicies"),
     ("policy", "poddisruptionbudgets"),
     ("batch", "jobs"),
-    ("actions.github.com", "autoscalingrunnersets"),
 }
 # Every CRD root's Applications tracked on kind-yadgar on 2026-10-01, less the
 # issuance records and Applications `collect` never lists. `collect` lists each
 # one's instances, so the role must grant it.
 TRACKED_CUSTOM_RESOURCES = {
+    "actions.github.com": {"autoscalingrunnersets"},
     "cert-manager.io": {"certificates", "clusterissuers", "issuers"},
     "eventing.keda.sh": {"cloudeventsources", "clustercloudeventsources"},
     "gateway.envoyproxy.io": {
