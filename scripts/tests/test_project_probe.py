@@ -288,6 +288,13 @@ def test_a_rise_of_another_reason_only_fails() -> None:
     assert run(Fake([BEFORE, ROSE_P])) == 1
 
 
+def test_another_reason_moving_first_does_not_end_the_poll_early() -> None:
+    # Someone else's `local/...` claim is scraped one poll before the probe's
+    # own increment. The poll waits for PROJECT_UNRESOLVABLE, not for any series.
+    both = vector({"a": 1, "b": 1}, {("a", U): 1, ("b", P): 1})
+    assert run(Fake([BEFORE, ROSE_P, both])) == 0
+
+
 def test_a_401_at_login_fails() -> None:
     fake = Fake([BEFORE], login=(401, {"error": "unauthenticated"}))
     assert run(fake) == 1

@@ -17,11 +17,12 @@
 # EGRESS ONLY. Nothing dials a runner pod, and no ingress rule is needed for the
 # probe; ingress is left to a separate change.
 #
-# EACH ClusterIP DESTINATION IS WRITTEN TWICE: as the pods behind it (a CNI that
+# EACH ClusterIP DESTINATION BUT DNS IS WRITTEN TWICE: as the pods behind it (a CNI that
 # sees the packet after DNAT) and as the Service address (one that sees it
 # before). `estate-front-egress` rules (b) and (c) make the same argument. Rule
 # (e) excepts the Service, pod and node ranges, so without the pair a
-# destination would be reachable on one kind of CNI only.
+# destination would be reachable on one kind of CNI only. DNS is the selector
+# alone, as in `estate-front-egress` (a), whose runners resolve names today.
 #
 # THE ADDRESSES WERE MEASURED on kind-yadgar, 2026-10-03, and a cluster rebuild
 # can move them: `kubernetes` 10.96.0.1 -> endpoint 10.89.4.2:6443 (the

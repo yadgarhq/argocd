@@ -412,7 +412,10 @@ def run(
             sleep(args.poll_interval)
             after = read(transport, f"poll {attempt}")
             deltas = {r: compare(before, after, r) for r in REASONS}
-            if any(d.rise >= 1 for d in deltas.values()):
+            # Wait for the series the verdict asserts. A trial may stop on
+            # either: it needs to see whichever one the call moved.
+            watched = REASONS if args.trial else (UNRESOLVABLE,)
+            if any(deltas[r].rise >= 1 for r in watched):
                 break
         end = now()
         say("deltas: " + "; ".join(f"{r} +{d.rise:g} resets={d.resets} unknown={d.unknown} missing={d.missing}" for r, d in deltas.items()))
