@@ -1,3 +1,8 @@
 # Helm templates are Go templates wearing YAML. Prettier cannot parse them and
 # would mangle them if it could.
 chart/templates/
+
+# The settled-state gate's verdict bytes, as `settled_gate.py judge` writes them
+# (json.dumps, indent 2). They are a shared vector with yadgarhq/estate's verdict
+# job, so their bytes are the contract and must not be reformatted.
+scripts/tests/fixtures/settled_gate/verdict/

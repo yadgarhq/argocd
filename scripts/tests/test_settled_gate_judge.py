@@ -263,7 +263,7 @@ def test_a_settled_estate_is_green(estate: Estate) -> None:
     assert verdict["digests"]["gateway"] == {"gateway": DIGESTS["gateway"]}
     assert verdict["digests"]["iam"] == {"iam": DIGESTS["iam"], "migrate": MIGRATE}
     assert verdict["tag_pinned"] == ["valkey/valkey"]
-    assert verdict["epoch"] == estate.derived["epoch"]
+    assert (verdict["K"], verdict["A"], verdict["P"], verdict["S"]) == ("e" * 64, S, P, S)
     assert verdict["read_at"] == "2026-10-03T12:30:00Z"
     assert len(runner.calls) == 4
 
@@ -530,7 +530,7 @@ def test_green_writes_settled_verdict(estate: Estate, tmp_path: Path) -> None:
     assert code == 0
     written = json.loads((tmp_path / "settled-verdict" / "verdict.json").read_text())
     assert written["result"] == "green"
-    assert written["sha"] == S and written["trial"] is False
+    assert written["S"] == S and written["trial"] is False
     assert not (tmp_path / "settled-trial").exists()
 
 
@@ -574,7 +574,7 @@ def test_trial_writes_settled_trial_never_settled_verdict(estate: Estate, tmp_pa
     assert code == 0
     assert run.derived_at == [TRIAL]
     written = json.loads((tmp_path / "settled-trial" / "verdict.json").read_text())
-    assert written["trial"] is True and written["data_sha"] == TRIAL and written["sha"] == S
+    assert written["trial"] is True and written["data_sha"] == TRIAL and written["S"] == S
     assert not (tmp_path / "settled-verdict").exists()
 
 
@@ -652,6 +652,41 @@ def test_find_verdict_matches_on_k_and_a(estate: Estate) -> None:
         archive.writestr("verdict.json", json.dumps({"epoch": EPOCH, "result": "green"}))
     github = github_with([artifact(1, "2026-10-03T10:00:00Z")], {10: workflow_run(10)}, {1: buffer.getvalue()})
     assert find(github) is None
+
+
+LEGACY_FIELDS = ("sha", "key", "anchor", "pin", "epoch")
+VERDICT_FIXTURES = REPOSITORY / "scripts" / "tests" / "fixtures" / "settled_gate" / "verdict"
+
+
+def test_the_verdict_carries_no_legacy_copy_of_s_k_a_p(estate: Estate, tmp_path: Path) -> None:
+    run(estate, tmp_path)
+    written = json.loads((tmp_path / "settled-verdict" / "verdict.json").read_text())
+    assert not set(LEGACY_FIELDS) & set(written), sorted(written)
+    assert {"S", "A", "K", "P", "result", "data_sha", "trial"} <= set(written)
+
+
+def test_a_refused_key_writes_no_verdict_and_exits_1(estate: Estate, tmp_path: Path, capsys) -> None:
+    """Estate refuses the same input itself, so a verdict with no K would only read as malformed there."""
+    refused = derivation()
+    refused.update(outcome="red", key=None, anchor=None, epoch={"key": None, "anchor": None},
+                   problems=["render key refused: spec.source.helm.valuesObject.released is a date"])
+    code, runner = run(estate, tmp_path, data_derivation=refused)
+    assert code == 1
+    assert not (tmp_path / "settled-verdict").exists()
+    assert list(tmp_path.iterdir()) == []
+    assert runner.calls == []
+    assert "RED, no verdict written: the render key was refused; estate refuses the same input itself" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("name", "mutate", "now"),
+    [("green", lambda e: None, BEFORE_DEADLINE), ("red", lambda e: e.yadgar["status"]["health"].update(status="Degraded"), AFTER_DEADLINE)],
+)
+def test_the_verdict_bytes_are_the_shared_fixture(estate: Estate, tmp_path: Path, name: str, mutate, now) -> None:
+    """Estate's verdict job reads these same bytes (its `scripts/tests/fixtures/verdict/`)."""
+    mutate(estate)
+    run(estate, tmp_path, now=now)
+    assert (tmp_path / "settled-verdict" / "verdict.json").read_bytes() == (VERDICT_FIXTURES / f"{name}.json").read_bytes()
 
 
 # ── 6. find-verdict ──────────────────────────────────────────────────────────
@@ -750,6 +785,24 @@ def test_find_verdict_skips_a_newer_verdict_for_another_epoch() -> None:
         {1: verdict_zip(EPOCH), 2: verdict_zip(other)},
     )
     assert find(github)["artifact_id"] == 1
+
+
+def test_find_verdict_never_matches_the_same_key_under_another_anchor() -> None:
+    """A -> B -> A: the newest verdict has the current K but the first A's anchor. It is not this epoch's."""
+    first_a = {"key": EPOCH["key"], "anchor": "4" * 40}
+    github = github_with([artifact(1, "2026-10-03T11:00:00Z")], {10: workflow_run(10)}, {1: verdict_zip(first_a, "green")})
+    assert find(github) is None
+
+
+def test_find_verdict_reads_at_most_the_five_newest_candidates() -> None:
+    """Estate's MAX_VERDICT_CANDIDATES: a verdict older than five newer eligible ones is not looked for."""
+    other = {"key": "f" * 64, "anchor": S}
+    artifacts = [artifact(i, f"2026-10-03T1{i}:00:00Z") for i in range(1, 7)]
+    runs_ = {i * 10: workflow_run(i * 10) for i in range(1, 7)}
+    zips = {i: verdict_zip(EPOCH if i == 1 else other) for i in range(1, 7)}
+    github = github_with(artifacts, runs_, zips)
+    assert find(github) is None
+    assert sum(1 for path in github.requested if path.startswith("https://api/zip/")) == 5
 
 
 def test_find_verdict_answers_none_when_no_verdict_names_the_epoch() -> None:

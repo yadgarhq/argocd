@@ -80,20 +80,23 @@ no cluster read. Then every clause is evaluated and every problem reported:
 
   A verdict carries what estate's verdict job reads: `S`, `A`, `K`, `P`,
   `result` (green or red) and, when red, `clause` (the failed clauses and the
-  first problem), beside the digests, deadline and read time.
+  first problem), beside `data_sha`, `trial`, the digests, deadline and read
+  time. Its bytes are pinned by `scripts/tests/fixtures/settled_gate/verdict/`.
 
   green    every clause held: the verdict goes to `<out-dir>/settled-verdict/`.
   pending  a clause is false and the deadline has not passed: NOTHING written.
   red      a clause is false after the deadline, or the derivation is red:
-           the verdict goes to `<out-dir>/settled-verdict/`.
+           the verdict goes to `<out-dir>/settled-verdict/`. A REFUSED render
+           key (no K) is red with NO verdict written, exit 1: estate refuses
+           the same input itself, and a verdict without K reads as malformed.
   infra    a refused or failed read: NOTHING written, exit 3.
 
 `--trial-sha` reads the DATA at that sha with this (main's) code, judges root
 against `--sha`, treats the deadline as passed, and writes `settled-trial/`,
 never `settled-verdict/`, so a trial can never become the verdict a poll reads.
 
-`find-verdict` returns the newest `settled-verdict` whose recorded epoch is
-(K, A): this repository and head repository, the default branch, the gate
+`find-verdict` returns the newest `settled-verdict` whose top-level `K` and
+`A` are the epoch's, among the five newest eligible (estate's cap): this repository and head repository, the default branch, the gate
 workflow's path, a `schedule` or `workflow_dispatch` run, not expired; never
 filtered on the run's conclusion; `settled-trial` never read.
 
@@ -812,13 +815,8 @@ def judge(derived: dict, cluster, *, root_sha: str, now: dt.datetime, trial: boo
         "A": derived["anchor"],
         "K": derived["key"],
         "P": derived["pin"],
-        "sha": root_sha,
         "data_sha": derived["sha"],
         "trial": trial,
-        "pin": derived["pin"],
-        "key": derived["key"],
-        "anchor": derived["anchor"],
-        "epoch": derived["epoch"],
         "anchor_committed_at": derived["anchor_committed_at"],
         "deadline": derived["deadline"],
         "digests": {
@@ -887,7 +885,7 @@ def run_judge(
     except InfrastructureError as error:
         print(f"INFRASTRUCTURE FAILURE, no verdict: {error}", file=sys.stderr)
         return 3
-    print(f"S {verdict['sha']}  data {verdict['data_sha']}  P {verdict['pin']}  K {verdict['key']}  A {verdict['anchor']}")
+    print(f"S {verdict['S']}  data {verdict['data_sha']}  P {verdict['P']}  K {verdict['K']}  A {verdict['A']}")
     print(f"deadline {verdict['deadline']}  read at {verdict['read_at']}  result {verdict['result']}")
     for name, containers in sorted(verdict["digests"].items()):
         print(f"  {name}: {containers}")
@@ -897,6 +895,9 @@ def run_judge(
         print(f"{verdict['result'].upper()}: {problem}")
     if verdict["result"] == "pending":
         return 0
+    if verdict["result"] == "red" and verdict["K"] is None:
+        print("RED, no verdict written: the render key was refused; estate refuses the same input itself", file=sys.stderr)
+        return 1
     artifact = TRIAL_ARTIFACT if trial_sha is not None else VERDICT_ARTIFACT
     target = out_dir / artifact
     target.mkdir(parents=True, exist_ok=True)
@@ -907,6 +908,8 @@ def run_judge(
 # ── GitHub, read-only: find-verdict and reachable ────────────────────────────
 
 GITHUB_API = "https://api.github.com"
+# Estate's verdict job reads at most this many candidates (its MAX_VERDICT_CANDIDATES); the gate matches it.
+MAX_VERDICT_CANDIDATES = 5
 VERDICT_EVENTS = frozenset({"schedule", "workflow_dispatch"})
 
 
@@ -965,7 +968,7 @@ def _read_verdict(archive: bytes) -> dict:
 
 
 def find_verdict(github, repository: str, workflow_path: str, epoch: dict, *, exclude_run_id: int | None = None) -> dict | None:
-    """The newest `settled-verdict` whose recorded `K` and `A` are `epoch`'s, or None.
+    """The newest `settled-verdict` whose recorded `K` and `A` are `epoch`'s, among the five newest eligible, or None.
 
     The same filters `verify.yaml` applies to its baseline: this repository and
     head repository, the default branch, this workflow's path, a `schedule` or
@@ -990,7 +993,7 @@ def find_verdict(github, repository: str, workflow_path: str, epoch: dict, *, ex
         key=lambda a: utc(a["created_at"]),
         reverse=True,
     )
-    for candidate in candidates:
+    for candidate in candidates[:MAX_VERDICT_CANDIDATES]:
         run = github.get(f"/repos/{repository}/actions/runs/{candidate['workflow_run']['id']}")
         if (
             run.get("path") != workflow_path
