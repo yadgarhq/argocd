@@ -20,11 +20,14 @@ WHAT `derive` COMPUTES, all from the data files at one commit `S`:
      over ONE `yaml.safe_load` (PyYAML 6.0.3, so YAML 1.1: `on` is true and
      `0755` is 493). Estate's verdict job computes the same K from the same
      bytes; the shared vectors are in `scripts/tests/test_settled_gate.py`.
+     A `spec.source` that is not a mapping, or that holds a non-string key or
+     a value JSON cannot carry (an unquoted date), is REFUSED, as estate
+     refuses it: at S that is a red with no K.
   A  the anchor: walking the history of the two files K reads newest-first,
      the last commit whose K still equals the current K. When history runs
      out, the oldest listed commit. A commit where K cannot be computed (a
-     file absent, or the Application not a mapping that parses) differs from
-     every K, so it ends the walk. A merge commit in the walk is red: argocd's
+     file absent, the Application not a mapping that parses, or a refused
+     source) differs from every K, so it ends the walk. A merge commit in the walk is red: argocd's
      rulesets are squash-only, so one was never reviewed as a linear change.
   E  (K, A), the epoch. Deadline = A's committer date + 3900s.
   R  every `apps/Deployment` the render holds, each container and init
@@ -105,11 +108,37 @@ class InfrastructureError(Exception):
     """A failure of the run, not of the estate. No verdict is written."""
 
 
+class KeyRefusal(ValueError):
+    """`spec.source` holds something canonical JSON cannot carry faithfully. A red, naming the field."""
+
+
 # ── K ────────────────────────────────────────────────────────────────────────
+
+
+def _refuse_unencodable(node, where: str) -> None:
+    """Refuse what YAML 1.1 can produce and canonical JSON cannot carry, exactly as estate's verdict job does.
+
+    PyYAML reads an `on:`/`yes:` key as a bool and `1:` as an int: mixed key
+    types make `sort_keys` raise, and a lone bool key would encode silently as
+    "true". An unquoted date is a `datetime.date`, which json cannot encode.
+    """
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if not isinstance(key, str):
+                raise KeyRefusal(
+                    f"spec.source{where} has a key {key!r} that YAML read as {type(key).__name__}, not a string; quote it"
+                )
+            _refuse_unencodable(value, f"{where}.{key}")
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            _refuse_unencodable(value, f"{where}[{index}]")
+    elif not (node is None or isinstance(node, (str, int, float, bool))):
+        raise KeyRefusal(f"spec.source{where} is a {type(node).__name__} ({node!r}), which canonical JSON cannot carry; quote it")
 
 
 def canonical_source(spec_source) -> bytes:
     """The one encoding of `spec.source` both sides hash. Changing any argument splits K from estate's."""
+    _refuse_unencodable(spec_source, "")
     return json.dumps(spec_source, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
 
 
@@ -129,13 +158,17 @@ def parse_application(application: bytes | None) -> dict | None:
 def render_key(table: bytes | None, application: bytes | None) -> str | None:
     """K, or None (⊥) when either file is absent or the Application does not parse.
 
-    `spec.source` absent hashes as JSON `null`: the key still exists, and step 0
-    refuses the source.
+    Raises `KeyRefusal` when `spec.source` is not a mapping or holds a non-string
+    key or a value JSON cannot carry: estate refuses the same inputs, so the
+    two sides never hash a silently coerced source.
     """
     document = parse_application(application)
     if table is None or document is None:
         return None
-    return hashlib.sha256(table + canonical_source(document["spec"].get("source"))).hexdigest()
+    source = document["spec"].get("source")
+    if not isinstance(source, dict):
+        raise KeyRefusal(f"{APPLICATION} has no mapping at spec.source")
+    return hashlib.sha256(table + canonical_source(source)).hexdigest()
 
 
 # ── git, read-only ───────────────────────────────────────────────────────────
@@ -213,7 +246,11 @@ def find_anchor(repo: Path, sha: str, key: str, runner: Callable) -> tuple[str, 
                 " argocd's main is squash-only, so this render change was never reviewed as one commit"
             )
             break
-        if render_key(read_at(repo, commit, TABLE, runner), read_at(repo, commit, APPLICATION, runner)) != key:
+        try:
+            older = render_key(read_at(repo, commit, TABLE, runner), read_at(repo, commit, APPLICATION, runner))
+        except KeyRefusal:
+            older = None
+        if older != key:
             break
         anchor, committed = commit, stamp
     return anchor, committed, problems
@@ -270,6 +307,8 @@ def parse_table(table: bytes) -> tuple[str | None, dict[str, str], list[str]]:
 
 def consistency_problems(pin, table_revision: str | None, chart_pin: bytes | None) -> list[str]:
     """Step 1: the three things a pin bump moves together, all at P."""
+    if not isinstance(pin, str) or not pin:
+        return [f"{APPLICATION} spec.source.targetRevision is {pin!r}, not a version string; quote it"]
     problems = []
     if table_revision is not None and table_revision != pin:
         problems.append(f"{TABLE} says targetRevision {table_revision}, but {APPLICATION} pins {pin}")
@@ -405,7 +444,23 @@ def derive(
 
     spec = document["spec"]
     source = spec.get("source") if isinstance(spec.get("source"), dict) else {}
-    key = render_key(table, application)
+    try:
+        key = render_key(table, application)
+    except KeyRefusal as refusal:
+        return {
+            "outcome": "red",
+            "problems": [f"render key refused: {refusal}", *allow_list_problems(spec)],
+            "sha": sha,
+            "pin": source.get("targetRevision"),
+            "values": None,
+            "key": None,
+            "anchor": None,
+            "anchor_committed_at": None,
+            "deadline": None,
+            "epoch": {"key": None, "anchor": None},
+            "deployments": {},
+            "tag_pinned": [],
+        }
     anchor, committed, problems = find_anchor(repo, sha, key, runner)
     committed_at = utc(committed)
     result = {

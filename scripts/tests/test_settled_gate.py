@@ -114,6 +114,64 @@ YAML_TRAPS_TABLE = b"targetRevision  0.3.38\n"
 YAML_TRAPS_K = "3a6bcb437e3ce19a7db3f616adfd22fc4e15d60cf152ee71eb98761d9b05a818"
 
 
+# ESTATE'S TRAP VECTOR, byte for byte (yadgarhq/estate `scripts/tests/fixtures/yaml-trap/`,
+# blobs 27e6ec9 and a74b706). Its frozen hex is estate's `TRAP_K` and `TRAP_CANONICAL`
+# in `scripts/tests/test_verdict_key.py`; both sides assert the same constants.
+ESTATE_TRAP_K = "1b6a71c36fa07523feda3822718b321560a667b299152e61e052a9d7e4baf17a"
+ESTATE_TRAP_CANONICAL = (
+    b'{"chart":"yadgar","helm":{"valuesObject":{"answer":true,"empty":null,'
+    b'"exponent":"1e3","mode":493,"name":"\\u00c5ngstr\\u00f6m \\u2713",'
+    b'"negative":false,"nested":{"a_first":[3,"2",1.0],"z_last":1},'
+    b'"octal_new":"0o755","ratio":0.5,"sexagesimal":80,"switch":true}},'
+    b'"repoURL":"ghcr.io/yadgarhq/charts","targetRevision":"0.3.38"}'
+)
+
+
+def test_the_estate_trap_fixture_is_estates_own_bytes() -> None:
+    def blob(data: bytes) -> str:
+        return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()  # git's own object id
+
+    assert blob(fixture("yaml-trap", "yadgar.yaml.raw")).startswith("27e6ec9")
+    assert blob(fixture("yaml-trap", "yadgar_render.sha256")).startswith("a74b706")
+
+
+def test_the_estate_trap_vector_canonicalises_to_estates_frozen_bytes() -> None:
+    source = yaml.safe_load(fixture("yaml-trap", "yadgar.yaml.raw"))["spec"]["source"]
+    assert sg.canonical_source(source) == ESTATE_TRAP_CANONICAL
+
+
+def test_the_estate_trap_vector_key() -> None:
+    assert sg.render_key(fixture("yaml-trap", "yadgar_render.sha256"), fixture("yaml-trap", "yadgar.yaml.raw")) == ESTATE_TRAP_K
+
+
+def trap_application(values: str) -> bytes:
+    return (
+        "spec:\n  source:\n    repoURL: ghcr.io/yadgarhq/charts\n    chart: yadgar\n"
+        f"    targetRevision: 0.3.38\n    helm:\n      valuesObject:\n          {values}\n"
+    ).encode()
+
+
+@pytest.mark.parametrize(
+    ("values", "named"),
+    [
+        ("on: 1\n          off_label: 2", "True"),
+        ("on: 1", "True"),
+        ("1: one", "1"),
+        ("released: 2026-10-03", "date"),
+        ("at: 2026-10-03 12:00:00", "datetime"),
+    ],
+)
+def test_what_canonical_json_cannot_carry_is_refused_naming_the_field(values: str, named: str) -> None:
+    """Estate refuses these the same way: a lone `on:` key would otherwise encode silently as "true"."""
+    with pytest.raises(sg.KeyRefusal, match=named):
+        sg.render_key(b"targetRevision  0.3.38\n", trap_application(values))
+
+
+def test_a_source_that_is_not_a_mapping_is_refused() -> None:
+    with pytest.raises(sg.KeyRefusal, match="spec.source"):
+        sg.render_key(b"targetRevision  0.3.38\n", b"spec:\n  source: [a]\n")
+
+
 def test_the_yaml_1_1_trap_vector_canonicalises_exactly() -> None:
     """YAML 1.1 reads `on`/`yes` as true and `0755` as octal 493; PyYAML keeps `1e3` a string. Estate must agree."""
     source = yaml.safe_load(YAML_TRAPS.encode())["spec"]["source"]
@@ -347,6 +405,15 @@ def test_a_merge_commit_in_the_render_history_is_red(repo: Repo) -> None:
     assert any("merge commit" in p and merge in p for p in result["problems"]), result["problems"]
 
 
+def test_a_commit_whose_key_is_refused_ends_the_walk(repo: Repo) -> None:
+    repo.adopt()
+    dated = application().replace("        gateway:\n", "        released: 2026-10-03\n        gateway:\n", 1)
+    assert dated != application() and "released" in yaml.safe_load(dated)["spec"]["source"]["helm"]["valuesObject"]
+    repo.commit("dated", {APPLICATION: dated})
+    fixed, _ = repo.commit("fixed", {APPLICATION: application()})
+    assert sg.derive(repo.path, fixed, render=fake_render)["anchor"] == fixed
+
+
 # ── 3. steps 0, 1, 3 and 4 ───────────────────────────────────────────────────
 
 
@@ -388,6 +455,25 @@ def test_a_missing_spec_source_is_red(repo: Repo) -> None:
     result = sg.derive(repo.path, sha, render=never_render)
     assert result["outcome"] == "red"
     assert any("spec.source" in p for p in result["problems"]), result["problems"]
+
+
+def test_an_unencodable_value_at_s_is_red_with_no_key_and_no_render(repo: Repo) -> None:
+    repo.adopt()
+    dated = application().replace("        gateway:\n", "        released: 2026-10-03\n        gateway:\n", 1)
+    sha, _ = repo.commit("dated", {APPLICATION: dated})
+    result = sg.derive(repo.path, sha, render=never_render)
+    assert result["outcome"] == "red"
+    assert result["key"] is None and result["anchor"] is None
+    assert any("date" in p and "released" in p for p in result["problems"]), result["problems"]
+
+
+def test_a_pin_that_is_not_a_string_is_red(repo: Repo) -> None:
+    text = application().replace("targetRevision: 0.3.38", "targetRevision: 0.4")
+    assert text != application()
+    sha, _ = repo.commit("adopt", {APPLICATION: text, TABLE: table_for(application(), pin="0.4"), CHART_PIN: chart_pin("0.4")})
+    result = sg.derive(repo.path, sha, render=never_render)
+    assert result["outcome"] == "red"
+    assert any("not a version string" in p for p in result["problems"]), result["problems"]
 
 
 def test_the_bot_bypass_pin_move_without_the_table_is_red_at_step_1(repo: Repo) -> None:
