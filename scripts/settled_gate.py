@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""The settled-state gate's derivation: which render epoch argocd `main` names (ledger 675, stage 2a).
+"""The settled-state gate: derive the render epoch argocd `main` names, and judge it once (ledger 675, stage 2).
 
-    settled_gate.py derive --repo DIR --sha SHA --out FILE
+    settled_gate.py derive       --repo DIR --sha SHA --out FILE
+    settled_gate.py judge        --repo DIR --sha S [--trial-sha SHA] --context CTX --out-dir DIR
+    settled_gate.py find-verdict --key K --anchor A --out FILE [--exclude-run-id ID]
+    settled_gate.py reachable    --sha SHA
     settled_gate.py stale
 
 THE PLAN IS `yadgarhq/docs` `plans/settled-state-smoke-gate.md`, "The
-settled-state definition" and "How the digests are derived". This file is
-stage 2a: `derive`. Stage 2b adds `judge` (one set of cluster reads),
-`find-verdict` and `reachable`. The private argocd-verify workflow runs this
-file only at argocd `main`, against data at a full commit sha (ADR-0844 (1)).
+settled-state definition", "How the digests are derived" and "The gate's
+shape". The private argocd-verify workflow runs this file only at argocd
+`main`, against data at a full commit sha (ADR-0844 (1)). `find-verdict` and
+`reachable` live here, not in the workflow's script, so the ADR-0829 and
+ADR-0844 controls they carry have tests.
 
 WHAT `derive` COMPUTES, all from the data files at one commit `S`:
 
@@ -53,6 +57,53 @@ parsing at S, an unknown sha, git or helm failing: `derive` raises
 `InfrastructureError`, the CLI exits 3 and writes NO output file, and the next
 poll retries. A red is a finding about the estate; a registry blip is not.
 
+`judge` DERIVES FIRST, THEN MAKES ONE SET OF READS through
+`verify_handover.Cluster` (get only, explicit context): `root` and `yadgar`
+Applications, Deployments and pods in `yadgar`. A red derivation is red with
+no cluster read. Then every clause is evaluated and every problem reported:
+
+  Clause A  the Deployments `yadgar` tracks equal R by name; each live pod
+            template's images equal R's; every pod the selector matches is
+            counted except a `Failed`/`Succeeded` one (listed, not counted); a
+            counted pod is Running, not terminating, and every container and
+            init container status carries R's digest. A tag-pinned container's
+            pod image equals the rendered string. Zero counted pods fail.
+  Clause B  root Synced at S or a descendant with no operation running
+            (`verify_handover.revision_state`); `yadgar` has P in
+            `spec.source.targetRevision`, `status.sync.revision` and
+            `status.sync.comparedTo.source.targetRevision`, V as parsed objects
+            in `comparedTo`, `Synced`, `Healthy` and `operationState.phase`
+            `Succeeded`; every rollout complete. An OutOfSync Application
+            names each object marked `requiresPruning` with status OutOfSync
+            (ADR-0851: FLAGGED, not tolerated). A Synced Application with
+            hook objects marked `requiresPruning` (measured live) is not failed.
+
+  A verdict carries what estate's verdict job reads: `S`, `A`, `K`, `P`,
+  `result` (green or red) and, when red, `clause` (the failed clauses and the
+  first problem), beside `data_sha`, `trial`, the digests, deadline and read
+  time. Its bytes are pinned by `scripts/tests/fixtures/settled_gate/verdict/`.
+
+  green    every clause held: the verdict goes to `<out-dir>/settled-verdict/`.
+  pending  a clause is false and the deadline has not passed: NOTHING written.
+  red      a clause is false after the deadline, or the derivation is red:
+           the verdict goes to `<out-dir>/settled-verdict/`. A REFUSED render
+           key (no K) is red with NO verdict written, exit 1: estate refuses
+           the same input itself, and a verdict without K reads as malformed.
+  infra    a refused or failed read: NOTHING written, exit 3.
+
+`--trial-sha` reads the DATA at that sha with this (main's) code, judges root
+against `--sha`, treats the deadline as passed, and writes `settled-trial/`,
+never `settled-verdict/`, so a trial can never become the verdict a poll reads.
+
+`find-verdict` returns the newest `settled-verdict` whose top-level `K` and
+`A` are the epoch's, among the five newest eligible (estate's cap): this repository and head repository, the default branch, the gate
+workflow's path, a `schedule` or `workflow_dispatch` run, not expired; never
+filtered on the run's conclusion; `settled-trial` never read.
+
+`reachable` accepts a full sha only when `compare/{branch}...{sha}` reads
+`behind` or `identical` for a branch of the repository itself. Never
+`commits/{sha}`: GitHub serves the whole fork network there.
+
 `stale` FAILS when estate main's newest commit is older than 45 days, or when
 main lists none, or when the API cannot answer. GitHub disables a public
 repository's scheduled workflows after 60 days without activity; it does not
@@ -60,9 +111,10 @@ define activity, and smoke's own runs are reported not to count. Smoke runs
 every 15 minutes, so the age of its newest run never grows until the schedule
 is already off: only the commit date can warn in time.
 
-Exit codes: 0 derived (or fresh), 1 red (or stale), 2 usage, 3 infrastructure.
-Standard library plus PyYAML; `derive`'s default render also needs pytest
-importable, because it imports the gate modules rather than copying them.
+Exit codes: 0 derived, green, pending, found-or-not, reachable or fresh; 1 red,
+unreachable or stale; 2 usage; 3 infrastructure. Standard library plus PyYAML;
+`derive`'s default render also needs pytest importable, because it imports the
+gate modules rather than copying them.
 """
 
 from __future__ import annotations
@@ -70,6 +122,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import io
 import json
 import os
 import re
@@ -78,8 +131,10 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
+import zipfile
 from collections.abc import Callable
 from pathlib import Path
+from urllib.parse import quote
 
 import yaml
 
@@ -540,12 +595,452 @@ def stale_problem(fetch: Callable[[str], object], now: dt.datetime, max_days: in
     return None
 
 
+# ── judge: one set of cluster reads ──────────────────────────────────────────
+
+TRACKING_ID = "argocd.argoproj.io/tracking-id"
+APPLICATION_NAME = "yadgar"
+TARGET_NAMESPACE = "yadgar"
+TERMINAL_POD_PHASES = frozenset({"Failed", "Succeeded"})
+VERDICT_ARTIFACT = "settled-verdict"
+TRIAL_ARTIFACT = "settled-trial"
+VERDICT_FILE = "verdict.json"
+IMAGE_ID_DIGEST = re.compile(r"(sha256:[0-9a-f]{64})$")
+
+
+def handover():
+    """`verify_handover`, loaded once: its `Cluster` (the read-only kubectl gate) and `revision_state` are reused."""
+    if "verify_handover" not in sys.modules:
+        scripts = str(REPOSITORY / "scripts")
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+    return __import__("verify_handover")
+
+
+def _labels_match(selector: dict, labels: dict) -> bool:
+    """A Kubernetes label selector, `matchLabels` and `matchExpressions`. An empty selector matches nothing here."""
+    match_labels = selector.get("matchLabels") or {}
+    expressions = selector.get("matchExpressions") or []
+    if not match_labels and not expressions:
+        return False
+    if any(labels.get(key) != value for key, value in match_labels.items()):
+        return False
+    for expression in expressions:
+        key, operator, values = expression.get("key"), expression.get("operator"), expression.get("values") or []
+        if operator == "In" and labels.get(key) not in values:
+            return False
+        if operator == "NotIn" and key in labels and labels[key] in values:
+            return False
+        if operator == "Exists" and key not in labels:
+            return False
+        if operator == "DoesNotExist" and key in labels:
+            return False
+        if operator not in {"In", "NotIn", "Exists", "DoesNotExist"}:
+            return False
+    return True
+
+
+def _tracked_by_application(deployment: dict) -> bool:
+    annotation = ((deployment.get("metadata") or {}).get("annotations") or {}).get(TRACKING_ID, "")
+    return annotation.split(":", 1)[0] == APPLICATION_NAME
+
+
+def _image_id_digest(image_id: str | None) -> str | None:
+    match = IMAGE_ID_DIGEST.search(image_id or "")
+    return match.group(1) if match else None
+
+
+def clause_a(derived: dict, deployments: list[dict], pods: list[dict]) -> tuple[list[str], list[str], list[str]]:
+    """`(problems, notes, pods not counted)` for Clause A: every Deployment runs what the pin renders."""
+    problems: list[str] = []
+    notes: list[str] = []
+    not_counted: list[str] = []
+    wanted = derived["deployments"]
+    tracked = {d["metadata"]["name"]: d for d in deployments if _tracked_by_application(d)}
+    for name in sorted(tracked.keys() - wanted.keys()):
+        problems.append(f"Clause A: Deployment {name} is tracked by `{APPLICATION_NAME}` but not in R")
+    for name in sorted(wanted.keys() - tracked.keys()):
+        problems.append(f"Clause A: Deployment {name} is in R but missing from namespace {TARGET_NAMESPACE}")
+
+    for name in sorted(wanted.keys() & tracked.keys()):
+        rendered = wanted[name]
+        live = tracked[name]
+        template = ((live.get("spec") or {}).get("template") or {}).get("spec") or {}
+        for field in ("containers", "initContainers"):
+            live_images = {c["name"]: c.get("image") for c in template.get(field) or []}
+            rendered_images = {c: entry["image"] for c, entry in rendered[field].items()}
+            if live_images != rendered_images:
+                problems.append(
+                    f"Clause A: Deployment {name} pod template {field}: wanted {rendered_images}, found {live_images}"
+                )
+            for container, entry in rendered[field].items():
+                if entry["digest"] is None:
+                    notes.append(f"Deployment {name} container {container} is tag-pinned ({entry['image']}); its digest is not asserted")
+
+        selector = (live.get("spec") or {}).get("selector") or {}
+        matched = [p for p in pods if _labels_match(selector, (p.get("metadata") or {}).get("labels") or {})]
+        counted = []
+        for pod in matched:
+            pod_name = pod["metadata"]["name"]
+            phase = (pod.get("status") or {}).get("phase")
+            if phase in TERMINAL_POD_PHASES:
+                not_counted.append(pod_name)
+                notes.append(f"pod {pod_name} of Deployment {name} is {phase}; not counted")
+            else:
+                counted.append(pod)
+        if not counted:
+            problems.append(f"Clause A: Deployment {name} has no pod to count")
+        for pod in counted:
+            problems += _pod_problems(name, rendered, pod)
+    return problems, notes, not_counted
+
+
+def _pod_problems(name: str, rendered: dict, pod: dict) -> list[str]:
+    pod_name = pod["metadata"]["name"]
+    status = pod.get("status") or {}
+    problems = []
+    if pod["metadata"].get("deletionTimestamp"):
+        problems.append(f"Clause A: Deployment {name} pod {pod_name} is terminating (deletionTimestamp set) and may still serve")
+    if status.get("phase") != "Running":
+        problems.append(f"Clause A: Deployment {name} pod {pod_name} is {status.get('phase')}, not Running")
+    spec_images = {
+        c["name"]: c.get("image")
+        for field in ("containers", "initContainers")
+        for c in (pod.get("spec") or {}).get(field) or []
+    }
+    for field, status_field in (("containers", "containerStatuses"), ("initContainers", "initContainerStatuses")):
+        statuses = {c.get("name"): c for c in status.get(status_field) or []}
+        for container, entry in rendered[field].items():
+            if entry["digest"] is None:
+                if spec_images.get(container) != entry["image"]:
+                    problems.append(
+                        f"Clause A: Deployment {name} pod {pod_name} container {container} (tag-pinned):"
+                        f" wanted image {entry['image']}, found {spec_images.get(container)}"
+                    )
+                continue
+            if container not in statuses:
+                problems.append(f"Clause A: Deployment {name} pod {pod_name} container {container}: no status in {status_field}")
+                continue
+            found = _image_id_digest(statuses[container].get("imageID"))
+            if found != entry["digest"]:
+                problems.append(
+                    f"Clause A: Deployment {name} pod {pod_name} container {container}: wanted {entry['digest']}, found {found}"
+                )
+    return problems
+
+
+def _parsed(value):
+    """Values as parsed objects: a YAML string is parsed, anything else round-trips through JSON."""
+    if isinstance(value, str):
+        try:
+            value = yaml.safe_load(value)
+        except yaml.YAMLError:
+            return value
+    return json.loads(json.dumps(value))
+
+
+def clause_b(derived: dict, root: dict, application: dict, deployments: list[dict], root_sha: str, is_ancestor) -> list[str]:
+    """Clause B: root at S, the Application Synced at P with V and a Succeeded operation, every rollout complete."""
+    problems: list[str] = []
+    state, message = handover().revision_state(root, root_sha, is_ancestor)
+    if state != "done":
+        problems.append(f"Clause B: root is not Synced at {root_sha} or a descendant: {message}")
+
+    pin = derived["pin"]
+    spec_source = (application.get("spec") or {}).get("source") or {}
+    status = application.get("status") or {}
+    sync = status.get("sync") or {}
+    compared = (sync.get("comparedTo") or {}).get("source") or {}
+    if spec_source.get("targetRevision") != pin:
+        problems.append(f"Clause B: {APPLICATION_NAME} spec.source.targetRevision is {spec_source.get('targetRevision')}, wanted {pin}")
+    if sync.get("revision") != pin:
+        found = sync.get("revision") if "revision" in sync else f"absent (revisions: {sync.get('revisions')})"
+        problems.append(f"Clause B: {APPLICATION_NAME} status.sync.revision is {found}, wanted {pin}")
+    if compared.get("targetRevision") != pin:
+        problems.append(
+            f"Clause B: {APPLICATION_NAME} status.sync.comparedTo.source.targetRevision is {compared.get('targetRevision')}, wanted {pin}"
+        )
+    if _parsed((compared.get("helm") or {}).get("valuesObject")) != _parsed(derived["values"]):
+        problems.append(f"Clause B: {APPLICATION_NAME} status.sync.comparedTo.source.helm.valuesObject differs from V")
+    if sync.get("status") != "Synced":
+        pruning = [
+            f"{r.get('group', '')}/{r.get('kind')}/{r.get('namespace', '')}/{r.get('name')}"
+            for r in status.get("resources") or []
+            if r.get("requiresPruning") and r.get("status") == "OutOfSync"
+        ]
+        why = f"; each of these requires pruning (ADR-0851: delete it by hand): {pruning}" if pruning else ""
+        problems.append(f"Clause B: {APPLICATION_NAME} status.sync.status is {sync.get('status')}, wanted Synced{why}")
+    health = (status.get("health") or {}).get("status")
+    if health != "Healthy":
+        problems.append(f"Clause B: {APPLICATION_NAME} status.health.status is {health}, wanted Healthy")
+    phase = (status.get("operationState") or {}).get("phase")
+    if phase != "Succeeded":
+        problems.append(
+            f"Clause B: {APPLICATION_NAME} operationState.phase is {phase}, wanted Succeeded (a failed PostSync hook reads Synced and Healthy)"
+        )
+
+    by_name = {d["metadata"]["name"]: d for d in deployments}
+    for name in sorted(derived["deployments"]):
+        if name in by_name:
+            problems += _rollout_problems(name, by_name[name])
+    return problems
+
+
+def _rollout_problems(name: str, deployment: dict) -> list[str]:
+    status = deployment.get("status") or {}
+    generation = (deployment.get("metadata") or {}).get("generation")
+    problems = []
+    if status.get("observedGeneration") != generation:
+        problems.append(f"Clause B: Deployment {name} observedGeneration {status.get('observedGeneration')} != generation {generation}")
+    counts = {field: status.get(field, 0) for field in ("replicas", "updatedReplicas", "readyReplicas", "availableReplicas")}
+    if len(set(counts.values())) != 1:
+        problems.append(f"Clause B: Deployment {name} replica counts differ: {counts}")
+    if status.get("unavailableReplicas"):
+        problems.append(f"Clause B: Deployment {name} unavailableReplicas is {status['unavailableReplicas']}")
+    progressing = next((c for c in status.get("conditions") or [] if c.get("type") == "Progressing"), {})
+    if progressing.get("reason") != "NewReplicaSetAvailable":
+        problems.append(f"Clause B: Deployment {name} Progressing reason is {progressing.get('reason')}, wanted NewReplicaSetAvailable")
+    return problems
+
+
+def judge(derived: dict, cluster, *, root_sha: str, now: dt.datetime, trial: bool = False, is_ancestor=None) -> dict:
+    """One set of reads, judged once. `result` is green, pending or red. A refused or failed read raises.
+
+    A red derivation is red with NO cluster read. Every clause is evaluated and
+    every problem reported, never only the first. Trial mode treats the
+    deadline as passed, so a not-settled read is red, not pending.
+    """
+    verdict = {
+        # Estate's verdict job reads S, A, K, P, result and (when red) clause.
+        "S": root_sha,
+        "A": derived["anchor"],
+        "K": derived["key"],
+        "P": derived["pin"],
+        "data_sha": derived["sha"],
+        "trial": trial,
+        "anchor_committed_at": derived["anchor_committed_at"],
+        "deadline": derived["deadline"],
+        "digests": {
+            name: {c: e["digest"] for field in containers.values() for c, e in field.items() if e["digest"]}
+            for name, containers in derived["deployments"].items()
+        },
+        "tag_pinned": derived["tag_pinned"],
+        "read_at": zulu(now),
+        "notes": [],
+        "not_counted": [],
+    }
+    if derived["outcome"] == "red":
+        return {**verdict, "result": "red", "problems": list(derived["problems"]), "clause": clause_of(derived["problems"], "derivation")}
+    verify_handover = handover()
+    try:
+        root = cluster.json("get", "application", "root", "-n", "argocd")
+        application = cluster.json("get", "application", APPLICATION_NAME, "-n", "argocd")
+        deployments = cluster.json("get", "deployments", "-n", TARGET_NAMESPACE).get("items") or []
+        pods = cluster.json("get", "pods", "-n", TARGET_NAMESPACE).get("items") or []
+    except (verify_handover.KubectlError, verify_handover.UsageError, ValueError) as error:
+        raise InfrastructureError(f"a cluster read failed: {error}") from error
+    problems, notes, not_counted = clause_a(derived, deployments, pods)
+    problems += clause_b(derived, root, application, deployments, root_sha, is_ancestor)
+    verdict.update(notes=notes, not_counted=not_counted, problems=problems)
+    if not problems:
+        return {**verdict, "result": "green"}
+    expired = trial or now > utc(derived["deadline"])
+    if not expired:
+        return {**verdict, "result": "pending"}
+    return {**verdict, "result": "red", "clause": clause_of(problems, "judge")}
+
+
+def clause_of(problems: list[str], fallback: str) -> str:
+    """The `clause` estate shows for a red: the clauses that failed, then the first problem."""
+    labels = sorted({p.split(":", 1)[0] for p in problems if p.startswith("Clause ")})
+    if not labels:
+        return f"{fallback}: {problems[0]}"
+    return f"{', '.join(labels)}: {problems[0].split(': ', 1)[-1]}"
+
+
+def run_judge(
+    repo: Path,
+    sha: str,
+    *,
+    context: str,
+    out_dir: Path,
+    trial_sha: str | None = None,
+    now: dt.datetime | None = None,
+    derive_at: Callable | None = None,
+    kubectl_runner: Callable = subprocess.run,
+    is_ancestor=None,
+    render: Callable[[bytes], list] | None = None,
+) -> int:
+    """Derive at the data sha, judge once, write the verdict. 0 green or pending, 1 red, 3 infrastructure.
+
+    A green or red verdict is written to `<out_dir>/settled-verdict/verdict.json`,
+    or to `settled-trial/` in trial mode, never both. Pending and an
+    infrastructure failure write nothing.
+    """
+    now = now or dt.datetime.now(dt.timezone.utc)
+    derive_at = derive_at or (lambda r, s, **_k: derive(r, s, render=render))
+    try:
+        derived = derive_at(repo, trial_sha or sha)
+        cluster = handover().Cluster(context, runner=kubectl_runner)
+        verdict = judge(derived, cluster, root_sha=sha, now=now, trial=trial_sha is not None, is_ancestor=is_ancestor)
+    except InfrastructureError as error:
+        print(f"INFRASTRUCTURE FAILURE, no verdict: {error}", file=sys.stderr)
+        return 3
+    print(f"S {verdict['S']}  data {verdict['data_sha']}  P {verdict['P']}  K {verdict['K']}  A {verdict['A']}")
+    print(f"deadline {verdict['deadline']}  read at {verdict['read_at']}  result {verdict['result']}")
+    for name, containers in sorted(verdict["digests"].items()):
+        print(f"  {name}: {containers}")
+    for note in verdict["notes"]:
+        print(f"note: {note}")
+    for problem in verdict["problems"]:
+        print(f"{verdict['result'].upper()}: {problem}")
+    if verdict["result"] == "pending":
+        return 0
+    if verdict["result"] == "red" and verdict["K"] is None:
+        print("RED, no verdict written: the render key was refused; estate refuses the same input itself", file=sys.stderr)
+        return 1
+    artifact = TRIAL_ARTIFACT if trial_sha is not None else VERDICT_ARTIFACT
+    target = out_dir / artifact
+    target.mkdir(parents=True, exist_ok=True)
+    (target / VERDICT_FILE).write_text(json.dumps({**verdict, "artifact": artifact}, indent=2, sort_keys=True) + "\n")
+    return 1 if verdict["result"] == "red" else 0
+
+
+# ── GitHub, read-only: find-verdict and reachable ────────────────────────────
+
+GITHUB_API = "https://api.github.com"
+# Estate's verdict job reads at most this many candidates (its MAX_VERDICT_CANDIDATES); the gate matches it.
+MAX_VERDICT_CANDIDATES = 5
+VERDICT_EVENTS = frozenset({"schedule", "workflow_dispatch"})
+
+
+class GitHubError(InfrastructureError):
+    """A GitHub API call that did not answer 2xx."""
+
+    def __init__(self, status: int, path: str) -> None:
+        super().__init__(f"GET {path}: HTTP {status}")
+        self.status = status
+
+
+class GitHub:
+    """GET-only GitHub REST client. The token (from GITHUB_TOKEN) is never printed and never follows a redirect."""
+
+    def __init__(self, token: str | None = None) -> None:
+        self.token = token if token is not None else os.environ.get("GITHUB_TOKEN")
+
+    def _request(self, url: str):
+        request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+        if self.token:
+            # Unredirected: an artifact download redirects to blob storage, which must not see the token.
+            request.add_unredirected_header("Authorization", f"Bearer {self.token}")
+        try:
+            return urllib.request.urlopen(request, timeout=30)  # only GITHUB_API and its artifact redirects
+        except urllib.error.HTTPError as error:
+            raise GitHubError(error.code, url.removeprefix(GITHUB_API)) from error
+        except (urllib.error.URLError, TimeoutError) as error:
+            raise InfrastructureError(f"GET {url.removeprefix(GITHUB_API)}: {error}") from error
+
+    def get(self, path: str):
+        with self._request(GITHUB_API + path) as response:
+            return json.loads(response.read())
+
+    def paginate(self, path: str, key: str | None = None) -> list:
+        items: list = []
+        separator = "&" if "?" in path else "?"
+        for page in range(1, 101):
+            body = self.get(f"{path}{separator}per_page=100&page={page}")
+            batch = body[key] if key else body
+            items += batch
+            if len(batch) < 100:
+                return items
+        raise InfrastructureError(f"GET {path}: more than 100 pages")
+
+    def download(self, url: str) -> bytes:
+        with self._request(url) as response:
+            return response.read()
+
+
+def _read_verdict(archive: bytes) -> dict:
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive)) as opened:
+            return json.loads(opened.read(VERDICT_FILE))
+    except (zipfile.BadZipFile, KeyError, ValueError) as error:
+        raise InfrastructureError(f"a {VERDICT_ARTIFACT} artifact holds no readable {VERDICT_FILE}: {error}") from error
+
+
+def find_verdict(github, repository: str, workflow_path: str, epoch: dict, *, exclude_run_id: int | None = None) -> dict | None:
+    """The newest `settled-verdict` whose recorded `K` and `A` are `epoch`'s, among the five newest eligible, or None.
+
+    The same filters `verify.yaml` applies to its baseline: this repository and
+    head repository, the default branch, this workflow's path, a `schedule` or
+    `workflow_dispatch` run, not expired. NOT the run's conclusion: a red
+    verdict's run may conclude failure, and a red verdict is still the
+    verdict. `settled-trial` is never read.
+    """
+    own = github.get(f"/repos/{repository}")
+    artifacts = github.paginate(f"/repos/{repository}/actions/artifacts?name={VERDICT_ARTIFACT}", "artifacts")
+    candidates = sorted(
+        (
+            a
+            for a in artifacts
+            if a.get("name") == VERDICT_ARTIFACT
+            and not a.get("expired")
+            and (run := a.get("workflow_run") or {})
+            and run.get("id") != exclude_run_id
+            and run.get("repository_id") == own["id"]
+            and run.get("head_repository_id") == own["id"]
+            and run.get("head_branch") == own["default_branch"]
+        ),
+        key=lambda a: utc(a["created_at"]),
+        reverse=True,
+    )
+    for candidate in candidates[:MAX_VERDICT_CANDIDATES]:
+        run = github.get(f"/repos/{repository}/actions/runs/{candidate['workflow_run']['id']}")
+        if (
+            run.get("path") != workflow_path
+            or run.get("event") not in VERDICT_EVENTS
+            or (run.get("head_repository") or {}).get("id") != own["id"]
+        ):
+            continue
+        verdict = _read_verdict(github.download(candidate["archive_download_url"]))
+        if (verdict.get("K"), verdict.get("A")) == (epoch["key"], epoch["anchor"]):
+            return {"found": True, "artifact_id": candidate["id"], "run_id": run["id"], "created_at": candidate["created_at"], "verdict": verdict}
+    return None
+
+
+def reachable(github, repository: str, sha: str) -> str | None:
+    """The first branch of `repository` that contains `sha`, or None.
+
+    `compare/{branch}...{sha}` reads `behind` or `identical` exactly when `sha`
+    is an ancestor of (or is) the branch head. Never `commits/{sha}`: GitHub
+    serves commits from the whole fork network through the parent's API, so a
+    fork-only sha resolves there. A 404 compare means "not on this branch".
+    """
+    if not FULL_SHA.fullmatch(sha):
+        raise InfrastructureError(f"{sha!r} is not a full 40-hex commit sha")
+    for branch in github.paginate(f"/repos/{repository}/branches"):
+        try:
+            status = github.get(f"/repos/{repository}/compare/{quote(branch['name'], safe='/')}...{sha}").get("status")
+        except GitHubError as error:
+            if error.status == 404:
+                continue
+            raise
+        if status in {"behind", "identical"}:
+            return branch["name"]
+    return None
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
 def _full_sha(value: str) -> str:
     if not FULL_SHA.fullmatch(value):
         raise argparse.ArgumentTypeError(f"{value!r} is not a full 40-hex commit sha")
+    return value
+
+
+def _hex64(value: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise argparse.ArgumentTypeError(f"{value!r} is not a 64-hex render key")
     return value
 
 
@@ -556,6 +1051,22 @@ def _parser() -> argparse.ArgumentParser:
     derived.add_argument("--repo", type=Path, default=REPOSITORY, help="the argocd checkout holding the sha")
     derived.add_argument("--sha", type=_full_sha, required=True, help="full 40-hex commit sha of the data")
     derived.add_argument("--out", type=Path, required=True, help="where the derivation (or the red) is written")
+    judged = sub.add_parser("judge", help="derive, then one set of cluster reads; exit 0 green/pending, 1 red, 3 infrastructure")
+    judged.add_argument("--repo", type=Path, default=REPOSITORY, help="the argocd checkout holding the sha(s)")
+    judged.add_argument("--sha", type=_full_sha, required=True, help="argocd main's full sha S (root must be at it)")
+    judged.add_argument("--trial-sha", type=_full_sha, help="read the DATA at this sha instead; writes settled-trial")
+    judged.add_argument("--context", required=True, help="kubectl context; there is no default")
+    judged.add_argument("--out-dir", type=Path, required=True, help="the verdict lands in <dir>/settled-verdict/ or settled-trial/")
+    found = sub.add_parser("find-verdict", help="the newest settled-verdict for an epoch; exit 3 when the API fails")
+    found.add_argument("--repository", default="yadgarhq/argocd-verify")
+    found.add_argument("--workflow-path", default=".github/workflows/settled.yaml")
+    found.add_argument("--key", type=_hex64, required=True)
+    found.add_argument("--anchor", type=_full_sha, required=True)
+    found.add_argument("--exclude-run-id", type=int, help="this run's own id")
+    found.add_argument("--out", type=Path, required=True, help='the verdict found, or {"found": false}')
+    reach = sub.add_parser("reachable", help="exit 0 when a full sha is on a branch of the repository itself, 1 when not")
+    reach.add_argument("--repository", default="yadgarhq/argocd")
+    reach.add_argument("--sha", type=_full_sha, required=True)
     sub.add_parser("stale", help=f"fail when estate main's newest commit is older than {STALE_DAYS} days")
     return parser
 
@@ -567,6 +1078,7 @@ def main(
     runner: Callable = subprocess.run,
     fetch: Callable[[str], object] | None = None,
     now: dt.datetime | None = None,
+    github=None,
 ) -> int:
     try:
         args = _parser().parse_args(argv)
@@ -578,6 +1090,20 @@ def main(
             print(f"FAIL: {problem}", file=sys.stderr)
             return 1
         return 0
+    if args.command == "judge":
+        verify_handover = handover()
+        return run_judge(
+            args.repo,
+            args.sha,
+            context=args.context,
+            out_dir=args.out_dir,
+            trial_sha=args.trial_sha,
+            now=now,
+            render=render,
+            is_ancestor=verify_handover.git_is_ancestor(args.repo),
+        )
+    if args.command in {"find-verdict", "reachable"}:
+        return _github_command(args, github or GitHub())
     try:
         result = derive(args.repo, args.sha, render=render, runner=runner)
     except InfrastructureError as error:
@@ -590,6 +1116,27 @@ def main(
     if result["tag_pinned"]:
         print(f"tag-pinned, digest not asserted: {', '.join(result['tag_pinned'])}")
     return 1 if result["outcome"] == "red" else 0
+
+
+def _github_command(args: argparse.Namespace, github) -> int:
+    try:
+        if args.command == "reachable":
+            branch = reachable(github, args.repository, args.sha)
+        else:
+            epoch = {"key": args.key, "anchor": args.anchor}
+            found = find_verdict(github, args.repository, args.workflow_path, epoch, exclude_run_id=args.exclude_run_id)
+    except InfrastructureError as error:
+        print(f"INFRASTRUCTURE FAILURE: {error}", file=sys.stderr)
+        return 3
+    if args.command == "reachable":
+        if branch is None:
+            print(f"REFUSED: {args.sha} is on no branch of {args.repository} (compare reads neither behind nor identical)")
+            return 1
+        print(f"{args.sha} is on {args.repository} branch {branch}")
+        return 0
+    args.out.write_text(json.dumps(found or {"found": False}, indent=2, sort_keys=True) + "\n")
+    print(f"verdict for epoch {epoch}: " + (f"artifact {found['artifact_id']}, run {found['run_id']}, {found['verdict'].get('result')}" if found else "none"))
+    return 0
 
 
 if __name__ == "__main__":
