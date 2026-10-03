@@ -96,12 +96,18 @@ REPOSITORY = Path(__file__).resolve().parent.parent
 # `scripts/tests/test_no_two_owners.py` held the rendered spec equal to the
 # deleted copy at this organisation's values.
 #
-# ONE POLICY IS LEFT, AND IT DECLARES NO INGRESS RULE. `estate-front-egress`'s
+# ONE POLICY WAS LEFT, AND IT DECLARES NO INGRESS RULE. `estate-front-egress`'s
 # `set()` examines nothing today, so this gate now guards only a FUTURE
 # ingress rule added to it or a new policy added here; the floor still
 # reddens if the policy is renamed or deleted.
+#
+# `post-merge-verifier-egress` (ledger 785, ADR-0841) IS THE SECOND, and it is
+# `policyTypes: [Egress]` with no ingress at all, so its `set()` examines
+# nothing either. It is listed so the floor counts it; its egress shape is held
+# by `scripts/tests/test_project_probe.py`.
 EXPECTED_ALLOW_ALL_PORTS: dict[str, set[int]] = {
     "estate-front-egress": set(),
+    "post-merge-verifier-egress": set(),
 }
 
 # FLOORS, not counts of what is here today — the same reason
