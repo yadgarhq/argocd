@@ -1924,19 +1924,28 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # gain `activeDeadlineSeconds` and a bounded script (platform#24).
 # `PIN_BEFORE_B9` stays 0.3.7: `test_the_old_pin_names_both_probe_defects`
 # needs a pin whose probes are defective.
+#
+# RE-MEASURED AT THE NEXT BUMP, 0.3.38 → 0.13.13, same shape. The first bump
+# here that ADDS objects, so the count no longer holds on both sides: 80 → 82,
+# and the two added are exactly `PIN_ADDED`, platform 0.1.36's serving leaves
+# for the broker and the cache (platform#36). Nothing mounts them at this pin.
+# The fields: all seven module images; the three `-db` Deployments gain the
+# four store v0.4.0 pool knobs (ADR-0837); and `Prune=false` on the four edge
+# objects (platform#31, ADR-0851). The two bootstrap Jobs do not move.
 PIN_BEFORE_B9 = "0.3.7"
-PREVIOUS_PIN = "0.3.13"
+PREVIOUS_PIN = "0.3.38"
+PIN_ADDED = {("Certificate", "nats-tls"), ("Certificate", "valkey-tls")}
 PIN_CHANGES = {
     *(
         ("Deployment", module, "spec.template.spec.containers[0].image")
-        for module in ("gateway", "iam", "iam-db", "project", "project-db", "task-db")
+        for module in ("gateway", "iam", "iam-db", "project", "project-db", "task", "task-db")
     ),
     *(("Deployment", module, "spec.template.spec.containers[0].env") for module in ("iam-db", "project-db", "task-db")),
     *(
-        ("Job", job, field)
-        for job in ("bootstrap-secrets", "admin-bootstrap-token")
-        for field in ("spec.activeDeadlineSeconds", "spec.template.spec.containers[0].args[0]")
+        (kind, name, "metadata.annotations")
+        for kind, name in (("Certificate", "gateway-tls"), ("EnvoyProxy", "edge"), ("Gateway", "edge"), ("GatewayClass", "eg"))
     ),
+    *((kind, name, "<object added or removed>") for kind, name in PIN_ADDED),
 }
 
 # THE FLIP ALONE, at the current pin: exactly these eight hook objects appear
@@ -2026,7 +2035,15 @@ def test_the_pin_alone_changes_only_the_named_fields(tmp_path: Path) -> None:
     after = parent_render(REPOSITORY, PREFLIGHT_OFF)
     changes = field_changes(before, after)
     print(f"[K3 pin] {PREVIOUS_PIN} -> {pinned[0]}: {len(before)} -> {len(after)} object(s), {len(changes)} change(s)")
-    assert len(before) > 0 and len(before) == len(after), (len(before), len(after))
+    # NOT `len(before) == len(after)` any more: this bump adds two objects. The
+    # count is replaced by the exact sets, which say more: nothing removed, and
+    # only `PIN_ADDED` added.
+    def names(documents: list) -> set[tuple[str, str]]:
+        return {(d["kind"], d["metadata"]["name"]) for d in documents if isinstance(d, dict) and d.get("kind")}
+
+    assert len(before) > 0, len(before)
+    assert names(before) - names(after) == set(), sorted(names(before) - names(after))
+    assert names(after) - names(before) == PIN_ADDED, sorted(names(after) - names(before))
     assert changes == PIN_CHANGES, sorted(changes)
 
 

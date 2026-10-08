@@ -2147,3 +2147,109 @@ projects/root.yaml`. Until that hand apply runs, `root` keeps the
    narrowed, now-reverted-in-git `include` live, and the reinstated
    ApplicationSet starts reconciling under an include that still excludes
    it.
+
+## The yadgar pin moves to parent chart 0.13.13
+
+**What the merge does.** It moves `applications/yadgar.yaml`'s
+`targetRevision` from 0.3.38 to 0.13.13, `scripts/chart_pin.json` to
+`v0.13.13` / `0.1.36`, and the five platform-sourced operator Applications
+(`cert-manager`, `keda`, `mariadb-operator`, `envoy-gateway`, `prometheus`)
+from `platform` 0.1.26 to 0.1.36. `valuesObject` does not change: 0.13.13
+renders today's values with no refusal and needs no new key.
+
+Merging is the deploy. `root` applies the six Applications from `main`, and
+`yadgar` syncs on its own (`selfHeal`, no `prune`). Measured 2026-10-08 with
+helm 3.18.4, and with a server-side dry run against `kind-yadgar`:
+
+- 88 → 90 objects. 0 removed. 2 added: `Certificate/nats-tls` and
+  `Certificate/valkey-tls` (platform#36). Nothing mounts them at this pin.
+- 13 changed: the image of all seven module Deployments; four new pool env
+  lines on `iam-db`, `project-db` and `task-db` (store v0.4.0); the
+  `Prune=false` annotation on `Certificate/gateway-tls`, `EnvoyProxy/edge`,
+  `Gateway/edge` and `GatewayClass/eg` (platform#31, ADR-0851); the scripts of
+  the `preflight` and `envoy-gateway-probe` hook Jobs (platform#32, ledger
+  1263).
+- The five operator Applications render byte-identically at 0.1.26 and
+  0.1.36, CRDs included. Only their `targetRevision` changes.
+- The dry run admits every object. No immutable field moves.
+
+**What runs.** PreSync: `preflight`, then `bootstrap-secrets` and
+`admin-bootstrap-token`. Sync: the seven Deployments roll, each
+`maxSurge: 1 / maxUnavailable: 0`. `valkey` and `nats` do not roll.
+cert-manager issues two new Secrets, `nats-tls` and `valkey-tls`. PostSync:
+`envoy-gateway-probe`. No `-db` image runs a new migration. The `-db` pool
+acquire timeout moves from 30 s to 25 s.
+
+### Before this merge — read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. Every Application Synced/Healthy; yadgar at 0.3.38. Any other state → STOP.
+kubectl --context kind-yadgar -n argocd get applications \
+  -o custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status
+
+# 2. The uids PB-1's acceptance checks after the merge. Expected, read 2026-10-08:
+#    Certificate/gateway-tls ef87adbb-6fd1-4a0e-b9fd-8a986ca5edeb
+#    EnvoyProxy/edge         6c45210d-e8a1-470e-9222-e9fb6239bbef
+#    Gateway/edge            2235fee3-2a90-41c8-bb54-b0e964b790d6
+#    GatewayClass/eg         9fb46cca-1d64-4b7d-b88a-7924f5da278c
+kubectl --context kind-yadgar -n yadgar get certificate/gateway-tls envoyproxy/edge gateway/edge \
+  -o custom-columns=KIND:.kind,NAME:.metadata.name,UID:.metadata.uid
+kubectl --context kind-yadgar get gatewayclass eg -o custom-columns=NAME:.metadata.name,UID:.metadata.uid
+
+# 3. The verifier snapshot. Its diff after the merge is RED BY DESIGN: seven
+#    Deployments change generation and roll. Read every named change.
+python3 scripts/verify_handover.py snapshot --context kind-yadgar --out before.json
+```
+
+### After this merge — read-only
+
+```bash
+# 1. yadgar Synced/Healthy at 0.13.13, and its last operation Succeeded.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. The five operators Synced/Healthy at 0.1.36.
+kubectl --context kind-yadgar -n argocd get applications \
+  -o custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status
+
+# 3. The hooks of this revision completed.
+kubectl --context kind-yadgar -n yadgar get jobs
+
+# 4. Seven Deployments rolled and are Ready; valkey did not roll.
+kubectl --context kind-yadgar -n yadgar get deploy,pods
+
+# 5. The two new Certificates are Ready.
+kubectl --context kind-yadgar -n yadgar get certificate nats-tls valkey-tls
+
+# 6. The four edge objects: SAME uid as "Before" step 2, now with Prune=false.
+kubectl --context kind-yadgar -n yadgar get certificate/gateway-tls envoyproxy/edge gateway/edge \
+  -o custom-columns=KIND:.kind,NAME:.metadata.name,UID:.metadata.uid,OPT:.metadata.annotations.argocd\.argoproj\.io/sync-options
+kubectl --context kind-yadgar get gatewayclass eg \
+  -o custom-columns=NAME:.metadata.name,UID:.metadata.uid,OPT:.metadata.annotations.argocd\.argoproj\.io/sync-options
+
+# 7. The verifier diff. Expect the seven rolls, and no vanished uid.
+python3 scripts/verify_handover.py wait --context kind-yadgar --app root --revision <merge sha>
+python3 scripts/verify_handover.py wait --context kind-yadgar --settled --since <time root reached the sha>
+python3 scripts/verify_handover.py snapshot --context kind-yadgar --out after.json
+python3 scripts/verify_handover.py diff before.json after.json
+```
+
+If a `-db` pod does not become Ready, its rollout stops behind
+`maxUnavailable: 0` and the old pods keep serving. Read its log before you
+revert.
+
+**Rollback — a revert, then two deletes by hand.** Revert the merge. `yadgar`
+syncs 0.3.38: the images and the `-db` env go back, and the client-side apply
+removes the edge `Prune=false` annotations. The hooks re-run with the 0.1.26
+scripts. No migration ran, so the downgrade is schema-safe. `yadgar` has no
+`automated.prune`, so the two Certificates stay, and `yadgar` reads OutOfSync
+with them as `requiresPruning`. cert-manager here sets no owner reference, so
+their Secrets stay too. Nothing mounts any of the four. NEEDS-MAX:
+
+```bash
+kubectl --context kind-yadgar -n yadgar delete certificate nats-tls valkey-tls
+kubectl --context kind-yadgar -n yadgar delete secret nats-tls valkey-tls
+```
