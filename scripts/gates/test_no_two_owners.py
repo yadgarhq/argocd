@@ -1932,18 +1932,20 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # The fields: all seven module images; the three `-db` Deployments gain the
 # four store v0.4.0 pool knobs (ADR-0837); and `Prune=false` on the four edge
 # objects (platform#31, ADR-0851). The two bootstrap Jobs do not move.
+#
+# RE-MEASURED AT THE NEXT BUMP, 0.13.13 → 0.19.1 (PB-2, ledger 925), same
+# shape. 82 objects on both sides, none added. The six server images only
+# (iam, iam-db, task, task-db, project and project-db: the B-U5 contracts);
+# gateway and platform keep their pins. The `clientAuth` and client-CA values
+# do NOT show here: both sides render them, because the 0.13.13 module charts
+# already carried the B-U5E expand. They show in K3 against `main`'s values.
 PIN_BEFORE_B9 = "0.3.7"
-PREVIOUS_PIN = "0.3.38"
-PIN_ADDED = {("Certificate", "nats-tls"), ("Certificate", "valkey-tls")}
+PREVIOUS_PIN = "0.13.13"
+PIN_ADDED: set[tuple[str, str]] = set()
 PIN_CHANGES = {
     *(
         ("Deployment", module, "spec.template.spec.containers[0].image")
-        for module in ("gateway", "iam", "iam-db", "project", "project-db", "task", "task-db")
-    ),
-    *(("Deployment", module, "spec.template.spec.containers[0].env") for module in ("iam-db", "project-db", "task-db")),
-    *(
-        (kind, name, "metadata.annotations")
-        for kind, name in (("Certificate", "gateway-tls"), ("EnvoyProxy", "edge"), ("Gateway", "edge"), ("GatewayClass", "eg"))
+        for module in ("iam", "iam-db", "project", "project-db", "task", "task-db")
     ),
     *((kind, name, "<object added or removed>") for kind, name in PIN_ADDED),
 }

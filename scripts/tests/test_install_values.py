@@ -89,7 +89,7 @@ IMPLICIT_RETRY = {"limit": 5, "backoff": {"duration": "5s", "factor": 2, "maxDur
 # THE MARGIN ON A MEASURED, UNBOUNDED DURATION.
 MEASURED_MARGIN = 3
 
-# ─── yadgar: chart 0.13.13, which embeds `platform` 0.1.36 ────────────────────
+# ─── yadgar: chart 0.19.1, which embeds `platform` 0.1.36 ─────────────────────
 #
 # WRITTEN FORWARD-LOOKING (ledger 1224, ADR-0830), NOW THE PIN. The numbers
 # below were hand-typed from `yadgarhq/platform#24` @2d86082
@@ -103,6 +103,8 @@ MEASURED_MARGIN = 3
 # and envoy-gateway-probe 45. Each equals the arithmetic below. Nothing
 # re-reads them. Re-measured 2026-10-08 at parent 0.13.13 (`platform` 0.1.36):
 # the same six numbers, and both `backoffLimit`s (bootstrap 4, the probes 0).
+# Parent 0.19.1 (PB-2) keeps `platform` 0.1.36: the four hook Jobs render
+# byte-identically, so the numbers stand.
 #
 # Rendered with `applications/yadgar.yaml`'s `valuesObject` (`iamKeys.create:
 # false` in this org), every attempt runs four hook Jobs from the platform

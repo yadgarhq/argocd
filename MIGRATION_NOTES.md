@@ -2377,3 +2377,148 @@ Deployment's last-applied configuration, so the client-side apply removes
 them, and the four Deployments roll back. This merge creates no object, so
 nothing is left to prune. The four Secrets stay, as they were before the
 merge.
+
+## The yadgar pin moves to parent chart 0.19.1, and the six servers stage their client CA (PB-2, ledger 925)
+
+**What the merge does.** It moves `applications/yadgar.yaml`'s
+`targetRevision` from 0.13.13 to 0.19.1 and `scripts/chart_pin.json`'s
+`chart_tag` to `v0.19.1`. `platform_version` stays 0.1.36, so no operator
+Application moves. It also adds three values to `tls` on each of the six gRPC
+servers (`iam`, `iam-db`, `task`, `task-db`, `project`, `project-db`):
+
+- `clientAuth: "off"`. Parent 0.19.1's server charts require the key, with no
+  default (ADR-0854). The binaries refuse to boot without
+  `LISTEN_TLS_CLIENT_AUTH`.
+- `clientCaSecret: <server>-tls` and `clientCaSecretKey: ca.crt` (ADR-0883).
+  This stages the client CA now, so the later flip to `optional` (B-U8) is a
+  one-key change.
+
+Parent 0.19.1 moves six module pins and nothing else: iam 0.9.2 → 0.10.0,
+iam-db 0.9.0 → 0.10.0, task 0.6.1 → 0.7.0, task-db 0.8.1 → 0.9.0, project
+0.2.1 → 0.3.0, project-db 0.5.1 → 0.6.0. Each tag is the B-U5 contract
+merge (iam#95, iam-db#86, task#74, task-db#87, project#30, project-db#56).
+gateway stays 0.10.2, config 0.2.0, platform 0.1.36.
+
+Merging is the deploy: `yadgar` syncs on its own (`selfHeal`, no `prune`).
+Measured 2026-10-09 with helm 3.18.4 and 4.3.0 (byte-identical renders), and
+with a server-side dry run against `kind-yadgar`:
+
+- 90 → 90 objects. 0 added. 0 removed.
+- 6 changed: the six server Deployments. Each gets a new image, the env
+  `LISTEN_TLS_CLIENT_AUTH=off` and `LISTEN_TLS_CLIENT_CA_FILE`, and a NEW
+  `client-ca` Secret volume (its `<server>-tls`, item `ca.crt`) with a
+  read-only mount. The volume renders no `optional` field, so it is
+  `optional: false`. `iam-db` mounts it at `/var/run/secrets/iam-db-client-ca`;
+  the other five mount it at `/var/run/config/client-ca`.
+- `gateway`, the hook Jobs, the Certificates and every other object are
+  byte-identical.
+- The dry run names the same six Deployments. It admits all 77 tracked
+  objects and all 13 hooks. The `yadgar` Application CR diff is
+  `targetRevision` and the 18 added value lines only.
+
+**What runs.** The six Deployments roll, each `maxSurge: 1 /
+maxUnavailable: 0`. No migration runs: no `-db` repository changes its
+schema between the live tag and the new tag, and store stays v0.4.0. Under
+`off`, `yadgar_lifecycle::serve_tls` (v0.2.20) drops the CA path. It does not
+read the file, does not build a client verifier, and does not watch the
+file. So no server asks a caller for a certificate, and every handshake
+completes as before.
+
+Two things look like faults and are not:
+
+- Each server logs one WARN at boot: "`LISTEN_TLS_CLIENT_CA_FILE` names a
+  client CA but `LISTEN_TLS_CLIENT_AUTH` is `off`, so this listener verifies
+  NO client certificate". That is the staged state this merge creates.
+- The `kind="serving"` gauge and the unreadable counter do not move. The CA
+  is not in the watch set under `off`.
+
+**A wrong staged name fails loudly.** The volume is not optional. A missing
+Secret or a missing `ca.crt` key stops the new pod at `FailedMount`, and the
+rollout stops behind `maxUnavailable: 0` while the old pods keep serving.
+The dry run cannot see a mount failure; "Before" step 2 is the live check.
+
+### Before this merge — read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. yadgar Synced/Healthy at 0.13.13. Any other state → STOP.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. Each <server>-tls Secret exists, carries ca.crt, and comes from the Issuer
+#    that issues the four *-client-tls leaves. KEY NAMES ONLY, never values.
+#    Read 2026-10-09: all six carry `ca.crt tls.crt tls.key`, same Issuer as
+#    the client leaves.
+kubectl --context kind-yadgar -n yadgar get secrets \
+  iam-tls iam-db-tls task-tls task-db-tls project-tls project-db-tls iam-client-tls \
+  -o go-template='{{range .items}}{{.metadata.name}} [{{range $k,$v := .data}}{{$k}} {{end}}] {{index .metadata.annotations "cert-manager.io/issuer-name"}}{{"\n"}}{{end}}'
+
+# 3. The six Deployments: READY == REPLICAS == UPDATED. Read 2026-10-09: 2/2/2 on all six.
+kubectl --context kind-yadgar -n yadgar get deploy iam iam-db task task-db project project-db \
+  -o custom-columns=NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas
+
+# 4. The serving gauge. Read 2026-10-09: 2 for each of the six servers.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=count%20by%20(service%2Ckind)(yadgar_tls_certificate_not_after_seconds%7Bkind%3D%22serving%22%7D)'
+
+# 5. No watched file is unreadable. Read 2026-10-09: 0 for all 7 services.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service)(yadgar_rotation_watched_files_unreadable)'
+
+# 6. The gateway's project registry. Read 2026-10-09: 1 on both gateway pods.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=yadgar_gateway_project_registry_loaded'
+```
+
+### After this merge — read-only
+
+```bash
+# 1. yadgar Synced/Healthy at 0.19.1, and its last operation Succeeded.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. Judge by Deployment readiness, not by the operation phase (it reads
+#    Succeeded even if a pod crashloops). Expect 2/2/2 on all six.
+kubectl --context kind-yadgar -n yadgar get deploy iam iam-db task task-db project project-db \
+  -o custom-columns=NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas
+
+# 3. The new env and volume are live: expect `off` and `<server>-tls` on each.
+kubectl --context kind-yadgar -n yadgar get deploy iam iam-db task task-db project project-db \
+  -o custom-columns='NAME:.metadata.name,AUTH:.spec.template.spec.containers[0].env[?(@.name=="LISTEN_TLS_CLIENT_AUTH")].value,CA:.spec.template.spec.volumes[?(@.name=="client-ca")].secret.secretName'
+
+# 4. The serving gauge is unchanged: 2 for each of the six servers.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=count%20by%20(service%2Ckind)(yadgar_tls_certificate_not_after_seconds%7Bkind%3D%22serving%22%7D)'
+
+# 5. Unreadable: 0 for all 7. Registry: 1 on both gateway pods.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service)(yadgar_rotation_watched_files_unreadable)'
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=yadgar_gateway_project_registry_loaded'
+```
+
+If a pod does not become Ready, its rollout stops behind
+`maxUnavailable: 0` and the old pods keep serving. Read its events
+(`FailedMount` names a wrong staged Secret) and its log before you revert.
+
+### Rollback — a revert
+
+If `yadgar`'s operation is still Running or retrying, end it first:
+
+```bash
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.status.operationState.phase} {.status.operationState.syncResult.revision}{"\n"}'
+```
+
+NEEDS-MAX: `argocd app terminate-op yadgar` against kind-yadgar's Argo CD. A
+revert does not interrupt an operation already running: v3.1.8's Application
+CRD has no `syncPolicy.retry.refresh` (see "The yadgar pin moves to parent
+chart 0.13.13", Rollback).
+
+Then revert the merge. `yadgar` syncs 0.13.13: the six images go back, and
+the added env, volume and mount lines are in each Deployment's last-applied
+configuration, so the client-side apply removes them. No migration ran, so
+the downgrade is schema-safe. This merge creates no object, so nothing is
+left to prune.
