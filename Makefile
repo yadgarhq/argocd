@@ -143,12 +143,6 @@ secrets: ## Load yadgar-dev-ca, iam-keys and estate-runner-github from 1Password
 # Argo CD is installed by hand exactly once, because a GitOps controller cannot
 # arrive by GitOps. Everything after this is `git push`.
 bootstrap: secrets ## Install Argo CD into the running cluster, then hand control to git.
-	@test -n "$$GITHUB_TOKEN" || { \
-		echo "GITHUB_TOKEN is unset."; \
-		echo "The D54 ApplicationSet enumerates the organisation through the"; \
-		echo "GitHub API; unauthenticated is rate-limited hard enough to look"; \
-		echo "like a broken generator. A read-only repo-scope token is enough."; \
-		exit 1; }
 	helm repo add argo https://argoproj.github.io/argo-helm >/dev/null
 	helm repo update >/dev/null
 	helm --kube-context $(KUBE_CONTEXT) upgrade --install argocd argo/argo-cd \
@@ -158,9 +152,6 @@ bootstrap: secrets ## Install Argo CD into the running cluster, then hand contro
 		--set dex.enabled=false \
 		--set notifications.enabled=false \
 		--wait
-	kubectl --context $(KUBE_CONTEXT) -n argocd create secret generic github-scm \
-		--from-literal=token="$$GITHUB_TOKEN" \
-		--dry-run=client -o yaml | $(SECRET_APPLY)
 	@echo "--- Argo CD up. Handing control to git. ---"
 	kubectl --context $(KUBE_CONTEXT) apply -f projects/root.yaml
 	@echo "Argo now manages its own values from yadgarhq/argocd. make ui / make password."

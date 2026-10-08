@@ -10,31 +10,34 @@ sync — live here too (ADR-0803; moved from
 [`yadgarhq/deploy`](https://github.com/yadgarhq/deploy)). Decisions are in
 [`yadgarhq/docs`](https://github.com/yadgarhq/docs) — D54 especially.
 
-| Path                           |                                                 |
-| ------------------------------ | ----------------------------------------------- |
-| `Makefile`                     | `make bootstrap`/`make secrets` (ADR-0803)      |
-| `install/values.yaml`          | Helm values for the `argo-cd` chart             |
-| `projects/root.yaml`           | app-of-apps root, applied once during bootstrap |
-| `applicationsets/modules.yaml` | discovers module repos across the organisation  |
-| `applications/<operator>.yaml` | the six operator Applications root adopted (E3) |
-| `applications/<child>.yaml`    | the five Applications `infra` released (M3)     |
-| `manifests/<name>/`            | directory sources; outside root's include glob  |
-| `scripts/gates/`               | gates that need helm or the network (CI only)   |
-| `MIGRATION_NOTES.md`           | what a change here needs from a person          |
-| `scripts/verify_handover.py`   | read-only post-merge verifier (below)           |
-| `scripts/project_probe.py`     | the 785 refusal-counter probe (ADR-0841)        |
-| `verifier/manifests/`          | their identity, ClusterRole and egress policy   |
+| Path                           |                                                    |
+| ------------------------------ | -------------------------------------------------- |
+| `Makefile`                     | `make bootstrap`/`make secrets` (ADR-0803)         |
+| `install/values.yaml`          | Helm values for the `argo-cd` chart                |
+| `projects/root.yaml`           | app-of-apps root, applied once during bootstrap    |
+| `applications/yadgar.yaml`     | the parent chart that deploys the estate's modules |
+| `applications/<operator>.yaml` | the six operator Applications root adopted (E3)    |
+| `applications/<child>.yaml`    | the five Applications `infra` released (M3)        |
+| `manifests/<name>/`            | directory sources; outside root's include glob     |
+| `scripts/gates/`               | gates that need helm or the network (CI only)      |
+| `MIGRATION_NOTES.md`           | what a change here needs from a person             |
+| `scripts/verify_handover.py`   | read-only post-merge verifier (below)              |
+| `scripts/project_probe.py`     | the 785 refusal-counter probe (ADR-0841)           |
+| `verifier/manifests/`          | their identity, ClusterRole and egress policy      |
 
-`applications/` holds single `Application` resources; `applicationsets/` holds
-generators that produce many. Keeping them apart matters because the two are
-read differently — one names a thing, the other names a rule.
+`applications/` holds single `Application` resources. It used to sit beside
+`applicationsets/`, which held generators that produced many — `yadgar-modules`
+discovered each module repo and generated one Application per module.
+Ledger 1270b retired that ApplicationSet and the directory with it, once
+`applications/yadgar.yaml`'s parent chart (ADR-0786) took over deploying the
+estate's modules as one Application.
 
 ## What lives where
 
-|                  |                                                                                       |
-| ---------------- | ------------------------------------------------------------------------------------- |
-| **this repo**    | Argo itself, every Application this organisation runs, and how Argo discovers modules |
-| **module repos** | each carries its own `chart/`, found by the ApplicationSet                            |
+|                  |                                                                                   |
+| ---------------- | --------------------------------------------------------------------------------- |
+| **this repo**    | Argo itself and every Application this organisation runs, `yadgar.yaml` included  |
+| **module repos** | each carries its own `chart/`, deployed by the parent chart `yadgar.yaml` sources |
 
 Infrastructure `Application` resources used to live in `deploy`, beside the
 manifests and values they pointed at, rather than being centralised here —
@@ -63,9 +66,9 @@ Application absent.
 `infra/` and root adopted each live object by name. `yadgar` is the parent
 chart's own `example/application.yaml` with this organisation's values inlined
 as `valuesObject`. The two directory sources, `tls` and `estate-front`, read
-`manifests/<name>/` here. `manifests/` sits outside root's
-`{applications,applicationsets}/*.yaml` include on purpose: that glob lets `*`
-cross `/`, so a file under `applications/` would be applied by root as well.
+`manifests/<name>/` here. `manifests/` sits outside root's `applications/*.yaml`
+include on purpose: that glob lets `*` cross `/`, so a file under
+`applications/` would be applied by root as well.
 `scripts/tests/test_infra_children.py` pins the five offline;
 `scripts/gates/` holds the two-owners gate and the `yadgar` example and render
 gates, which need helm and run in CI's `two-owners` job.
@@ -87,31 +90,25 @@ safer default for the one component that would have to fix itself.
 
 ## How modules get deployed
 
-`applicationsets/modules.yaml` uses Argo's **SCM Provider generator** over the
-`yadgarhq` organisation. A repo is deployed when it has a `chart/` directory and
-carries the **`yadgar-deployable`** topic. Nothing central lists the modules — a
-new module is a new repo, and it deploys.
+`applications/yadgar.yaml` is `yadgarhq/chart`'s parent chart, with this
+organisation's values inlined as `valuesObject` (ADR-0786). One Application,
+one sync, deploys every module as a subchart of the published parent chart
+version — a module release bumps that version rather than editing anything
+here.
 
-That is D54: an umbrella chart would pin every module's version in one
-`Chart.yaml`, so a module release would edit the umbrella and every module would
-wait on it. At 69 repos that is the worst instance of the coupling shape D7, D21
-and D51 already refuse.
-
-**Opt-in, never opt-out.** A generator that deploys anything appearing in the
-organisation is aimed at the next scratch repo.
-
-## Setup it needs
-
-The generator enumerates the organisation through the GitHub API. Unauthenticated
-works for public repos but is rate-limited hard, so:
-
-```bash
-kubectl -n argocd create secret generic github-scm \
-  --from-literal=token=<PAT, read-only repo scope>
-```
-
-There is no `argocd` CLI dependency — the server runs in the cluster, and
-`kubectl` on its CRDs does the same job.
+**Before this (D54, retired at ledger 1270b).** `applicationsets/modules.yaml`
+used Argo's **SCM Provider generator** over the `yadgarhq` organisation: a repo
+deployed when it had a `chart/` directory and carried the
+**`yadgar-deployable`** topic, so nothing central listed the modules. That
+generated an Application per module to avoid an umbrella chart pinning every
+module's version in one `Chart.yaml`, where a module release would edit the
+umbrella and every module would wait on it. The parent chart cutover
+(`plans/dogfooding-the-parent-chart.md` in `yadgarhq/docs`) moved every module
+under the one published chart instead, and the generator's last live job —
+reading `versions/<module>.yaml` for a per-module image pin — moved with it,
+so the ApplicationSet generated zero Applications and was retired along with
+`versions/`, `scripts/versions_pinned.py` and the `github-scm` Secret its
+generator authenticated with.
 
 ## Post-merge verification
 

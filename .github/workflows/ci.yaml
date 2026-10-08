@@ -12,13 +12,16 @@ name: ci
 # Push to main runs the version report only. Validating there would re-run what
 # the pull request just passed, on code already merged, with nobody watching.
 #
-# ONE ACTOR PUSHES TO `main` DIRECTLY HERE, AND IT IS NOT A PERSON. Once the
-# release App is a bypass actor on this repository's `main` ruleset, `ci-release`
-# writes `versions/<module>.yaml` on every module release with no pull request —
-# that is what the bypass is for, and it is why this comment no longer says
-# direct pushes are impossible. Those commits are machine-written and touch
-# nothing this file validates, so there is still no drift for a push-path
-# validation to catch.
+# ONE ACTOR USED TO PUSH TO `main` DIRECTLY HERE, AND IT WAS NOT A PERSON.
+# While the release App is a bypass actor on this repository's `main` ruleset,
+# `ci-release` used to write `versions/<module>.yaml` on every module release
+# with no pull request — that was what the bypass was for. That write retired
+# at ledger 1270a (actions#107): `ci-release` writes nothing to this
+# repository any more, so the push path this comment used to warn about is
+# gone. Removing the bypass actor itself from the ruleset is ledger 1272
+# (A-U6), tracked separately. The commits that DID land this way were
+# machine-written and touched nothing this file validates, so there was still
+# no drift for a push-path validation to catch.
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited]

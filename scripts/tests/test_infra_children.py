@@ -29,9 +29,11 @@ WHAT IS ASSERTED, and each has a red case below. Offline: no helm, no network.
      (`MANIFEST_DIGESTS`). Changing one is a live change: the tls Job's pod
      template, for one, recreates the Job.
   4. No Application under `applications/` sources a path under
-     `applications/` or `applicationsets/` of this repository: root's include
-     glob lets `*` cross `/`, so root would apply that file itself, a second
-     owner. And no Application sources `yadgarhq/deploy` any more.
+     `applications/` of this repository: root's include glob lets `*` cross
+     `/`, so root would apply that file itself, a second owner. (The same
+     guard still also catches `applicationsets/` by name — generic logic
+     kept after ledger 1270b retired that directory itself.) And no
+     Application sources `yadgarhq/deploy` any more.
   5. `estate-front-runner`'s `controllerServiceAccount` names `arc`'s release:
      Argo uses the Application name as the release name, and the chart names
      its ServiceAccount `<release>-gha-rs-controller`. Renaming `arc` breaks
@@ -309,9 +311,16 @@ def release_coupling_errors(tree: Path) -> list[str]:
 
 @pytest.fixture
 def copy(tmp_path: Path) -> Path:
-    """A writable copy of the directories these gates read."""
+    """A writable copy of the directories these gates read.
+
+    No `applicationsets/` here: ledger 1270b retired that directory from the
+    repository. `self_sourced_inside_root`'s guard still checks the name by
+    string, generically, which needs no directory on disk to exist —
+    `test_a_nested_application_sourcing_applicationsets_reddens` below proves
+    that against a fabricated path, not a real copied tree.
+    """
     tree = tmp_path / "tree"
-    for directory in ("applications", "applicationsets", "projects", "manifests"):
+    for directory in ("applications", "projects", "manifests"):
         shutil.copytree(REPOSITORY / directory, tree / directory)
     return tree
 

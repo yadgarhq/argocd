@@ -1,9 +1,11 @@
 """Every Secret-writing pipeline in the Makefile applies server-side (ledger 1225).
 
-`make secrets` and `make bootstrap`'s `github-scm` line load four Secrets —
-`yadgar-dev-ca`, `iam-keys`, `estate-runner-github` and `github-scm` —
-through `kubectl create secret ... --dry-run=client -o yaml | kubectl apply
--f -`. CLIENT-SIDE apply stamps the result with the
+`make secrets` loads three Secrets — `yadgar-dev-ca`, `iam-keys` and
+`estate-runner-github` — through `kubectl create secret ...
+--dry-run=client -o yaml | kubectl apply -f -`. (`make bootstrap` loaded a
+fourth, `github-scm`, until ledger 1270b dropped that line along with the
+`yadgar-modules` ApplicationSet it authenticated.) CLIENT-SIDE apply stamps
+the result with the
 `kubectl.kubernetes.io/last-applied-configuration` annotation, which holds a
 byte-for-byte copy of the object it just wrote — for a Secret, that is the
 plaintext payload sitting in the cluster a SECOND time, readable by anyone
@@ -12,7 +14,7 @@ that annotation from four live Secrets (`github-scm`, `yadgar-dev-ca`,
 `estate-runner-github`, `iam-keys`); this ledger (1225) is the fix that
 stops a `make secrets` / `make bootstrap` rerun from re-adding it.
 
-THE FIX: every one of the four `kubectl create secret` pipelines now ends in
+THE FIX: every one of the three `kubectl create secret` pipelines now ends in
 `$(SECRET_APPLY)`, a Makefile variable defined once as `kubectl apply
 --server-side --field-manager=yadgar-deploy --force-conflicts -f -`.
 `--force-conflicts` is NOT needed merely because every Secret this Makefile
@@ -219,12 +221,12 @@ def test_every_secret_write_is_server_side(working_tree: Path) -> None:
     )
 
 
-def test_four_secrets_are_covered(working_tree: Path) -> None:
-    """Locks the count: yadgar-dev-ca, iam-keys, estate-runner-github, github-scm."""
+def test_three_secrets_are_covered(working_tree: Path) -> None:
+    """Locks the count: yadgar-dev-ca, iam-keys, estate-runner-github."""
     destinations = secret_apply_destinations(working_tree)
-    assert len(destinations) == 4, (
-        "expected 4 Secret-writing pipelines (yadgar-dev-ca, iam-keys, "
-        f"estate-runner-github, github-scm), found {len(destinations)}: {destinations}"
+    assert len(destinations) == 3, (
+        "expected 3 Secret-writing pipelines (yadgar-dev-ca, iam-keys, "
+        f"estate-runner-github), found {len(destinations)}: {destinations}"
     )
 
 
@@ -260,7 +262,7 @@ def test_secret_apply_var_undefined_reddens(tmp_path: Path) -> None:
     assert mutated != text, "the SECRET_APPLY definition line is gone — update the regex"
     makefile.write_text(mutated)
     offenders = [d for d in secret_apply_destinations(tree) if "--server-side" not in d]
-    assert len(offenders) == 4, (
+    assert len(offenders) == 3, (
         "removing the SECRET_APPLY definition should un-resolve every "
         f"`$(SECRET_APPLY)` destination back to a literal, non-server-side string: {offenders}"
     )
@@ -321,10 +323,10 @@ def test_a_secret_heredoc_reddens(tmp_path: Path) -> None:
         "\tYAML\n"
     )
     makefile.write_text(text + heredoc_target)
-    # The old, substring-based gate stays blind: still exactly 4 pipelines,
+    # The old, substring-based gate stays blind: still exactly 3 pipelines,
     # none flagged, the heredoc never counted at all.
     destinations = secret_apply_destinations(tree)
-    assert len(destinations) == 4
+    assert len(destinations) == 3
     offenders = [d for d in destinations if "--server-side" not in d]
     assert offenders == [], "if this fails, the substring gate started seeing the heredoc on its own"
     # The new gate catches it directly.

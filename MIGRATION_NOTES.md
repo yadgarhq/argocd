@@ -222,7 +222,10 @@ kubectl --context kind-yadgar -n argocd get application root \
 kubectl --context kind-yadgar -n argocd get application root -o json \
   | jq -r '.status.resources[] | "\(.kind)/\(.name) \(.status)"'
 # expect: Application/argocd, ApplicationSet/yadgar-modules and the six
-#         Applications, each Synced.
+#         Applications, each Synced. (Read at the time of this merge.
+#         Ledger 1270b later retired ApplicationSet/yadgar-modules — a
+#         verification run after that merge lists seven resources, not
+#         eight, with the ApplicationSet gone.)
 
 # 2. Each of the six: SAME uid as the table, tracking-id now
 #    root:argoproj.io/Application:argocd/<name>, NO sync-options annotation,
@@ -1740,11 +1743,12 @@ somewhere; comparing tags proves nothing.
 
 **Bumping it is a deliberate edit, and that is the standing obligation.** The
 workflow rebuilds weekly on cron (`17 4 * * 1`), so a new digest exists most
-Mondays and none of them moves this repository. That is the same discipline as
-`image.digest` in `yadgarhq/argocd`'s `versions/<module>.yaml`: the pin moves
-when a person moves it. A cluster left unbumped keeps running the digest in git,
-which is correct rather than broken — it simply ages. One difference worth
-naming: those files carry a tag alongside the digest and this one does not. Here
+Mondays and none of them moves this repository. That is the same discipline
+`image.digest` in `yadgarhq/argocd`'s `versions/<module>.yaml` used to carry,
+before that mechanism retired at ledger 1270b: the pin moved when a person
+moved it. A cluster left unbumped keeps running the digest in git, which is
+correct rather than broken — it simply ages. One difference worth naming:
+those files carried a tag alongside the digest and this one does not. Here
 the digest is the whole pin, and nothing should add a tag back beside it.
 
 **How to check the roll landed, because Argo will not tell you.** Argo CD has no
@@ -2083,3 +2087,39 @@ What is verified about the new digest is that it is what CI published, scanned,
 asserted and signed, and that it survives templating into the
 `AutoscalingRunnerSet`. That it runs a smoke suite successfully is the next
 dispatched run's job to show, by the `imageID` check in §1.
+
+## Retiring the yadgar-modules ApplicationSet (ledger 1270b)
+
+This merge deletes `applicationsets/modules.yaml`, `versions/*.yaml` (all
+seven), `scripts/versions_pinned.py`, the `versions-pinned` pre-commit hook,
+and the `github-scm` Secret creation and its `GITHUB_TOKEN` gate from
+`make bootstrap`. The ApplicationSet generated zero Applications before this
+merge (its `NotIn` selector already excluded every `yadgar-deployable`
+module, since the parent chart cutover, ADR-0786, took over deploying them),
+so `kubectl --context kind-yadgar get applicationsets -A` going empty prunes
+nothing live.
+
+**NEEDS-MAX, after this merge syncs:**
+
+1. Delete the live Secret: `kubectl --context kind-yadgar -n argocd delete
+secret github-scm`. Nothing reads it any more — the ApplicationSet it
+   authenticated is gone from git and, once this merge syncs, from the
+   cluster too.
+2. Revoke that Secret's PAT at the GitHub token source it was minted from
+   (the read-only, repo-scoped token `make bootstrap`'s old `GITHUB_TOKEN`
+   gate asked for). The token is in 1Password or wherever it was minted;
+   this repository holds no copy of it and never did.
+
+**Rollback — NOT a plain revert of the Secret deletion.** The Makefile line
+that created `github-scm` is gone, so reverting this merge does not recreate
+the Secret. If a revert of this whole merge is ever needed (reinstating
+`applicationsets/modules.yaml` and `versions/`), the Secret must be recreated
+by hand first, before the ApplicationSet starts reconciling again:
+
+```bash
+kubectl --context kind-yadgar -n argocd create secret generic github-scm \
+  --from-literal=token=<PAT, read-only repo scope>
+```
+
+Minting a fresh token is the only way to do this once the one named above is
+revoked — the old token is gone, by design, the moment step 2 above runs.

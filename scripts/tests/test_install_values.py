@@ -22,9 +22,12 @@ WHAT THE TIMEOUT DOES, read in argo-cd v3.1.8 (becb020)
   terminated on the next one.
 
 SO THE VALUE MUST OUTLAST THE LONGEST LEGITIMATE RETRY CHAIN ON THIS CLUSTER.
-Every AUTOMATED Application root syncs is read: `applications/*.yaml`,
-`projects/*.yaml` (root itself) and the template of each ApplicationSet under
-`applicationsets/`. For each: its backoff waits, plus its per-attempt allowance
+Every AUTOMATED Application root syncs is read: `applications/*.yaml` and
+`projects/*.yaml` (root itself). `ARGO_FILES` also carried
+`applicationsets/*.yaml`, the template of each ApplicationSet under that
+directory, until ledger 1270b retired the `yadgar-modules` ApplicationSet and
+the directory with it — nothing generates an ApplicationSet-keyed row today.
+For each file: its backoff waits, plus its per-attempt allowance
 (ATTEMPT_ALLOWANCE below) for each of its `limit + 1` attempts. The floor is the
 largest of those. An automated Application with no `retry` block gets Argo's
 implicit `RetryStrategy{Limit: 5}` (`:2148`) with the default backoff, 5s x2,
@@ -69,7 +72,7 @@ import yaml
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 VALUES = REPOSITORY / "install" / "values.yaml"
-ARGO_FILES = ("applications/*.yaml", "projects/*.yaml", "applicationsets/*.yaml")
+ARGO_FILES = ("applications/*.yaml", "projects/*.yaml")
 
 SYNC_TIMEOUT_KEY = "controller.sync.timeout.seconds"
 
@@ -187,11 +190,10 @@ ATTEMPT_ALLOWANCE = {
     "post-merge-verifier": (1 * MEASURED_MARGIN, "measured, not bounded: no hook, sync 0 s"),
     # A directory of Application manifests; no hook.
     "root": (12 * MEASURED_MARGIN, "measured, not bounded: no hook, sync 12 s"),
-    # Generates NO Application today: all 7 `yadgar-deployable` repositories are
-    # in its NotIn list (2026-10-01), so nothing can be measured. The module
-    # charts carry no hook (yadgar 0.3.13 render), so this takes the largest
-    # no-hook sync measured here, estate-front's 11 s.
-    "applicationset/yadgar-modules": (11 * MEASURED_MARGIN, "measured, not bounded: no instance; largest no-hook sync"),
+    # The `applicationset/yadgar-modules` row that used to sit here (it
+    # generated no Application: all 7 `yadgar-deployable` repositories were in
+    # its NotIn list, 2026-10-01) is gone — ledger 1270b retired the
+    # ApplicationSet and `applicationsets/` with it.
 }
 
 GO_UNIT_SECONDS = {"h": 3600.0, "m": 60.0, "s": 1.0}
@@ -295,7 +297,9 @@ def values() -> dict:
 
 @pytest.fixture
 def copy(tmp_path: Path) -> Path:
-    for directory in ("applications", "projects", "applicationsets"):
+    # No `applicationsets/` here: ledger 1270b retired it, and ARGO_FILES no
+    # longer globs that directory either.
+    for directory in ("applications", "projects"):
         shutil.copytree(REPOSITORY / directory, tmp_path / directory)
     return tmp_path
 
@@ -328,10 +332,10 @@ def test_the_floor_is_yadgars_chain() -> None:
 
 
 def test_every_automated_application_is_read() -> None:
-    # The denominator: argocd is manual, so it is not here.
+    # The denominator: argocd is manual, so it is not here. No
+    # `applicationset/yadgar-modules` row either — ledger 1270b retired it.
     assert sorted(automated_applications()) == sorted(
         [
-            "applicationset/yadgar-modules",
             "arc",
             "cert-manager",
             "envoy-gateway",
@@ -348,10 +352,9 @@ def test_every_automated_application_is_read() -> None:
     )
 
 
-def test_root_and_the_applicationset_use_the_implicit_retry() -> None:
+def test_root_uses_the_implicit_retry() -> None:
     applications = automated_applications()
     assert applications["root"] is None
-    assert applications["applicationset/yadgar-modules"] is None
 
 
 def test_every_allowance_is_labelled() -> None:
