@@ -233,11 +233,12 @@ spec:
                 # obligation this line carries. The workflow rebuilds weekly on
                 # cron to refresh its apt and rustup layers, so a new digest
                 # exists most Mondays and NOTHING moves this file — the same
-                # discipline as `image.digest` in `yadgarhq/argocd`'s
-                # `versions/<module>.yaml`. A cluster left unbumped keeps
-                # running the digest below, which is correct rather than
-                # broken; it simply ages. (Unlike those files there is no tag
-                # to carry alongside — the digest is the whole pin.)
+                # discipline `image.digest` in `yadgarhq/argocd`'s
+                # `versions/<module>.yaml` used to carry, before that
+                # mechanism retired at ledger 1270b. A cluster left unbumped
+                # keeps running the digest below, which is correct rather
+                # than broken; it simply ages. (Unlike those files there was
+                # no tag to carry alongside — the digest is the whole pin.)
                 #
                 # NO `imagePullSecrets`, DELIBERATELY, and the package is public
                 # to match. The `estate-runner` package is public (ledger 661),

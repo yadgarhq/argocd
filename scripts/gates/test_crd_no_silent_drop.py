@@ -82,10 +82,11 @@ WHAT IS STILL NOT RENDERED, A STATED SCOPE LIMIT RATHER THAN AN OVERSIGHT.
 Applications with no `chart` key at all — `chart_source` returns `None` for
 them and they are skipped, the same way they are skipped by
 `scripts/gates/test_no_two_owners.py`'s own D side. Nothing under
-`applicationsets/` is rendered either: an ApplicationSet is a template
-generating Applications, not a chart source itself, and module charts
-(`yadgarhq/applicationsets/yadgar-modules.yaml`'s subject) carry no CRDs
-today. Closing either gap is a different, larger gate than this one.
+`applicationsets/` was rendered either, while that directory existed: an
+ApplicationSet is a template generating Applications, not a chart source
+itself, and the module charts `yadgar-modules.yaml` generated carried no
+CRDs. Ledger 1270b retired that ApplicationSet and the directory with it.
+Closing either gap is a different, larger gate than this one.
 
 WHY `scripts/gates/`, NOT A NEW CI JOB. The `two-owners` job already needs
 helm and the registry and already runs `pytest scripts/gates -q` — see

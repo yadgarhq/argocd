@@ -9,8 +9,8 @@
 # verifier; MIGRATION_NOTES.md, "The post-merge verifier", holds its exact
 # files and the order a person creates them in.
 #
-# `verifier/` sits outside root's `{applications,applicationsets}/*.yaml`
-# include, so root applies this Application and only this Application applies
+# `verifier/` sits outside root's `applications/*.yaml` include, so root
+# applies this Application and only this Application applies
 # the RBAC.
 apiVersion: argoproj.io/v1alpha1
 kind: Application

@@ -46,8 +46,10 @@ WHAT IS ASSERTED, and each has a red case below:
      are. PLATFORM_SOURCED holds one row per operator. Checks 2 to 7 cover
      all five.
   9. D7.1 OF THE OPERATORS HANDOVER (ADR-0824): `mariadb-operator-crds` is
-     retired. No file under `applications/` or `applicationsets/` is named for
-     it, and no manifest there declares an Application with its name. Its 12
+     retired. No file under `applications/` is named for it, and no manifest
+     there declares an Application with its name. `retired_present` below
+     also still checks an `applicationsets/` directory by name, generic
+     logic kept after ledger 1270b retired that directory itself. Its 12
      CRDs stayed in the cluster, untracked, until D7.3 swapped
      `mariadb-operator` to `platform`, which renders them. A revived
      Application would apply the same CRDs beside that one, as the same
@@ -751,8 +753,8 @@ def test_a_renamed_application_reddens(copy: Path) -> None:
 def test_a_narrowed_root_include_reddens(copy: Path) -> None:
     path = copy / "projects" / "root.yaml"
     text = path.read_text()
-    assert "{applications,applicationsets}/*.yaml" in text
-    path.write_text(text.replace("{applications,applicationsets}/*.yaml", "applicationsets/*.yaml"))
+    assert "applications/*.yaml" in text
+    path.write_text(text.replace("applications/*.yaml", "nowhere/*.yaml"))
     assert outside_root(copy) == list(ADOPTED)
 
 

@@ -10,12 +10,14 @@ named deploy's paths, and nothing else.
 LEDGER 742. `applications/estate-front-runner.yaml` pins the runner container to
 `ghcr.io/yadgarhq/estate-runner@sha256:52bb30bb…` (ledger 610, c60b69f8). That
 pin is the ONE image reference in this repository that names an artefact this
-organisation builds itself, and NOTHING CHECKED IT. It is not covered by
-`scripts/versions_pinned.py` beside this file, which reads `versions/*.yaml`
-and derives its subject from this repository's own history — the runner is not a
-`yadgar-deployable` module, has no `chart/`, and writes no version file. So the
-pin could go stale, be edited back to a tag, or be pointed at a digest nobody
-signed, and no check anywhere would say a word.
+organisation builds itself, and NOTHING CHECKED IT. It was never covered by
+`scripts/versions_pinned.py`, which read `versions/*.yaml` and derived its
+subject from this repository's own history (retired at ledger 1270b along with
+`versions/` and the `yadgar-modules` ApplicationSet) — the runner is not a
+`yadgar-deployable` module, has no `chart/`, and wrote no version file even
+while that mechanism existed. So the pin could go stale, be edited back to a
+tag, or be pointed at a digest nobody signed, and no check anywhere would say
+a word.
 
 THREE WAYS THE PIN CAN BE LOST, AND ONLY ONE OF THEM LOOKS LIKE A MISTAKE.
 
@@ -29,9 +31,10 @@ THREE WAYS THE PIN CAN BE LOST, AND ONLY ONE OF THEM LOOKS LIKE A MISTAKE.
   `template.spec.containers[]` is a Helm VALUE. Remove the `image` key and the
   `gha-runner-scale-set` chart falls back to its own default runner image, the
   Application still renders, Argo still reports Synced, and a check that merely
-  validates the references it finds finds none and reports success. That is the
-  same asymmetry `versions_pinned.py` was written for: the thing whose absence
-  is the failure cannot be the thing that triggers the check.
+  validates the references it finds finds none and reports success. That was the
+  same asymmetry `versions_pinned.py` was written for, before it retired at
+  ledger 1270b: the thing whose absence is the failure cannot be the thing
+  that triggers the check.
 - POINTED AT AN UNSIGNED DIGEST. A digest is immutable, so it always LOOKS like
   a pin. `--verify-signature` below is the only part of this file that can tell
   a digest CI signed from a digest somebody pushed.
@@ -40,8 +43,9 @@ WHY THIS LIVES IN THIS REPOSITORY AND NOT IN `yadgarhq/actions`. D62 puts SHARED
 CI in one place, and this check is not shared:
 `applications/estate-front-runner.yaml` exists nowhere else, so a definition in
 `yadgarhq/actions` would be a hook that is a no-op in every other repository. It
-is exactly the argument `versions_pinned.py` makes beside it — a fact about one
-deployment is gated where that deployment lives.
+is exactly the argument `versions_pinned.py` used to make beside it, before it
+retired at ledger 1270b — a fact about one deployment is gated where that
+deployment lives.
 
 THE EKU GATE USED TO BE THE OTHER HALF OF THAT SENTENCE, and ledger 720 moved
 it, which is worth recording because it sharpens the test rather than weakening
@@ -154,7 +158,8 @@ RUNNER_CHART = "gha-runner-scale-set"
 FIRST_PARTY = "ghcr.io/yadgarhq/"
 
 # Lowercase hex only: that is what the registry emits and what the kubelet
-# accepts. Same expression as `versions_pinned.py`'s, deliberately.
+# accepts. Same expression `versions_pinned.py` used, before it retired at
+# ledger 1270b.
 DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 # FLOORS, not counts of what is here today. Adding a second scale set is a

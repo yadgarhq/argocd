@@ -65,9 +65,9 @@ configs:
   cm:
     # HOW ARGO MARKS WHAT IT OWNS — the `argocd.argoproj.io/tracking-id`
     # annotation rather than an `app.kubernetes.io/instance`-style label. The
-    # earlier text here described D54's SCM Provider generator, which is a
-    # different mechanism in a different file (`applicationsets/modules.yaml`)
-    # and is not affected by this key.
+    # earlier text here described D54's SCM Provider generator, which was a
+    # different mechanism in a different file (`applicationsets/modules.yaml`,
+    # retired at ledger 1270b) and was never affected by this key.
     #
     # A PIN, NOT A CHANGE. Measured 2026-09-06 against Argo CD v3.1.8 with this
     # key absent from the live ConfigMap: every module resource already carries
