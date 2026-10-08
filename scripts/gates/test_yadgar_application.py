@@ -25,7 +25,11 @@ CI job, never in the offline pre-commit hook.
       byte-identical, 0 differing objects". A difference is named by object.
       Re-measured 2026-10-03 at 0.3.38 (ledger 1266): still 88 objects, none
       added or removed, 10 changed (six module Deployments and four platform
-      hook Jobs).
+      hook Jobs). Re-measured 2026-10-08 at 0.13.13: 90 objects, 2 added
+      (`Certificate/nats-tls` and `Certificate/valkey-tls`, platform 0.1.36's
+      serving leaves), none removed, 13 changed (seven module Deployments,
+      the `preflight` and `envoy-gateway-probe` hook Jobs, and `Prune=false`
+      on the four edge objects).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
@@ -64,7 +68,7 @@ from test_no_two_owners import REPOSITORY, parent_render, tuples_of  # noqa: F40
 APPLICATION = REPOSITORY / "applications" / "yadgar.yaml"
 TABLE = Path(__file__).resolve().parent / "yadgar_render.sha256"
 EXAMPLE_URL = "https://raw.githubusercontent.com/yadgarhq/chart/v{revision}/example/application.yaml"
-EXPECTED_OBJECTS = 88
+EXPECTED_OBJECTS = 90
 
 # The two paths E3 excepts, and nothing else.
 EXCEPTED = (("spec", "syncPolicy"), ("spec", "source", "helm", "valuesObject"))
