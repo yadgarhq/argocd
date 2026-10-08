@@ -79,7 +79,7 @@ spec:
                 #
                 # NOT SIGNATURE-CHECKED. `scripts/runner_image_pinned.py` holds
                 # every scale-set runner image to a digest. Its cosign check
-                # skips this one repository (`UPSTREAM_RUNNER`): GitHub
+                # skips this one repository (`UPSTREAM_RUNNER`), in this file only: GitHub
                 # publishes it, and this organisation's CI never signs it.
                 #
                 # BUMPING IT IS A DELIBERATE EDIT. GitHub refuses a runner

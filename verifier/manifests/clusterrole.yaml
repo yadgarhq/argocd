@@ -16,7 +16,11 @@
 #
 # A TYPE MISSING HERE FAILS LOUDLY. When an Application starts tracking a kind
 # this role does not name, the snapshot stops on Forbidden rather than skipping
-# it. Add the kind here, in a reviewed change.
+# it. Add the kind here, in a reviewed change. ARC's three instance plurals
+# (EphemeralRunner, EphemeralRunnerSet, AutoscalingListener) are listed AHEAD
+# of that, deliberately: `collect` never lists them (`UNLISTED_INSTANCE_CRDS`),
+# and naming them now keeps a later Application that tracks one from failing
+# as Forbidden.
 #
 # `scripts/tests/test_verify_handover.py` holds this shape: read verbs only, no
 # wildcard, no `secrets`, and every type the script reads on every run.

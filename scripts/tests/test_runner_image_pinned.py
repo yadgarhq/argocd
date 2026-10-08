@@ -33,6 +33,10 @@ _spec.loader.exec_module(rip)
 
 FIRST = "ghcr.io/yadgarhq/estate-runner@sha256:" + "a" * 64
 THIRD = "ghcr.io/actions/actions-runner@sha256:" + "b" * 64
+HEX = "d" * 64
+# The one file the skip applies to, and the file it must NOT apply to.
+VERIFIER_RUNNER = Path("applications/post-merge-verifier-runner.yaml")
+ESTATE_RUNNER = Path("applications/estate-front-runner.yaml")
 
 
 @pytest.fixture
@@ -65,7 +69,7 @@ def test_both_scale_sets_are_read(in_repository: None) -> None:
 
 
 def test_cosign_is_not_asked_about_githubs_runner_image(cosign_calls: list[list[str]]) -> None:
-    references = [(Path("a.yaml"), 1, FIRST, True), (Path("b.yaml"), 2, THIRD, True)]
+    references = [(Path("a.yaml"), 1, FIRST, True), (VERIFIER_RUNNER, 2, THIRD, True)]
     problems = rip.verify_signatures(references)
     assert [call[-1] for call in cosign_calls] == [FIRST]
     assert len(problems) == 1 and FIRST in problems[0]
@@ -77,6 +81,30 @@ def test_any_other_third_party_scale_set_image_is_still_asked_and_reddens(cosign
     problems = rip.verify_signatures([(Path("c.yaml"), 3, other, True)])
     assert [call[-1] for call in cosign_calls] == [other]
     assert len(problems) == 1 and other in problems[0]
+
+
+@pytest.mark.parametrize(
+    "lookalike",
+    [
+        f"ghcr.io/actions/actions-runner-evil@sha256:{HEX}",
+        f"ghcr.io/actions/actions-runner/evil@sha256:{HEX}",
+        f"ghcr.io/actions/runner-images@sha256:{HEX}",
+        f"ghcr.io/actions/actions-runner:2.338.0@sha256:{HEX}",
+    ],
+    ids=["suffix-repo", "sub-path", "sibling-repo", "tag-plus-digest"],
+)
+def test_a_lookalike_of_the_upstream_runner_is_still_asked(cosign_calls: list[list[str]], lookalike: str) -> None:
+    """The skip is the exact repository `ghcr.io/actions/actions-runner` by digest, nothing near it."""
+    problems = rip.verify_signatures([(VERIFIER_RUNNER, 88, lookalike, True)])
+    assert [call[-1] for call in cosign_calls] == [lookalike]
+    assert len(problems) == 1 and lookalike in problems[0]
+
+
+def test_the_stock_runner_in_estate_front_runner_is_still_asked(cosign_calls: list[list[str]]) -> None:
+    """The skip is scoped to the verifier's runner file: estate-front-runner keeps ledger 610's signature rule."""
+    problems = rip.verify_signatures([(ESTATE_RUNNER, 284, THIRD, True)])
+    assert [call[-1] for call in cosign_calls] == [THIRD]
+    assert len(problems) == 1 and THIRD in problems[0]
 
 
 def test_a_third_party_scale_set_image_on_a_tag_still_reddens() -> None:

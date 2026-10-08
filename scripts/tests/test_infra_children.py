@@ -331,6 +331,33 @@ def release_coupling_errors(tree: Path) -> list[str]:
     return errors
 
 
+# ADR-0829: the verifier's cluster-read identity runs workflow code only from
+# the PRIVATE repository. A scale set registered against a public repository
+# takes jobs from any workflow a collaborator pushes there.
+VERIFIER_SERVICE_ACCOUNT = "post-merge-verifier"
+VERIFIER_RUNNER = "post-merge-verifier-runner"
+VERIFIER_CONFIG_URL = "https://github.com/yadgarhq/argocd-verify"
+
+
+def scale_set_values(tree: Path, name: str) -> dict:
+    return (((load(tree, name).get("spec") or {}).get("source") or {}).get("helm") or {}).get("valuesObject") or {}
+
+
+def verifier_identity_errors(tree: Path) -> list[str]:
+    """ADR-0829: every scale set running as the verifier SA registers against the private repository only,
+    and the verifier's runner runs as that SA."""
+    errors = []
+    for name in scale_set_applications(tree):
+        values = scale_set_values(tree, name)
+        account = ((values.get("template") or {}).get("spec") or {}).get("serviceAccountName")
+        if account == VERIFIER_SERVICE_ACCOUNT and values.get("githubConfigUrl") != VERIFIER_CONFIG_URL:
+            errors.append(f"{name}: runs as {VERIFIER_SERVICE_ACCOUNT} but registers against {values.get('githubConfigUrl')!r}")
+    runner = scale_set_values(tree, VERIFIER_RUNNER)
+    if ((runner.get("template") or {}).get("spec") or {}).get("serviceAccountName") != VERIFIER_SERVICE_ACCOUNT:
+        errors.append(f"{VERIFIER_RUNNER}: does not run as {VERIFIER_SERVICE_ACCOUNT}")
+    return errors
+
+
 @pytest.fixture
 def copy(tmp_path: Path) -> Path:
     """A writable copy of the directories these gates read.
@@ -392,6 +419,10 @@ def test_no_application_sources_the_retired_repository() -> None:
 
 def test_the_runner_names_arcs_release() -> None:
     assert release_coupling_errors(REPOSITORY) == []
+
+
+def test_the_verifier_identity_runs_only_private_workflows() -> None:
+    assert verifier_identity_errors(REPOSITORY) == []
 
 
 def test_every_scale_set_is_read_for_the_coupling() -> None:
@@ -570,6 +601,37 @@ def test_a_runner_pointed_at_another_controller_reddens(copy: Path) -> None:
         lambda d: d["spec"]["source"]["helm"]["valuesObject"]["controllerServiceAccount"].update(namespace="arc"),
     )
     assert release_coupling_errors(copy) == ["estate-front-runner"]
+
+
+def test_the_verifier_runner_registered_against_a_public_repository_reddens(copy: Path) -> None:
+    mutate(
+        copy,
+        VERIFIER_RUNNER,
+        lambda d: d["spec"]["source"]["helm"]["valuesObject"].update(githubConfigUrl="https://github.com/yadgarhq/argocd"),
+    )
+    assert verifier_identity_errors(copy) == [
+        f"{VERIFIER_RUNNER}: runs as {VERIFIER_SERVICE_ACCOUNT} but registers against 'https://github.com/yadgarhq/argocd'"
+    ]
+
+
+def test_another_scale_set_running_as_the_verifier_reddens(copy: Path) -> None:
+    mutate(
+        copy,
+        "estate-front-runner",
+        lambda d: d["spec"]["source"]["helm"]["valuesObject"]["template"]["spec"].update(serviceAccountName=VERIFIER_SERVICE_ACCOUNT),
+    )
+    assert verifier_identity_errors(copy) == [
+        f"estate-front-runner: runs as {VERIFIER_SERVICE_ACCOUNT} but registers against 'https://github.com/yadgarhq/estate'"
+    ]
+
+
+def test_the_verifier_runner_on_another_service_account_reddens(copy: Path) -> None:
+    mutate(
+        copy,
+        VERIFIER_RUNNER,
+        lambda d: d["spec"]["source"]["helm"]["valuesObject"]["template"]["spec"].update(serviceAccountName="default"),
+    )
+    assert verifier_identity_errors(copy) == [f"{VERIFIER_RUNNER}: does not run as {VERIFIER_SERVICE_ACCOUNT}"]
 
 
 def test_the_verifier_runner_pointed_at_another_controller_reddens(copy: Path) -> None:

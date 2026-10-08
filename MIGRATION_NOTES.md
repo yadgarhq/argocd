@@ -366,7 +366,10 @@ commit on `main`.
    so the verifier lists it, and the role must grant that in the SAME PR or
    the next snapshot fails as Forbidden.
 
-   **Done by the ledger 1219 pull request; merging it is the person's step.**
+   **Done by the ledger 1219 pull request; merging it is the person's step,
+   and only after step 2.** Create the Secret
+   `post-merge-verifier/argocd-verify-github` BEFORE the merge, so the
+   controller registers the scale set on its first reconcile.
    The applied copy is the only copy: read
    `applications/post-merge-verifier-runner.yaml` and the `actions.github.com`
    rule in `verifier/manifests/clusterrole.yaml`, not a snippet here. What it
@@ -398,9 +401,12 @@ commit on `main`.
    `arc` release coupling on every `gha-runner-scale-set` Application, not on
    `estate-front-runner` alone. `scripts/runner_image_pinned.py` still holds
    every scale-set runner image to a digest. `--verify-signature` skips one
-   repository, `ghcr.io/actions/actions-runner` (`UPSTREAM_RUNNER`): GitHub's
-   runner image is pinned and NOT signature-checked. Any other third-party
-   scale-set image is still asked, and still fails.
+   repository, exactly `ghcr.io/actions/actions-runner@`, and only in
+   `post-merge-verifier-runner.yaml`: GitHub's runner image is pinned and NOT
+   signature-checked there. A lookalike repository, any other third-party
+   image, or the same image in `estate-front-runner.yaml` is still asked, and
+   still fails. A test also holds ADR-0829: a scale set running as
+   `post-merge-verifier` registers against `yadgarhq/argocd-verify` only.
 
    **What merging step 3 does.** `root` creates
    `Application/post-merge-verifier-runner`. It syncs a Role and a
@@ -409,12 +415,14 @@ commit on `main`.
    `post-merge-verifier` Application widens the ClusterRole by the three ARC
    plurals. Then:
 
-   - **No Secret yet:** the controller cannot register the scale set, and no
-     listener starts. The Application reads Synced and **Progressing** (the
-     AutoscalingRunnerSet health rule in `install/values.yaml`). The
-     controller log in `arc-systems` names the missing Secret.
-   - **Once the Secret exists:** the controller creates the listener pod in
-     `arc-systems`, and the AutoscalingRunnerSet reaches phase `Running`.
+   - **With the Secret in place (the intended order):** the controller
+     registers the scale set with GitHub and creates the listener pod in
+     `arc-systems`. The AutoscalingRunnerSet reaches phase `Running`.
+   - **If the merge lands first by mistake:** no listener starts. The
+     Application reads Synced and **Progressing** (the AutoscalingRunnerSet
+     health rule in `install/values.yaml`), and the controller log in
+     `arc-systems` names the missing Secret. Create the Secret; the
+     controller then catches up.
    - **`minRunners: 0`:** no runner pod exists until a job is queued. The
      first runner pod comes with the first `verify.yaml` run, after step 4.
 
@@ -435,12 +443,19 @@ commit on `main`.
    done
    ```
 
-   **Still NEEDS-MAX after the merge, in order:**
+   **NEEDS-MAX, in order:**
 
-   1. The Secret `argocd-verify-github` in `post-merge-verifier` (step 2). It
-      was absent on 2026-10-08. Then wait for phase `Running` and one listener
-      pod for `argocd-verify` in `arc-systems`.
-   2. Step 4: `VERIFY_ENABLED=true`, only once that listener is up.
+   1. Before the merge: the Secret `argocd-verify-github` in
+      `post-merge-verifier` (step 2). It was absent on 2026-10-08. Check it
+      by name only, never its data:
+
+      ```bash
+      kubectl --context kind-yadgar -n post-merge-verifier get secret argocd-verify-github -o name
+      ```
+
+   2. Merge the pull request. Wait for phase `Running` and one listener pod
+      for `argocd-verify` in `arc-systems`.
+   3. Step 4: `VERIFY_ENABLED=true`, only once that listener is up.
 
    **Rollback.** Root has no `prune`, and the Application carries no
    `resources-finalizer`. So a git revert leaves the live Application and its
@@ -460,7 +475,16 @@ commit on `main`.
    kubectl --context kind-yadgar -n post-merge-verifier delete rolebinding argocd-verify-gha-rs-manager
    kubectl --context kind-yadgar -n post-merge-verifier delete role argocd-verify-gha-rs-manager
    kubectl --context kind-yadgar -n post-merge-verifier get autoscalingrunnersets,roles,rolebindings   # expect: none left
+   # 4. Only now the Secret: the controller needed it to deregister the scale
+   #    set from GitHub while AutoscalingRunnerSet/argocd-verify was deleted.
+   kubectl --context kind-yadgar -n post-merge-verifier delete secret argocd-verify-github
    ```
+
+   Then uninstall the GitHub App from `yadgarhq/argocd-verify` (the App's
+   settings, "Install App"), so its Administration-write key stops being a
+   live credential. Keep the Secret until the AutoscalingRunnerSet is gone:
+   deleted first, the controller cannot deregister the scale set, and a
+   stale runner registration stays on `argocd-verify`.
 
    The chart puts the finalizer `actions.github.com/cleanup-protection` on
    the Role and the RoleBinding. Only the `arc` controller takes it off, when
@@ -471,7 +495,7 @@ commit on `main`.
    both stay `Terminating` (see "Removing it again"). The same revert narrows
    the ClusterRole: `post-merge-verifier` self-heals it on its next sync.
 
-   **Between the merge and the Secret, this Application is not Healthy.**
+   **If the Secret is missing, this Application is not Healthy.**
    Anything that waits on every Application under root (the verifier's own
    `wait` and `diff`, which FAIL a non-Healthy Application) stays pending or
    red until the Secret is in and the scale set reaches `Running`.
