@@ -157,6 +157,13 @@ spec:
           iam: { tls: { enabled: true } } # DIAL to iam
           task: { tls: { enabled: true } } # DIAL to task
           project: { tls: { enabled: true } } # DIAL to project
+          # THE CLIENT LEAF EACH CALLER PRESENTS ON ITS DIALS (ledger 770, ADR-0852).
+          # `platform` issues `gateway-client-tls`, `iam-client-tls`, `task-client-tls`
+          # and `project-client-tls`. This value and `iamDb`, `taskDb` and `projectDb`
+          # `.tls.clientCertSecret` below mount each into its caller. No server asks
+          # for a client certificate at this pin (no `*_TLS_CLIENT_AUTH` renders), so
+          # presenting one changes no handshake.
+          clientCertificate: { secret: gateway-client-tls }
           networkPolicy:
             enabled: true
             clients:
@@ -180,7 +187,7 @@ spec:
         iam:
           autoscaling: { enabled: true }
           tls: { enabled: true }
-          iamDb: { tls: { enabled: true } }
+          iamDb: { tls: { enabled: true, clientCertSecret: iam-client-tls } }
           # THE ENROLMENT URL KEEPS ITS PORT, AND `global.hostname` ABOVE WOULD DROP
           # IT. With `global.hostname` set and this key empty, iam derives
           # `https://gateway.yadgar.internal` with NO port (ADR-0808: an edge on 443).
@@ -242,7 +249,7 @@ spec:
         task:
           autoscaling: { enabled: true }
           tls: { enabled: true }
-          taskDb: { tls: { enabled: true } }
+          taskDb: { tls: { enabled: true, clientCertSecret: task-client-tls } }
           networkPolicy:
             {
               enabled: true,
@@ -270,7 +277,8 @@ spec:
         project:
           autoscaling: { enabled: true }
           tls: { enabled: true }
-          projectDb: { tls: { enabled: true } }
+          projectDb:
+            { tls: { enabled: true, clientCertSecret: project-client-tls } }
           networkPolicy:
             {
               enabled: true,

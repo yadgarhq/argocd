@@ -442,20 +442,26 @@ spec:
                     # live, because this reference deployment's kind cluster
                     # carries no workloads to scrape.
                     #
-                    # NOTHING PRESENTS THE REMAINING FIVE, so they can never
-                    # appear here at all. The internal root is `duration:
-                    # 87600h` with `renewBefore: 8760h`
+                    # TWO CAN NEVER APPEAR HERE, because no yadgar process
+                    # presents them. The internal root is `duration: 87600h`
+                    # with `renewBefore: 8760h`
                     # (`infra/internal-tls/issuer.yaml`), the one certificate on
                     # a different clock. `gateway-tls` is served by the edge
                     # Gateway's listener rather than by any yadgar process.
-                    # `gateway-client-tls`, `iam-client-tls` and
-                    # `task-client-tls` are issued and mounted into no pod —
-                    # checked against the live manifests in `argocd`, not
-                    # inferred.
+                    #
+                    # THE FOUR CLIENT LEAVES — `gateway-client-tls`,
+                    # `iam-client-tls`, `task-client-tls` and
+                    # `project-client-tls` — were issued and mounted into no pod
+                    # until ledger 770. Its four values in
+                    # `applications/yadgar.yaml` mount each leaf into its
+                    # caller, which then watches it and exports it at
+                    # `kind="client"`. Read that series live after the merge;
+                    # do not assume it.
                     #
                     # SO A QUIET RULE HERE MEANS `iam`, `task`, `iam-db` AND
-                    # `task-db` ARE FINE. It says nothing about the other five.
-                    # It is still worth landing, for the reason below.
+                    # `task-db` ARE FINE, and, once ledger 770 is live, the four
+                    # client leaves too. It says nothing about the root or the
+                    # edge leaf. It is still worth landing, for the reason below.
                     #
                     # It measures what the PROCESS loaded, which is the gap
                     # cert-manager's own metrics cannot see: cert-manager knows
