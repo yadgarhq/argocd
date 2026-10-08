@@ -29,7 +29,10 @@ CI job, never in the offline pre-commit hook.
       (`Certificate/nats-tls` and `Certificate/valkey-tls`, platform 0.1.36's
       serving leaves), none removed, 13 changed (seven module Deployments,
       the `preflight` and `envoy-gateway-probe` hook Jobs, and `Prune=false`
-      on the four edge objects).
+      on the four edge objects). Re-measured 2026-10-08 with the four client
+      leaves (ledger 770): 90 objects, 4 changed (the `gateway`, `iam`, `task`
+      and `project` Deployments, each gaining its client-leaf volume, mount
+      and `*_TLS_CLIENT_{CERT,KEY}_FILE` env).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
@@ -263,6 +266,37 @@ def test_autoscaling_off_names_the_scaled_object_and_the_deployment(table: dict[
         "added": [],
         "changed": ["apps/Deployment//gateway"],
     }
+
+
+# ── THE FOUR CLIENT LEAVES (ledger 770, B-U1) ────────────────────────────────
+
+# Each caller's Deployment and the client leaf `platform` issues for it.
+# K3 alone cannot hold this: `--write` blesses whatever renders, so a misspelt
+# Secret name would pass K3 while mounting nothing that exists.
+CLIENT_LEAVES = {
+    "gateway": "gateway-client-tls",
+    "iam": "iam-client-tls",
+    "task": "task-client-tls",
+    "project": "project-client-tls",
+}
+
+
+def test_every_issued_client_leaf_is_mounted_by_its_caller() -> None:
+    documents = [d for d in parent_render(REPOSITORY) if isinstance(d, dict) and d.get("kind")]
+    issued = {
+        d["spec"]["secretName"]
+        for d in documents
+        if d["kind"] == "Certificate" and d["spec"]["secretName"].endswith("-client-tls")
+    }
+    mounted = {
+        d["metadata"]["name"]: {
+            v["secret"]["secretName"] for v in d["spec"]["template"]["spec"].get("volumes", []) if "secret" in v
+        }
+        for d in documents
+        if d["kind"] == "Deployment"
+    }
+    assert issued == set(CLIENT_LEAVES.values())
+    assert {name: leaf for name, leaf in CLIENT_LEAVES.items() if leaf not in mounted.get(name, set())} == {}
 
 
 def write_table() -> None:

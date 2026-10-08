@@ -2266,3 +2266,114 @@ their Secrets stay too. Nothing mounts any of the four. NEEDS-MAX:
 kubectl --context kind-yadgar -n yadgar delete certificate nats-tls valkey-tls
 kubectl --context kind-yadgar -n yadgar delete secret nats-tls valkey-tls
 ```
+
+## The four callers present their client leaves (ledger 770)
+
+**What the merge does.** It adds four values to `applications/yadgar.yaml`:
+`gateway.clientCertificate.secret: gateway-client-tls`, and
+`clientCertSecret` under `iam.iamDb.tls`, `task.taskDb.tls` and
+`project.projectDb.tls` (`iam-client-tls`, `task-client-tls`,
+`project-client-tls`). `platform` already issues these four Secrets. Until
+this merge, no pod mounts them. The pin stays at 0.13.13.
+
+Merging is the deploy: `yadgar` syncs on its own (`selfHeal`, no `prune`).
+Measured 2026-10-08 at parent 0.13.13 with helm 3.18.4 and 4.3.0 (same object
+diff), and with a server-side dry run against `kind-yadgar`:
+
+- 90 → 90 objects. 0 added. 0 removed.
+- 4 changed: `Deployment/gateway`, `iam`, `task` and `project`. Each gains one
+  Secret volume (`optional: true`, items `tls.crt` and `tls.key`), one
+  read-only mount, and its `*_TLS_CLIENT_CERT_FILE` / `*_TLS_CLIENT_KEY_FILE`
+  env. `gateway` gets the pair for each of its three dials (`IAM_`, `TASK_`,
+  `PROJECT_`), all naming one file pair.
+- The server dry run names the same four Deployments. Every changed line is
+  an addition. It admits all 77 tracked objects and all 13 hooks.
+
+**What runs.** The four Deployments roll, each `maxSurge: 1 /
+maxUnavailable: 0`. No other object changes. No server asks for a client
+certificate at this pin (no `*_TLS_CLIENT_AUTH` renders), so every handshake
+completes as before.
+
+### Before this merge — read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. yadgar Synced/Healthy at 0.13.13. Any other state → STOP.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. The four Certificates are Ready. Read 2026-10-08: all True.
+kubectl --context kind-yadgar -n yadgar get certificate \
+  gateway-client-tls iam-client-tls task-client-tls project-client-tls
+
+# 3. Baseline of the gauge, through the API server's service proxy
+#    (prometheus-server port 80). Read 2026-10-08: empty, no kind="client" series.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=count%20by%20(service%2Ckind)(yadgar_tls_certificate_not_after_seconds%7Bkind%3D%22client%22%7D)'
+```
+
+### After this merge — read-only
+
+```bash
+# 1. yadgar Synced/Healthy, and its last operation Succeeded.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. The four Deployments rolled (new pod start times) and are Ready.
+kubectl --context kind-yadgar -n yadgar get pods -l 'app in (gateway,iam,task,project)' \
+  -o custom-columns=NAME:.metadata.name,START:.status.startTime,READY:.status.containerStatuses[0].ready
+
+# 3. Each mounts its leaf.
+kubectl --context kind-yadgar -n yadgar get deploy gateway iam task project \
+  -o custom-columns=NAME:.metadata.name,SECRETS:.spec.template.spec.volumes[*].secret.secretName
+
+# 4. The gauge: expect 2 (one per pod) for each of gateway, iam, task and project.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=count%20by%20(service%2Ckind)(yadgar_tls_certificate_not_after_seconds%7Bkind%3D%22client%22%7D)'
+
+# 5. No watched file is unreadable: expect 0 for all 7 services.
+#    Read 2026-10-08 before the merge: 0 for all 7.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service)(yadgar_rotation_watched_files_unreadable)'
+
+# 6. The gateway's project registry loaded: expect 1 per gateway pod.
+#    Read 2026-10-08 before the merge: 1 on both pods.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=yadgar_gateway_project_registry_loaded'
+
+# 7. Judge by Deployment readiness: READY == REPLICAS and UPDATED == REPLICAS on all four.
+kubectl --context kind-yadgar -n yadgar get deploy gateway iam task project \
+  -o custom-columns=NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas
+```
+
+The operation phase reads Succeeded even if a pod crashloops. Judge by
+Deployment readiness (`readyReplicas == replicas`, `updatedReplicas ==
+replicas`), step 7 above.
+
+The gauge proves each process loaded its leaf and watches it. It does not
+prove the dial presents the leaf; a server that runs `clientAuth` proves that.
+
+If a pod does not become Ready, its rollout stops behind `maxUnavailable: 0`
+and the old pods keep serving. Read its log before you revert.
+
+### Rollback — a revert
+
+If `yadgar`'s operation is still Running or retrying, end it first:
+
+```bash
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.status.operationState.phase} {.status.operationState.syncResult.revision}{"\n"}'
+```
+
+NEEDS-MAX: `argocd app terminate-op yadgar` against kind-yadgar's Argo CD. A
+revert does not interrupt an operation already running: v3.1.8's Application
+CRD has no `syncPolicy.retry.refresh` (see "The yadgar pin moves to parent
+chart 0.13.13", Rollback).
+
+Then revert the merge. The added volume, mount and env lines are in each
+Deployment's last-applied configuration, so the client-side apply removes
+them, and the four Deployments roll back. This merge creates no object, so
+nothing is left to prune. The four Secrets stay, as they were before the
+merge.
