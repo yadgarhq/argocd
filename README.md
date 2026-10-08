@@ -181,7 +181,8 @@ the current directory.
 self-hosted runner registered against it would run whatever workflow a
 collaborator pushes, with the verifier's cluster-read token. The scheduled
 workflow lives in a private repository, `yadgarhq/argocd-verify`, whose runner
-registers against that repository alone; it checks out this repository at
+registers against that repository alone (its scale set is
+`applications/post-merge-verifier-runner.yaml`); it checks out this repository at
 `main`'s sha and runs the script above as the `post-merge-verifier`
 ServiceAccount, which `applications/post-merge-verifier.yaml` syncs from
 `verifier/manifests/`. `MIGRATION_NOTES.md`, "The post-merge verifier", holds

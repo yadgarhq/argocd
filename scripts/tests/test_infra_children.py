@@ -34,10 +34,12 @@ WHAT IS ASSERTED, and each has a red case below. Offline: no helm, no network.
      guard still also catches `applicationsets/` by name — generic logic
      kept after ledger 1270b retired that directory itself.) And no
      Application sources `yadgarhq/deploy` any more.
-  5. `estate-front-runner`'s `controllerServiceAccount` names `arc`'s release:
+  5. Every scale set's `controllerServiceAccount` names `arc`'s release:
      Argo uses the Application name as the release name, and the chart names
      its ServiceAccount `<release>-gha-rs-controller`. Renaming `arc` breaks
-     the runner's RoleBinding silently.
+     each runner's RoleBinding silently. The scale sets are found by chart:
+     `estate-front-runner` and, from ledger 1219, `post-merge-verifier-runner`
+     (not an adopted child, so not in `CHILDREN`).
 
 WHAT IS NOT HERE, AND WHERE IT IS. `yadgar` equal to the chart's own
 `example/application.yaml` outside `syncPolicy` and `valuesObject`, and its
@@ -297,16 +299,36 @@ def retired_repository_sources(tree: Path) -> list[str]:
     ]
 
 
+SCALE_SET_CHART = "gha-runner-scale-set"
+
+
+def scale_set_applications(tree: Path) -> list[str]:
+    """Every Application under `applications/` whose source is the ARC scale-set chart, by name."""
+    return sorted(
+        (document.get("metadata") or {}).get("name")
+        for _, document in application_documents(tree)
+        if any(source.get("chart") == SCALE_SET_CHART for source in sources_of(document))
+    )
+
+
 def release_coupling_errors(tree: Path) -> list[str]:
-    """`estate-front-runner`'s controller ServiceAccount must name `arc`'s release and namespace."""
+    """Every scale set whose controller ServiceAccount does not name `arc`'s release and namespace.
+
+    `estate-front-runner` and (ledger 1219) `post-merge-verifier-runner`; read by
+    chart, so a third scale set is covered on the day it is added.
+    """
     arc = load(tree, "arc")
-    runner = load(tree, "estate-front-runner")
-    values = (((runner.get("spec") or {}).get("source") or {}).get("helm") or {}).get("valuesObject") or {}
     expected = {
         "namespace": ((arc.get("spec") or {}).get("destination") or {}).get("namespace"),
         "name": f"{(arc.get('metadata') or {}).get('name')}-gha-rs-controller",
     }
-    return [] if values.get("controllerServiceAccount") == expected else ["estate-front-runner"]
+    errors = []
+    for name in scale_set_applications(tree):
+        runner = load(tree, name)
+        values = (((runner.get("spec") or {}).get("source") or {}).get("helm") or {}).get("valuesObject") or {}
+        if values.get("controllerServiceAccount") != expected:
+            errors.append(name)
+    return errors
 
 
 @pytest.fixture
@@ -370,6 +392,13 @@ def test_no_application_sources_the_retired_repository() -> None:
 
 def test_the_runner_names_arcs_release() -> None:
     assert release_coupling_errors(REPOSITORY) == []
+
+
+def test_every_scale_set_is_read_for_the_coupling() -> None:
+    """The coupling covers every `gha-runner-scale-set` Application, not one file by name."""
+    scale_sets = scale_set_applications(REPOSITORY)
+    print(f"[infra retire] {len(scale_sets)} scale-set Application(s) checked against arc's release: {scale_sets}")
+    assert scale_sets == ["estate-front-runner", "post-merge-verifier-runner"]
 
 
 # ── red cases ────────────────────────────────────────────────────────────────
@@ -497,7 +526,7 @@ def test_a_missing_child_reddens(copy: Path) -> None:
 def test_a_renamed_child_reddens(copy: Path) -> None:
     mutate(copy, "arc", lambda d: d["metadata"].update(name="arc-controller"))
     assert identity_errors(copy) == ["arc"]
-    assert release_coupling_errors(copy) == ["estate-front-runner"]
+    assert release_coupling_errors(copy) == ["estate-front-runner", "post-merge-verifier-runner"]
 
 
 def test_a_finalizer_reddens(copy: Path) -> None:
@@ -541,6 +570,15 @@ def test_a_runner_pointed_at_another_controller_reddens(copy: Path) -> None:
         lambda d: d["spec"]["source"]["helm"]["valuesObject"]["controllerServiceAccount"].update(namespace="arc"),
     )
     assert release_coupling_errors(copy) == ["estate-front-runner"]
+
+
+def test_the_verifier_runner_pointed_at_another_controller_reddens(copy: Path) -> None:
+    mutate(
+        copy,
+        "post-merge-verifier-runner",
+        lambda d: d["spec"]["source"]["helm"]["valuesObject"]["controllerServiceAccount"].update(name="gha-rs-controller"),
+    )
+    assert release_coupling_errors(copy) == ["post-merge-verifier-runner"]
 
 
 def test_sources_beside_source_reddens(copy: Path) -> None:

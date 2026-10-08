@@ -186,6 +186,13 @@ ATTEMPT_ALLOWANCE = {
     "estate-front": (11 * MEASURED_MARGIN, "measured, not bounded: no hook, sync 11 s"),
     # gha-runner-scale-set 0.14.2 templates no Job.
     "estate-front-runner": (1 * MEASURED_MARGIN, "measured, not bounded: no hook, sync 1 s"),
+    # NOT YET MEASURED FOR THIS APPLICATION (ledger 1219): it has never synced.
+    # The row borrows estate-front-runner's 1 s, the same chart at the same
+    # version (0.14.2), which templates no Job. Re-measure after the first sync.
+    "post-merge-verifier-runner": (
+        1 * MEASURED_MARGIN,
+        "measured, not bounded: no hook, sync 1 s (estate-front-runner's, same chart 0.14.2)",
+    ),
     # `verifier/manifests`: a Namespace, a ServiceAccount, a ClusterRole, a binding
     # and (ledger 785) an egress NetworkPolicy. The 0 s was measured before the policy.
     "post-merge-verifier": (1 * MEASURED_MARGIN, "measured, not bounded: no hook, sync 0 s"),
@@ -345,6 +352,7 @@ def test_every_automated_application_is_read() -> None:
             "keda",
             "mariadb-operator",
             "post-merge-verifier",
+            "post-merge-verifier-runner",
             "prometheus",
             "root",
             "tls",
