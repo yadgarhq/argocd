@@ -2332,7 +2332,25 @@ kubectl --context kind-yadgar -n yadgar get deploy gateway iam task project \
 # 4. The gauge: expect 2 (one per pod) for each of gateway, iam, task and project.
 kubectl --context kind-yadgar get --raw \
   '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=count%20by%20(service%2Ckind)(yadgar_tls_certificate_not_after_seconds%7Bkind%3D%22client%22%7D)'
+
+# 5. No watched file is unreadable: expect 0 for all 7 services.
+#    Read 2026-10-08 before the merge: 0 for all 7.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service)(yadgar_rotation_watched_files_unreadable)'
+
+# 6. The gateway's project registry loaded: expect 1 per gateway pod.
+#    Read 2026-10-08 before the merge: 1 on both pods.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=yadgar_gateway_project_registry_loaded'
+
+# 7. Judge by Deployment readiness: READY == REPLICAS and UPDATED == REPLICAS on all four.
+kubectl --context kind-yadgar -n yadgar get deploy gateway iam task project \
+  -o custom-columns=NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas
 ```
+
+The operation phase reads Succeeded even if a pod crashloops. Judge by
+Deployment readiness (`readyReplicas == replicas`, `updatedReplicas ==
+replicas`), step 7 above.
 
 The gauge proves each process loaded its leaf and watches it. It does not
 prove the dial presents the leaf; a server that runs `clientAuth` proves that.
