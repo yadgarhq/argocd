@@ -2241,8 +2241,21 @@ If a `-db` pod does not become Ready, its rollout stops behind
 `maxUnavailable: 0` and the old pods keep serving. Read its log before you
 revert.
 
-**Rollback — a revert, then two deletes by hand.** Revert the merge. `yadgar`
-syncs 0.3.38: the images and the `-db` env go back, and the client-side apply
+**Rollback — a revert, then two deletes by hand.** If `yadgar`'s operation is
+still Running or retrying, end it first:
+
+```bash
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.status.operationState.phase} {.status.operationState.syncResult.revision}{"\n"}'
+```
+
+NEEDS-MAX: `argocd app terminate-op yadgar` against kind-yadgar's Argo CD. A
+revert does not interrupt an operation already running: v3.1.8's Application
+CRD has no `syncPolicy.retry.refresh`. Measured 2026-10-08: the live CRD's
+`syncPolicy.retry` properties are `["backoff","limit"]`, and `argocd-server`
+runs `quay.io/argoproj/argocd:v3.1.8`.
+
+Then revert the merge. `yadgar` syncs 0.3.38: the images and the `-db` env go back, and the client-side apply
 removes the edge `Prune=false` annotations. The hooks re-run with the 0.1.26
 scripts. No migration ran, so the downgrade is schema-safe. `yadgar` has no
 `automated.prune`, so the two Certificates stay, and `yadgar` reads OutOfSync
