@@ -202,8 +202,8 @@ def test_a_restored_modules_applicationset_reddens(tmp_path: Path) -> None:
     assert offenders == ["applicationsets/modules.yaml"]
 
 
-def test_an_untracked_versions_directory_does_not_redden(tmp_path: Path) -> None:
-    """A directory present only on disk, never tracked, is not this gate's business."""
+def test_an_untracked_versions_directory_still_reddens(tmp_path: Path) -> None:
+    """`versions_directory_present` is a filesystem check, not a git check — an untracked revival still catches."""
     tree = tmp_path / "copy"
     tree.mkdir()
     _git(["init", "-q"], cwd=tree)
@@ -211,9 +211,9 @@ def test_an_untracked_versions_directory_does_not_redden(tmp_path: Path) -> None
     _git(["add", "-A"], cwd=tree)
     (tree / "versions").mkdir()
     (tree / "versions" / "scratch.yaml").write_text("untracked: true\n")
-    # Untracked, so _tracked_files never sees it — but the directory check is
-    # a filesystem check, not a git check, so it still catches an untracked
-    # revival the same as a committed one.
+    # Untracked, so _tracked_files never sees it — but the directory check
+    # does not go through _tracked_files at all, so it still catches an
+    # untracked revival the same as a committed one.
     assert versions_directory_present(tree)
 
 

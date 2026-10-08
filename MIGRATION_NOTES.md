@@ -224,8 +224,8 @@ kubectl --context kind-yadgar -n argocd get application root -o json \
 # expect: Application/argocd, ApplicationSet/yadgar-modules and the six
 #         Applications, each Synced. (Read at the time of this merge.
 #         Ledger 1270b later retired ApplicationSet/yadgar-modules — a
-#         verification run after that merge lists seven resources, not
-#         eight, with the ApplicationSet gone.)
+#         verification run after that merge lists every Application root
+#         selects, without the ApplicationSet.)
 
 # 2. Each of the six: SAME uid as the table, tracking-id now
 #    root:argoproj.io/Application:argocd/<name>, NO sync-options annotation,
@@ -2101,25 +2101,49 @@ nothing live.
 
 **NEEDS-MAX, after this merge syncs:**
 
-1. Delete the live Secret: `kubectl --context kind-yadgar -n argocd delete
+1. `root` is NOT self-managed — it carries no
+   `argocd.argoproj.io/tracking-id` (measured live: its `managedFields` name
+   no Argo field manager at all) because `make bootstrap` applies
+   `projects/root.yaml` by hand, client-side, and nothing in git ever
+   re-applies `root`'s own object; `root`'s own `directory.include` lives
+   outside the glob it reads, so it never selects itself. This merge's
+   deletion of `applicationsets/modules.yaml` prunes
+   `ApplicationSet/yadgar-modules` on its own (a file that stops matching the
+   LIVE include, whatever that include's exact text is), but narrowing the
+   `include` field itself — `{applications,applicationsets}/*.yaml` to
+   `applications/*.yaml` — does not go live on its own. After the prune
+   above is observed:
+   ```bash
+   kubectl --context kind-yadgar diff -f projects/root.yaml
+   # expect exactly one field: include: applications/*.yaml
+   kubectl --context kind-yadgar apply -f projects/root.yaml
+   ```
+2. Delete the live Secret: `kubectl --context kind-yadgar -n argocd delete
 secret github-scm`. Nothing reads it any more — the ApplicationSet it
    authenticated is gone from git and, once this merge syncs, from the
    cluster too.
-2. Revoke that Secret's PAT at the GitHub token source it was minted from
+3. Revoke that Secret's PAT at the GitHub token source it was minted from
    (the read-only, repo-scoped token `make bootstrap`'s old `GITHUB_TOKEN`
    gate asked for). The token is in 1Password or wherever it was minted;
    this repository holds no copy of it and never did.
 
-**Rollback — NOT a plain revert of the Secret deletion.** The Makefile line
-that created `github-scm` is gone, so reverting this merge does not recreate
-the Secret. If a revert of this whole merge is ever needed (reinstating
-`applicationsets/modules.yaml` and `versions/`), the Secret must be recreated
-by hand first, before the ApplicationSet starts reconciling again:
+**Rollback — NOT a plain revert, and order matters.** A revert restores the
+Makefile line, but `make bootstrap` is not re-run, so the Secret must be
+recreated by hand:
 
-```bash
-kubectl --context kind-yadgar -n argocd create secret generic github-scm \
-  --from-literal=token=<PAT, read-only repo scope>
-```
-
-Minting a fresh token is the only way to do this once the one named above is
-revoked — the old token is gone, by design, the moment step 2 above runs.
+1. Recreate the Secret by hand, with a FRESH PAT (the one named in step 3
+   above is revoked, not recoverable):
+   ```bash
+   kubectl --context kind-yadgar -n argocd create secret generic github-scm \
+     --from-literal=token=<fresh PAT, read-only repo scope>
+   ```
+2. Revert this merge. `applicationsets/modules.yaml`, `versions/*.yaml`,
+   `scripts/versions_pinned.py`, the pre-commit hook and the Makefile lines
+   are all preserved verbatim in its diff.
+3. If step 1 of the NEEDS-MAX list above was already done — `projects/root.yaml`
+   was hand-applied with the narrowed `include` — re-apply the REVERTED
+   `projects/root.yaml` by hand too: `kubectl --context kind-yadgar apply -f
+projects/root.yaml`. Until that hand apply runs, `root` keeps the
+   narrowed, now-reverted-in-git `include` live, and the reinstated
+   ApplicationSet starts reconciling under an include that still excludes
+   it.

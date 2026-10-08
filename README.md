@@ -14,7 +14,7 @@ sync — live here too (ADR-0803; moved from
 | ------------------------------ | -------------------------------------------------- |
 | `Makefile`                     | `make bootstrap`/`make secrets` (ADR-0803)         |
 | `install/values.yaml`          | Helm values for the `argo-cd` chart                |
-| `projects/root.yaml`           | app-of-apps root, applied once during bootstrap    |
+| `projects/root.yaml`           | app-of-apps root — hand-applied, not self-managed  |
 | `applications/yadgar.yaml`     | the parent chart that deploys the estate's modules |
 | `applications/<operator>.yaml` | the six operator Applications root adopted (E3)    |
 | `applications/<child>.yaml`    | the five Applications `infra` released (M3)        |
@@ -24,6 +24,12 @@ sync — live here too (ADR-0803; moved from
 | `scripts/verify_handover.py`   | read-only post-merge verifier (below)              |
 | `scripts/project_probe.py`     | the 785 refusal-counter probe (ADR-0841)           |
 | `verifier/manifests/`          | their identity, ClusterRole and egress policy      |
+
+`projects/root.yaml` is applied by hand, once, at `make bootstrap` — it sits
+outside its own `directory.include` glob, so it never selects itself and
+nothing re-applies it on a git change. A change to this one file needs a
+hand `kubectl apply -f projects/root.yaml` to go live; every other file root
+selects reaches the cluster through root's normal automated sync.
 
 `applications/` holds single `Application` resources. It used to sit beside
 `applicationsets/`, which held generators that produced many — `yadgar-modules`

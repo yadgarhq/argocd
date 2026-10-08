@@ -127,9 +127,10 @@ jobs:
   #                      offline in the `operator-applications` hook.
   #
   # NOT A PRE-COMMIT HOOK, UNLIKE `operator-applications`. That hook's whole
-  # point (`versions-pinned`'s own comment makes the same argument) is that what
-  # a developer runs locally is what CI runs — which requires no network call a
-  # developer might not have. The platform-version half needs one, so the
+  # point (the `repo: local` block comment in `.pre-commit-config.yaml` makes
+  # the same argument) is that what a developer runs locally is what CI runs
+  # — which requires no network call a developer might not have. The
+  # platform-version half needs one, so the
   # script runs here instead, LOCAL TO THIS REPOSITORY rather than in
   # `yadgarhq/actions`: no other repository carries a `chart_pin.json`.
   #
