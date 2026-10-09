@@ -5151,3 +5151,245 @@ Low: this restores the state measured before B-U9 (task-db). Find out why `task-
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 ```
+
+## task refuses a caller with no client certificate: `clientAuth: "required"` (B-U9.4, ledger 925, ledger 1406)
+
+**What the merge does.** It changes one value in `applications/yadgar.yaml`:
+`task.tls.clientAuth`, from `"optional"` to `"required"`. `task-db`, `iam-db`,
+`project-db` and `project` are already at `"required"` (argocd#77, #78, #80).
+`iam` stays at `"optional"` (B-U9.5). The pin stays at 0.23.1 (PB-3,
+argocd#79).
+
+**The caller.** `task`'s gRPC server (port 50052) has ONE caller: `gateway`.
+The render sets `TASK_HOST` on `Deployment/gateway` only, `task-ingress`
+admits `app: gateway` only, and of the yadgarhq services only the gateway's
+source builds a `TaskServiceClient` (`src/tools.rs`, `src/tools/change.rs`).
+The gateway presents `gateway-client-tls` on this hop
+(`TASK_TLS_CLIENT_{CERT,KEY}_FILE` = `/var/run/secrets/client-cert/client.{crt,key}`;
+`CLIENT_HOPS` `gateway: TASK` pins it). The live `yadgar_calls_total` on
+`task` has one tool, `FindTasks`, and only `OK` outcomes.
+
+**The evidence (ADR-0884).** The hop has no passive traffic: only an operator
+task tool call crosses it. The claude-probe user sent `find_tasks` through the
+gateway (gateway 0.12.0 pods `gateway-fc8c6594-nkzhw` / `-q7t8j`, task v0.7.1
+pods `task-d4fc9b65b-8xqn4` / `-jqvbt`), all on 2026-10-09 (UTC):
+
+- 22:40:52–22:41:07: 6 of 6 OK. `FindTasks` OK +5 / +1.
+- 22:47:07–22:47:23: 6 of 6 OK. `FindTasks` 5 → 8 and 1 → 4.
+- 22:52:35–22:52:50, after 5 m 12 s idle: 6 of 6 OK. `FindTasks` 8 → 12 and
+  4 → 6.
+
+No non-OK outcome. Read again at 22:56:13: `FindTasks` OK 12 / 6, gateway
+`find_tasks` OK 9 / 9, no other series, 0 WARN or ERROR lines in either
+`task` pod's log. Under `optional` these calls do not prove that the gateway
+PRESENTS its leaf. Two facts narrow that gap: the same `gateway-client-tls`
+is accepted under `required` by `project` today (`ListProjects` OK 65 / 45 at
+23:00:28 on `project-6b7b6cf949-*`), and `gateway-client-tls` and `task-tls`
+have the same issuer, `yadgar-internal-ca`.
+
+Merging is the deploy: `yadgar` syncs on its own (`selfHeal`, no `prune`).
+Measured 2026-10-09 (UTC) at base `d45e6d2` with helm 3.18.4, and with
+server-side dry runs against `kind-yadgar`:
+
+- 90 → 90 objects. 0 added. 0 removed.
+- 1 changed: `Deployment/task`. One env value moves:
+  `LISTEN_TLS_CLIENT_AUTH` `optional` → `required`. Nothing else in it moves.
+- `Deployment/task` with Argo's tracking-id: `kubectl diff` shows only the env
+  value and `generation` (46 → 47); `apply --dry-run=server` admits it
+  (`configured`). On `main` it is `unchanged`. The `yadgar` Application CR
+  with root's tracking-id: the one value; `configured`. Only these two objects
+  were dry-run.
+
+**What runs.** `task` rolls, `maxSurge: 1 / maxUnavailable: 0`, 2 replicas.
+`gateway` does NOT roll. Its HTTP/2 connections to the old `task` pods end
+when those pods stop, so the first task call after the roll is a fresh
+handshake under `required`. task v0.7.1 locks lifecycle v0.2.20, tonic 0.14.6
+and rustls 0.23.45: under `required`, `serve_tls` passes
+`client_auth_optional(false)` (lifecycle `src/serve_tls.rs:335-337`).
+
+**task DOES NOT LOG ITS MODE AT BOOT.** Unlike `task-db`, task v0.7.1's
+`task listening` line has no `client_auth` field (`src/boot.rs:98-106`), and
+`watching` is 7 under both `optional` and `required`. So the mode is read
+from the new pods' spec env, and a bad value is a boot refusal. The request
+below is the go/no-go. The NEEDS-MAX P1 probe is the only direct proof of
+enforcement.
+
+### Before this merge — read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. yadgar Synced/Healthy at 0.23.1. Any other state → STOP.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. task 2/2/2 at `optional`, generation 46; task-db, iam-db, project-db and
+#    project at `required`; iam at `optional`. Read 2026-10-09: exactly that.
+kubectl --context kind-yadgar -n yadgar get deploy task task-db iam-db project-db project iam gateway \
+  -o custom-columns='NAME:.metadata.name,GEN:.metadata.generation,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,AUTH:.spec.template.spec.containers[0].env[?(@.name=="LISTEN_TLS_CLIENT_AUTH")].value'
+
+# 3. The calls, per pod. Read 2026-10-09 22:56:13 UTC: task FindTasks OK 12
+#    and 6, gateway find_tasks OK 9 and 9, no non-OK series.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service%2Cpod%2Ctool%2Coutcome)(yadgar_calls_total%7Bservice%3D~%22gateway%7Ctask%7Ctask-db%22%2Ctool!~%22server%2Fdiscover%22%7D)' \
+  | jq -r '.data.result[] | "\(.metric.service) \(.metric.pod) \(.metric.tool) \(.metric.outcome) \(.value[1])"' | sort
+```
+
+### The find_tasks probe (coordinator)
+
+The operator's own credential. Nothing here prints or stores it: the password
+is read without echo, and the token stays in a shell variable that is unset at
+the end. The project header is a claim, not an identity (ADR-0511).
+
+```bash
+G='https://gateway.yadgar.internal:18443'; PV='2026-07-28'; CLAIM='local/claude/scratch'
+read -rs -p 'claude-probe password: ' PW; echo
+raw="$(curl -sS --max-time 20 -w '\n%{http_code}' -H 'content-type: application/json' \
+  --data-binary @<(P="$PW" jq -nc '{username:"claude-probe",password:env.P,label:"host-curl"}') \
+  "$G/auth/login")"; unset PW
+echo "login HTTP ${raw##*$'\n'}"                       # expect 200
+TOKEN="$(printf '%s' "${raw%$'\n'*}" | jq -er .token)"; raw=''
+# ONE find_tasks. Repeat 6 times, 5 s apart.
+curl -sS --max-time 30 -w '\nHTTP %{http_code}\n' \
+  --config <(printf 'header = "authorization: Bearer %s"\n' "$TOKEN") \
+  -H 'content-type: application/json' -H "mcp-protocol-version: $PV" \
+  -H 'mcp-method: tools/call' -H 'mcp-name: find_tasks' -H "x-yadgar-project: $CLAIM" \
+  --data-binary @<(jq -nc --arg pv "$PV" '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"find_tasks",arguments:{page_size:5},_meta:{"io.modelcontextprotocol/protocolVersion":$pv,"io.modelcontextprotocol/clientCapabilities":{}}}}') \
+  "$G/" | jq -c 'if type=="object" then {error, isError: .result.isError} else . end' 2>/dev/null
+unset TOKEN
+```
+
+Expect HTTP 200, no JSON-RPC `error` and no `isError`. The `mcp-protocol-version`
+header must equal the `_meta` version, or the gateway answers 400. Then wait
+at least 45 s (one scrape) and read "Before" 3.
+
+### After this merge — read-only
+
+**THE ROLL LOOKS GREEN EVEN IF THE HOP IS BROKEN.** The readiness probe is
+`tcpSocket`, and the hop has no passive traffic. So a `task` that refuses the
+gateway's leaf is still Ready, the Deployment is still 2/2/2, and `yadgar` is
+still Synced/Healthy. The go/no-go is a request.
+
+```bash
+# 1. yadgar Synced/Healthy at 0.23.1, and its last operation Succeeded.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. task generation 47, 2/2/2, AUTH `required`; NO other Deployment moved
+#    (gateway stays at generation 72, task-db at 50).
+kubectl --context kind-yadgar -n yadgar get deploy task task-db iam-db project-db project iam gateway \
+  -o custom-columns='NAME:.metadata.name,GEN:.metadata.generation,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,AUTH:.spec.template.spec.containers[0].env[?(@.name=="LISTEN_TLS_CLIENT_AUTH")].value'
+
+# 3. Each NEW task pod: its own spec says `required`, and it booted with TLS.
+#    (task logs no client_auth field; see above.)
+for p in $(kubectl --context kind-yadgar -n yadgar get pod -l app=task -o name); do
+  echo "$p $(kubectl --context kind-yadgar -n yadgar get "$p" \
+    -o jsonpath='{.status.startTime} {.spec.containers[0].env[?(@.name=="LISTEN_TLS_CLIENT_AUTH")].value}')"
+  kubectl --context kind-yadgar -n yadgar logs "$p" | grep -E '"task listening"' | grep -o '"tls":[a-z]*'
+done
+
+# 4. Unreadable: expect 0 for all 7.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service)(yadgar_rotation_watched_files_unreadable)'
+```
+
+5. **THE GO/NO-GO.** Run the probe above 6 times, then read "Before" 3
+   after ≥45 s. Pass: every call HTTP 200 with no `error` and no `isError`;
+   `FindTasks` OK under at least one NEW `task` pod name; zero non-OK on
+   gateway `find_tasks` and on `task` `FindTasks`. kube-proxy balances per
+   connection, so all six calls can land on one new pod. That is a pass.
+6. **After an idle interval** (at least 5 minutes with no call), run the six
+   calls again and read "Before" 3. Expect the same pass, with counters
+   growing. This checks that the gateway reconnects under `required`, not
+   only that the first connection worked.
+
+**The discriminator.** A refused handshake never reaches `task`'s handler, so
+`task` counts NOTHING for it. The failure shows as the `find_tasks` error and
+as a non-OK `find_tasks` outcome on a gateway pod, with no new `FindTasks` on
+`task`.
+
+**Blast radius, stated plainly.** Every gateway task tool (`find_tasks`,
+`read_task`, `create_task`, `edit_task`, `transition_task`) calls `task`. If
+`task` refuses `gateway-client-tls`, every one of them fails, but only when a
+request arrives. Nothing fails before that, and nothing shows. `task`'s only
+caller is `gateway`. Logins and project calls do not cross this hop.
+
+### Live refusal probe — NEEDS-MAX, operator-run
+
+The same probes as the project section above (no agent runs a port-forward),
+against ONE NEW `task` pod on port 50052: P1 (no certificate → `certificate
+required`) and P2 (a leaf from a CA made on the spot → `unknown ca` or `bad
+certificate`), with `-connect 127.0.0.1:15052 -servername task.yadgar.svc`
+through the tunnel below. At the request, from a clone of yadgarhq/proto
+(expect a TLS error naming `certificate required` and NO gRPC status; a gRPC
+status or a task list means the handshake was ACCEPTED: STOP and revert):
+
+```bash
+# Terminal 1: a tunnel to ONE NEW task pod. Leave it running.
+kubectl --context kind-yadgar -n yadgar port-forward \
+  "$(kubectl --context kind-yadgar -n yadgar get pod -l app=task -o name | head -1)" 15052:50052
+
+# Terminal 2:
+grpcurl -insecure -authority task.yadgar.svc -import-path . -proto yadgar/taskapi/v1/taskapi.proto \
+  -d '{}' 127.0.0.1:15052 yadgar.taskapi.v1.TaskService/FindTasks
+```
+
+Do NOT add `-cert` to grpcurl to prove the wrong anchor (ledger 1400). P2
+proves it. The positive control is the gateway's OK traffic in step 5.
+
+### Rollback — a revert
+
+The revert target is `optional`, not `off`.
+
+If `yadgar`'s operation is still Running or retrying, end it first. NEEDS-MAX:
+`argocd app terminate-op yadgar` against kind-yadgar's Argo CD. A revert does
+not interrupt an operation already running.
+
+Then revert the WHOLE merge commit: the value, the K3 table, the gate map and
+this section move together. A values-only revert reddens K3 and
+`test_every_server_states_its_client_auth_and_stages_its_own_ca`. `task`
+rolls back to `optional`. The other servers do not move.
+
+Break-glass, if git cannot merge in time (NEEDS-MAX): suspend auto-sync on
+`yadgar`, then
+`kubectl --context kind-yadgar -n yadgar set env deployment/task LISTEN_TLS_CLIENT_AUTH=off`.
+`off` is the emergency value (ADR-0854). With the CA file still set, `off`
+only logs a WARN (lifecycle `src/serve_tls.rs:265-271`). Deleting the
+variable is a boot refusal. Revert in git afterwards.
+
+### Pre-written revert body
+
+Title: `revert: task goes back to clientAuth "optional" (B-U9.4 rollback)`.
+Use this body for the whole-commit revert. Fill in the observed failure under
+`## Why`, and validate it with the actions `pr_body.py` before the push.
+
+```text
+## What
+
+This PR reverts the B-U9.4 (task) merge as one commit. `task.tls.clientAuth` goes back from `"required"` to `"optional"`. The K3 table, `EXPECTED_CLIENT_AUTH`, the comments and the `MIGRATION_NOTES.md` section revert with it. `task-db`, `iam-db`, `project-db` and `project` stay at `"required"`. `iam` stays at `"optional"`.
+
+**Merging rolls `Deployment/task` on kind-yadgar.**
+
+## Why
+
+<!-- FILL IN: the observed failure, e.g. "find_tasks fails and the new task pods count no FindTasks call". -->
+
+The rollback target is `optional`, not `off`: under `optional` the server still verifies any leaf it gets, and accepts a caller that sends none.
+
+## Changelog
+
+- revert: task goes back to clientAuth "optional" (B-U9.4 rollback, ledger 925)
+
+## Verification
+
+- If `yadgar`'s operation was still Running or retrying, `argocd app terminate-op yadgar` ran first (NEEDS-MAX).
+- After the sync: task 2/2/2 with `LISTEN_TLS_CLIENT_AUTH` `optional` and new pod start times; gateway not rolled.
+- One operator `find_tasks` answers OK, and `yadgar_calls_total` shows `FindTasks` OK on a new task pod.
+
+## Risk
+
+Low: this restores the state measured before B-U9.4. Find out why `gateway-client-tls` was refused by `task` before B-U9.5 (iam), which carries every login on the same leaf.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+```
