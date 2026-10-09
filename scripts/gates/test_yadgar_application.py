@@ -67,6 +67,10 @@ CI job, never in the offline pre-commit hook.
       `NATS_TLS_ENABLED` and `VALKEY_TLS_ENABLED` "0" and iam's
       `NATS_TLS_ENABLED` "0"; valkey's unix-socket args, probes and
       `/run/valkey` `emptyDir`; the nats pod's `checksum/config` annotation).
+      Re-measured 2026-10-10 at 0.23.1 with task-db's `clientAuth:
+      "required"` (B-U9, ledger 925): 90 objects, none added or removed, 1
+      changed (the `task-db` Deployment's `LISTEN_TLS_CLIENT_AUTH`,
+      `optional` to `required`).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
@@ -354,9 +358,11 @@ CLIENT_CA_ITEMS = [{"key": "ca.crt", "path": "ca.crt"}]
 # one caller and steady passive traffic. task-db, the plan's first, waits: its
 # hop carries no request without an operator call. B-U9 (project) moves
 # project, whose only caller is gateway: the gateway's registry poll is its
-# passive signal. Each later step edits this one line.
+# passive signal. B-U9 (task-db) moves task-db once operator find_tasks calls
+# crossed its hop OK under optional (ADR-0884). Each later step edits this
+# one line.
 EXPECTED_CLIENT_AUTH = {server: "off" for server in SERVERS} | {
-    "task-db": "optional",
+    "task-db": "required",
     "iam-db": "required",
     "project-db": "required",
     "project": "required",

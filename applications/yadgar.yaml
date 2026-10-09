@@ -227,10 +227,14 @@ spec:
         # a caller that stops presenting its leaf on that hop is an outage. The
         # first two are `iam-db` and `project-db` (B-U9): each has one caller and
         # steady passive traffic, so a refused leaf shows within minutes. `task-db`
-        # waits at `"optional"`: its hop carries no request without an operator
+        # waited at `"optional"`: its hop carries no request without an operator
         # call. `project` is third (B-U9): its one caller is `gateway`, and each
         # gateway pod's 60 s registry poll (`ListProjects`) is its passive signal.
         # It is the first hop where the gateway's `gateway-client-tls` is required.
+        # `task-db` is fourth (B-U9): operator `find_tasks` calls crossed `task` →
+        # `task-db` OK under `"optional"` (ADR-0884), so its one caller's
+        # `task-client-tls` has verified there. With no passive traffic, a refused
+        # leaf shows only at the next request, and then every task call fails.
         iam:
           autoscaling: { enabled: true }
           tls:
@@ -323,7 +327,7 @@ spec:
           autoscaling: { enabled: true }
           tls:
             enabled: true
-            clientAuth: "optional"
+            clientAuth: "required"
             clientCaSecret: task-db-tls
             clientCaSecretKey: ca.crt
           networkPolicy:
