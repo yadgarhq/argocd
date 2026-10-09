@@ -1940,6 +1940,18 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # do NOT show here: both sides render them, because the 0.13.13 module charts
 # already carried the B-U5E expand. They show in K3 against `main`'s values.
 #
+# RE-MEASURED AT THE NEXT BUMP, 0.19.1 → 0.23.1 (PB-3, ledger 925), same
+# shape. 82 objects on both sides, none added: `Certificate/nats-tls` and
+# `Certificate/valkey-tls` were already added at 0.13.13. 11 fields in 6
+# objects. Four images (gateway 0.12.0, iam 0.11.0, task 0.7.1, project
+# 0.3.1). valkey (platform 0.2.1, B-V2): the unix-socket args, the socket-based
+# exec liveness replacing `tcpSocket`, the socket-based readiness, and the
+# `/run/valkey` `emptyDir` with its mount. nats (B-N2): the pod template's
+# `checksum/config` annotation. The `NATS_TLS_ENABLED` / `VALKEY_TLS_ENABLED`
+# "0" lines on gateway and iam do NOT show here: the 0.19.1 client charts
+# already render them once the keys are written (the B-N3E/B-V3E expand). They
+# show in K3 against `main`'s values.
+#
 # BOTH SIDES RENDER EVERY SERVER AT `clientAuth: "off"`, FROM B-U8a ON. The
 # 0.13.13 module charts predate the B-U5 contracts, and their render checks
 # refuse `optional` and `required` by name ("not enforced yet"). Once a hop
@@ -1948,7 +1960,7 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # both sides keeps this a measurement of the pin alone. The modes themselves
 # are gated by `test_yadgar_application.py`'s `EXPECTED_CLIENT_AUTH` and by K3.
 PIN_BEFORE_B9 = "0.3.7"
-PREVIOUS_PIN = "0.13.13"
+PREVIOUS_PIN = "0.19.1"
 PIN_ALONE_OVERRIDES: tuple[str, ...] = (
     *PREFLIGHT_OFF,
     *(
@@ -1961,8 +1973,20 @@ PIN_ADDED: set[tuple[str, str]] = set()
 PIN_CHANGES = {
     *(
         ("Deployment", module, "spec.template.spec.containers[0].image")
-        for module in ("iam", "iam-db", "project", "project-db", "task", "task-db")
+        for module in ("gateway", "iam", "project", "task")
     ),
+    *(
+        ("Deployment", "valkey", f"spec.template.spec.{field}")
+        for field in (
+            "containers[0].args[0]",
+            "containers[0].livenessProbe.exec",
+            "containers[0].livenessProbe.tcpSocket",
+            "containers[0].readinessProbe.exec.command[2]",
+            "containers[0].volumeMounts",
+            "volumes",
+        )
+    ),
+    ("StatefulSet", "nats", "spec.template.metadata.annotations"),
     *((kind, name, "<object added or removed>") for kind, name in PIN_ADDED),
 }
 

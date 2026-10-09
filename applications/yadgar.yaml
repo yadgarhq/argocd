@@ -57,7 +57,7 @@ spec:
     # stamps this line, `kind/application.yaml`'s and the `platform` pin of
     # `operators-application.yaml` in the commit each tag points at (ADR-0820),
     # so each tag's examples pin that tag. In your copy, you move it.
-    targetRevision: 0.19.1
+    targetRevision: 0.23.1
     helm:
       valuesObject:
         # THIS ORGANISATION'S VALUES FOR THE PARENT CHART, READ BY infra/yadgar-app.yaml
@@ -181,6 +181,15 @@ spec:
           # parent's broker, which `platform` renders as `nats` from 0.1.15
           # (`fullnameOverride`, ADR-0805; parent 0.2.42 pins 0.1.17). See
           # `platform.nats` below.
+          #
+          # THE NATS AND VALKEY DIALS STATE THEIR TLS SWITCH, NEVER DEFAULT IT (ADR-0845,
+          # ADR-0852, PB-3). gateway 0.12.0 and iam 0.11.0 require `nats.tls.enabled`
+          # (and gateway `valkey.tls.enabled`) with no default, so the keys move with
+          # the pin that first requires them. `false` is today's posture: each renders
+          # `NATS_TLS_ENABLED`/`VALKEY_TLS_ENABLED` as "0" and no CA or certificate
+          # mount. The hop steps after PB-3 (B-N4.x, B-V4.x) turn them on one at a time.
+          nats: { tls: { enabled: false } }
+          valkey: { tls: { enabled: false } }
 
         # ── THE SIX SERVICES ─────────────────────────────────────────────────────────
         # `scrapeFrom.namespace: observability` is where Prometheus runs; each module's
@@ -240,7 +249,10 @@ spec:
           # can reach. Measured 2026-09-27 at the pinned 0.3.7: without this line,
           # `global.hostname` changes exactly this one env value and rolls `iam`.
           enrolment: { gateway: "https://gateway.yadgar.internal:18443" }
-          # NO `nats.url`, AS OF B5; see `gateway` above.
+          # NO `nats.url`, AS OF B5; see `gateway` above. `nats.tls.enabled` is stated
+          # for the same reason as gateway's (PB-3); iam's NATS client identity, when
+          # it is turned on, is its own `nats.tls.clientCertSecret` (ADR-0885).
+          nats: { tls: { enabled: false } }
           networkPolicy:
             {
               enabled: true,
@@ -402,6 +414,12 @@ spec:
           # that set this true.
           valkey:
             create: true
+            # THE SERVER'S TLS POSTURE IS STATED, NEVER DEFAULTED (B-L1, B-V2, PB-3).
+            # Platform 0.2.1 refuses `valkey.create` without these. `"off"` is quoted:
+            # a bare `off` is YAML 1.1's false, which the chart refuses by name.
+            # `plaintext: true` keeps the cleartext port 6379 every client dials today.
+            # The valkey Deployment is `Recreate`, so any change here empties the cache.
+            tls: { enabled: false, clientAuth: "off", plaintext: true }
 
           # ── THE INTERNAL CA AND ITS TEN LEAVES: THE PARENT'S, AS OF STEP 5 ─────────
           # `infra/internal-tls-app.yaml` and `infra/internal-tls/` were deleted in the
@@ -448,6 +466,11 @@ spec:
           # both clients' module default dials.
           nats:
             create: true
+            # THE BROKER'S TLS POSTURE IS STATED, NEVER DEFAULTED (B-L1, B-N2, PB-3).
+            # Platform 0.2.1 refuses `nats.create` without both keys. NATS has no
+            # `optional` mode, so the next value after `"off"` is `"required"`
+            # (ADR-0854).
+            tls: { enabled: false, clientAuth: "off" }
 
           # ── THE EDGE: THE PARENT'S, AS OF STEP 7 ───────────────────────────────────
           # `infra/tls/{certificate,envoyproxy,gatewayclass,gateway}.yaml` were deleted

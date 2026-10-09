@@ -4833,3 +4833,118 @@ Low: this restores the state measured before B-U9 (project). The ledger 1400 wor
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 ```
+
+## The yadgar pin moves to parent chart 0.23.1, with the NATS and valkey TLS keys stated off (PB-3, ledger 925)
+
+**What the merge does.** It moves `applications/yadgar.yaml`'s
+`targetRevision` from 0.19.1 to 0.23.1. It moves `scripts/chart_pin.json` to
+`v0.23.1` / `0.2.1`, and the five platform-sourced operator Applications
+(`cert-manager`, `envoy-gateway`, `keda`, `mariadb-operator`, `prometheus`)
+from `platform` 0.1.36 to 0.2.1. It adds the TLS keys that the new pin
+requires with no default, each at today's posture (K-9):
+
+- `platform.nats.tls: { enabled: false, clientAuth: "off" }` (B-N2).
+- `platform.valkey.tls: { enabled: false, clientAuth: "off", plaintext: true }` (B-V2).
+- `gateway.nats.tls.enabled: false` and `gateway.valkey.tls.enabled: false` (B-N3, B-V3).
+- `iam.nats.tls.enabled: false` (B-N3).
+
+Without them, parent 0.23.1 refuses the render at the schema
+(`gateway: valkey.tls: enabled is required`, `gateway: nats.tls: enabled is
+required`, `iam: nats.tls: enabled is required`), and `platform` refuses
+`nats.create` and `valkey.create` with no TLS keys.
+
+Parent 0.23.1 moves gateway 0.10.2 → 0.12.0, iam 0.10.0 → 0.11.0, task
+0.7.0 → 0.7.1, project 0.3.0 → 0.3.1 and platform 0.1.36 → 0.2.1. The
+`-db` charts and config do not move.
+
+Measured 2026-10-09 with helm 3.18.4 and a server-side dry run against
+`kind-yadgar`:
+
+- `yadgar`: 90 → 90 objects. 0 added. 0 removed. 6 changed. The
+  `nats-tls` and `valkey-tls` Certificates already exist (added at 0.13.13).
+- `gateway`, `iam`, `task`, `project`: a new image. gateway also gains
+  `NATS_TLS_ENABLED=0` and `VALKEY_TLS_ENABLED=0`; iam gains
+  `NATS_TLS_ENABLED=0`. No CA or certificate env, volume or mount.
+- `valkey`: the unix-socket args, an `emptyDir` at `/run/valkey`, a
+  socket-based readiness, and a socket-based exec liveness in place of
+  `tcpSocket`. The cleartext port 6379 stays.
+- `StatefulSet/nats`: a `checksum/config` pod annotation. `ConfigMap/nats-config`
+  does not change.
+- The hook Jobs and every other object are byte-identical.
+- The five operator Applications render byte-identically at 0.2.1, CRDs
+  included. Only their `targetRevision` changes.
+- The dry run names the same six objects. It admits all 77 tracked objects
+  and all 13 hooks. The six Application CRs are `configured (server dry run)`.
+
+**What runs.** gateway, iam, task and project roll (`maxSurge: 1 /
+maxUnavailable: 0`). nats rolls once, for the annotation: one replica, so the
+broker is down for the roll. An invalidation published in that gap is lost,
+and gateway's credential cache TTL bounds the stale answer. valkey is
+`Recreate`: the cache empties, and the gateway's rate limiter degrades
+(`yadgar_gateway_rate_limit_degraded_total` rises) until valkey is Ready. No
+migration runs: no `-db` chart moves.
+
+### Before this merge — read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. yadgar Synced/Healthy at 0.19.1; the five operators at 0.1.36.
+kubectl --context kind-yadgar -n argocd get application yadgar cert-manager envoy-gateway keda mariadb-operator prometheus \
+  -o custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase
+
+# 2. Read 2026-10-09: gateway, iam, task, project 2/2/2; valkey 1/1/1; nats 1/1.
+kubectl --context kind-yadgar -n yadgar get deploy gateway iam task project valkey \
+  -o custom-columns=NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas
+kubectl --context kind-yadgar -n yadgar get sts nats
+
+# 3. Read 2026-10-09: invalidation consuming 1 and registry 1 on both gateway
+#    pods; unreadable 0 for all 7; no degraded series.
+for query in yadgar_gateway_invalidation_consuming yadgar_gateway_project_registry_loaded \
+  'sum%20by%20(service)(yadgar_rotation_watched_files_unreadable)' \
+  'sum%20by%20(pod)(yadgar_gateway_rate_limit_degraded_total)'; do
+  kubectl --context kind-yadgar get --raw \
+    "/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=$query"; echo
+done
+```
+
+### After this merge — read-only
+
+```bash
+# 1. yadgar Synced/Healthy at 0.23.1; the five operators Synced/Healthy at 0.2.1
+#    with no new operation (byte-identical render).
+kubectl --context kind-yadgar -n argocd get application yadgar cert-manager envoy-gateway keda mariadb-operator prometheus \
+  -o custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase
+
+# 2. Judge by readiness, not by the operation phase. Expect the counts in "Before" 2.
+kubectl --context kind-yadgar -n yadgar get deploy gateway iam task project valkey \
+  -o custom-columns=NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas
+kubectl --context kind-yadgar -n yadgar get sts nats
+
+# 3. The off switches are live: expect `0 0` on gateway and `0` on iam.
+kubectl --context kind-yadgar -n yadgar get deploy gateway iam \
+  -o custom-columns='NAME:.metadata.name,NATS:.spec.template.spec.containers[0].env[?(@.name=="NATS_TLS_ENABLED")].value,VALKEY:.spec.template.spec.containers[0].env[?(@.name=="VALKEY_TLS_ENABLED")].value'
+
+# 4. The queries in "Before" 3: consuming 1 and registry 1 on both new gateway
+#    pods; unreadable 0; the degraded counter stops rising once valkey is Ready.
+```
+
+Each gateway and iam pod logs that its NATS (and gateway's valkey) hop is
+dialled in cleartext only if a CA or client file is also set; none renders,
+so expect no such WARN.
+
+### Rollback — a revert
+
+If `yadgar`'s operation is still Running or retrying, end it first. NEEDS-MAX:
+`argocd app terminate-op yadgar` against kind-yadgar's Argo CD. v3.1.8's
+Application CRD has no `syncPolicy.retry.refresh`, so a revert does not
+interrupt a running operation.
+
+Then revert the merge. `yadgar` syncs 0.19.1: the four images go back, and
+the added env, args, probe and volume lines are in each object's
+last-applied configuration, so the client-side apply removes them. valkey
+rolls again (`Recreate`, the cache empties again) and nats rolls again (the
+annotation goes). The five operator Applications go back to 0.1.36 with a
+byte-identical render. This merge creates no object, so nothing is left to
+prune, and no migration ran.

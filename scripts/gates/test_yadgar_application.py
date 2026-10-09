@@ -61,6 +61,12 @@ CI job, never in the offline pre-commit hook.
       ledger 925): 90 objects, none added or removed, 1 changed (the
       `project` Deployment's `LISTEN_TLS_CLIENT_AUTH`, `optional` to
       `required`).
+      Re-measured 2026-10-09 at 0.23.1 with the NATS and valkey TLS keys
+      stated off (PB-3, ledger 925): 90 objects, none added or removed, 6
+      changed (the `gateway`, `iam`, `task` and `project` images; gateway's
+      `NATS_TLS_ENABLED` and `VALKEY_TLS_ENABLED` "0" and iam's
+      `NATS_TLS_ENABLED` "0"; valkey's unix-socket args, probes and
+      `/run/valkey` `emptyDir`; the nats pod's `checksum/config` annotation).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
@@ -473,6 +479,20 @@ CLIENT_HOPS = {
     "task": ("TASK_DB",),
     "project": ("PROJECT_DB",),
 }
+# THE HOPS A CALLER DIALS IN CLEARTEXT, BY DESIGN, UNTIL THEIR HOP STEP (PB-3).
+# gateway 0.12.0 and iam 0.11.0 (parent 0.23.1) render `NATS_TLS_ENABLED` and
+# gateway `VALKEY_TLS_ENABLED`, both "0", from the explicit `tls.enabled:
+# false` this file states. They are pinned here, not in `CLIENT_HOPS`, because
+# `CLIENT_HOPS` asserts "1" and a presented leaf, which a hop that is off does
+# not have. ADR-0885's iam/NATS entry lands here first; each hop MOVES to
+# `CLIENT_HOPS` in the values PR that turns it on (B-N4.2 for NATS, B-V4.2 for
+# valkey). While a hop is off its chart renders the `_ENABLED` "0" line and
+# nothing else: no other `<PREFIX>_TLS_*` env, and no volume projecting the
+# server leaf whose `ca.crt` it would trust (the value named beside each).
+CLEARTEXT_HOPS = {
+    "gateway": {"NATS": "nats-tls", "VALKEY": "valkey-tls"},
+    "iam": {"NATS": "nats-tls"},
+}
 # The cert-manager Issuer (not its Secret) every client leaf is issued from.
 LEAF_ISSUER = {"group": "cert-manager.io", "kind": "Issuer", "name": "yadgar-internal-ca"}
 # Each env half and the leaf key the volume must project to that file.
@@ -528,6 +548,45 @@ def env_value(documents: list, kind: str, name: str, variable: str) -> object:
     return found[0] if found else None
 
 
+def pinned_hops() -> set[tuple[str, str, str]]:
+    """Every hop this file names, presented (`CLIENT_HOPS`) or cleartext (`CLEARTEXT_HOPS`)."""
+    return {
+        ("Deployment", caller, prefix)
+        for hops in (CLIENT_HOPS, CLEARTEXT_HOPS)
+        for caller, prefixes in hops.items()
+        for prefix in prefixes
+    }
+
+
+def cleartext_failures(documents: list) -> dict[str, object]:
+    """Every `CLEARTEXT_HOPS` hop that renders more than its "0" switch, keyed `<caller>/<PREFIX>: <what>`."""
+    deployments = {d["metadata"]["name"]: d for d in documents if d["kind"] == "Deployment"}
+    failures: dict[str, object] = {}
+    for caller, hops in CLEARTEXT_HOPS.items():
+        deployment = deployments.get(caller)
+        if deployment is None:
+            failures[f"{caller}: Deployment"] = None
+            continue
+        pod = deployment["spec"]["template"]["spec"]
+        env = {
+            e["name"]: e.get("value")
+            for key in CONTAINER_LISTS
+            for container in pod.get(key) or []
+            for e in container.get("env") or []
+        }
+        for prefix, server_leaf in hops.items():
+            hop = f"{caller}/{prefix}"
+            switch = f"{prefix}_TLS_ENABLED"
+            if env.get(switch) != "0":
+                failures[f"{hop}: {switch}"] = env.get(switch)
+            for name in sorted(n for n in env if n.startswith(f"{prefix}_TLS_") and n != switch):
+                failures[f"{hop}: {name}"] = env[name]
+            for volume in pod.get("volumes") or []:
+                if (volume.get("secret") or {}).get("secretName") == server_leaf:
+                    failures[f"{hop}: volume {volume['name']}"] = server_leaf
+    return failures
+
+
 def client_identity_failures(documents: list) -> dict[str, object]:
     """Every hop whose caller does not present its own issued leaf, keyed `<caller>/<PREFIX>: <what>`.
 
@@ -540,8 +599,7 @@ def client_identity_failures(documents: list) -> dict[str, object]:
     certificates = {d["spec"]["secretName"]: d["spec"] for d in documents if d["kind"] == "Certificate"}
     deployments = {d["metadata"]["name"]: d for d in documents if d["kind"] == "Deployment"}
     failures: dict[str, object] = {}
-    pinned = {("Deployment", caller, prefix) for caller, prefixes in CLIENT_HOPS.items() for prefix in prefixes}
-    for kind, name, prefix in sorted(rendered_client_hops(documents) - pinned):
+    for kind, name, prefix in sorted(rendered_client_hops(documents) - pinned_hops()):
         failures[f"{kind}/{name}/{prefix}: not in CLIENT_HOPS"] = env_value(
             documents, kind, name, f"{prefix}_TLS_ENABLED"
         )
@@ -689,9 +747,36 @@ def test_a_missing_caller_deployment_names_its_caller(rendered: list) -> None:
     assert client_identity_failures(documents) == {"iam: Deployment": None}
 
 
-def test_the_rendered_client_hops_are_exactly_client_hops(rendered: list) -> None:
-    assert rendered_client_hops(rendered) == {
-        ("Deployment", caller, prefix) for caller, prefixes in CLIENT_HOPS.items() for prefix in prefixes
+def test_the_rendered_client_hops_are_exactly_the_pinned_hops(rendered: list) -> None:
+    assert rendered_client_hops(rendered) == pinned_hops()
+
+
+def test_every_cleartext_hop_renders_its_switch_off_and_nothing_else(rendered: list) -> None:
+    assert cleartext_failures(rendered) == {}
+
+
+def test_a_cleartext_hop_turned_on_names_its_hop(rendered: list) -> None:
+    change = set_env("VALKEY_TLS_ENABLED", "1")
+    assert cleartext_failures(mutated(rendered, "Deployment", "gateway", change)) == {
+        "gateway/VALKEY: VALKEY_TLS_ENABLED": "1"
+    }
+
+
+def test_a_ca_env_on_a_cleartext_hop_names_its_hop(rendered: list) -> None:
+    change = add_env("containers", "NATS_TLS_CA_FILE", "/var/run/secrets/nats-ca/ca.crt")
+    assert cleartext_failures(mutated(rendered, "Deployment", "iam", change)) == {
+        "iam/NATS: NATS_TLS_CA_FILE": "/var/run/secrets/nats-ca/ca.crt"
+    }
+
+
+def test_a_server_leaf_volume_on_a_cleartext_hop_names_its_hop(rendered: list) -> None:
+    def mount_nats_ca(deployment: dict) -> None:
+        deployment["spec"]["template"]["spec"]["volumes"].append(
+            {"name": "nats-ca", "secret": {"secretName": "nats-tls"}}
+        )
+
+    assert cleartext_failures(mutated(rendered, "Deployment", "gateway", mount_nats_ca)) == {
+        "gateway/NATS: volume nats-ca": "nats-tls"
     }
 
 
