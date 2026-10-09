@@ -876,6 +876,12 @@ TRACKED_CUSTOM_RESOURCES = {
     "keda.sh": {"clustertriggerauthentications", "scaledjobs", "scaledobjects", "triggerauthentications"},
 }
 REQUIRED |= {(group, plural) for group, plurals in TRACKED_CUSTOM_RESOURCES.items() for plural in plurals}
+# ARC's three per-job plurals (ledger 1219, with the runner Application).
+# `collect` never lists their instances (`UNLISTED_INSTANCE_CRDS`: they churn on
+# every poll), and no Application tracks one. The role names them anyway, so a
+# later tracked one does not stop the snapshot on Forbidden.
+ARC_UNLISTED_PLURALS = {"ephemeralrunnersets", "ephemeralrunners", "autoscalinglisteners"}
+REQUIRED |= {("actions.github.com", plural) for plural in ARC_UNLISTED_PLURALS}
 
 
 def rbac_documents(tree: Path) -> list[dict]:
@@ -1027,3 +1033,10 @@ def test_arc_runner_instances_are_never_listed(responses) -> None:
     vh.collect(vh.Cluster(CONTEXT, runner=runner))
     listed = {c[4] for c in runner.calls}
     assert not listed & set(ARC_CHURN)
+
+
+def test_the_role_names_every_arc_plural_the_script_skips() -> None:
+    """The ClusterRole's three extra ARC plurals are exactly the ones `collect` skips."""
+    skipped = {n.removesuffix(".actions.github.com") for n in vh.UNLISTED_INSTANCE_CRDS if n.endswith(".actions.github.com")}
+    assert skipped == ARC_UNLISTED_PLURALS
+    assert {("actions.github.com", p) for p in ARC_UNLISTED_PLURALS} <= REQUIRED

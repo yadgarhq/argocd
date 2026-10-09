@@ -1,0 +1,104 @@
+# The runner scale set the post-merge verifier runs on (ledger 1219; step 3 of
+# "The post-merge verifier" in MIGRATION_NOTES.md). `root` selects this file.
+#
+# IT REGISTERS AGAINST THE PRIVATE `yadgarhq/argocd-verify`, NEVER THIS
+# REPOSITORY. This repository is public, and a runner registered here would take
+# a job from any workflow a collaborator pushes. MIGRATION_NOTES.md, "Why not
+# the existing runner, and why not this repository", has the whole argument.
+#
+# THE SCALE SET'S NAME IS THE `runs-on:` LABEL. `argocd-verify`'s `verify.yaml`
+# says `runs-on: argocd-verify`. Renaming `runnerScaleSetName` leaves that
+# workflow queued for ever, with no error anywhere.
+#
+# THE CREDENTIAL. `githubConfigSecret` is a NAME. A person creates the Secret
+# `argocd-verify-github` in `post-merge-verifier` by hand (step 2 of the same
+# section); it is not in git. The listener that holds it runs in `arc-systems`
+# and executes no workflow code. Until the Secret exists the
+# `AutoscalingRunnerSet` reads no `.status.phase`, so this Application reads
+# Progressing (the `actions.github.com_AutoscalingRunnerSet` health rule in
+# install/values.yaml), and no runner registers.
+#
+# THE RUNNER POD RUNS AS `post-merge-verifier`, the read-only ServiceAccount
+# `applications/post-merge-verifier.yaml` syncs (get/list/watch, no Secrets).
+# With `serviceAccountName` set, the chart creates no ServiceAccount of its own.
+# `verifier/manifests/networkpolicy.yaml` confines the pod's egress.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: post-merge-verifier-runner
+  namespace: argocd
+  annotations:
+    # After applications/arc.yaml (-10), whose chart carries the
+    # `autoscalingrunnersets.actions.github.com` CRD: a custom resource applied
+    # before its definition is a hard sync failure. After
+    # applications/post-merge-verifier.yaml (no wave, so 0), which creates the
+    # namespace and the ServiceAccount the runner pod names. Root assesses no
+    # child Application's health, so the wave orders the apply only; the
+    # bounded `retry` below covers a namespace that is not there yet.
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  project: default
+  source:
+    repoURL: ghcr.io/actions/actions-runner-controller-charts
+    chart: gha-runner-scale-set
+    # The same chart version as applications/estate-front-runner.yaml, and the
+    # same as the controller in applications/arc.yaml (0.14.2).
+    targetRevision: 0.14.2
+    helm:
+      valuesObject:
+        githubConfigUrl: https://github.com/yadgarhq/argocd-verify
+        githubConfigSecret: argocd-verify-github
+        runnerScaleSetName: argocd-verify
+
+        # The controller's ServiceAccount, by name. Without it the chart does
+        # not render under Argo CD (its `lookup` returns nothing in `helm
+        # template`); applications/estate-front-runner.yaml says why at length.
+        # `arc` is applications/arc.yaml's release name. Renaming that
+        # Application breaks this silently.
+        controllerServiceAccount:
+          namespace: arc-systems
+          name: arc-gha-rs-controller
+
+        # Idle to nothing, one job at a time. `verify.yaml` serialises itself
+        # with a `concurrency` group; any other workflow on this label (the
+        # 785 `project-probe.yaml`) queues behind it rather than in parallel.
+        minRunners: 0
+        maxRunners: 1
+
+        template:
+          spec:
+            serviceAccountName: post-merge-verifier
+            containers:
+              - name: runner
+                # The stock runner image, pinned by digest. It is the
+                # multi-arch index of `ghcr.io/actions/actions-runner:2.338.0`,
+                # read off the registry on 2026-10-08 (it was `:latest` then
+                # too). `wait --require-ancestry` needs git, and this digest
+                # carries `git version 2.55.0` (Ubuntu 24.04.5), run in the
+                # image on 2026-10-08.
+                #
+                # NOT SIGNATURE-CHECKED. `scripts/runner_image_pinned.py` holds
+                # every scale-set runner image to a digest. Its cosign check
+                # skips this one repository (`UPSTREAM_RUNNER`), in this file only: GitHub
+                # publishes it, and this organisation's CI never signs it.
+                #
+                # BUMPING IT IS A DELIBERATE EDIT. GitHub refuses a runner
+                # binary that is too far behind at registration, so this pin
+                # ages into a listener that cannot start a runner.
+                image: ghcr.io/actions/actions-runner@sha256:4ffadc0002b2581327e06101fc8c06cd189232baf79fe561fac9caeb76f5e807
+                command: ["/home/runner/run.sh"]
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: post-merge-verifier
+  # S0 (ADR-0828), the same as the other Applications: self-heal, no `prune`
+  # key, and the chart example's bounded `retry`. No `CreateNamespace`: the
+  # namespace is applications/post-merge-verifier.yaml's object.
+  syncPolicy:
+    automated:
+      selfHeal: true
+    retry:
+      limit: 6
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m

@@ -274,8 +274,11 @@ in one merge, and delete them in a second merge.
 `scripts/verify_handover.py` replaces the per-merge scratch scripts of the
 operators handover. README.md, "Post-merge verification", says what it checks.
 This repository holds the script, its tests and its read-only identity. **It
-holds no workflow and no runner, deliberately**: the scheduled run lives in a
-private repository, `yadgarhq/argocd-verify`, whose files are below.
+holds no workflow, and no runner registers against it, deliberately**: the
+scheduled run lives in a private repository, `yadgarhq/argocd-verify`, whose
+files are below. From step 3 (ledger 1219) this repository does declare that
+runner's scale set, `applications/post-merge-verifier-runner.yaml`, which
+registers against `argocd-verify` only.
 
 ### What merging this does on its own
 
@@ -363,73 +366,139 @@ commit on `main`.
    so the verifier lists it, and the role must grant that in the SAME PR or
    the next snapshot fails as Forbidden.
 
-   `applications/post-merge-verifier-runner.yaml` (pin the runner image by
-   digest, read off the registry when writing the file):
+   **Done by the ledger 1219 pull request; merging it is the person's step,
+   and only after step 2.** Create the Secret
+   `post-merge-verifier/argocd-verify-github` BEFORE the merge, so the
+   controller registers the scale set on its first reconcile.
+   The applied copy is the only copy: read
+   `applications/post-merge-verifier-runner.yaml` and the `actions.github.com`
+   rule in `verifier/manifests/clusterrole.yaml`, not a snippet here. What it
+   pins, each read on 2026-10-08:
 
-   ```yaml
-   apiVersion: argoproj.io/v1alpha1
-   kind: Application
-   metadata:
-     name: post-merge-verifier-runner
-     namespace: argocd
-   spec:
-     project: default
-     source:
-       repoURL: ghcr.io/actions/actions-runner-controller-charts
-       chart: gha-runner-scale-set
-       targetRevision: 0.14.2
-       helm:
-         valuesObject:
-           githubConfigUrl: https://github.com/yadgarhq/argocd-verify
-           githubConfigSecret: argocd-verify-github
-           runnerScaleSetName: argocd-verify # = runs-on and actionlint.yaml
-           controllerServiceAccount: # see deploy's estate-front-runner for why
-             namespace: arc-systems
-             name: arc-gha-rs-controller
-           minRunners: 0
-           maxRunners: 1
-           template:
-             spec:
-               # The read-only identity; the chart then creates no
-               # no-permission ServiceAccount of its own.
-               serviceAccountName: post-merge-verifier
-               containers:
-                 - name: runner
-                   image: ghcr.io/actions/actions-runner@sha256:<DIGEST>
-                   command: ["/home/runner/run.sh"]
-     destination:
-       server: https://kubernetes.default.svc
-       namespace: post-merge-verifier
-     syncPolicy:
-       automated:
-         selfHeal: true
-       retry:
-         limit: 6
-         backoff: { duration: 15s, factor: 2, maxDuration: 5m }
+   - Chart `gha-runner-scale-set` 0.14.2 (OCI digest
+     `sha256:579e3a1bdf4032b3c3de3e9b0880a4a6d3c1989a67c06010f680c1cc49524d11`),
+     the same version as `estate-front-runner` and as the live controller
+     (`ghcr.io/actions/gha-runner-scale-set-controller:0.14.2`).
+   - Runner image
+     `ghcr.io/actions/actions-runner@sha256:4ffadc0002b2581327e06101fc8c06cd189232baf79fe561fac9caeb76f5e807`,
+     the multi-arch index of `:2.338.0`. It carries `git version 2.55.0`, run
+     in the image, so `wait --require-ancestry` can start.
+   - `runnerScaleSetName: argocd-verify` (the `runs-on:` label),
+     `githubConfigSecret: argocd-verify-github`,
+     `serviceAccountName: post-merge-verifier`, `minRunners: 0`,
+     `maxRunners: 1`, and `controllerServiceAccount`
+     `arc-systems/arc-gha-rs-controller` (the live controller's
+     ServiceAccount).
+   - `argocd.argoproj.io/sync-wave: "1"`, which the earlier snippet here did
+     not have: after `arc` (-10, the CRD) and `post-merge-verifier` (0, the
+     namespace and the ServiceAccount). Root assesses no child Application's
+     health, so the wave orders the apply only; `retry` covers the rest.
+   - The role names all four ARC plurals. `REQUIRED` in
+     `scripts/tests/test_verify_handover.py` gains the three the script
+     skips. Their CRD schemas hold Secret names, never a runner credential.
+
+   Two gates moved with it. `scripts/tests/test_infra_children.py` checks the
+   `arc` release coupling on every `gha-runner-scale-set` Application, not on
+   `estate-front-runner` alone. `scripts/runner_image_pinned.py` still holds
+   every scale-set runner image to a digest. `--verify-signature` skips one
+   repository, exactly `ghcr.io/actions/actions-runner@`, and only in
+   `post-merge-verifier-runner.yaml`: GitHub's runner image is pinned and NOT
+   signature-checked there. A lookalike repository, any other third-party
+   image, or the same image in `estate-front-runner.yaml` is still asked, and
+   still fails. A test also holds ADR-0829: a scale set running as
+   `post-merge-verifier` registers against `yadgarhq/argocd-verify` only.
+
+   **What merging step 3 does.** `root` creates
+   `Application/post-merge-verifier-runner`. It syncs a Role and a
+   RoleBinding (`argocd-verify-gha-rs-manager`, for the controller) and
+   `AutoscalingRunnerSet/argocd-verify`, all in `post-merge-verifier`. The
+   `post-merge-verifier` Application widens the ClusterRole by the three ARC
+   plurals. Then:
+
+   - **With the Secret in place (the intended order):** the controller
+     registers the scale set with GitHub and creates the listener pod in
+     `arc-systems`. The AutoscalingRunnerSet reaches phase `Running`.
+   - **If the merge lands first by mistake:** no listener starts. The
+     Application reads Synced and **Progressing** (the AutoscalingRunnerSet
+     health rule in `install/values.yaml`), and the controller log in
+     `arc-systems` names the missing Secret. Create the Secret; the
+     controller then catches up.
+   - **`minRunners: 0`:** no runner pod exists until a job is queued. The
+     first runner pod comes with the first `verify.yaml` run, after step 4.
+
+   ```bash
+   # Before the merge, read-only:
+   kubectl --context kind-yadgar diff -f applications/post-merge-verifier-runner.yaml
+   kubectl --context kind-yadgar apply --dry-run=server -f verifier/manifests/clusterrole.yaml
+   # After the merge, read-only:
+   kubectl --context kind-yadgar -n argocd get application post-merge-verifier-runner \
+     -o jsonpath='{.status.sync.status}/{.status.health.status}{"\n"}'
+   kubectl --context kind-yadgar -n post-merge-verifier get autoscalingrunnersets \
+     -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,RUNNERS:.status.currentRunners
+   kubectl --context kind-yadgar -n arc-systems get autoscalinglisteners,pods
+   kubectl --context kind-yadgar -n arc-systems logs deploy/arc-gha-rs-controller --since=15m | grep argocd-verify
+   for r in autoscalingrunnersets ephemeralrunnersets ephemeralrunners autoscalinglisteners; do
+     kubectl --context kind-yadgar auth can-i list "$r.actions.github.com" \
+       --as=system:serviceaccount:post-merge-verifier:post-merge-verifier -A   # expect: yes
+   done
    ```
 
-   Add to `verifier/manifests/clusterrole.yaml`, and to `REQUIRED` in
-   `scripts/tests/test_verify_handover.py`:
+   **NEEDS-MAX, in order:**
 
-   ```yaml
-   # All four ARC plurals. The verifier lists the AutoscalingRunnerSet root
-   # tracks; it never lists EphemeralRunner, EphemeralRunnerSet or
-   # AutoscalingListener instances (UNLISTED_INSTANCE_CRDS: they churn on
-   # every poll), but naming them keeps a later tracked one from failing as
-   # Forbidden.
-   - apiGroups: [actions.github.com]
-     resources:
-       - autoscalingrunnersets
-       - ephemeralrunnersets
-       - ephemeralrunners
-       - autoscalinglisteners
-     verbs: [get, list, watch]
+   1. Before the merge: the Secret `argocd-verify-github` in
+      `post-merge-verifier` (step 2). It was absent on 2026-10-08. Check it
+      by name only, never its data:
+
+      ```bash
+      kubectl --context kind-yadgar -n post-merge-verifier get secret argocd-verify-github -o name
+      ```
+
+   2. Merge the pull request. Wait for phase `Running` and one listener pod
+      for `argocd-verify` in `arc-systems`.
+   3. Step 4: `VERIFY_ENABLED=true`, only once that listener is up.
+
+   **Rollback.** Root has no `prune`, and the Application carries no
+   `resources-finalizer`. So a git revert leaves the live Application and its
+   objects in place, and deleting the Application orphans its objects rather
+   than deleting them. Delete `VERIFY_ENABLED` first, so no job is queued.
+   Then, after the revert merges, delete each object by name, in this order,
+   while `arc` still runs:
+
+   ```bash
+   gh-personal variable delete VERIFY_ENABLED --repo yadgarhq/argocd-verify
+   # 1. The Application first, so self-heal stops recreating the scale set.
+   kubectl --context kind-yadgar -n argocd delete application post-merge-verifier-runner
+   # 2. The scale set. The controller removes its listener and runner sets, then
+   #    takes the cleanup-protection finalizer off the Role and the RoleBinding.
+   kubectl --context kind-yadgar -n post-merge-verifier delete autoscalingrunnerset argocd-verify
+   # 3. The Role and the RoleBinding. The controller does NOT delete them.
+   kubectl --context kind-yadgar -n post-merge-verifier delete rolebinding argocd-verify-gha-rs-manager
+   kubectl --context kind-yadgar -n post-merge-verifier delete role argocd-verify-gha-rs-manager
+   kubectl --context kind-yadgar -n post-merge-verifier get autoscalingrunnersets,roles,rolebindings   # expect: none left
+   # 4. Only now the Secret: the controller needed it to deregister the scale
+   #    set from GitHub while AutoscalingRunnerSet/argocd-verify was deleted.
+   kubectl --context kind-yadgar -n post-merge-verifier delete secret argocd-verify-github
    ```
 
-   **git in the runner image.** `wait --require-ancestry` refuses to start
-   without git. The upstream `actions/runner` `images/Dockerfile` on `main`
-   installs git from the git-core PPA (read 2026-10-01); confirm it for the
-   digest you pin with `docker run --rm <image> git --version`.
+   Then uninstall the GitHub App from `yadgarhq/argocd-verify` (the App's
+   settings, "Install App"), so its Administration-write key stops being a
+   live credential. Keep the Secret until the AutoscalingRunnerSet is gone:
+   deleted first, the controller cannot deregister the scale set, and a
+   stale runner registration stays on `argocd-verify`.
+
+   The chart puts the finalizer `actions.github.com/cleanup-protection` on
+   the Role and the RoleBinding. Only the `arc` controller takes it off, when
+   the scale set is deleted, and it only takes the finalizer off: ARC
+   0.14.2's `removeManagerRoleFinalizer` and
+   `removeManagerRoleBindingFinalizer` call `RemoveFinalizer`, never `Delete`
+   (`autoscalingrunnerset_controller.go`, read 2026-10-08). With `arc` gone,
+   both stay `Terminating` (see "Removing it again"). The same revert narrows
+   the ClusterRole: `post-merge-verifier` self-heals it on its next sync.
+
+   **If the Secret is missing, this Application is not Healthy.**
+   Anything that waits on every Application under root (the verifier's own
+   `wait` and `diff`, which FAIL a non-Healthy Application) stays pending or
+   red until the Secret is in and the scale set reaches `Running`.
 
 4. **Create the private repository's files** (below), then set its variable
    `VERIFY_ENABLED` to `true` once the scale set's listener is up:

@@ -10,11 +10,17 @@
 # THE CUSTOM RESOURCES BELOW are the instances of every CRD root's Applications
 # tracked on kind-yadgar on 2026-10-01, less the ones `collect` never lists
 # (cert-manager's CertificateRequests, Orders and Challenges). A CRD swap that
-# goes wrong deletes these, so the snapshot records each one's uid.
+# goes wrong deletes these, so the snapshot records each one's uid. The one
+# exception is ARC: its rule names all four plurals, the three `collect` skips
+# included (ledger 1219; the rule's own comment says why).
 #
 # A TYPE MISSING HERE FAILS LOUDLY. When an Application starts tracking a kind
 # this role does not name, the snapshot stops on Forbidden rather than skipping
-# it. Add the kind here, in a reviewed change.
+# it. Add the kind here, in a reviewed change. ARC's three instance plurals
+# (EphemeralRunner, EphemeralRunnerSet, AutoscalingListener) are listed AHEAD
+# of that, deliberately: `collect` never lists them (`UNLISTED_INSTANCE_CRDS`),
+# and naming them now keeps a later Application that tracks one from failing
+# as Forbidden.
 #
 # `scripts/tests/test_verify_handover.py` holds this shape: read verbs only, no
 # wildcard, no `secrets`, and every type the script reads on every run.
@@ -64,11 +70,19 @@ rules:
     resources: [jobs]
     verbs: [get, list, watch]
   # Custom resources: one rule per group, every plural named.
-  # The one ARC kind an Application tracks (estate-front-runner (and, from
-  # A-U10's runner App, the verifier runner)); controller-created children
-  # are tracked by no Application and `collect` never lists them.
+  # All four ARC plurals. Applications track the AutoscalingRunnerSet
+  # (estate-front-runner and post-merge-verifier-runner), and the verifier
+  # lists it. It never lists EphemeralRunner, EphemeralRunnerSet or
+  # AutoscalingListener instances (`UNLISTED_INSTANCE_CRDS`: they churn on
+  # every poll), but naming them keeps a later tracked one from failing as
+  # Forbidden. Their schemas hold Secret names, never a runner credential
+  # (read off the live CRDs, 2026-10-08).
   - apiGroups: [actions.github.com]
-    resources: [autoscalingrunnersets]
+    resources:
+      - autoscalingrunnersets
+      - ephemeralrunnersets
+      - ephemeralrunners
+      - autoscalinglisteners
     verbs: [get, list, watch]
   - apiGroups: [cert-manager.io]
     resources: [certificates, clusterissuers, issuers]

@@ -110,6 +110,18 @@ that job is NOT yet a required check, which MIGRATION_NOTES.md says out loud
 along with the one-line ruleset change that would make it one. Until that
 change, it is a red cross nobody is required to clear.
 
+ONE NAMED UPSTREAM IMAGE IS PINNED BUT NOT SIGNATURE-CHECKED (ledger 1219).
+`applications/post-merge-verifier-runner.yaml` runs GitHub's stock
+`ghcr.io/actions/actions-runner`, by digest. It is still held to a digest. But
+cosign is not asked about it: the identity below is `yadgarhq/actions`'s
+workflow, which never signs GitHub's image, so asking would be red on every
+pull request and would say nothing about the pin. The exemption is that one
+repository (`UPSTREAM_RUNNER`, matched as a prefix ending in `@`, so a
+lookalike repository, a sub-path or a tag-plus-digest is still asked), in that
+one file (`UPSTREAM_RUNNER_FILE`). The same image in any other scale set, in
+`estate-front-runner.yaml` above all, is still asked and still fails: ledger
+610's signature requirement there is unchanged.
+
 THREE CAUSES, THREE MESSAGES (ADR-0578). cosign absent, registry unreachable,
 and a digest genuinely not signed by CI are three different facts, and only the
 third says anything about the pin. The first two REFUSE rather than skip: a
@@ -156,6 +168,17 @@ RUNNER_CHART = "gha-runner-scale-set"
 # The registry namespace this organisation publishes into. See the docstring for
 # why this and not "every image in applications/".
 FIRST_PARTY = "ghcr.io/yadgarhq/"
+
+# GitHub's own runner image, the one third-party scale-set image this gate pins
+# without asking cosign (ledger 1219; see the docstring). A digest reference only.
+UPSTREAM_RUNNER = "ghcr.io/actions/actions-runner@"
+# The one file the skip applies to.
+UPSTREAM_RUNNER_FILE = "post-merge-verifier-runner.yaml"
+
+
+def upstream_runner(path, value: str) -> bool:
+    """True only for GitHub's runner image, by digest, in the verifier's runner file."""
+    return pathlib.Path(path).name == UPSTREAM_RUNNER_FILE and value.startswith(UPSTREAM_RUNNER)
 
 # Lowercase hex only: that is what the registry emits and what the kubelet
 # accepts. Same expression `versions_pinned.py` used, before it retired at
@@ -294,9 +317,9 @@ def collect():
                     f"this repository does not name, does not build and cannot "
                     f"verify. Argo renders it, reports Synced, and nothing else "
                     f"says a word. Restore "
-                    f"`template.spec.containers[].image` with the digest "
-                    f"`yadgarhq/actions`'s `estate-runner image` workflow "
-                    f"published and signed."
+                    f"`template.spec.containers[].image`, pinned by "
+                    f"`@sha256:<64 hex>` (a yadgarhq-built image must also be "
+                    f"signed by its CI workflow)."
                 )
                 continue
             for _, value, line in runner_images:
@@ -333,9 +356,9 @@ def unpinned(references) -> list[str]:
             f"a digest. A tag is mutable: `estate-runner` is rebuilt weekly and "
             f"its `latest` is re-promoted on every run, so the pod's contents "
             f"change with no commit in this repository to point at. Pin the "
-            f"digest that workflow published and signed — "
-            f"`ghcr.io/yadgarhq/<image>@sha256:<64 hex>` — which is what ledger "
-            f"610 did here and what D61 requires everywhere else in this estate."
+            f"digest by `@sha256:<64 hex>` (a yadgarhq-built image must also be "
+            f"signed by its CI workflow) — which is what ledger 610 did here "
+            f"and what D61 requires everywhere else in this estate."
         )
     return problems
 
@@ -383,6 +406,8 @@ def verify_signatures(references) -> list[str]:
     for path, line, value, _ in references:
         if not digest_pinned(value):
             continue  # already a problem, and a tag has no digest to verify
+        if upstream_runner(path, value):
+            continue  # GitHub's runner image: pinned, not ours to verify (see docstring)
         result = subprocess.run(
             [
                 "cosign",
@@ -445,13 +470,30 @@ def main() -> int:
             print(f"::error::{problem}")
         return 1
 
+    upstream = [r for r in references if upstream_runner(r[0], r[2])]
+    first_party = [r for r in references if r[2].startswith(FIRST_PARTY)]
+    other = [r for r in references if r not in upstream and r not in first_party]
     verified = " and signed by CI" if arguments.verify_signature else ""
     print(
-        f"{len(references)} first-party image reference(s), each digest-pinned"
+        f"{len(first_party)} first-party image reference(s), each digest-pinned"
         f"{verified}: "
-        + "; ".join(f"{path}:{line} {value}" for path, line, value, _ in references)
+        + "; ".join(f"{path}:{line} {value}" for path, line, value, _ in first_party)
         + "."
     )
+    if other:
+        print(
+            f"{len(other)} other third-party scale-set image reference(s), each "
+            f"digest-pinned{verified or ' (--verify-signature requires CI signature)'}: "
+            + "; ".join(f"{path}:{line} {value}" for path, line, value, _ in other)
+            + "."
+        )
+    if upstream:
+        print(
+            f"{len(upstream)} upstream runner image reference(s) ({UPSTREAM_RUNNER}), each "
+            f"digest-pinned, not signature-checked: "
+            + "; ".join(f"{path}:{line} {value}" for path, line, value, _ in upstream)
+            + "."
+        )
     return 0
 
 

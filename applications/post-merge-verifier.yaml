@@ -7,7 +7,8 @@
 # runner registered against it would take jobs from any workflow a collaborator
 # pushes. The runner registers against a PRIVATE repository that runs only the
 # verifier; MIGRATION_NOTES.md, "The post-merge verifier", holds its exact
-# files and the order a person creates them in.
+# files and the order a person creates them in. Its scale set is
+# applications/post-merge-verifier-runner.yaml (ledger 1219).
 #
 # `verifier/` sits outside root's `applications/*.yaml` include, so root
 # applies this Application and only this Application applies
