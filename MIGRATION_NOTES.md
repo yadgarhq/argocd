@@ -5393,3 +5393,277 @@ Low: this restores the state measured before B-U9.4. Find out why `gateway-clien
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 ```
+
+## iam refuses a caller with no client certificate: `clientAuth: "required"` (B-U9.5, ledger 925, ledger 1406)
+
+**What the merge does.** It changes one value in `applications/yadgar.yaml`:
+`iam.tls.clientAuth`, from `"optional"` to `"required"`. `task-db`, `iam-db`,
+`project-db`, `project` and `task` are already at `"required"` (argocd#77,
+#78, #80, #81). After this merge no server is at `"optional"`. The pin stays
+at 0.23.1 (PB-3, argocd#79).
+
+**The caller.** `iam`'s gRPC server (port 50052) has ONE caller: `gateway`.
+The render sets `IAM_HOST` on `Deployment/gateway` only, `iam-ingress` admits
+`app: gateway` only on 50052, and of the yadgarhq repos only the gateway's
+source builds an `IamServiceClient` (`src/attest/resolve.rs`,
+`src/http/auth.rs`, `src/http/admin.rs`). All three use the ONE channel that
+`src/boot/wiring.rs` builds with `upstream::connect_iam` from
+`UpstreamTls::from_env(IAM)`, so logins, credential resolves and the admin
+RPCs present the same leaf. The gateway presents `gateway-client-tls` on
+this hop (`IAM_TLS_CLIENT_{CERT,KEY}_FILE` =
+`/var/run/secrets/client-cert/client.{crt,key}`; `CLIENT_HOPS` `gateway: IAM`
+pins it).
+
+**The evidence (ADR-0884).** The hop has no passive traffic: a login or an
+authenticated request whose credential is not in the gateway's 300 s cache
+crosses it. `yadgar_calls_total` on the current iam pods
+`iam-6f4b8b4c6-7xn7h` / `-pd2bs` (iam 0.11.0, booted 22:05 UTC), by first
+scrape that shows each increment, 2026-10-09 (UTC):
+
+- `-7xn7h`: `Login` OK 1 (22:41), 2 (22:52); `ResolveCredential` OK 2
+  (22:41), 3 (22:47), 4 (22:52), 5 (22:53), 6 (23:24).
+- `-pd2bs`: `Login` OK 1 (22:47), 2 (23:19), 3 (23:24);
+  `ResolveCredential` OK 1 (22:47), 3 (23:19), 4 (23:24).
+
+Both pods, OK only, before and after a 26-minute idle gap (22:53 to 23:19),
+which is longer than the 300 s cache, so the gateway handshook with iam
+again. The gateway side matches: `auth/login` OK 2 on `gateway-fc8c6594-nkzhw`
+and 3 on `-q7t8j`, the same totals as iam's `Login`. Read again at 23:27:21
+and 23:30:20: unchanged, no non-OK series on `iam` or `gateway`, 0 WARN lines
+in either iam pod's log. Under `optional` these calls do not prove that the
+gateway PRESENTS its leaf. The same `gateway-client-tls` is accepted under
+`required` today by `project` (`ListProjects` OK 96 / 73) and by `task` on
+its new pods (`FindTasks` OK 6 / 6 on `task-79c47d8bd5-*`), read 23:30:15, and
+it has the same issuer, `yadgar-internal-ca`, as `iam-tls`.
+
+Merging is the deploy: `yadgar` syncs on its own (`selfHeal`, no `prune`).
+Measured 2026-10-09 (UTC) at base `7089f51` with helm 3.18.4, and with
+server-side dry runs against `kind-yadgar`:
+
+- 90 → 90 objects. 0 added. 0 removed.
+- 1 changed: `Deployment/iam`. One env value moves:
+  `LISTEN_TLS_CLIENT_AUTH` `optional` → `required`. Nothing else in it moves.
+- `Deployment/iam` with Argo's tracking-id: `kubectl diff` shows only the env
+  value and `generation` (62 → 63); `apply --dry-run=server` admits it
+  (`configured`). On `main` it is `unchanged`. The `yadgar` Application CR
+  with root's tracking-id: the one value; `configured`. Only these two objects
+  were dry-run.
+
+**What runs.** `iam` rolls, `maxSurge: 1 / maxUnavailable: 0`, 2 replicas.
+`gateway` does NOT roll. Its HTTP/2 connections to the old iam pods end when
+those pods stop, so the next login after the roll is a fresh handshake under
+`required`. iam 0.11.0 locks lifecycle v0.2.20, tonic 0.14.6 and rustls
+0.23.45: under `required`, `serve_tls` passes `client_auth_optional(false)`
+(lifecycle `src/serve_tls.rs:337`).
+
+**iam DOES NOT LOG ITS MODE AT BOOT.** iam 0.11.0's `iam listening` line has
+`tls` and `watching` but no `client_auth` field (`src/main.rs:280-288`), and
+`watching` is 9 under both `optional` and `required` (the client CA is
+watched in both verifying modes). So the mode is read from the new pods' spec
+env. A bad value is a boot refusal. The login below is the go/no-go. The
+NEEDS-MAX P1 probe is the only direct proof of enforcement.
+
+**THE BROKER, ON THE SAME ROLL (ledger 1420).** Both current iam pods logged
+`cannot reach the broker` at 22:05 (NATS `Connection refused`, during PB-3)
+and publish no cache invalidations. iam does not retry that connect. The roll
+replaces both pods, and NATS is up now, so each NEW pod is expected to log
+`publishing cache invalidation` with `"authenticated":true` and `"tls":false`
+(NATS stays cleartext at 0.23.1) and NO `cannot reach the broker` line.
+
+**Known noise on the new pods, NOT a regression.** Every iam pod logs
+`the key identity is UNVERIFIED` (ERROR, about every 5 minutes, ADR-0764,
+ADR-0765), and iam-db counts `SetKeyIdentity` `FAILED_PRECONDITION`
+(about 1.3k per iam-db pod at 23:27). Both are on the current pods too.
+
+### Before this merge — read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. yadgar Synced/Healthy at 0.23.1. Any other state → STOP.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. iam 2/2/2 at `optional`, generation 62; the other five servers at
+#    `required`; gateway generation 72. Read 2026-10-09 23:30: exactly that.
+kubectl --context kind-yadgar -n yadgar get deploy iam iam-db task task-db project project-db gateway \
+  -o custom-columns='NAME:.metadata.name,GEN:.metadata.generation,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,AUTH:.spec.template.spec.containers[0].env[?(@.name=="LISTEN_TLS_CLIENT_AUTH")].value'
+
+# 3. The calls, per pod. Read 2026-10-09 23:30:20 UTC: iam Login OK 2 / 3,
+#    ResolveCredential OK 6 / 4; gateway auth/login OK 2 / 3; no non-OK.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service%2Cpod%2Ctool%2Coutcome)(yadgar_calls_total%7Bservice%3D~%22gateway%7Ciam%22%2Ctool!~%22server%2Fdiscover%22%7D)' \
+  | jq -r '.data.result[] | "\(.metric.service) \(.metric.pod) \(.metric.tool) \(.metric.outcome) \(.value[1])"' | sort
+```
+
+### The login probe (coordinator)
+
+The operator's own credential. Nothing here prints or stores it: the password
+is read without echo, and the token stays in a shell variable that is unset at
+the end. A FRESH login every round: its token is new to the gateway's cache,
+so the round crosses the hop twice, `Login` and then `ResolveCredential`. A
+`find_tasks` on an old, cached token can answer 200 without touching iam.
+
+```bash
+G='https://gateway.yadgar.internal:18443'; PV='2026-07-28'; CLAIM='local/claude/scratch'
+read -rs -p 'claude-probe password: ' PW; echo
+raw="$(curl -sS --max-time 20 -w '\n%{http_code}' -H 'content-type: application/json' \
+  --data-binary @<(P="$PW" jq -nc '{username:"claude-probe",password:env.P,label:"host-curl"}') \
+  "$G/auth/login")"; unset PW
+echo "login HTTP ${raw##*$'\n'}"                       # expect 200
+TOKEN="$(printf '%s' "${raw%$'\n'*}" | jq -er .token)"; raw=''
+# find_tasks with the NEW token: the gateway resolves it through iam.
+# Repeat 3 times, 5 s apart. The status goes to stderr, so jq cannot swallow it.
+curl -sS --max-time 30 -w '%{stderr}HTTP %{http_code}\n' \
+  --config <(printf 'header = "authorization: Bearer %s"\n' "$TOKEN") \
+  -H 'content-type: application/json' -H "mcp-protocol-version: $PV" \
+  -H 'mcp-method: tools/call' -H 'mcp-name: find_tasks' -H "x-yadgar-project: $CLAIM" \
+  --data-binary @<(jq -nc --arg pv "$PV" '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"find_tasks",arguments:{page_size:5},_meta:{"io.modelcontextprotocol/protocolVersion":$pv,"io.modelcontextprotocol/clientCapabilities":{}}}}') \
+  "$G/" | jq -c 'if type=="object" then {error, isError: .result.isError} else . end' 2>/dev/null
+unset TOKEN
+```
+
+One round is the login plus three `find_tasks`. Expect login HTTP 200, then
+HTTP 200 with no JSON-RPC `error` and no `isError`. Run the round TWICE
+(two logins), then wait at least 45 s (one scrape) and read "Before" 3.
+
+### After this merge — read-only
+
+**THE ROLL LOOKS GREEN EVEN IF THE HOP IS BROKEN.** The readiness probe is
+`tcpSocket`, and the hop has no passive traffic. So an `iam`
+that refuses the gateway's leaf is still Ready, the Deployment is still
+2/2/2, and `yadgar` is still Synced/Healthy. Tokens already in the gateway's
+cache keep working for up to 300 s after that. The go/no-go is a FRESH login.
+
+```bash
+# 1. yadgar Synced/Healthy at 0.23.1, and its last operation Succeeded.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. iam generation 63, 2/2/2, AUTH `required`; NO other Deployment moved
+#    (gateway stays at 72, iam-db at 62, task at 47).
+kubectl --context kind-yadgar -n yadgar get deploy iam iam-db task task-db project project-db gateway \
+  -o custom-columns='NAME:.metadata.name,GEN:.metadata.generation,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,AUTH:.spec.template.spec.containers[0].env[?(@.name=="LISTEN_TLS_CLIENT_AUTH")].value'
+
+# 3. Each NEW iam pod: its own spec says `required`, it booted with TLS, and
+#    it reached the broker. Expect `"tls":true`, one `publishing cache
+#    invalidation` line, and 0 `cannot reach the broker` lines.
+for p in $(kubectl --context kind-yadgar -n yadgar get pod -l app=iam -o name); do
+  echo "$p $(kubectl --context kind-yadgar -n yadgar get "$p" \
+    -o jsonpath='{.status.startTime} {.spec.containers[0].env[?(@.name=="LISTEN_TLS_CLIENT_AUTH")].value}')"
+  kubectl --context kind-yadgar -n yadgar logs "$p" | grep -E '"iam listening"' | grep -o '"tls":[a-z]*'
+  kubectl --context kind-yadgar -n yadgar logs "$p" | grep -o '"publishing cache invalidation"[^}]*'
+  echo "broker refused: $(kubectl --context kind-yadgar -n yadgar logs "$p" | grep -c 'cannot reach the broker')"
+done
+
+# 4. Unreadable: expect 0 for all 7.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service)(yadgar_rotation_watched_files_unreadable)'
+```
+
+5. **THE GO/NO-GO.** Run the login probe round twice, then read "Before" 3
+   after ≥45 s. Pass: both logins HTTP 200; every `find_tasks` HTTP 200 with
+   no `error` and no `isError`; `Login` OK AND `ResolveCredential` OK under
+   at least one NEW iam pod name; zero non-OK on gateway `auth/login` and
+   `find_tasks` and on iam `Login` and `ResolveCredential`. kube-proxy
+   balances per connection, so all calls can land on one new pod. That is a
+   pass.
+6. **After an idle interval** (at least 6 minutes with no call, longer than
+   the gateway's 300 s credential cache), run one more round and read
+   "Before" 3. Expect the same pass, with counters growing.
+7. **iam-db keeps answering iam.** `GetKeyIdentity` OK keeps growing on the
+   iam-db pods, now called by the new iam pods. This hop (iam → iam-db) is
+   already `required` and does not change here.
+
+**The discriminator.** A refused handshake never reaches iam's handler, so
+iam counts NOTHING for it. The failure shows as a login that is not HTTP 200
+and as a non-OK `auth/login` outcome on a gateway pod, with no new `Login` on
+iam.
+
+**Blast radius, stated plainly.** `iam` is the authentication plane. If it
+refuses `gateway-client-tls`, every login fails at once, every admin and
+enrolment call fails, and every authenticated request fails as soon as its
+token leaves the gateway's 300 s cache. Nothing fails before a request, and
+nothing shows. `iam`'s only caller is `gateway`.
+
+### Live refusal probe — NEEDS-MAX, operator-run
+
+The same probes as the project section above (no agent runs a port-forward),
+against ONE NEW iam pod on port 50052: P1 (no certificate → `certificate
+required`) and P2 (a leaf from a CA made on the spot → `unknown ca` or `bad
+certificate`), with `-connect 127.0.0.1:15052 -servername iam.yadgar.svc`
+through the tunnel below. At the request, from a clone of yadgarhq/proto
+(expect a TLS error naming `certificate required` and NO gRPC status; a gRPC
+status, even `UNAUTHENTICATED`, means the handshake was ACCEPTED: STOP and
+revert):
+
+```bash
+# Terminal 1: a tunnel to ONE NEW iam pod. Leave it running.
+kubectl --context kind-yadgar -n yadgar port-forward \
+  "$(kubectl --context kind-yadgar -n yadgar get pod -l app=iam -o name | head -1)" 15052:50052
+
+# Terminal 2:
+grpcurl -insecure -authority iam.yadgar.svc -import-path . -proto yadgar/iam/v1/iam.proto \
+  -d '{}' 127.0.0.1:15052 yadgar.iam.v1.IamService/ResolveCredential
+```
+
+Do NOT add `-cert` to grpcurl to prove the wrong anchor (ledger 1400). P2
+proves it. The positive control is the gateway's OK traffic in step 5.
+
+### Rollback — a revert
+
+The revert target is `optional`, not `off`.
+
+If `yadgar`'s operation is still Running or retrying, end it first. NEEDS-MAX:
+`argocd app terminate-op yadgar` against kind-yadgar's Argo CD. A revert does
+not interrupt an operation already running.
+
+Then revert the WHOLE merge commit: the value, the K3 table, the gate map and
+this section move together. A values-only revert reddens K3 and
+`test_every_server_states_its_client_auth_and_stages_its_own_ca`. `iam`
+rolls back to `optional`. The other servers do not move.
+
+Break-glass, if git cannot merge in time (NEEDS-MAX): suspend auto-sync on
+`yadgar`, then
+`kubectl --context kind-yadgar -n yadgar set env deployment/iam LISTEN_TLS_CLIENT_AUTH=off`.
+`off` is the emergency value (ADR-0854). iam 0.11.0 reads it through
+lifecycle v0.2.20 like the other servers: with TLS on and the CA file still
+set, `off` only logs a WARN (lifecycle `src/serve_tls.rs:265-271`). Deleting
+the variable is a boot refusal. Revert in git afterwards.
+
+### Pre-written revert body
+
+Title: `revert: iam goes back to clientAuth "optional" (B-U9.5 rollback)`.
+Use this body for the whole-commit revert. Fill in the observed failure under
+`## Why`, and validate it with the actions `pr_body.py` before the push.
+
+```text
+## What
+
+This PR reverts the B-U9.5 (iam) merge as one commit. `iam.tls.clientAuth` goes back from `"required"` to `"optional"`. The K3 table, `EXPECTED_CLIENT_AUTH`, the comments and the `MIGRATION_NOTES.md` section revert with it. `task-db`, `iam-db`, `project-db`, `project` and `task` stay at `"required"`.
+
+**Merging rolls `Deployment/iam` on kind-yadgar.**
+
+## Why
+
+<!-- FILL IN: the observed failure, e.g. "a fresh login fails and the new iam pods count no Login call". -->
+
+The rollback target is `optional`, not `off`: under `optional` the server still verifies any leaf it gets, and accepts a caller that sends none.
+
+## Changelog
+
+- revert: iam goes back to clientAuth "optional" (B-U9.5 rollback, ledger 925)
+
+## Verification
+
+- If `yadgar`'s operation was still Running or retrying, `argocd app terminate-op yadgar` ran first (NEEDS-MAX).
+- After the sync: iam 2/2/2 with `LISTEN_TLS_CLIENT_AUTH` `optional` and new pod start times; gateway not rolled.
+- One operator login answers HTTP 200, and `yadgar_calls_total` shows `Login` OK on a new iam pod.
+
+## Risk
+
+Low: this restores the state measured before B-U9.5. Find out why `gateway-client-tls` was refused by `iam` while `task` and `project` accept it under `required`.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+```

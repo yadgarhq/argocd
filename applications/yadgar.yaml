@@ -239,11 +239,16 @@ spec:
         # `find_tasks` calls crossed `gateway` → `task` OK under `"optional"`
         # (ADR-0884). This hop also has no passive traffic, so a refused
         # `gateway-client-tls` shows only at the next task tool call.
+        # `iam` is sixth and last (B-U9.5): its one caller is `gateway`, and
+        # operator logins and the `ResolveCredential` calls behind them crossed
+        # `gateway` → `iam` OK under `"optional"` (ADR-0884). A refused leaf
+        # fails every login at once, and every authenticated request once the
+        # gateway's 300 s credential cache expires.
         iam:
           autoscaling: { enabled: true }
           tls:
             enabled: true
-            clientAuth: "optional"
+            clientAuth: "required"
             clientCaSecret: iam-tls
             clientCaSecretKey: ca.crt
           iamDb: { tls: { enabled: true, clientCertSecret: iam-client-tls } }
