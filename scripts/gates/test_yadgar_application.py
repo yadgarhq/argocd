@@ -53,6 +53,10 @@ CI job, never in the offline pre-commit hook.
       Re-measured 2026-10-09 with iam's `clientAuth: "optional"` (B-U8e,
       ledger 925): 90 objects, none added or removed, 1 changed (the `iam`
       Deployment's `LISTEN_TLS_CLIENT_AUTH`, `off` to `optional`).
+      Re-measured 2026-10-09 with iam-db's and project-db's `clientAuth:
+      "required"` (B-U9, ledger 925): 90 objects, none added or removed, 2
+      changed (the `iam-db` and `project-db` Deployments'
+      `LISTEN_TLS_CLIENT_AUTH`, `optional` to `required`).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
@@ -336,11 +340,14 @@ CLIENT_CA_ITEMS = [{"key": "ca.crt", "path": "ca.crt"}]
 # and project-db, whose only callers are iam and project. B-U8c moves
 # project, whose only caller is gateway. B-U8d moves task, whose only caller
 # is gateway. B-U8e moves iam, whose only caller is gateway, so all six are
-# `optional`. Each later step edits this one line.
+# `optional`. B-U9 moves iam-db and project-db to `required` first: each has
+# one caller and steady passive traffic. task-db, the plan's first, waits: its
+# hop carries no request without an operator call. Each later step edits this
+# one line.
 EXPECTED_CLIENT_AUTH = {server: "off" for server in SERVERS} | {
     "task-db": "optional",
-    "iam-db": "optional",
-    "project-db": "optional",
+    "iam-db": "required",
+    "project-db": "required",
     "project": "optional",
     "task": "optional",
     "iam": "optional",
@@ -433,9 +440,28 @@ def test_every_server_states_its_client_auth_and_stages_its_own_ca() -> None:
 #     Secret (an empty optional mount) refuses the boot naming the path.
 #   - `src/rotate.rs`: both files are in the rotation watch set, and a change
 #     ends the process, so a Secret deleted later restarts into that refusal.
-# So the one silent path is a dropped or misdirected env, and that is what
-# this pins. The "loud on a missing file" reading is verified for the gateway
-# only; the backend callers are pinned for shape (env, mount, volume, leaf).
+# The three backend callers read the same way (B-U9, re-read at the 0.19.1
+# parent's pins: iam v0.10.0, task v0.7.0, project v0.3.0, all on yadgar-dial
+# v0.2.14 and yadgar-lifecycle v0.2.20). Each dials its `-db` through
+# `upstream::connect` (iam `src/boot.rs:283`, task `src/main.rs:245`, project
+# `src/main.rs:175`) with `.map_err(|e| refusal(&e))?`, and that call is
+# `yadgar_dial::connect_tls` with the identity from `UpstreamTls::options()`
+# (`src/upstream.rs:303-333` in each). `connect_tls` (`src/connect.rs:226`)
+# runs `TlsOptions::prepare` (`src/tls.rs:115`), which reads the certificate
+# (`:187`) and the key (`:193`) before the lazy dial, so a missing file
+# refuses the boot naming the path. Each `src/rotate.rs` puts the identity in
+# the watch set as `Presented::Client` (iam `:146-148`, task `:88-90`,
+# project `:90-92`), and a change ends the process (each `src/rotate.rs:15`,
+# "The ruling: exit on change").
+# So for all four callers the one silent path is a dropped or misdirected
+# env, and that is what this pins.
+#
+# THE MAP IS COMPLETE, AND THE RENDER SAYS SO. `rendered_client_hops` reads
+# every non-`LISTEN_` `*_TLS_ENABLED` env NAME in every container, init
+# container and ephemeral container of every object in the render, hooks
+# included. That set must equal this map, so a caller or hop added by a chart
+# bump reddens here instead of going unpinned. No container in the render
+# uses `envFrom`; one that did could carry a hop this scan cannot see.
 CLIENT_HOPS = {
     "gateway": ("TASK", "IAM", "PROJECT"),
     "iam": ("IAM_DB",),
@@ -448,16 +474,72 @@ LEAF_ISSUER = {"group": "cert-manager.io", "kind": "Issuer", "name": "yadgar-int
 LEAF_KEYS = {"CERT": "tls.crt", "KEY": "tls.key"}
 
 
+CONTAINER_LISTS = ("containers", "initContainers", "ephemeralContainers")
+
+
+def rendered_client_hops(documents: list) -> set[tuple[str, str, str]]:
+    """Every `(kind, name, PREFIX)` whose render carries a non-`LISTEN_` `<PREFIX>_TLS_ENABLED` env.
+
+    By NAME, whatever its value: a hop rendered `"0"` is still a hop.
+    """
+    hops: set[tuple[str, str, str]] = set()
+
+    def walk(node: object, kind: str, name: str) -> None:
+        if isinstance(node, dict):
+            for key in CONTAINER_LISTS:
+                for container in node.get(key) or []:
+                    for env in container.get("env") or []:
+                        variable = env.get("name", "")
+                        if variable.endswith("_TLS_ENABLED") and not variable.startswith("LISTEN_"):
+                            hops.add((kind, name, variable.removesuffix("_TLS_ENABLED")))
+            for value in node.values():
+                walk(value, kind, name)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value, kind, name)
+
+    for document in documents:
+        walk(document, document["kind"], document["metadata"]["name"])
+    return hops
+
+
+def env_value(documents: list, kind: str, name: str, variable: str) -> object:
+    """The value of `variable` in any container of one object, for a failure message."""
+    document = next(d for d in documents if d["kind"] == kind and d["metadata"]["name"] == name)
+    found: list = []
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            for key in CONTAINER_LISTS:
+                for container in node.get(key) or []:
+                    found.extend(e.get("value") for e in container.get("env") or [] if e.get("name") == variable)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(document)
+    return found[0] if found else None
+
+
 def client_identity_failures(documents: list) -> dict[str, object]:
     """Every hop whose caller does not present its own issued leaf, keyed `<caller>/<PREFIX>: <what>`.
 
     THE PATHS ARE READ OFF THE RENDER, never written here: each env names a
     file, the mount at that file's directory names a volume, and that volume
     must project the caller's leaf with `tls.crt`/`tls.key` at the file's name.
+    A rendered hop that `CLIENT_HOPS` does not name is keyed
+    `<kind>/<name>/<PREFIX>: not in CLIENT_HOPS`.
     """
     certificates = {d["spec"]["secretName"]: d["spec"] for d in documents if d["kind"] == "Certificate"}
     deployments = {d["metadata"]["name"]: d for d in documents if d["kind"] == "Deployment"}
     failures: dict[str, object] = {}
+    pinned = {("Deployment", caller, prefix) for caller, prefixes in CLIENT_HOPS.items() for prefix in prefixes}
+    for kind, name, prefix in sorted(rendered_client_hops(documents) - pinned):
+        failures[f"{kind}/{name}/{prefix}: not in CLIENT_HOPS"] = env_value(
+            documents, kind, name, f"{prefix}_TLS_ENABLED"
+        )
     for caller, prefixes in CLIENT_HOPS.items():
         leaf = CLIENT_LEAVES[caller]
         certificate = certificates.get(leaf) or {}
@@ -465,7 +547,11 @@ def client_identity_failures(documents: list) -> dict[str, object]:
             failures[f"{caller}: {leaf} issuerRef"] = certificate.get("issuerRef")
         if "client auth" not in (certificate.get("usages") or []):
             failures[f"{caller}: {leaf} usages"] = certificate.get("usages")
-        pod = deployments[caller]["spec"]["template"]["spec"]
+        deployment = deployments.get(caller)
+        if deployment is None:
+            failures[f"{caller}: Deployment"] = None
+            continue
+        pod = deployment["spec"]["template"]["spec"]
         container = pod["containers"][0]
         env = {e["name"]: e.get("value") for e in container.get("env", [])}
         mounts = {m["mountPath"]: m for m in container.get("volumeMounts", [])}
@@ -591,6 +677,45 @@ def test_another_secret_on_the_gateway_names_all_three_hops() -> None:
         for half, suffix in (("CERT", "crt"), ("KEY", "key"))
     }
 
+
+
+def test_a_missing_caller_deployment_names_its_caller(rendered: list) -> None:
+    documents = [d for d in rendered if not (d["kind"] == "Deployment" and d["metadata"]["name"] == "iam")]
+    assert client_identity_failures(documents) == {"iam: Deployment": None}
+
+
+def test_the_rendered_client_hops_are_exactly_client_hops(rendered: list) -> None:
+    assert rendered_client_hops(rendered) == {
+        ("Deployment", caller, prefix) for caller, prefixes in CLIENT_HOPS.items() for prefix in prefixes
+    }
+
+
+def add_env(container_list: str, name: str, value: str):
+    """Add one env to the first container of `container_list`, creating an init container if there is none."""
+
+    def change(workload: dict) -> None:
+        pod = workload["spec"]["template"]["spec"]
+        containers = pod.setdefault(container_list, [])
+        if not containers:
+            containers.append({"name": "probe", "image": "probe"})
+        containers[0].setdefault("env", []).append({"name": name, "value": value})
+
+    return change
+
+
+def test_an_unpinned_hop_in_a_hook_jobs_init_container_names_it(rendered: list) -> None:
+    """By the env NAME: a hop written `"0"` is still a hop somebody may later turn on."""
+    change = add_env("initContainers", "NATS_TLS_ENABLED", "0")
+    assert client_identity_failures(mutated(rendered, "Job", "preflight", change)) == {
+        "Job/preflight/NATS: not in CLIENT_HOPS": "0"
+    }
+
+
+def test_an_unpinned_hop_on_a_server_names_it(rendered: list) -> None:
+    change = add_env("containers", "NATS_TLS_ENABLED", "1")
+    assert client_identity_failures(mutated(rendered, "Deployment", "iam-db", change)) == {
+        "Deployment/iam-db/NATS: not in CLIENT_HOPS": "1"
+    }
 
 def write_table() -> None:
     document = committed()

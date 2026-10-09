@@ -213,6 +213,13 @@ spec:
         # `task` is fourth (B-U8d): its one caller is `gateway`, which presents
         # the same `gateway-client-tls`. `iam` is fifth and last (B-U8e): its one
         # caller is `gateway`, which presents the same `gateway-client-tls`.
+        #
+        # Under `"required"` a caller that sends no certificate is refused too, so
+        # a caller that stops presenting its leaf on that hop is an outage. The
+        # first two are `iam-db` and `project-db` (B-U9): each has one caller and
+        # steady passive traffic, so a refused leaf shows within minutes. `task-db`
+        # waits at `"optional"`: its hop carries no request without an operator
+        # call.
         iam:
           autoscaling: { enabled: true }
           tls:
@@ -243,7 +250,7 @@ spec:
           autoscaling: { enabled: true }
           tls:
             enabled: true
-            clientAuth: "optional"
+            clientAuth: "required"
             clientCaSecret: iam-db-tls
             clientCaSecretKey: ca.crt
           networkPolicy:
@@ -339,7 +346,7 @@ spec:
           autoscaling: { enabled: true }
           tls:
             enabled: true
-            clientAuth: "optional"
+            clientAuth: "required"
             clientCaSecret: project-db-tls
             clientCaSecretKey: ca.crt
           networkPolicy:
