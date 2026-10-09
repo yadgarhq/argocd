@@ -1,6 +1,6 @@
 # K3: sha256 of each object `applications/yadgar.yaml` renders, as canonical JSON.
 # Regenerate: python3 scripts/gates/test_yadgar_application.py --write
-targetRevision  0.19.1
+targetRevision  0.23.1
 2355fad035bd3696b4fc741ed21eba814d3f4941a75fa16fb16cc73d4a4f0696  /ConfigMap//audit
 d19a8a2ae018718b5fd1626dade2ec71e47cd2516e203491e319a02e4dab0968  /ConfigMap//gateway-knobs
 cb6ae654735654b6b1dba8278b0376e0dd07518fc10a6cac97575ad9f4e08acd  /ConfigMap//nats-config
@@ -25,15 +25,15 @@ a09d6e21f3be46bc1e95a3f81493a41a51535ecba1cea48c44bb1516e64f541a  /ServiceAccoun
 0c1903ade9cc52becb857589671587e1609530a1fc49dae17378212452cdc5db  /ServiceAccount//project-db
 c0e197e038ddb56ee493c89d54a9f31a7a28989db10e6b62499af0d35298bc60  /ServiceAccount//task
 edb82b5473dc6e2170e034831628de8b51bc03c3dbc474c487c285b8e25ee7bb  /ServiceAccount//task-db
-493c9ee00f564a3e46d66eb991581f9350b3ffd34bedd4c8a371a0c53e6e9e66  apps/Deployment//gateway
-31861b72d1dc4fb2eabf900d164c7911a8068c7b58b648a39239285c10534aa9  apps/Deployment//iam
+a0fb65ad32e4a75831b6c49a1a9eb9d868ad061cf1285fd9d4e19b1f5b470ecb  apps/Deployment//gateway
+71336218f919dc4902712fc3d62c5444b2e7ddb60d165c859c21a016f9ac4614  apps/Deployment//iam
 255aefcc0c3509c830a0ad46dd3dc0d7a1d315448b87dda831d37980dd2b65eb  apps/Deployment//iam-db
-1b3829e1179dc50fbd055187f8c9e86eaaf1efdb53013c072f21b585f0aa4551  apps/Deployment//project
+6dddb6f1119a3d3fc97209f67b70c1c65864e337d96f7a98b85c740fb2ef8d85  apps/Deployment//project
 711370d5d4e52716097c5a77c46fffc35b31c94ccf15f5a44ad434292a1e9e34  apps/Deployment//project-db
-5908a8f4506fb7d4491aa4e40c4dfa57ca1e9c17884adeb0e61227b5f6b65e5d  apps/Deployment//task
+2a4398abba7fdf598b051b2b489c0601388909ea83cddbdfb155aa1575016db3  apps/Deployment//task
 126290ddebfd8a455b555947676ce5c76958daf7eba6f4ad587cf5608912d74f  apps/Deployment//task-db
-8a1c4a0d5d1c446ee5f33c8996d9e89a021b0b530d4a2cae93ec2d53357adad5  apps/Deployment//valkey
-d617428ba1c542e119101c3cc0111a91ee0c2d36841fcc169f0cb9e3d3dd722a  apps/StatefulSet//nats
+ef7aef076e33bbbd412303e08fdf13335e308f6a9ce605133243b3a6c30fa698  apps/Deployment//valkey
+a9fc68dbe8da8139306cbb976a046b614cb162a654cab37c64d3bdc39fb208b8  apps/StatefulSet//nats
 aac3d30b38147f49357856fbda3ec9d299a019c556fad5c73d37a64c48c3c206  batch/Job//admin-bootstrap-token
 fe2c897299ca1bc3f65945dbd17851d46d8e188a2485ab1287197785824fd2fa  batch/Job//bootstrap-secrets
 78379b7cc1e2a6b49ec7c8e92a7f08e9d509bb70f024c4034622441d90cee934  batch/Job//envoy-gateway-probe
