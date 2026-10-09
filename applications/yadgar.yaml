@@ -235,6 +235,10 @@ spec:
         # `task-db` OK under `"optional"` (ADR-0884), so its one caller's
         # `task-client-tls` has verified there. With no passive traffic, a refused
         # leaf shows only at the next request, and then every task call fails.
+        # `task` is fifth (B-U9.4): its one caller is `gateway`, and operator
+        # `find_tasks` calls crossed `gateway` → `task` OK under `"optional"`
+        # (ADR-0884). This hop also has no passive traffic, so a refused
+        # `gateway-client-tls` shows only at the next task tool call.
         iam:
           autoscaling: { enabled: true }
           tls:
@@ -312,7 +316,7 @@ spec:
           autoscaling: { enabled: true }
           tls:
             enabled: true
-            clientAuth: "optional"
+            clientAuth: "required"
             clientCaSecret: task-tls
             clientCaSecretKey: ca.crt
           taskDb: { tls: { enabled: true, clientCertSecret: task-client-tls } }
