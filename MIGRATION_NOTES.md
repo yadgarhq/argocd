@@ -3512,17 +3512,6 @@ kubectl --context kind-yadgar get --raw \
   '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service%2Cpod%2Ctool%2Coutcome)(yadgar_calls_total%7Bservice%3D~%22task%7Cgateway%22%2Ctool!~%22server%2Fdiscover%22%7D)'
 ```
 
-**7. Clear B-U8a's hop first — NEEDS-MAX, operator-run, before the merge.**
-No request has crossed `task` → `task-db` since B-U8a synced (task-db rolled
-2026-10-09T00:52Z; `task` has counted no call since). So B-U8a's acceptance
-is still open. If B-U8d merges first, the first task request after it
-exercises two unverified hops at once, and a failure does not say which one
-broke. Send one task request through the gateway with your own client, for
-example a `find_tasks` from the yadgar client, and read the step-6 query
-again. Expect `service="task"`, `tool="FindTasks"`, `outcome="OK"` on a
-current `task` pod. Anything else is a B-U8a fault: STOP, do not merge
-B-U8d, and follow B-U8a's rollback.
-
 ### Live refusal probe — NEEDS-MAX, operator-run
 
 A port-forward and a local `openssl` are a cluster action (`port-forward`
@@ -3631,9 +3620,12 @@ the readiness probe (`tcpSocket`) cannot see it either.
   are removed. A handshake that `task` refuses never reaches `task`'s
   handler, so `task` counts NOTHING. The failure shows only on the gateway:
   `yadgar_calls_total{service="gateway",tool="find_tasks"}` with a non-OK
-  `outcome` (the gRPC status name of the transport error; `UNAVAILABLE` is
-  the likely one, not measured), and the client gets a tool error. Every
-  task tool call for every user fails the same way: revert at once.
+  `outcome`: any non-OK outcome from the upstream (`ToolError::Upstream`).
+  The code is not measured: `UNAVAILABLE` if refused inside the handshake;
+  `UNKNOWN`, `INTERNAL` or `CANCELLED` if the TLS 1.3 alert arrives after it
+  (neither lifecycle nor dial pins a TLS version). The client gets a tool
+  error. Every task tool call for every user fails the same way: revert at
+  once.
 - The estate smoke rows C-01 (iam path) and C-10 (task path) are the card's
   functional acceptance. They CANNOT run today: the estate verdict gate is red
   until the settled-state gate produces a `settled-verdict` artifact (ledger
@@ -3645,6 +3637,22 @@ the readiness probe (`tcpSocket`) cannot see it either.
 kubectl --context kind-yadgar get --raw \
   '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service%2Cpod%2Ctool%2Coutcome)(yadgar_calls_total%7Bservice%3D~%22task%7Cgateway%22%2Ctool!~%22server%2Fdiscover%22%7D)'
 ```
+
+**Which hop broke — read after one post-merge `find_tasks` (operator-run).**
+This one request also exercises B-U8a's hop (`task` → `task-db`) for the
+first time, and the two hops fail in different places. `task` v0.7.0 counts
+a `task-db` failure as its own non-OK `FindTasks` and logs a WARN; a
+handshake `task` refuses records nothing on `task`.
+
+| Reading after one post-merge `find_tasks`                                                                                                              | Broken hop                                    |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------- |
+| gateway `find_tasks` OK, and new task pod `FindTasks` OK                                                                                               | none, pass                                    |
+| task pod has `FindTasks` non-OK (UNAVAILABLE or INTERNAL), task log WARN `task-db returned an error`, client tool error says "task store"              | task→task-db (B-U8a): revert B-U8a, not B-U8d |
+| no new `service="task"` sample, gateway `find_tasks` non-OK, client gets tool result `isError:true` (HTTP 200) with transport text                     | gateway→task (B-U8d): revert B-U8d            |
+| gateway WARN `attestation failed`, JSON-RPC error (HTTP 401/503, "the credential could not be verified"), or `RESOURCE_EXHAUSTED` / `INVALID_ARGUMENT` | gateway-local, not this change                |
+
+If both hops are broken, row 3 fires first: revert B-U8d, then send one more
+request to test B-U8a.
 
 If a `task` pod does not become Ready, the rollout stops behind
 `maxUnavailable: 0` and the old pods keep serving. Read the log first: a CA
@@ -3668,7 +3676,9 @@ and this section move together. A values-only revert reddens K3 and
 `test_every_server_states_its_client_auth_and_stages_its_own_ca`. The revert
 returns `EXPECTED_CLIENT_AUTH` to the three `-db` servers and `project` at
 `optional`; it does not touch B-U8a, B-U8b or B-U8c. It also restores the
-B-U8b wording fix below to its old text; re-land that on its own if wanted.
+B-U8b and B-U8c wording fixes above (B-U8b's caller-proof sentence and both
+"within about a minute" claims) to their old text; re-land them on their own
+if wanted.
 `task` rolls back to `off`: it stops asking for a certificate and drops the
 CA from its watch set. Nothing is created, so nothing is left to prune.
 
