@@ -75,6 +75,10 @@ CI job, never in the offline pre-commit hook.
       "required"` (B-U9.4, ledger 925): 90 objects, none added or removed, 1
       changed (the `task` Deployment's `LISTEN_TLS_CLIENT_AUTH`, `optional`
       to `required`).
+      Re-measured 2026-10-09 at 0.23.1 with iam's `clientAuth:
+      "required"` (B-U9.5, ledger 925): 90 objects, none added or removed, 1
+      changed (the `iam` Deployment's `LISTEN_TLS_CLIENT_AUTH`, `optional`
+      to `required`).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
@@ -365,14 +369,17 @@ CLIENT_CA_ITEMS = [{"key": "ca.crt", "path": "ca.crt"}]
 # passive signal. B-U9 (task-db) moves task-db once operator find_tasks calls
 # crossed its hop OK under optional (ADR-0884). B-U9.4 moves task, whose
 # only caller is gateway, once operator find_tasks calls crossed gateway →
-# task OK under optional (ADR-0884). Each later step edits this one line.
+# task OK under optional (ADR-0884). B-U9.5 moves iam, the last, whose only
+# caller is gateway, once operator logins and the credential resolves behind
+# them crossed gateway → iam OK under optional (ADR-0884). No server is left
+# at optional; a revert edits this one line.
 EXPECTED_CLIENT_AUTH = {server: "off" for server in SERVERS} | {
     "task-db": "required",
     "iam-db": "required",
     "project-db": "required",
     "project": "required",
     "task": "required",
-    "iam": "optional",
+    "iam": "required",
 }
 
 
