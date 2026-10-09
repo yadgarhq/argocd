@@ -208,6 +208,8 @@ spec:
         # its only caller is `task`, which presents `task-client-tls` (ledger 770).
         # `iam-db` and `project-db` are second (B-U8b): each has one caller, `iam`
         # and `project`, which present `iam-client-tls` and `project-client-tls`.
+        # `project` is third (B-U8c): its one caller is `gateway`, which presents
+        # `gateway-client-tls` (the edge's `gateway-tls` is a different leaf).
         iam:
           autoscaling: { enabled: true }
           tls:
@@ -318,7 +320,7 @@ spec:
           autoscaling: { enabled: true }
           tls:
             enabled: true
-            clientAuth: "off"
+            clientAuth: "optional"
             clientCaSecret: project-tls
             clientCaSecretKey: ca.crt
           projectDb:

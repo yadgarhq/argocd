@@ -44,6 +44,9 @@ CI job, never in the offline pre-commit hook.
       "optional"` (B-U8b, ledger 925): 90 objects, none added or removed, 2
       changed (the `iam-db` and `project-db` Deployments'
       `LISTEN_TLS_CLIENT_AUTH`, `off` to `optional`).
+      Re-measured 2026-10-09 with project's `clientAuth: "optional"` (B-U8c,
+      ledger 925): 90 objects, none added or removed, 1 changed (the
+      `project` Deployment's `LISTEN_TLS_CLIENT_AUTH`, `off` to `optional`).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
@@ -324,12 +327,13 @@ CLIENT_CA_ITEMS = [{"key": "ca.crt", "path": "ca.crt"}]
 # The mode each server states, one hop at a time (ADR-0852): off, then
 # optional (B-U8a..e), then required (B-U9.1..5). PB-2 staged all six at
 # `off`. B-U8a moves task-db, whose only caller is task. B-U8b moves iam-db
-# and project-db, whose only callers are iam and project. Each later step
-# edits this one line.
+# and project-db, whose only callers are iam and project. B-U8c moves
+# project, whose only caller is gateway. Each later step edits this one line.
 EXPECTED_CLIENT_AUTH = {server: "off" for server in SERVERS} | {
     "task-db": "optional",
     "iam-db": "optional",
     "project-db": "optional",
+    "project": "optional",
 }
 
 
