@@ -404,6 +404,194 @@ def test_every_server_states_its_client_auth_and_stages_its_own_ca() -> None:
     assert wrong == {}
 
 
+
+# ── EACH CALLER'S UPSTREAM CLIENT IDENTITY (ledger 1396, before B-U9) ───────
+
+# Every hop a caller dials, by the env prefix its binary reads. The gateway
+# dials three servers with ONE leaf; each backend caller dials its `-db`.
+# B-U9 makes a server `required`; from then on a caller that stops presenting
+# its leaf on a hop is an outage. K3 cannot hold this: `--write` blesses
+# whatever renders, so a dropped `*_TLS_CLIENT_*` env, an env pointing at a
+# file no volume projects, `*_TLS_ENABLED` flipped, or the volume pointed at
+# another Secret would pass K3. `test_every_issued_client_leaf_is_mounted_by_
+# its_caller` above holds only that the Secret is mounted SOMEWHERE in the pod.
+# The parent chart's own B-U6 refusal (0.19.1 `_validate.tpl`) covers a caller
+# that presents NOTHING to an `optional`/`required` server; it does not check
+# WHICH leaf (`gateway.clientCertificate.secret=iam-client-tls` renders), nor
+# that each env names a file the volume projects, nor a hop whose server is
+# `off`.
+#
+# WHY `optional: true` ON THE LEAF VOLUME IS NOT REFUSED HERE. The gateway
+# chart (0.10.2) hard-codes it. It is not a silent path for the gateway at
+# v0.10.2, read off the source:
+#   - `src/upstream/tls.rs`: with `<PREFIX>_TLS_ENABLED` "1", both
+#     `_TLS_CLIENT_*_FILE` set become the dial's identity; one without the
+#     other refuses the boot.
+#   - `src/boot/wiring.rs` (`connect_task`, `connect_iam`, `connect_project`):
+#     each `.map_err(refusal)?`, and `yadgar_dial` v0.2.14 `TlsOptions::prepare`
+#     reads the certificate and the key BEFORE the lazy dial, so a missing
+#     Secret (an empty optional mount) refuses the boot naming the path.
+#   - `src/rotate.rs`: both files are in the rotation watch set, and a change
+#     ends the process, so a Secret deleted later restarts into that refusal.
+# So the one silent path is a dropped or misdirected env, and that is what
+# this pins. The "loud on a missing file" reading is verified for the gateway
+# only; the backend callers are pinned for shape (env, mount, volume, leaf).
+CLIENT_HOPS = {
+    "gateway": ("TASK", "IAM", "PROJECT"),
+    "iam": ("IAM_DB",),
+    "task": ("TASK_DB",),
+    "project": ("PROJECT_DB",),
+}
+# The cert-manager Issuer (not its Secret) every client leaf is issued from.
+LEAF_ISSUER = {"group": "cert-manager.io", "kind": "Issuer", "name": "yadgar-internal-ca"}
+# Each env half and the leaf key the volume must project to that file.
+LEAF_KEYS = {"CERT": "tls.crt", "KEY": "tls.key"}
+
+
+def client_identity_failures(documents: list) -> dict[str, object]:
+    """Every hop whose caller does not present its own issued leaf, keyed `<caller>/<PREFIX>: <what>`.
+
+    THE PATHS ARE READ OFF THE RENDER, never written here: each env names a
+    file, the mount at that file's directory names a volume, and that volume
+    must project the caller's leaf with `tls.crt`/`tls.key` at the file's name.
+    """
+    certificates = {d["spec"]["secretName"]: d["spec"] for d in documents if d["kind"] == "Certificate"}
+    deployments = {d["metadata"]["name"]: d for d in documents if d["kind"] == "Deployment"}
+    failures: dict[str, object] = {}
+    for caller, prefixes in CLIENT_HOPS.items():
+        leaf = CLIENT_LEAVES[caller]
+        certificate = certificates.get(leaf) or {}
+        if certificate.get("issuerRef") != LEAF_ISSUER:
+            failures[f"{caller}: {leaf} issuerRef"] = certificate.get("issuerRef")
+        if "client auth" not in (certificate.get("usages") or []):
+            failures[f"{caller}: {leaf} usages"] = certificate.get("usages")
+        pod = deployments[caller]["spec"]["template"]["spec"]
+        container = pod["containers"][0]
+        env = {e["name"]: e.get("value") for e in container.get("env", [])}
+        mounts = {m["mountPath"]: m for m in container.get("volumeMounts", [])}
+        volumes = {v["name"]: v for v in pod.get("volumes", [])}
+        for prefix in prefixes:
+            hop = f"{caller}/{prefix}"
+            if env.get(f"{prefix}_TLS_ENABLED") != "1":
+                failures[f"{hop}: {prefix}_TLS_ENABLED"] = env.get(f"{prefix}_TLS_ENABLED")
+            for half, key in LEAF_KEYS.items():
+                name = f"{prefix}_TLS_CLIENT_{half}_FILE"
+                directory, _, file = (env.get(name) or "").rpartition("/")
+                mount = mounts.get(directory) or {}
+                secret = (volumes.get(mount.get("name")) or {}).get("secret") or {}
+                if not (
+                    mount.get("readOnly")
+                    and secret.get("secretName") == leaf
+                    and {"key": key, "path": file} in (secret.get("items") or [])
+                ):
+                    failures[f"{hop}: {name}"] = env.get(name)
+    return failures
+
+
+@pytest.fixture(scope="module")
+def rendered() -> list:
+    return [d for d in parent_render(REPOSITORY) if isinstance(d, dict) and d.get("kind")]
+
+
+def test_every_caller_presents_its_own_leaf_on_every_hop(rendered: list) -> None:
+    assert client_identity_failures(rendered) == {}
+
+
+def mutated(documents: list, kind: str, name: str, change) -> list:
+    """A deep copy of `documents` with `change` applied to one object."""
+    copy = json.loads(json.dumps(documents))
+    change(next(d for d in copy if d["kind"] == kind and d["metadata"]["name"] == name))
+    return copy
+
+
+def env_of(deployment: dict) -> list:
+    return deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+
+
+def set_env(name: str, value: str):
+    def change(deployment: dict) -> None:
+        next(e for e in env_of(deployment) if e["name"] == name)["value"] = value
+
+    return change
+
+
+def test_a_dropped_client_env_names_its_hop(rendered: list) -> None:
+    def drop(deployment: dict) -> None:
+        env_of(deployment)[:] = [e for e in env_of(deployment) if e["name"] != "TASK_TLS_CLIENT_KEY_FILE"]
+
+    assert client_identity_failures(mutated(rendered, "Deployment", "gateway", drop)) == {
+        "gateway/TASK: TASK_TLS_CLIENT_KEY_FILE": None
+    }
+
+
+def test_a_client_env_at_a_file_the_leaf_does_not_project_names_its_hop(rendered: list) -> None:
+    """Not reachable by a values override (the chart writes these paths), so the render is edited."""
+    wrong = "/var/run/secrets/client-cert/tls.crt"
+    change = set_env("PROJECT_TLS_CLIENT_CERT_FILE", wrong)
+    assert client_identity_failures(mutated(rendered, "Deployment", "gateway", change)) == {
+        "gateway/PROJECT: PROJECT_TLS_CLIENT_CERT_FILE": wrong
+    }
+
+
+def test_a_hop_flipped_to_cleartext_names_its_hop(rendered: list) -> None:
+    change = set_env("IAM_TLS_ENABLED", "0")
+    assert client_identity_failures(mutated(rendered, "Deployment", "gateway", change)) == {
+        "gateway/IAM: IAM_TLS_ENABLED": "0"
+    }
+
+
+def test_a_backend_callers_env_at_a_wrong_directory_names_its_hop(rendered: list) -> None:
+    wrong = "/var/run/secrets/client-cert/client.pem"
+    change = set_env("IAM_DB_TLS_CLIENT_CERT_FILE", wrong)
+    assert client_identity_failures(mutated(rendered, "Deployment", "iam", change)) == {
+        "iam/IAM_DB: IAM_DB_TLS_CLIENT_CERT_FILE": wrong
+    }
+
+
+def test_a_writable_leaf_mount_names_its_hop(rendered: list) -> None:
+    def writable(deployment: dict) -> None:
+        mounts = deployment["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]
+        next(m for m in mounts if m["name"] == "client-cert")["readOnly"] = False
+
+    assert client_identity_failures(mutated(rendered, "Deployment", "task", writable)) == {
+        "task/TASK_DB: TASK_DB_TLS_CLIENT_CERT_FILE": "/var/run/secrets/client-cert/client.crt",
+        "task/TASK_DB: TASK_DB_TLS_CLIENT_KEY_FILE": "/var/run/secrets/client-cert/client.key",
+    }
+
+
+def test_a_leaf_without_client_auth_names_its_caller(rendered: list) -> None:
+    def server_only(certificate: dict) -> None:
+        certificate["spec"]["usages"] = ["server auth", "digital signature"]
+
+    assert client_identity_failures(mutated(rendered, "Certificate", "gateway-client-tls", server_only)) == {
+        "gateway: gateway-client-tls usages": ["server auth", "digital signature"]
+    }
+
+
+def test_a_leaf_from_another_issuer_names_its_caller(rendered: list) -> None:
+    def other_issuer(certificate: dict) -> None:
+        certificate["spec"]["issuerRef"]["name"] = "another-ca"
+
+    assert client_identity_failures(mutated(rendered, "Certificate", "task-client-tls", other_issuer)) == {
+        "task: task-client-tls issuerRef": {"group": "cert-manager.io", "kind": "Issuer", "name": "another-ca"}
+    }
+
+
+def test_another_secret_on_the_gateway_names_all_three_hops() -> None:
+    """End to end through the chart: the gateway's one volume carries iam's leaf instead of its own."""
+    documents = [
+        d
+        for d in parent_render(REPOSITORY, ("--set", "gateway.clientCertificate.secret=iam-client-tls"))
+        if isinstance(d, dict) and d.get("kind")
+    ]
+    path = "/var/run/secrets/client-cert/client"
+    assert client_identity_failures(documents) == {
+        f"gateway/{prefix}: {prefix}_TLS_CLIENT_{half}_FILE": f"{path}.{suffix}"
+        for prefix in CLIENT_HOPS["gateway"]
+        for half, suffix in (("CERT", "crt"), ("KEY", "key"))
+    }
+
+
 def write_table() -> None:
     document = committed()
     rendered = digests(parent_render(REPOSITORY))
