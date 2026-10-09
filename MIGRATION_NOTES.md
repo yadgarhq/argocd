@@ -4567,7 +4567,7 @@ That the leaf is on the wire is a source fact plus a gate:
 **The gateway's calls to `project`.** Exactly two RPCs, and only one runs:
 
 - `ListProjects`, the registry poll (gateway v0.10.2
-  `src/project/registry.rs:330`), every
+  `src/project/registry.rs:342`), every
   `YADGAR_PROJECT_REGISTRY_POLL_SECONDS` (60, live).
 - `ResolveProject` (`src/project/remediate.rs:140`) runs ONLY under
   `enforcing`. Live mode is `YADGAR_PROJECT_VALIDATION_MODE=counting`, and in
@@ -4653,9 +4653,19 @@ kubectl --context kind-yadgar get --raw \
 kubectl --context kind-yadgar get --raw \
   '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service%2Cpod%2Ctool%2Coutcome)(yadgar_calls_total%7Bservice%3D~%22project%7Cproject-db%22%7D)'
 
-# 6. Expect 0 "could not be refreshed" WARN lines on both gateway pods.
+# 6. The gateway's registry refresh. Expect no "could not be refreshed" WARN
+#    after the roll window. One transient WARN inside the roll window is not
+#    a no-go: the go/no-go is the counter growth in step 5 plus the WARN's
+#    `error` text (see the discriminator below).
 for p in $(kubectl --context kind-yadgar -n yadgar get pod -l app=gateway -o name); do
   kubectl --context kind-yadgar -n yadgar logs --since=15m "$p" | grep -E 'project registry' | tail -2
+done
+
+# 7. The gateway tracks the NEW project pods (ledger 1401, dial#29). Expect, on BOTH
+#    gateway pods, an "endpoint added" for host project naming each new project pod IP.
+kubectl --context kind-yadgar -n yadgar get pod -l app=project -o custom-columns=N:.metadata.name,IP:.status.podIP
+for p in $(kubectl --context kind-yadgar -n yadgar get pod -l app=gateway -o name); do
+  kubectl --context kind-yadgar -n yadgar logs --since=30m "$p" | grep 'yadgar_dial::resolve' | grep '"host":"project"' | tail -4
 done
 ```
 
@@ -4672,6 +4682,7 @@ gateway's side, and as an absence on the server's.
   v0.10.2 `src/project/registry.rs:319-324`). A gateway pod that starts
   meanwhile (a restart, or a KEDA scale-up) never loads: it logs the ERROR
   "the project registry has NEVER loaded" (`:311-317`).
+- **Stale endpoints (ledger 1401), NOT a refused leaf:** the same absence and the same WARN, but the gateway's latest `endpoint added` for host `project` is missing a new pod IP, or the WARN's `error` reads `tcp connect error` or `did not answer within 5s`. A refused leaf shows the new IPs added and an `error` naming the TLS alert. Do not revert and do not stop the train on a stale-endpoint signature; it is dial#29 (fixed in dial v0.2.17, not yet in gateway).
 - `project-db` stalled while `project` still counts OK is NOT this change: that
   is the `project` → `project-db` hop (argocd#77).
 - `yadgar_gateway_project_registry_loaded` does NOT prove this hop (ledger
