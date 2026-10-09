@@ -2335,3 +2335,1809 @@ their Secrets stay too. Nothing mounts any of the four. NEEDS-MAX:
 kubectl --context kind-yadgar -n yadgar delete certificate nats-tls valkey-tls
 kubectl --context kind-yadgar -n yadgar delete secret nats-tls valkey-tls
 ```
+
+## The four callers present their client leaves (ledger 770)
+
+**What the merge does.** It adds four values to `applications/yadgar.yaml`:
+`gateway.clientCertificate.secret: gateway-client-tls`, and
+`clientCertSecret` under `iam.iamDb.tls`, `task.taskDb.tls` and
+`project.projectDb.tls` (`iam-client-tls`, `task-client-tls`,
+`project-client-tls`). `platform` already issues these four Secrets. Until
+this merge, no pod mounts them. The pin stays at 0.13.13.
+
+Merging is the deploy: `yadgar` syncs on its own (`selfHeal`, no `prune`).
+Measured 2026-10-08 at parent 0.13.13 with helm 3.18.4 and 4.3.0 (same object
+diff), and with a server-side dry run against `kind-yadgar`:
+
+- 90 → 90 objects. 0 added. 0 removed.
+- 4 changed: `Deployment/gateway`, `iam`, `task` and `project`. Each gains one
+  Secret volume (`optional: true`, items `tls.crt` and `tls.key`), one
+  read-only mount, and its `*_TLS_CLIENT_CERT_FILE` / `*_TLS_CLIENT_KEY_FILE`
+  env. `gateway` gets the pair for each of its three dials (`IAM_`, `TASK_`,
+  `PROJECT_`), all naming one file pair.
+- The server dry run names the same four Deployments. Every changed line is
+  an addition. It admits all 77 tracked objects and all 13 hooks.
+
+**What runs.** The four Deployments roll, each `maxSurge: 1 /
+maxUnavailable: 0`. No other object changes. No server asks for a client
+certificate at this pin (no `*_TLS_CLIENT_AUTH` renders), so every handshake
+completes as before.
+
+### Before this merge — read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. yadgar Synced/Healthy at 0.13.13. Any other state → STOP.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. The four Certificates are Ready. Read 2026-10-08: all True.
+kubectl --context kind-yadgar -n yadgar get certificate \
+  gateway-client-tls iam-client-tls task-client-tls project-client-tls
+
+# 3. Baseline of the gauge, through the API server's service proxy
+#    (prometheus-server port 80). Read 2026-10-08: empty, no kind="client" series.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=count%20by%20(service%2Ckind)(yadgar_tls_certificate_not_after_seconds%7Bkind%3D%22client%22%7D)'
+```
+
+### After this merge — read-only
+
+```bash
+# 1. yadgar Synced/Healthy, and its last operation Succeeded.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. The four Deployments rolled (new pod start times) and are Ready.
+kubectl --context kind-yadgar -n yadgar get pods -l 'app in (gateway,iam,task,project)' \
+  -o custom-columns=NAME:.metadata.name,START:.status.startTime,READY:.status.containerStatuses[0].ready
+
+# 3. Each mounts its leaf.
+kubectl --context kind-yadgar -n yadgar get deploy gateway iam task project \
+  -o custom-columns=NAME:.metadata.name,SECRETS:.spec.template.spec.volumes[*].secret.secretName
+
+# 4. The gauge: expect 2 (one per pod) for each of gateway, iam, task and project.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=count%20by%20(service%2Ckind)(yadgar_tls_certificate_not_after_seconds%7Bkind%3D%22client%22%7D)'
+
+# 5. No watched file is unreadable: expect 0 for all 7 services.
+#    Read 2026-10-08 before the merge: 0 for all 7.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service)(yadgar_rotation_watched_files_unreadable)'
+
+# 6. The gateway's project registry loaded: expect 1 per gateway pod.
+#    Read 2026-10-08 before the merge: 1 on both pods.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=yadgar_gateway_project_registry_loaded'
+
+# 7. Judge by Deployment readiness: READY == REPLICAS and UPDATED == REPLICAS on all four.
+kubectl --context kind-yadgar -n yadgar get deploy gateway iam task project \
+  -o custom-columns=NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas
+```
+
+The operation phase reads Succeeded even if a pod crashloops. Judge by
+Deployment readiness (`readyReplicas == replicas`, `updatedReplicas ==
+replicas`), step 7 above.
+
+The gauge proves each process loaded its leaf and watches it. It does not
+prove the dial presents the leaf; a server that runs `clientAuth` proves that.
+
+If a pod does not become Ready, its rollout stops behind `maxUnavailable: 0`
+and the old pods keep serving. Read its log before you revert.
+
+### Rollback — a revert
+
+If `yadgar`'s operation is still Running or retrying, end it first:
+
+```bash
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.status.operationState.phase} {.status.operationState.syncResult.revision}{"\n"}'
+```
+
+NEEDS-MAX: `argocd app terminate-op yadgar` against kind-yadgar's Argo CD. A
+revert does not interrupt an operation already running: v3.1.8's Application
+CRD has no `syncPolicy.retry.refresh` (see "The yadgar pin moves to parent
+chart 0.13.13", Rollback).
+
+Then revert the merge. The added volume, mount and env lines are in each
+Deployment's last-applied configuration, so the client-side apply removes
+them, and the four Deployments roll back. This merge creates no object, so
+nothing is left to prune. The four Secrets stay, as they were before the
+merge.
+
+## The yadgar pin moves to parent chart 0.19.1, and the six servers stage their client CA (PB-2, ledger 925)
+
+**What the merge does.** It moves `applications/yadgar.yaml`'s
+`targetRevision` from 0.13.13 to 0.19.1 and `scripts/chart_pin.json`'s
+`chart_tag` to `v0.19.1`. `platform_version` stays 0.1.36, so no operator
+Application moves. It also adds three values to `tls` on each of the six gRPC
+servers (`iam`, `iam-db`, `task`, `task-db`, `project`, `project-db`):
+
+- `clientAuth: "off"`. Parent 0.19.1's server charts require the key, with no
+  default (ADR-0854). The binaries refuse to boot without
+  `LISTEN_TLS_CLIENT_AUTH`.
+- `clientCaSecret: <server>-tls` and `clientCaSecretKey: ca.crt` (ADR-0883).
+  This stages the client CA now, so the later flip to `optional` (B-U8) is a
+  one-key change.
+
+Parent 0.19.1 moves six module pins and nothing else: iam 0.9.2 → 0.10.0,
+iam-db 0.9.0 → 0.10.0, task 0.6.1 → 0.7.0, task-db 0.8.1 → 0.9.0, project
+0.2.1 → 0.3.0, project-db 0.5.1 → 0.6.0. Each tag is the B-U5 contract
+merge (iam#95, iam-db#86, task#74, task-db#87, project#30, project-db#56).
+gateway stays 0.10.2, config 0.2.0, platform 0.1.36.
+
+Merging is the deploy: `yadgar` syncs on its own (`selfHeal`, no `prune`).
+Measured 2026-10-09 with helm 3.18.4 and 4.3.0 (byte-identical renders), and
+with a server-side dry run against `kind-yadgar`:
+
+- 90 → 90 objects. 0 added. 0 removed.
+- 6 changed: the six server Deployments. Each gets a new image, the env
+  `LISTEN_TLS_CLIENT_AUTH=off` and `LISTEN_TLS_CLIENT_CA_FILE`, and a NEW
+  `client-ca` Secret volume (its `<server>-tls`, item `ca.crt`) with a
+  read-only mount. The volume renders no `optional` field, so it is
+  `optional: false`. `iam-db` mounts it at `/var/run/secrets/iam-db-client-ca`;
+  the other five mount it at `/var/run/config/client-ca`.
+- `gateway`, the hook Jobs, the Certificates and every other object are
+  byte-identical.
+- The dry run names the same six Deployments. It admits all 77 tracked
+  objects and all 13 hooks. The `yadgar` Application CR diff is
+  `targetRevision` and the 18 added value lines only.
+
+**What runs.** The six Deployments roll, each `maxSurge: 1 /
+maxUnavailable: 0`. No migration runs: no `-db` repository changes its
+schema between the live tag and the new tag, and store stays v0.4.0. Under
+`off`, `yadgar_lifecycle::serve_tls` (v0.2.20) drops the CA path. It does not
+read the file, does not build a client verifier, and does not watch the
+file. So no server asks a caller for a certificate, and every handshake
+completes as before.
+
+Two things look like faults and are not:
+
+- Each server logs one WARN at boot: "`LISTEN_TLS_CLIENT_CA_FILE` names a
+  client CA but `LISTEN_TLS_CLIENT_AUTH` is `off`, so this listener verifies
+  NO client certificate". That is the staged state this merge creates.
+- The `kind="serving"` gauge and the unreadable counter do not move. The CA
+  is not in the watch set under `off`.
+
+**A wrong staged name fails loudly.** The volume is not optional. A missing
+Secret or a missing `ca.crt` key stops the new pod at `FailedMount`, and the
+rollout stops behind `maxUnavailable: 0` while the old pods keep serving.
+The dry run cannot see a mount failure; "Before" step 2 is the live check.
+
+### Before this merge — read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. yadgar Synced/Healthy at 0.13.13. Any other state → STOP.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. Each <server>-tls Secret exists, carries ca.crt, and comes from the Issuer
+#    that issues the four *-client-tls leaves. KEY NAMES ONLY, never values.
+#    Read 2026-10-09: all six carry `ca.crt tls.crt tls.key`, same Issuer as
+#    the client leaves.
+kubectl --context kind-yadgar -n yadgar get secrets \
+  iam-tls iam-db-tls task-tls task-db-tls project-tls project-db-tls iam-client-tls \
+  -o go-template='{{range .items}}{{.metadata.name}} [{{range $k,$v := .data}}{{$k}} {{end}}] {{index .metadata.annotations "cert-manager.io/issuer-name"}}{{"\n"}}{{end}}'
+
+# 3. The six Deployments: READY == REPLICAS == UPDATED. Read 2026-10-09: 2/2/2 on all six.
+kubectl --context kind-yadgar -n yadgar get deploy iam iam-db task task-db project project-db \
+  -o custom-columns=NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas
+
+# 4. The serving gauge. Read 2026-10-09: 2 for each of the six servers.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=count%20by%20(service%2Ckind)(yadgar_tls_certificate_not_after_seconds%7Bkind%3D%22serving%22%7D)'
+
+# 5. No watched file is unreadable. Read 2026-10-09: 0 for all 7 services.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service)(yadgar_rotation_watched_files_unreadable)'
+
+# 6. The gateway's project registry. Read 2026-10-09: 1 on both gateway pods.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=yadgar_gateway_project_registry_loaded'
+```
+
+### After this merge — read-only
+
+```bash
+# 1. yadgar Synced/Healthy at 0.19.1, and its last operation Succeeded.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. Judge by Deployment readiness, not by the operation phase (it reads
+#    Succeeded even if a pod crashloops). Expect 2/2/2 on all six.
+kubectl --context kind-yadgar -n yadgar get deploy iam iam-db task task-db project project-db \
+  -o custom-columns=NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas
+
+# 3. The new env and volume are live: expect `off` and `<server>-tls` on each.
+kubectl --context kind-yadgar -n yadgar get deploy iam iam-db task task-db project project-db \
+  -o custom-columns='NAME:.metadata.name,AUTH:.spec.template.spec.containers[0].env[?(@.name=="LISTEN_TLS_CLIENT_AUTH")].value,CA:.spec.template.spec.volumes[?(@.name=="client-ca")].secret.secretName'
+
+# 4. The serving gauge is unchanged: 2 for each of the six servers.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=count%20by%20(service%2Ckind)(yadgar_tls_certificate_not_after_seconds%7Bkind%3D%22serving%22%7D)'
+
+# 5. Unreadable: 0 for all 7. Registry: 1 on both gateway pods.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service)(yadgar_rotation_watched_files_unreadable)'
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=yadgar_gateway_project_registry_loaded'
+```
+
+If a pod does not become Ready, its rollout stops behind
+`maxUnavailable: 0` and the old pods keep serving. Read its events
+(`FailedMount` names a wrong staged Secret) and its log before you revert.
+
+### Rollback — a revert
+
+If `yadgar`'s operation is still Running or retrying, end it first:
+
+```bash
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.status.operationState.phase} {.status.operationState.syncResult.revision}{"\n"}'
+```
+
+NEEDS-MAX: `argocd app terminate-op yadgar` against kind-yadgar's Argo CD. A
+revert does not interrupt an operation already running: v3.1.8's Application
+CRD has no `syncPolicy.retry.refresh` (see "The yadgar pin moves to parent
+chart 0.13.13", Rollback).
+
+Then revert the merge. `yadgar` syncs 0.13.13: the six images go back, and
+the added env, volume and mount lines are in each Deployment's last-applied
+configuration, so the client-side apply removes them. No migration ran, so
+the downgrade is schema-safe. This merge creates no object, so nothing is
+left to prune.
+
+## task-db asks its caller for a client certificate: `clientAuth: "optional"` (B-U8a, ledger 925)
+
+**What the merge does.** It changes one value in `applications/yadgar.yaml`:
+`task-db.tls.clientAuth` from `"off"` to `"optional"`. The other five servers
+stay at `"off"`. The pin stays at 0.19.1. PB-2 already staged the client CA
+(`client-ca` volume from `task-db-tls`, item `ca.crt`, and
+`LISTEN_TLS_CLIENT_CA_FILE`), so this is a one-key change.
+
+Merging is the deploy: `yadgar` syncs on its own (`selfHeal`, no `prune`).
+Measured 2026-10-09 with helm 3.18.4 and 4.3.0 (byte-identical renders), and
+with a server-side dry run against `kind-yadgar`:
+
+- 90 → 90 objects. 0 added. 0 removed.
+- 1 changed: `Deployment/task-db`. One env value moves:
+  `LISTEN_TLS_CLIENT_AUTH` `off` → `optional`. Nothing else in it moves.
+- The dry run names only `Deployment/task-db` (the env value and
+  `generation`). It admits all 77 tracked objects and all 13 hooks. The
+  `yadgar` Application CR diff is the one value.
+
+**What runs.** `task-db` rolls, `maxSurge: 1 / maxUnavailable: 0`, 2
+replicas. No other Deployment rolls. Under `optional`,
+`yadgar_lifecycle::serve_tls` (lifecycle v0.2.20, task-db v0.9.0):
+
+- reads `LISTEN_TLS_CLIENT_CA_FILE` at boot, and refuses to boot if the file
+  is unreadable, unparsable, or holds no certificate;
+- builds a client verifier with that file as its only anchor
+  (`client_ca_root`) and `client_auth_optional(true)`;
+- asks every caller for a certificate. A caller that sends none is accepted.
+  A caller that sends one has it verified: a leaf from another CA, or an
+  expired leaf, is refused;
+- adds the CA file to the rotation watch set.
+
+The only caller is `task` (`task-db-ingress` admits `app: task` only). `task`
+presents `task-client-tls` (ledger 770, live since argocd#68). `task-db-tls`
+and `task-client-tls` both come from `Issuer/yadgar-internal-ca`, so the CA
+in `task-db-tls`'s `ca.crt` issued `task`'s leaf. `task-client-tls` carries
+the `client auth` usage.
+
+**`optional` is not a control.** Anyone can send no certificate. This step
+is the first live use of `task`'s leaf: if the leaf is wrong or expired,
+`task` → `task-db` fails now. Only `required` (B-U9.1) proves that the leaf
+is on the wire.
+
+**Rotation.** The CA file now joins the watch set (`File::read`). Readiness
+does not change: the readiness probe is `tcpSocket` on `grpc`, which no
+client-certificate mode touches. A leaf renewal rewrites `ca.crt` with the
+same bytes, so it does not cause a second restart. Only a new CA changes the
+file. The process then drains and exits 0, as for a leaf rotation.
+
+**Things that change in the log, and are not faults.** The boot WARN
+"`LISTEN_TLS_CLIENT_CA_FILE` names a client CA but `LISTEN_TLS_CLIENT_AUTH`
+is `off` …" goes away. The `task-db listening` line reads
+`"client_auth":"optional"` and `"watching":5` (4 before: the CA is the
+fifth file).
+
+### Before this merge — read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. yadgar Synced/Healthy at 0.19.1. Any other state → STOP.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. task-db 2/2/2 at `off`, with the CA staged. Read 2026-10-09: 2 2 2 off task-db-tls.
+kubectl --context kind-yadgar -n yadgar get deploy task-db task \
+  -o custom-columns='NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,AUTH:.spec.template.spec.containers[0].env[?(@.name=="LISTEN_TLS_CLIENT_AUTH")].value,CA:.spec.template.spec.volumes[?(@.name=="client-ca")].secret.secretName'
+
+# 3. The server leaf and the caller's leaf come from one Issuer. NAMES ONLY.
+#    Read 2026-10-09: both `yadgar-internal-ca` (Issuer), both Ready.
+kubectl --context kind-yadgar -n yadgar get certificate task-db-tls task-client-tls \
+  -o custom-columns='NAME:.metadata.name,ISSUER:.spec.issuerRef.name,KIND:.spec.issuerRef.kind,READY:.status.conditions[?(@.type=="Ready")].status,NOTAFTER:.status.notAfter'
+kubectl --context kind-yadgar -n yadgar get secret task-db-tls task-client-tls \
+  -o go-template='{{range .items}}{{.metadata.name}} {{index .metadata.annotations "cert-manager.io/issuer-name"}}{{"\n"}}{{end}}'
+
+# 4. The boot line. Read 2026-10-09: "client_auth":"off", "watching":4, and the
+#    "names a client CA but ... is `off`" WARN.
+kubectl --context kind-yadgar -n yadgar logs deploy/task-db | grep -E 'task-db listening|names a client CA'
+
+# 5. Unreadable: 0 for all 7. Read 2026-10-09: 0 for all 7.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service)(yadgar_rotation_watched_files_unreadable)'
+
+# 6. The task path's call counter. Read 2026-10-09: NO series in the window
+#    (Prometheus keeps about 26 h here; the last task call was 2026-10-08 17:59Z).
+#    task-db itself exports no `yadgar_calls_total` series, even for calls that
+#    task counts as OK. That is observed, not explained.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service%2Ctool%2Coutcome)(yadgar_calls_total%7Bservice%3D~%22task%7Ctask-db%22%7D)'
+```
+
+### Live refusal probe — NEEDS-MAX, operator-run
+
+A port-forward and a local `openssl` are a cluster action (`port-forward`
+opens a tunnel into the pod). A throwaway pod in namespace `yadgar` is a
+cluster mutation. Neither is run by an agent. Never use a pod that carries
+`app: task`: the Service selects that label, so the pod takes real traffic.
+
+```bash
+# Terminal 1: a tunnel to ONE task-db pod. Leave it running.
+kubectl --context kind-yadgar -n yadgar port-forward \
+  "$(kubectl --context kind-yadgar -n yadgar get pod -l app=task-db -o name | head -1)" 15051:50051
+
+# Terminal 2, BEFORE the merge (mode `off`): the tunnel works, and the server
+# asks for no certificate. Expect CONNECTED, `ALPN protocol: h2`, and NO line
+# "Acceptable client certificate CA names". If the handshake fails here, the
+# tunnel is the problem, not the mode: STOP.
+openssl s_client -connect 127.0.0.1:15051 -servername task-db.yadgar.svc -alpn h2 </dev/null 2>&1 \
+  | grep -E 'CONNECTED|ALPN|Acceptable client certificate CA names|No client certificate CA names|alert'
+
+# A leaf from a CA made on the spot (the "wrong anchor"). Local files only.
+cd "$(mktemp -d)"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
+  -subj '/CN=b-u8a-probe-foreign-ca' -keyout ca.key -out ca.crt
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -subj '/CN=b-u8a-probe-leaf' -keyout leaf.key -out leaf.csr
+printf 'keyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n' > leaf.ext
+openssl x509 -req -in leaf.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 \
+  -extfile leaf.ext -out leaf.crt
+```
+
+After the merge, when `task-db` is 2/2/2 at `optional` (restart the tunnel:
+the old pod is gone):
+
+```bash
+# P1. No certificate → ACCEPTED. Expect "Acceptable client certificate CA names"
+#     (the server now asks), a cipher, and NO alert.
+openssl s_client -connect 127.0.0.1:15051 -servername task-db.yadgar.svc -alpn h2 -tls1_2 </dev/null 2>&1 \
+  | grep -E 'CONNECTED|Acceptable client certificate CA names|Cipher is|alert'
+
+# P2. A leaf from the wrong anchor → REFUSED. TLS 1.2 refuses inside the
+#     handshake: expect an alert ("unknown ca" or "bad certificate") and
+#     "Cipher is (NONE)".
+openssl s_client -connect 127.0.0.1:15051 -servername task-db.yadgar.svc -alpn h2 -tls1_2 \
+  -cert leaf.crt -key leaf.key </dev/null 2>&1 | grep -E 'Cipher is|alert'
+
+# P2, TLS 1.3. The client finishes its side first, and the refusal arrives
+# as an alert on the first read. Expect an alert line before the timeout.
+# No alert at all means the leaf was ACCEPTED: STOP and revert.
+(sleep 3) | timeout 8 openssl s_client -connect 127.0.0.1:15051 -servername task-db.yadgar.svc \
+  -alpn h2 -tls1_3 -cert leaf.crt -key leaf.key -ign_eof 2>&1 | grep -E 'alert|Cipher is'
+```
+
+If `-tls1_2` fails at once with "protocol version" and no other alert, the
+listener accepts TLS 1.3 only. Then use the TLS 1.3 forms for P1 as well.
+Stop the tunnel and delete the temp directory afterwards.
+
+### After this merge — read-only
+
+```bash
+# 1. yadgar Synced/Healthy at 0.19.1, and its last operation Succeeded.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. Judge by Deployment readiness, not by the operation phase. Expect
+#    task-db 2/2/2 with AUTH `optional` and new pod start times; task 2/2/2 at `off`.
+kubectl --context kind-yadgar -n yadgar get deploy task-db task \
+  -o custom-columns='NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,AUTH:.spec.template.spec.containers[0].env[?(@.name=="LISTEN_TLS_CLIENT_AUTH")].value'
+kubectl --context kind-yadgar -n yadgar get pods -l app=task-db \
+  -o custom-columns=NAME:.metadata.name,START:.status.startTime,READY:.status.containerStatuses[0].ready
+
+# 3. The CA file is READ and WATCHED. Expect, on each new pod,
+#    "client_auth":"optional" and "watching":5, and NO "names a client CA" WARN.
+for p in $(kubectl --context kind-yadgar -n yadgar get pod -l app=task-db -o name); do
+  kubectl --context kind-yadgar -n yadgar logs "$p" | grep -E 'task-db listening|names a client CA'
+done
+
+# 4. Unreadable: expect 0 for task-db (and for all 7).
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service)(yadgar_rotation_watched_files_unreadable)'
+
+# 5. The serving gauge: still 2 for task-db.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=count%20by%20(service%2Ckind)(yadgar_tls_certificate_not_after_seconds%7Bkind%3D%22serving%22%7D)'
+```
+
+**The task path — what can and cannot be checked.**
+
+- The estate smoke rows C-01 (iam path) and C-10 (task path) are the card's
+  functional acceptance. They CANNOT run today: the estate verdict gate is red
+  until the settled-state gate produces a `settled-verdict` artifact (ledger
+  675, stage 3). Do not read a red estate run as this change.
+- No passive signal exists. Nothing calls `task` on kind-yadgar between smoke
+  runs, so no request crosses task → task-db after the roll on its own. The
+  roll closes `task`'s open HTTP/2 connections to the old pods. The FIRST
+  request after the roll is the first live check of `task-client-tls`.
+- `yadgar_dial_upstream_never_resolved{app="task",upstream="task-db"}` reads 0.
+  That proves name resolution only, not a handshake.
+- **Substitute live signal (NEEDS-MAX, operator-run).** Send one task request
+  through the gateway with your own client, for example a `find_tasks` from the
+  yadgar client. Then read the counter. Expect a NEW `outcome="OK"` sample for
+  `service="task"` (FindTasks), and no `UNAVAILABLE` or `INTERNAL`. A refused
+  `task` leaf is a transport failure: it shows as a non-OK outcome on `task`'s
+  call (`UNAVAILABLE` is the likely code; not measured).
+
+```bash
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service%2Ctool%2Coutcome)(yadgar_calls_total%7Bservice%3D%22task%22%7D)'
+```
+
+If a `task-db` pod does not become Ready, the rollout stops behind
+`maxUnavailable: 0` and the old pods keep serving. Read its log first: a CA
+file that cannot be read or parsed refuses the boot and names the path.
+
+### Rollback — a revert
+
+If `yadgar`'s operation is still Running or retrying, end it first:
+
+```bash
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.status.operationState.phase} {.status.operationState.syncResult.revision}{"\n"}'
+```
+
+NEEDS-MAX: `argocd app terminate-op yadgar` against kind-yadgar's Argo CD. A
+revert does not interrupt an operation already running (see "The yadgar pin
+moves to parent chart 0.13.13", Rollback).
+
+Then revert the WHOLE merge commit: the value, the K3 table, the two gate
+files and this section move together. A values-only revert reddens K3 and
+`test_every_server_states_its_client_auth_and_stages_its_own_ca`. The revert
+also removes the two ledger 1392 assertions (the `client-ca` items and the
+non-vacuous issuer check); re-land them on their own if they are wanted.
+`task-db` rolls back to `off`: it stops asking for a certificate, and drops
+the CA from its watch set. Nothing is created, so nothing is left to prune.
+
+Break-glass, if git cannot merge in time (NEEDS-MAX): suspend auto-sync on
+`yadgar`, then
+`kubectl --context kind-yadgar -n yadgar set env deployment/task-db LISTEN_TLS_CLIENT_AUTH=off`.
+`off` is the only valid emergency value. Deleting the variable is a boot
+refusal (ADR-0854). Revert in git afterwards.
+
+## iam-db and project-db ask their callers for a client certificate: `clientAuth: "optional"` (B-U8b, ledger 925)
+
+**What the merge does.** It changes two values in `applications/yadgar.yaml`:
+`iam-db.tls.clientAuth` and `project-db.tls.clientAuth`, each from `"off"` to
+`"optional"`. `task-db` stays at `"optional"` (B-U8a). `iam`, `task` and
+`project` stay at `"off"`. The pin stays at 0.19.1. PB-2 already staged both
+client CAs (`client-ca` volume from `<server>-tls`, item `ca.crt`, and
+`LISTEN_TLS_CLIENT_CA_FILE`), so this is a two-key change.
+
+Merging is the deploy: `yadgar` syncs on its own (`selfHeal`, no `prune`).
+Measured 2026-10-09 at base `0b67914` with helm 3.18.4 and 4.3.0
+(byte-identical renders), and with a server-side dry run against
+`kind-yadgar`:
+
+- 90 → 90 objects. 0 added. 0 removed.
+- 2 changed: `Deployment/iam-db` and `Deployment/project-db`. In each, one env
+  value moves: `LISTEN_TLS_CLIENT_AUTH` `off` → `optional`. Nothing else in
+  them moves.
+- The dry run names only those two Deployments (the env value and
+  `generation`). It admits all 77 tracked objects and all 13 hooks. The
+  `yadgar` Application CR diff is the two values.
+
+**What runs.** `iam-db` and `project-db` roll in the same sync, each
+`maxSurge: 1 / maxUnavailable: 0`, 2 replicas. They are two independent hops:
+judge each by its own readiness. No other Deployment rolls. Under `optional`,
+`yadgar_lifecycle::serve_tls` (lifecycle v0.2.20; iam-db v0.10.0, project-db
+v0.6.0):
+
+- reads `LISTEN_TLS_CLIENT_CA_FILE` at boot, and refuses to boot if the file
+  is unreadable, unparsable, or holds no certificate;
+- builds a client verifier with that file as its only anchor
+  (`client_ca_root`) and `client_auth_optional(true)`;
+- asks every caller for a certificate. A caller that sends none is accepted.
+  A caller that sends one has it verified: a leaf from another CA, or an
+  expired leaf, is refused;
+- adds the CA file to the rotation watch set.
+
+**The callers.** Each server has one caller.
+
+| Server       | NetworkPolicy admits (port 50051) | Caller presents      | Caller env                                      |
+| ------------ | --------------------------------- | -------------------- | ----------------------------------------------- |
+| `iam-db`     | `app: iam` only                   | `iam-client-tls`     | `IAM_DB_TLS_CLIENT_CERT_FILE` / `_KEY_FILE`     |
+| `project-db` | `app: project` only               | `project-client-tls` | `PROJECT_DB_TLS_CLIENT_CERT_FILE` / `_KEY_FILE` |
+
+`iam` v0.10.0 and `project` v0.3.0 hand that identity to
+`yadgar_dial::connect_tls` through `UpstreamTls::options()`, and register it
+as `Presented::Client` in their watch sets. Both leaves and both server leaves
+come from `Issuer/yadgar-internal-ca`, so the CA in each server's `ca.crt`
+issued its caller's leaf. Both client leaves carry the `client auth` usage.
+The NetworkPolicy is a render fact. Live corroboration (the control is the
+NetworkPolicy, enforced per ledger 511): on both servers, every
+`yadgar_calls_total` series is an RPC that the named caller makes (`GetKeyIdentity`, `SetKeyIdentity` on
+`iam-db`; `ListProjects` on `project-db`).
+
+**`optional` is not a control.** Anyone can send no certificate. This step
+is the first live use of `iam`'s and `project`'s leaves: if a leaf is wrong
+or expired, that hop fails now. Only `required` (B-U9.2) proves that the
+leaf is on the wire.
+
+**Rotation.** The CA file now joins each watch set (`File::read`). Readiness
+does not change: both readiness probes are `tcpSocket` on `grpc`, which no
+client-certificate mode touches. A leaf renewal rewrites `ca.crt` with the
+same bytes, so it does not cause a second restart. Only a new CA changes the
+file. The process then drains and exits 0, as for a leaf rotation.
+
+**Things that change in the log, and are not faults.** The boot WARN
+"`LISTEN_TLS_CLIENT_CA_FILE` names a client CA but `LISTEN_TLS_CLIENT_AUTH`
+is `off` …" goes away on both servers. The `iam-db listening` and
+`project-db listening` lines read `"watching":5` (4 before: serving
+certificate, key, database password and rotation configuration; the CA is the
+fifth file). This is a prediction from source, not yet observed.
+
+**THESE TWO BOOT LINES CARRY NO `client_auth` FIELD.** Unlike `task-db`
+v0.9.0, the `listening` line in iam-db v0.10.0 and project-db v0.6.0 logs
+only `tls` and `watching`. The mode is read from the Deployment env, and the
+log evidence is the WARN gone plus `"watching":5`.
+
+### Before this merge — read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. yadgar Synced/Healthy at 0.19.1. Any other state → STOP.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. iam-db and project-db 2/2/2 at `off`, with the CA staged.
+#    Read 2026-10-09: iam-db 2 2 2 off iam-db-tls; project-db 2 2 2 off project-db-tls.
+kubectl --context kind-yadgar -n yadgar get deploy iam-db project-db iam project \
+  -o custom-columns='NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,AUTH:.spec.template.spec.containers[0].env[?(@.name=="LISTEN_TLS_CLIENT_AUTH")].value,CA:.spec.template.spec.volumes[?(@.name=="client-ca")].secret.secretName'
+
+# 3. The server leaves and the callers' leaves come from one Issuer. NAMES ONLY.
+#    Read 2026-10-09: all four `yadgar-internal-ca` (Issuer), all Ready.
+kubectl --context kind-yadgar -n yadgar get certificate iam-db-tls project-db-tls iam-client-tls project-client-tls \
+  -o custom-columns='NAME:.metadata.name,ISSUER:.spec.issuerRef.name,KIND:.spec.issuerRef.kind,READY:.status.conditions[?(@.type=="Ready")].status,NOTAFTER:.status.notAfter,USAGES:.spec.usages'
+kubectl --context kind-yadgar -n yadgar get secret iam-db-tls project-db-tls iam-client-tls project-client-tls \
+  -o go-template='{{range .items}}{{.metadata.name}} {{index .metadata.annotations "cert-manager.io/issuer-name"}}{{"\n"}}{{end}}'
+
+# 4. The boot lines. Read 2026-10-09: "watching":4 and the
+#    "names a client CA but ... is `off`" WARN, on all four pods.
+for d in iam-db project-db; do
+  for p in $(kubectl --context kind-yadgar -n yadgar get pod -l app=$d -o name); do
+    kubectl --context kind-yadgar -n yadgar logs "$p" | grep -E "$d listening|names a client CA"
+  done
+done
+
+# 5. Unreadable: 0 for all 7. Read 2026-10-09: 0 for all 7.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service)(yadgar_rotation_watched_files_unreadable)'
+
+# 6. The passive call series, per pod. Read 2026-10-09, about 2.7/min for each
+#    iam-db tool and about 2/min for project-db ListProjects, all on the old pods.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service%2Cpod%2Ctool%2Coutcome)(yadgar_calls_total%7Bservice%3D~%22iam-db%7Cproject-db%7Cproject%22%7D)'
+```
+
+### Live refusal probe — NEEDS-MAX, operator-run
+
+A port-forward and a local `openssl` are a cluster action (`port-forward`
+opens a tunnel into the pod). A throwaway pod in namespace `yadgar` is a
+cluster mutation. Neither is run by an agent. Never use a pod that carries
+`app: iam` or `app: project`: the Services select those labels, so the pod
+takes real traffic.
+
+```bash
+# Terminal 1: a tunnel to ONE pod of each server. Leave both running.
+kubectl --context kind-yadgar -n yadgar port-forward \
+  "$(kubectl --context kind-yadgar -n yadgar get pod -l app=iam-db -o name | head -1)" 15052:50051
+# Terminal 2:
+kubectl --context kind-yadgar -n yadgar port-forward \
+  "$(kubectl --context kind-yadgar -n yadgar get pod -l app=project-db -o name | head -1)" 15053:50051
+
+# Terminal 3, BEFORE the merge (mode `off`): each tunnel works, and the server
+# asks for no certificate. Expect CONNECTED, `ALPN protocol: h2`, and NO line
+# "Acceptable client certificate CA names". If a handshake fails here, the
+# tunnel is the problem, not the mode: STOP.
+openssl s_client -connect 127.0.0.1:15052 -servername iam-db.yadgar.svc -alpn h2 </dev/null 2>&1 \
+  | grep -E 'CONNECTED|ALPN|Acceptable client certificate CA names|No client certificate CA names|alert'
+openssl s_client -connect 127.0.0.1:15053 -servername project-db.yadgar.svc -alpn h2 </dev/null 2>&1 \
+  | grep -E 'CONNECTED|ALPN|Acceptable client certificate CA names|No client certificate CA names|alert'
+
+# A leaf from a CA made on the spot (the "wrong anchor"). Local files only.
+cd "$(mktemp -d)"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
+  -subj '/CN=b-u8b-probe-foreign-ca' -keyout ca.key -out ca.crt
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -subj '/CN=b-u8b-probe-leaf' -keyout leaf.key -out leaf.csr
+printf 'keyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n' > leaf.ext
+openssl x509 -req -in leaf.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 \
+  -extfile leaf.ext -out leaf.crt
+```
+
+After the merge, when both servers are 2/2/2 at `optional` (restart both
+tunnels: the old pods are gone). Run each probe against BOTH servers:
+`15052` / `iam-db.yadgar.svc` and `15053` / `project-db.yadgar.svc`.
+
+```bash
+for t in 15052:iam-db 15053:project-db; do
+  port=${t%%:*}; name=${t#*:}.yadgar.svc
+  echo "== $name"
+  # P1. No certificate → ACCEPTED. Expect "Acceptable client certificate CA
+  #     names" (the server now asks), a cipher, and NO alert.
+  openssl s_client -connect 127.0.0.1:$port -servername $name -alpn h2 -tls1_2 </dev/null 2>&1 \
+    | grep -E 'CONNECTED|Acceptable client certificate CA names|Cipher is|alert'
+  # P2. A leaf from the wrong anchor → REFUSED. TLS 1.2 refuses inside the
+  #     handshake: expect an alert ("unknown ca" or "bad certificate") and
+  #     "Cipher is (NONE)".
+  openssl s_client -connect 127.0.0.1:$port -servername $name -alpn h2 -tls1_2 \
+    -cert leaf.crt -key leaf.key </dev/null 2>&1 | grep -E 'Cipher is|alert'
+  # P2, TLS 1.3. The client finishes its side first, and the refusal arrives
+  # as an alert on the first read. Expect an alert line before the timeout.
+  # No alert at all means the leaf was ACCEPTED: STOP and revert.
+  (sleep 3) | timeout 8 openssl s_client -connect 127.0.0.1:$port -servername $name \
+    -alpn h2 -tls1_3 -cert leaf.crt -key leaf.key -ign_eof 2>&1 | grep -E 'alert|Cipher is'
+done
+```
+
+If `-tls1_2` fails at once with "protocol version" and no other alert, the
+listener accepts TLS 1.3 only. Then use the TLS 1.3 forms for P1 as well.
+Stop both tunnels and delete the temp directory afterwards.
+
+### After this merge — read-only
+
+```bash
+# 1. yadgar Synced/Healthy at 0.19.1, and its last operation Succeeded.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. Judge by Deployment readiness, not by the operation phase. Expect
+#    iam-db and project-db each 2/2/2 with AUTH `optional` and new pod start
+#    times; iam and project 2/2/2 at `off`, NOT rolled.
+kubectl --context kind-yadgar -n yadgar get deploy iam-db project-db iam project \
+  -o custom-columns='NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,AUTH:.spec.template.spec.containers[0].env[?(@.name=="LISTEN_TLS_CLIENT_AUTH")].value'
+kubectl --context kind-yadgar -n yadgar get pods -l 'app in (iam-db,project-db)' \
+  -o custom-columns=NAME:.metadata.name,START:.status.startTime,READY:.status.containerStatuses[0].ready
+
+# 3. The CA file is READ and WATCHED. Expect, on each of the four new pods,
+#    "watching":5 and NO "names a client CA" WARN. (No `client_auth` field:
+#    these two binaries do not log it.)
+for d in iam-db project-db; do
+  for p in $(kubectl --context kind-yadgar -n yadgar get pod -l app=$d -o name); do
+    kubectl --context kind-yadgar -n yadgar logs "$p" | grep -E "$d listening|names a client CA"
+  done
+done
+
+# 4. Unreadable: expect 0 for iam-db and project-db (and for all 7).
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service)(yadgar_rotation_watched_files_unreadable)'
+
+# 5. The serving gauge: still 2 for iam-db and 2 for project-db.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=count%20by%20(service%2Ckind)(yadgar_tls_certificate_not_after_seconds%7Bkind%3D%22serving%22%7D)'
+```
+
+**The two hops — the passive signal for each.** Unlike `task` → `task-db`,
+both hops carry traffic on their own, so the new pods are checked within a
+few minutes of becoming Ready, with no operator request; judge by two reads
+at least 5 minutes apart. A failed
+handshake never reaches the server's handler, so an `OK` call counted by a
+NEW server pod is a call that crossed the hop after the roll.
+
+- **`iam` → `iam-db`.** Signal: `yadgar_calls_total{service="iam-db",tool="GetKeyIdentity",outcome="OK"}`
+  under the NEW `iam-db` pod names, growing. Its source is a standing defect,
+  not normal traffic: `iam`'s key-identity task retries for ever, because
+  `iam-db` answers `SetKeyIdentity` with `FAILED_PRECONDITION`, reason
+  "the store holds rows and no marker" (read 2026-10-09; `iam` logs an ERROR
+  "the key identity is UNVERIFIED …" every 300 s). Each retry is a
+  `GetKeyIdentity` (OK), then a `SetKeyIdentity` (FAILED_PRECONDITION),
+  about 2.7/min for each. Both are
+  application answers, so both prove the handshake. If the marker defect is
+  fixed first, this signal stops, and the hop has no passive traffic. The
+  failure shape: the `reason` in `iam`'s ERROR line changes from that
+  FAILED_PRECONDITION text to a transport reason, and the new `iam-db` pods
+  count no calls.
+- **`project` → `project-db`.** Signal: `yadgar_calls_total{service="project-db",tool="ListProjects",outcome="OK"}`
+  under the NEW `project-db` pod names, growing. Its source is the gateway's
+  project-registry poll (`YADGAR_PROJECT_REGISTRY_POLL_SECONDS` 60, on each
+  gateway pod): gateway calls `project`'s `ListProjects`, and `project` calls
+  `project-db`'s `ListProjects` once for each one (read 2026-10-09: about
+  2/min on each, 1:1). The failure shape: `project`'s `ListProjects` shows a
+  non-OK outcome (`UNAVAILABLE` is the likely code; not measured), and the
+  gateway logs its registry-load failure.
+- **`yadgar_gateway_project_registry_loaded` does NOT prove this hop after the
+  roll (ledger 1395).** It is a gateway → `project` signal, and the poll does
+  cross `project` → `project-db`. But the gauge means "EVER loaded" (gateway
+  v0.10.2 `src/project/registry.rs`): a later failed reload leaves it at 1.
+  The gateway does not roll here, so the gauge stays 1 whatever the new
+  `project-db` pods do. Read the `project-db` counter above instead.
+- **ledger 1393 is task-db only.** `iam-db` and `project-db` both export
+  `yadgar_calls_total` (and `yadgar_call_duration_seconds`,
+  `yadgar_bytes_returned_total`); `task-db` exports none of them.
+- The estate smoke rows C-01 (iam path) and C-10 (task path) are the card's
+  functional acceptance. They CANNOT run today: the estate verdict gate is red
+  until the settled-state gate produces a `settled-verdict` artifact (ledger
+  675, stage 3). Do not read a red estate run as this change.
+
+```bash
+# Expect NEW pod names on both servers, outcome OK, growing between two reads a
+# few minutes apart; no new non-OK outcome on `project`.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service%2Cpod%2Ctool%2Coutcome)(yadgar_calls_total%7Bservice%3D~%22iam-db%7Cproject-db%7Cproject%22%7D)'
+for p in $(kubectl --context kind-yadgar -n yadgar get pod -l app=iam -o name); do
+  kubectl --context kind-yadgar -n yadgar logs --since=15m "$p" | grep -E 'key identity' | tail -2
+done
+```
+
+If a pod of either server does not become Ready, its rollout stops behind
+`maxUnavailable: 0` and its old pods keep serving. The other server's rollout
+is independent. Read the log first: a CA file that cannot be read or parsed
+refuses the boot and names the path.
+
+### Rollback — a revert
+
+If `yadgar`'s operation is still Running or retrying, end it first:
+
+```bash
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.status.operationState.phase} {.status.operationState.syncResult.revision}{"\n"}'
+```
+
+NEEDS-MAX: `argocd app terminate-op yadgar` against kind-yadgar's Argo CD. A
+revert does not interrupt an operation already running (see "The yadgar pin
+moves to parent chart 0.13.13", Rollback).
+
+Then revert the WHOLE merge commit: the two values, the K3 table, the gate
+test and this section move together. A values-only revert reddens K3 and
+`test_every_server_states_its_client_auth_and_stages_its_own_ca`. The revert
+returns `EXPECTED_CLIENT_AUTH` to `task-db` alone at `optional`; it does not
+touch B-U8a. Both servers roll back to `off`: they stop asking for a
+certificate and drop the CA from their watch sets. Nothing is created, so
+nothing is left to prune. One hop alone cannot be reverted with `git revert`;
+for that, write a new PR that sets one value back to `"off"`, with its own K3
+line and map entry.
+
+Break-glass, if git cannot merge in time (NEEDS-MAX): suspend auto-sync on
+`yadgar`, then, for the failing server or both:
+
+```bash
+kubectl --context kind-yadgar -n yadgar set env deployment/iam-db LISTEN_TLS_CLIENT_AUTH=off
+kubectl --context kind-yadgar -n yadgar set env deployment/project-db LISTEN_TLS_CLIENT_AUTH=off
+```
+
+`off` is the only valid emergency value. Deleting the variable is a boot
+refusal (ADR-0854). Revert in git afterwards.
+
+## project asks its caller for a client certificate: `clientAuth: "optional"` (B-U8c, ledger 925)
+
+**What the merge does.** It changes one value in `applications/yadgar.yaml`:
+`project.tls.clientAuth`, from `"off"` to `"optional"`. `task-db` (B-U8a),
+`iam-db` and `project-db` (B-U8b) stay at `"optional"`. `iam` and `task` stay
+at `"off"`. The pin stays at 0.19.1. PB-2 already staged the client CA
+(`client-ca` volume from `project-tls`, item `ca.crt`, and
+`LISTEN_TLS_CLIENT_CA_FILE`), so this is a one-key change.
+
+Merging is the deploy: `yadgar` syncs on its own (`selfHeal`, no `prune`).
+Measured 2026-10-09 at base `da44a10` with helm 3.18.4 and 4.3.0
+(byte-identical renders), and with a server-side dry run against
+`kind-yadgar`:
+
+- 90 → 90 objects. 0 added. 0 removed.
+- 1 changed: `Deployment/project`. One env value moves:
+  `LISTEN_TLS_CLIENT_AUTH` `off` → `optional`. Nothing else in it moves.
+- The dry run names only `Deployment/project` (the env value and
+  `generation`). It admits all 77 tracked objects and all 13 hooks. The
+  `yadgar` Application CR diff is the one value.
+
+**What runs.** `project` rolls, `maxSurge: 1 / maxUnavailable: 0`, 2
+replicas. No other Deployment rolls; the gateway does NOT roll. Under
+`optional`, `yadgar_lifecycle::serve_tls` (lifecycle v0.2.20; project v0.3.0):
+
+- reads `LISTEN_TLS_CLIENT_CA_FILE` at boot, and refuses to boot if the file
+  is unreadable, unparsable, or holds no certificate;
+- builds a client verifier with that file as its only anchor
+  (`client_ca_root`) and `client_auth_optional(true)`;
+- asks every caller for a certificate. A caller that sends none is accepted.
+  A caller that sends one has it verified: a leaf from another CA, or an
+  expired leaf, is refused;
+- adds the CA file to the rotation watch set.
+
+**The caller.** `project` has one caller on its gRPC port, 50052.
+
+| Server    | NetworkPolicy admits (port 50052) | Caller presents      | Caller env                                   |
+| --------- | --------------------------------- | -------------------- | -------------------------------------------- |
+| `project` | `app: gateway` only               | `gateway-client-tls` | `PROJECT_TLS_CLIENT_CERT_FILE` / `_KEY_FILE` |
+
+`gateway` v0.10.2 reads the `PROJECT` prefix through `UpstreamTls::from_env`
+and dials `project` with `yadgar_dial::connect_tls(.., &tls.options())`;
+`options()` adds the identity, and dial v0.2.14 hands it to tonic as
+`Identity::from_pem`. The gateway mounts ONE client leaf,
+`gateway-client-tls`, for all three upstreams (task, iam, project). It is
+NOT `gateway-tls`: that is the edge's serving leaf, from
+`ClusterIssuer/yadgar-dev-ca`, and it is never presented to `project`.
+
+`gateway-client-tls` and `project-tls` both come from
+`Issuer/yadgar-internal-ca`, so the CA in `project-tls`'s `ca.crt` is the CA
+that issued the gateway's leaf. Read 2026-10-09: the CA Certificate is at
+revision 1, `notBefore` 2026-09-05T12:40:48Z, before both leaves
+(`gateway-client-tls` 2026-09-05T12:40:52Z, `project-tls`
+2026-09-07T13:01:34Z), so no CA rotation sits between the two issuances. The
+leaf carries the `client auth` usage.
+
+No other workload dials `project`: `task` v0.7.0 and `iam` v0.10.0 have no
+`project` upstream, no hook Job references it, and the `estate-front` and
+`post-merge-verifier` egress policies allow no yadgar pod on 50052. The
+NetworkPolicy is the control (enforced per ledger 511). Live corroboration:
+every `yadgar_calls_total{service="project"}` series is `ListProjects`, the
+one RPC the gateway's registry poll makes, at about 1/min on each pod (two
+gateway pods, a 60 s poll each). The readiness probe (`tcpSocket` on `grpc`)
+and the Prometheus scrape (9090, plain HTTP) do not complete a TLS handshake
+on 50052, so the mode does not touch them.
+
+**`optional` is not a control.** Anyone can send no certificate. This step
+is the first live use of `gateway-client-tls` against a verifying server: if
+the leaf is wrong or expired, this hop fails now. An `OK` call proves only
+that the handshake completed: either the leaf verified, or the gateway sent
+none. That the gateway sends its leaf is a source fact, not an observation.
+Only `required` (B-U9.3) proves that the leaf is on the wire.
+
+**Rotation.** The CA file now joins the watch set (`File::read`). A leaf
+renewal rewrites `ca.crt` with the same bytes, so it does not cause a second
+restart. Only a new CA changes the file. The process then drains and exits 0,
+as for a leaf rotation.
+
+**Things that change in the log, and are not faults.** The boot WARN
+"`LISTEN_TLS_CLIENT_CA_FILE` names a client CA but `LISTEN_TLS_CLIENT_AUTH`
+is `off` …" goes away. The `project listening` line reads `"watching":7` (6
+before: serving certificate and key, the `project-db` CA, the client
+certificate and key, and the rotation configuration; the client CA is the
+seventh file). This is a prediction from source, not yet observed.
+
+**THE BOOT LINE CARRIES NO `client_auth` FIELD.** project v0.3.0's
+`project listening` line logs only `addr`, `tls`, `watching` and the rotation
+and drain settings. The mode is read from the Deployment env, and the log
+evidence is the WARN gone plus `"watching":7`.
+
+### Before this merge — read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. yadgar Synced/Healthy at 0.19.1. Any other state → STOP.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. project 2/2/2 at `off`, with the CA staged; the gateway presents its
+#    client leaf to project. Read 2026-10-09: project 2 2 2 off project-tls.
+kubectl --context kind-yadgar -n yadgar get deploy project gateway \
+  -o custom-columns='NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,AUTH:.spec.template.spec.containers[0].env[?(@.name=="LISTEN_TLS_CLIENT_AUTH")].value,CA:.spec.template.spec.volumes[?(@.name=="client-ca")].secret.secretName,LEAF:.spec.template.spec.volumes[?(@.name=="client-cert")].secret.secretName'
+kubectl --context kind-yadgar -n yadgar get deploy gateway \
+  -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}={.value}{"\n"}{end}' \
+  | grep -E '^PROJECT_|VALIDATION_MODE'
+
+# 3. The server leaf and the caller's leaf come from one Issuer, and no CA
+#    rotation sits between them. Certificate objects only: NAMES AND STATUS.
+#    Read 2026-10-09: both `yadgar-internal-ca` (Issuer), Ready; CA revision 1,
+#    notBefore before both leaves.
+kubectl --context kind-yadgar -n yadgar get certificate yadgar-internal-ca gateway-client-tls project-tls \
+  -o custom-columns='NAME:.metadata.name,ISSUER:.spec.issuerRef.name,KIND:.spec.issuerRef.kind,READY:.status.conditions[?(@.type=="Ready")].status,NOTBEFORE:.status.notBefore,REV:.status.revision,USAGES:.spec.usages'
+
+# 4. The boot lines. Read 2026-10-09: "watching":6 and the
+#    "names a client CA but ... is `off`" WARN, on both pods.
+for p in $(kubectl --context kind-yadgar -n yadgar get pod -l app=project -o name); do
+  kubectl --context kind-yadgar -n yadgar logs "$p" | grep -E "project listening|names a client CA"
+done
+
+# 5. Unreadable: 0 for all 7. Read 2026-10-09: 0 for all 7.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service)(yadgar_rotation_watched_files_unreadable)'
+
+# 6. The passive call series, per pod. Read 2026-10-09: ListProjects OK only,
+#    about 1/min on each project pod.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service%2Cpod%2Ctool%2Coutcome)(yadgar_calls_total%7Bservice%3D~%22project%7Cproject-db%22%7D)'
+
+# 7. The gateway's registry refresh. Read 2026-10-09: one "is loaded" INFO per
+#    gateway pod at its boot, and NO "could not be refreshed" WARN.
+for p in $(kubectl --context kind-yadgar -n yadgar get pod -l app=gateway -o name); do
+  kubectl --context kind-yadgar -n yadgar logs "$p" | grep -E 'project registry' | tail -3
+done
+```
+
+### Live refusal probe — NEEDS-MAX, operator-run
+
+A port-forward and a local `openssl` are a cluster action (`port-forward`
+opens a tunnel into the pod). A throwaway pod in namespace `yadgar` is a
+cluster mutation. Neither is run by an agent. Never use a pod that carries
+`app: gateway`: the edge's Service selects that label, so the pod takes real
+traffic.
+
+```bash
+# Terminal 1: a tunnel to ONE project pod. Leave it running.
+kubectl --context kind-yadgar -n yadgar port-forward \
+  "$(kubectl --context kind-yadgar -n yadgar get pod -l app=project -o name | head -1)" 15054:50052
+
+# Terminal 2, BEFORE the merge (mode `off`): the tunnel works, and the server
+# asks for no certificate. Expect CONNECTED, `ALPN protocol: h2`, and NO line
+# "Acceptable client certificate CA names". If the handshake fails here, the
+# tunnel is the problem, not the mode: STOP.
+openssl s_client -connect 127.0.0.1:15054 -servername project.yadgar.svc -alpn h2 </dev/null 2>&1 \
+  | grep -E 'CONNECTED|ALPN|Acceptable client certificate CA names|No client certificate CA names|alert'
+
+# A leaf from a CA made on the spot (the "wrong anchor"). Local files only.
+cd "$(mktemp -d)"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
+  -subj '/CN=b-u8c-probe-foreign-ca' -keyout ca.key -out ca.crt
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -subj '/CN=b-u8c-probe-leaf' -keyout leaf.key -out leaf.csr
+printf 'keyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n' > leaf.ext
+openssl x509 -req -in leaf.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 \
+  -extfile leaf.ext -out leaf.crt
+```
+
+After the merge, when `project` is 2/2/2 at `optional` (restart the tunnel:
+the old pods are gone):
+
+```bash
+# P1. No certificate → ACCEPTED. Expect "Acceptable client certificate CA
+#     names" (the server now asks), a cipher, and NO alert.
+openssl s_client -connect 127.0.0.1:15054 -servername project.yadgar.svc -alpn h2 -tls1_2 </dev/null 2>&1 \
+  | grep -E 'CONNECTED|Acceptable client certificate CA names|Cipher is|alert'
+# P2. A leaf from the wrong anchor → REFUSED. TLS 1.2 refuses inside the
+#     handshake: expect an alert ("unknown ca" or "bad certificate") and
+#     "Cipher is (NONE)".
+openssl s_client -connect 127.0.0.1:15054 -servername project.yadgar.svc -alpn h2 -tls1_2 \
+  -cert leaf.crt -key leaf.key </dev/null 2>&1 | grep -E 'Cipher is|alert'
+# P2, TLS 1.3. The client finishes its side first, and the refusal arrives
+# as an alert on the first read. Expect an alert line before the timeout.
+# No alert at all means the leaf was ACCEPTED: STOP and revert.
+(sleep 3) | timeout 8 openssl s_client -connect 127.0.0.1:15054 -servername project.yadgar.svc \
+  -alpn h2 -tls1_3 -cert leaf.crt -key leaf.key -ign_eof 2>&1 | grep -E 'alert|Cipher is'
+```
+
+If `-tls1_2` fails at once with "protocol version" and no other alert, the
+listener accepts TLS 1.3 only. Then use the TLS 1.3 form for P1 as well.
+Stop the tunnel and delete the temp directory afterwards.
+
+### After this merge — read-only
+
+```bash
+# 1. yadgar Synced/Healthy at 0.19.1, and its last operation Succeeded.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. Judge by Deployment readiness, not by the operation phase. Expect
+#    project 2/2/2 with AUTH `optional` and new pod start times; gateway
+#    2/2/2, NOT rolled.
+kubectl --context kind-yadgar -n yadgar get deploy project gateway \
+  -o custom-columns='NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,AUTH:.spec.template.spec.containers[0].env[?(@.name=="LISTEN_TLS_CLIENT_AUTH")].value'
+kubectl --context kind-yadgar -n yadgar get pods -l 'app in (project,gateway)' \
+  -o custom-columns=NAME:.metadata.name,START:.status.startTime,READY:.status.containerStatuses[0].ready
+
+# 3. The CA file is READ and WATCHED. Expect, on both new pods,
+#    "watching":7 and NO "names a client CA" WARN. (No `client_auth` field:
+#    this binary does not log it.)
+for p in $(kubectl --context kind-yadgar -n yadgar get pod -l app=project -o name); do
+  kubectl --context kind-yadgar -n yadgar logs "$p" | grep -E "project listening|names a client CA"
+done
+
+# 4. Unreadable: expect 0 for project (and for all 7).
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service)(yadgar_rotation_watched_files_unreadable)'
+
+# 5. The serving gauge: still 2 for project.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=count%20by%20(service%2Ckind)(yadgar_tls_certificate_not_after_seconds%7Bkind%3D%22serving%22%7D)'
+```
+
+**The hop — the passive signal.** `gateway` → `project` carries traffic on
+its own: each gateway pod polls the project registry every 60 s
+(`YADGAR_PROJECT_REGISTRY_POLL_SECONDS`), and each poll is a `ListProjects`
+call on `project`. The new pods are exercised within a few minutes (about 2
+polls/min, balanced per request across both pods by dial's p2c); judge by
+two reads at least 5 minutes apart. No operator request is needed. A failed handshake never reaches
+the server's handler, so an `OK` call counted by a NEW `project` pod is a
+call that crossed the hop after the roll.
+
+- **Signal:** `yadgar_calls_total{service="project",tool="ListProjects",outcome="OK"}`
+  under the NEW `project` pod names, growing (about 1/min on each pod).
+  Under `optional` this proves the handshake completed, not that the leaf
+  was presented (see above).
+- **`yadgar_gateway_project_registry_loaded` does NOT prove this hop
+  (ledger 1395).** It means "EVER loaded" (gateway v0.10.2
+  `src/project/registry.rs`): a later failed reload leaves it at 1. The
+  gateway does not roll here, so the gauge stays 1 whatever the new `project`
+  pods do. The card's "registry loaded = 1" acceptance is replaced by the
+  counter above.
+- **The failure shape.** A refused leaf does NOT stop the rollout: the
+  readiness probe is `tcpSocket`, so the new pods go Ready and the old pods
+  are removed. Then the new `project` pods count no `ListProjects`, and each
+  gateway pod logs, once a minute, the WARN "the project registry could not
+  be refreshed; the previously loaded set stays in force" (0 such lines
+  before the merge). `YADGAR_PROJECT_VALIDATION_MODE` is `counting` (live,
+  2026-10-09), so a failed refresh is a degraded window, not a 503 per
+  scoped call: the gateway keeps the set it already holds. Revert at once
+  all the same.
+- `project-db` also keeps counting `ListProjects` 1:1 with `project`; a stop
+  there with `project` still OK is a `project` → `project-db` fault (B-U8b),
+  not this change.
+- The estate smoke rows C-01 (iam path) and C-10 (task path) are the card's
+  functional acceptance. They CANNOT run today: the estate verdict gate is red
+  until the settled-state gate produces a `settled-verdict` artifact (ledger
+  675, stage 3). Do not read a red estate run as this change.
+
+```bash
+# Expect NEW project pod names, outcome OK, growing between two reads a few
+# minutes apart; and no "could not be refreshed" WARN on either gateway pod.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service%2Cpod%2Ctool%2Coutcome)(yadgar_calls_total%7Bservice%3D~%22project%7Cproject-db%22%7D)'
+for p in $(kubectl --context kind-yadgar -n yadgar get pod -l app=gateway -o name); do
+  kubectl --context kind-yadgar -n yadgar logs --since=15m "$p" | grep -E 'project registry' | tail -2
+done
+```
+
+If a `project` pod does not become Ready, the rollout stops behind
+`maxUnavailable: 0` and the old pods keep serving. Read the log first: a CA
+file that cannot be read or parsed refuses the boot and names the path.
+
+### Rollback — a revert
+
+If `yadgar`'s operation is still Running or retrying, end it first:
+
+```bash
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.status.operationState.phase} {.status.operationState.syncResult.revision}{"\n"}'
+```
+
+NEEDS-MAX: `argocd app terminate-op yadgar` against kind-yadgar's Argo CD. A
+revert does not interrupt an operation already running (see "The yadgar pin
+moves to parent chart 0.13.13", Rollback).
+
+Then revert the WHOLE merge commit: the value, the K3 table, the gate test
+and this section move together. A values-only revert reddens K3 and
+`test_every_server_states_its_client_auth_and_stages_its_own_ca`. The revert
+returns `EXPECTED_CLIENT_AUTH` to the three `-db` servers at `optional`; it
+does not touch B-U8a or B-U8b. `project` rolls back to `off`: it stops asking
+for a certificate and drops the CA from its watch set. Nothing is created, so
+nothing is left to prune.
+
+Break-glass, if git cannot merge in time (NEEDS-MAX): suspend auto-sync on
+`yadgar`, then
+`kubectl --context kind-yadgar -n yadgar set env deployment/project LISTEN_TLS_CLIENT_AUTH=off`.
+`off` is the only valid emergency value. Deleting the variable is a boot
+refusal (ADR-0854). Revert in git afterwards.
+
+## task asks its caller for a client certificate: `clientAuth: "optional"` (B-U8d, ledger 925)
+
+**What the merge does.** It changes one value in `applications/yadgar.yaml`:
+`task.tls.clientAuth`, from `"off"` to `"optional"`. `task-db` (B-U8a),
+`iam-db` and `project-db` (B-U8b) and `project` (B-U8c) stay at
+`"optional"`. `iam` stays at `"off"`. The pin stays at 0.19.1. PB-2 already
+staged the client CA (`client-ca` volume from `task-tls`, item `ca.crt`, and
+`LISTEN_TLS_CLIENT_CA_FILE`), so this is a one-key change.
+
+Merging is the deploy: `yadgar` syncs on its own (`selfHeal`, no `prune`).
+Measured 2026-10-09 at base `3cd2dfd` with helm 3.18.4 and 4.3.0
+(byte-identical renders), and with a server-side dry run against
+`kind-yadgar`:
+
+- 90 → 90 objects. 0 added. 0 removed.
+- 1 changed: `Deployment/task`. One env value moves:
+  `LISTEN_TLS_CLIENT_AUTH` `off` → `optional`. Nothing else in it moves.
+- The dry run names only `Deployment/task` (the env value and
+  `generation`). It admits all 77 tracked objects and all 13 hooks. The
+  `yadgar` Application CR diff is the one value.
+
+**What runs.** `task` rolls, `maxSurge: 1 / maxUnavailable: 0`, 2 replicas.
+No other Deployment rolls; the gateway does NOT roll. Under `optional`,
+`yadgar_lifecycle::serve_tls` (lifecycle v0.2.20; task v0.7.0):
+
+- reads `LISTEN_TLS_CLIENT_CA_FILE` at boot, and refuses to boot if the file
+  is unreadable, unparsable, or holds no certificate;
+- builds a client verifier with that file as its only anchor
+  (`client_ca_root`) and `client_auth_optional(true)`;
+- asks every caller for a certificate. A caller that sends none is accepted.
+  A caller that sends one has it verified: a leaf from another CA, or an
+  expired leaf, is refused;
+- adds the CA file to the rotation watch set.
+
+**The caller.** `task` has one caller on its gRPC port, 50052.
+
+| Server | NetworkPolicy admits (port 50052) | Caller presents      | Caller env                                |
+| ------ | --------------------------------- | -------------------- | ----------------------------------------- |
+| `task` | `app: gateway` only               | `gateway-client-tls` | `TASK_TLS_CLIENT_CERT_FILE` / `_KEY_FILE` |
+
+`gateway` v0.10.2 reads the `TASK` prefix through `UpstreamTls::from_env`
+and dials `task` with `connect_task` → `yadgar_dial::connect_tls(..,
+&tls.options())`; `options()` adds the identity, and dial v0.2.14 hands it to
+tonic as `Identity::from_pem`. The rendered and live gateway env point
+`TASK_TLS_CLIENT_CERT_FILE` / `_KEY_FILE` at the `client-cert` volume, which
+is `gateway-client-tls`: the same leaf the gateway already presents to
+`project` (B-U8c). It is NOT `gateway-tls`, the edge's serving leaf from
+`ClusterIssuer/yadgar-dev-ca`, which is never presented to `task`.
+
+The argocd gates do not pin this env (ledger 1396): they check only that the
+gateway mounts `gateway-client-tls` (`CLIENT_LEAVES`), not that
+`TASK_TLS_CLIENT_CERT_FILE` / `_KEY_FILE` point at it. That gate is deferred
+to before B-U9. For this hop the values were read directly, in the render
+and live on 2026-10-09: `/var/run/secrets/client-cert/client.crt` and
+`/var/run/secrets/client-cert/client.key`, with the `client-cert` volume
+from `gateway-client-tls`. Before-check 2 below reads them again.
+
+`gateway-client-tls` and `task-tls` both come from
+`Issuer/yadgar-internal-ca`, so the CA in `task-tls`'s `ca.crt` is the CA
+that issued the gateway's leaf. Read 2026-10-09 (Certificate status only, no
+Secret read): the CA Certificate is at revision 1, `notBefore`
+2026-09-05T12:40:48Z, before both leaves (`gateway-client-tls` and
+`task-tls`, both 2026-09-05T12:40:52Z, both revision 1), so no CA rotation
+sits between the two issuances. The leaf carries the `client auth` usage.
+
+No other workload dials `task`: `project` v0.3.0 and `iam` v0.10.0 have no
+`task` upstream, no hook Job references it or carries `app: gateway`, and
+the `estate-front` and `post-merge-verifier` egress policies allow no yadgar
+pod on 50052. The NetworkPolicy is the control (enforced per ledger 511).
+There is no live corroboration for this hop: no request reached `task` in
+the Prometheus window (see the passive signal below). The readiness probe
+(`tcpSocket` on `grpc`) and the Prometheus scrape (9090, plain HTTP) do not
+complete a TLS handshake on 50052, so the mode does not touch them.
+
+**`optional` is not a control.** Anyone can send no certificate. This step
+is the first live use of `gateway-client-tls` against `task` with
+verification on: if the leaf is wrong or expired, this hop fails now. An
+`OK` call proves only that the handshake completed: either the leaf
+verified, or the gateway sent none. That the gateway sends its leaf is a
+source fact, not an observation. Only `required` (B-U9.4) proves that the
+leaf is on the wire.
+
+**The blast radius is larger than B-U8c's.** `task` carries all five task
+tools (`create_task`, `read_task`, `find_tasks`, `edit_task`,
+`transition_task`): `tools/call` reaches `task` through one channel
+(`dispatch.rs`, `tools::call(state.task.clone(), ..)`). There is no
+degraded mode like the project registry's `counting`: a refused leaf fails
+every task tool call for every user, at once.
+
+**Rotation.** The CA file now joins the watch set (`File::read`). A leaf
+renewal rewrites `ca.crt` with the same bytes, so it does not cause a second
+restart. Only a new CA changes the file. The process then drains and exits 0,
+as for a leaf rotation.
+
+**Things that change in the log, and are not faults.** The boot WARN
+"`LISTEN_TLS_CLIENT_CA_FILE` names a client CA but `LISTEN_TLS_CLIENT_AUTH`
+is `off` …" goes away. The `task listening` line reads `"watching":7` (6
+before: serving certificate and key, the `task-db` CA, the client
+certificate and key, and the rotation configuration; the client CA is the
+seventh file). This is a prediction from source (task v0.7.0
+`tests/assembly.rs::a_verifying_listener_watches_its_client_ca_and_off_does_not`),
+not yet observed.
+
+**THE BOOT LINE CARRIES NO `client_auth` FIELD.** task v0.7.0's
+`task listening` line logs only `addr`, `tls`, `watching` and the rotation
+and drain settings. The mode is read from the Deployment env, and the log
+evidence is the WARN gone plus `"watching":7`.
+
+### Before this merge — read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. yadgar Synced/Healthy at 0.19.1. Any other state → STOP.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. task 2/2/2 at `off`, with the CA staged; the gateway presents its
+#    client leaf to task. Read 2026-10-09: task 2 2 2 off task-tls.
+kubectl --context kind-yadgar -n yadgar get deploy task gateway \
+  -o custom-columns='NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,AUTH:.spec.template.spec.containers[0].env[?(@.name=="LISTEN_TLS_CLIENT_AUTH")].value,CA:.spec.template.spec.volumes[?(@.name=="client-ca")].secret.secretName,LEAF:.spec.template.spec.volumes[?(@.name=="client-cert")].secret.secretName'
+kubectl --context kind-yadgar -n yadgar get deploy gateway \
+  -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}={.value}{"\n"}{end}' \
+  | grep -E '^TASK_'
+
+# 3. The CA and both leaves: one Issuer, and no CA rotation between them.
+#    Certificate objects only: NAMES AND STATUS, no Secret read. Read
+#    2026-10-09: CA revision 1, notBefore 2026-09-05T12:40:48Z; task-tls and
+#    gateway-client-tls `yadgar-internal-ca` (Issuer), Ready, revision 1,
+#    notBefore 2026-09-05T12:40:52Z. If the CA's revision is above 1, or its
+#    notBefore is later than either leaf's: STOP.
+kubectl --context kind-yadgar -n yadgar get certificate yadgar-internal-ca gateway-client-tls task-tls \
+  -o custom-columns='NAME:.metadata.name,ISSUER:.spec.issuerRef.name,KIND:.spec.issuerRef.kind,READY:.status.conditions[?(@.type=="Ready")].status,NOTBEFORE:.status.notBefore,REV:.status.revision,USAGES:.spec.usages'
+
+# 4. The boot lines. Read 2026-10-09: "watching":6 and the
+#    "names a client CA but ... is `off`" WARN, on both pods.
+for p in $(kubectl --context kind-yadgar -n yadgar get pod -l app=task -o name); do
+  kubectl --context kind-yadgar -n yadgar logs "$p" | grep -E "task listening|names a client CA"
+done
+
+# 5. Unreadable: 0 for all 7. Read 2026-10-09: 0 for all 7.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service)(yadgar_rotation_watched_files_unreadable)'
+
+# 6. The task call series. Read 2026-10-09: NO series on the current task
+#    pods (started 2026-10-09T00:04Z), and zero increase for task over the
+#    whole Prometheus window (retention is 1 day, not 7).
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service%2Cpod%2Ctool%2Coutcome)(yadgar_calls_total%7Bservice%3D~%22task%7Cgateway%22%2Ctool!~%22server%2Fdiscover%22%7D)'
+```
+
+### Live refusal probe — NEEDS-MAX, operator-run
+
+A port-forward and a local `openssl` are a cluster action (`port-forward`
+opens a tunnel into the pod). A throwaway pod in namespace `yadgar` is a
+cluster mutation. Neither is run by an agent. Never use a pod that carries
+`app: gateway`: the edge's Service selects that label, so the pod takes real
+traffic.
+
+```bash
+# Terminal 1: a tunnel to ONE task pod. Leave it running.
+kubectl --context kind-yadgar -n yadgar port-forward \
+  "$(kubectl --context kind-yadgar -n yadgar get pod -l app=task -o name | head -1)" 15055:50052
+
+# Terminal 2, BEFORE the merge (mode `off`): the tunnel works, and the server
+# asks for no certificate. Expect CONNECTED, `ALPN protocol: h2`, and NO line
+# "Acceptable client certificate CA names". If the handshake fails here, the
+# tunnel is the problem, not the mode: STOP.
+openssl s_client -connect 127.0.0.1:15055 -servername task.yadgar.svc -alpn h2 </dev/null 2>&1 \
+  | grep -E 'CONNECTED|ALPN|Acceptable client certificate CA names|No client certificate CA names|alert'
+
+# A leaf from a CA made on the spot (the "wrong anchor"). Local files only.
+cd "$(mktemp -d)"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
+  -subj '/CN=b-u8d-probe-foreign-ca' -keyout ca.key -out ca.crt
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -subj '/CN=b-u8d-probe-leaf' -keyout leaf.key -out leaf.csr
+printf 'keyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n' > leaf.ext
+openssl x509 -req -in leaf.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 \
+  -extfile leaf.ext -out leaf.crt
+```
+
+After the merge, when `task` is 2/2/2 at `optional` (restart the tunnel:
+the old pods are gone):
+
+```bash
+# P1. No certificate → ACCEPTED. Expect "Acceptable client certificate CA
+#     names" (the server now asks), a cipher, and NO alert.
+openssl s_client -connect 127.0.0.1:15055 -servername task.yadgar.svc -alpn h2 -tls1_2 </dev/null 2>&1 \
+  | grep -E 'CONNECTED|Acceptable client certificate CA names|Cipher is|alert'
+# P2. A leaf from the wrong anchor → REFUSED. TLS 1.2 refuses inside the
+#     handshake: expect an alert ("unknown ca" or "bad certificate") and
+#     "Cipher is (NONE)".
+openssl s_client -connect 127.0.0.1:15055 -servername task.yadgar.svc -alpn h2 -tls1_2 \
+  -cert leaf.crt -key leaf.key </dev/null 2>&1 | grep -E 'Cipher is|alert'
+# P2, TLS 1.3. The client finishes its side first, and the refusal arrives
+# as an alert on the first read. Expect an alert line before the timeout.
+# No alert at all means the leaf was ACCEPTED: STOP and revert.
+(sleep 3) | timeout 8 openssl s_client -connect 127.0.0.1:15055 -servername task.yadgar.svc \
+  -alpn h2 -tls1_3 -cert leaf.crt -key leaf.key -ign_eof 2>&1 | grep -E 'alert|Cipher is'
+```
+
+If `-tls1_2` fails at once with "protocol version" and no other alert, the
+listener accepts TLS 1.3 only. Then use the TLS 1.3 form for P1 as well.
+Stop the tunnel and delete the temp directory afterwards.
+
+### After this merge — read-only
+
+```bash
+# 1. yadgar Synced/Healthy at 0.19.1, and its last operation Succeeded.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. Judge by Deployment readiness, not by the operation phase. Expect
+#    task 2/2/2 with AUTH `optional` and new pod start times; gateway
+#    2/2/2, NOT rolled.
+kubectl --context kind-yadgar -n yadgar get deploy task gateway \
+  -o custom-columns='NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,AUTH:.spec.template.spec.containers[0].env[?(@.name=="LISTEN_TLS_CLIENT_AUTH")].value'
+kubectl --context kind-yadgar -n yadgar get pods -l 'app in (task,gateway)' \
+  -o custom-columns=NAME:.metadata.name,START:.status.startTime,READY:.status.containerStatuses[0].ready
+
+# 3. The CA file is READ and WATCHED. Expect, on both new pods,
+#    "watching":7 and NO "names a client CA" WARN. (No `client_auth` field:
+#    this binary does not log it.)
+for p in $(kubectl --context kind-yadgar -n yadgar get pod -l app=task -o name); do
+  kubectl --context kind-yadgar -n yadgar logs "$p" | grep -E "task listening|names a client CA"
+done
+
+# 4. Unreadable: expect 0 for task (and for all 7).
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service)(yadgar_rotation_watched_files_unreadable)'
+
+# 5. The serving gauge: still 2 for task.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=count%20by%20(service%2Ckind)(yadgar_tls_certificate_not_after_seconds%7Bkind%3D%22serving%22%7D)'
+```
+
+**The hop — no passive signal (ledger 1393).** Nothing calls `task` on its
+own. In gateway v0.10.2 the only use of the `task` channel is `tools/call`
+for the five task tools (`src/http/dispatch.rs`); `tools/list` answers from
+a static catalogue and the registry poll calls `project`, not `task`. Read
+2026-10-09: `yadgar_calls_total{service="task"}` shows zero increase over
+the whole Prometheus window (retention is 1 day, not 7). So a broken hop stays invisible until a user calls a task tool, and
+the readiness probe (`tcpSocket`) cannot see it either.
+
+- **The after-check is one request, and it is mandatory (NEEDS-MAX,
+  operator-run).** Send one task request through the gateway with your own
+  client, for example a `find_tasks` from the yadgar client, as soon as
+  `task` is 2/2/2. Then read the counters below.
+- **Pass:** a NEW `yadgar_calls_total{service="task",tool="FindTasks",outcome="OK"}`
+  sample under a NEW `task` pod name, and the gateway's own
+  `yadgar_calls_total{service="gateway",tool="find_tasks",outcome="OK"}`
+  growing by one. Under `optional` this proves the handshake completed, not
+  that the leaf was presented (see above).
+- **The failure shape.** A refused leaf does NOT stop the rollout: the
+  readiness probe is `tcpSocket`, so the new pods go Ready and the old pods
+  are removed. A handshake that `task` refuses never reaches `task`'s
+  handler, so `task` counts NOTHING. The failure shows only on the gateway:
+  `yadgar_calls_total{service="gateway",tool="find_tasks"}` with a non-OK
+  `outcome`: any non-OK outcome from the upstream (`ToolError::Upstream`).
+  The code is not measured: `UNAVAILABLE` if refused inside the handshake;
+  `UNKNOWN`, `INTERNAL` or `CANCELLED` if the TLS 1.3 alert arrives after it
+  (neither lifecycle nor dial pins a TLS version). The client gets a tool
+  error. Every task tool call for every user fails the same way: revert at
+  once.
+- The estate smoke rows C-01 (iam path) and C-10 (task path) are the card's
+  functional acceptance. They CANNOT run today: the estate verdict gate is red
+  until the settled-state gate produces a `settled-verdict` artifact (ledger
+  675, stage 3). Do not read a red estate run as this change.
+
+```bash
+# Read once before the request and once after it. Expect a NEW task pod name
+# with FindTasks OK, and gateway find_tasks OK one higher.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service%2Cpod%2Ctool%2Coutcome)(yadgar_calls_total%7Bservice%3D~%22task%7Cgateway%22%2Ctool!~%22server%2Fdiscover%22%7D)'
+```
+
+**Which hop broke — read after one post-merge `find_tasks` (operator-run).**
+This one request also exercises B-U8a's hop (`task` → `task-db`) for the
+first time, and the two hops fail in different places. `task` v0.7.0 counts
+a `task-db` failure as its own non-OK `FindTasks` and logs a WARN; a
+handshake `task` refuses records nothing on `task`.
+
+| Reading after one post-merge `find_tasks`                                                                                                              | Broken hop                                    |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------- |
+| gateway `find_tasks` OK, and new task pod `FindTasks` OK                                                                                               | none, pass                                    |
+| task pod has `FindTasks` non-OK (UNAVAILABLE or INTERNAL), task log WARN `task-db returned an error`, client tool error says "task store"              | task→task-db (B-U8a): revert B-U8a, not B-U8d |
+| no new `service="task"` sample, gateway `find_tasks` non-OK, client gets tool result `isError:true` (HTTP 200) with transport text                     | gateway→task (B-U8d): revert B-U8d            |
+| gateway WARN `attestation failed`, JSON-RPC error (HTTP 401/503, "the credential could not be verified"), or `RESOURCE_EXHAUSTED` / `INVALID_ARGUMENT` | gateway-local, not this change                |
+
+If both hops are broken, row 3 fires first: revert B-U8d, then send one more
+request to test B-U8a.
+
+If a `task` pod does not become Ready, the rollout stops behind
+`maxUnavailable: 0` and the old pods keep serving. Read the log first: a CA
+file that cannot be read or parsed refuses the boot and names the path.
+
+### Rollback — a revert
+
+If `yadgar`'s operation is still Running or retrying, end it first:
+
+```bash
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.status.operationState.phase} {.status.operationState.syncResult.revision}{"\n"}'
+```
+
+NEEDS-MAX: `argocd app terminate-op yadgar` against kind-yadgar's Argo CD. A
+revert does not interrupt an operation already running (see "The yadgar pin
+moves to parent chart 0.13.13", Rollback).
+
+Then revert the WHOLE merge commit: the value, the K3 table, the gate test
+and this section move together. A values-only revert reddens K3 and
+`test_every_server_states_its_client_auth_and_stages_its_own_ca`. The revert
+returns `EXPECTED_CLIENT_AUTH` to the three `-db` servers and `project` at
+`optional`; it does not touch B-U8a, B-U8b or B-U8c. It also restores the
+B-U8b and B-U8c wording fixes above (B-U8b's caller-proof sentence and both
+"within about a minute" claims) to their old text; re-land them on their own
+if wanted.
+`task` rolls back to `off`: it stops asking for a certificate and drops the
+CA from its watch set. Nothing is created, so nothing is left to prune.
+
+Break-glass, if git cannot merge in time (NEEDS-MAX): suspend auto-sync on
+`yadgar`, then
+`kubectl --context kind-yadgar -n yadgar set env deployment/task LISTEN_TLS_CLIENT_AUTH=off`.
+`off` is the only valid emergency value. Deleting the variable is a boot
+refusal (ADR-0854). Revert in git afterwards.
+
+## iam asks its caller for a client certificate: `clientAuth: "optional"` (B-U8e, ledger 925)
+
+**What the merge does.** It changes one value in `applications/yadgar.yaml`:
+`iam.tls.clientAuth`, from `"off"` to `"optional"`. This is the last B-U8
+step: after it all six servers are at `"optional"` (`task-db` B-U8a,
+`iam-db` and `project-db` B-U8b, `project` B-U8c, `task` B-U8d). The pin
+stays at 0.19.1. PB-2 already staged the client CA (`client-ca` volume from
+`iam-tls`, item `ca.crt`, and `LISTEN_TLS_CLIENT_CA_FILE`), so this is a
+one-key change.
+
+Merging is the deploy: `yadgar` syncs on its own (`selfHeal`, no `prune`).
+Measured 2026-10-09 at base `6160947` with helm 3.18.4 and 4.3.0
+(byte-identical renders), and with a server-side dry run against
+`kind-yadgar`:
+
+- 90 → 90 objects. 0 added. 0 removed.
+- 1 changed: `Deployment/iam`. One env value moves:
+  `LISTEN_TLS_CLIENT_AUTH` `off` → `optional`. Nothing else in it moves.
+- The dry run names only `Deployment/iam` (the env value and
+  `generation`). It admits all 77 tracked objects and all 13 hooks. The
+  `yadgar` Application CR diff is the one value.
+
+**What runs.** `iam` rolls, `maxSurge: 1 / maxUnavailable: 0`, 2 replicas
+(KEDA, minimum 2). No other Deployment rolls; the gateway does NOT roll.
+Under `optional`, `yadgar_lifecycle::serve_tls` (lifecycle v0.2.20; iam
+v0.10.0):
+
+- reads `LISTEN_TLS_CLIENT_CA_FILE` at boot, and refuses to boot if the file
+  is unreadable, unparsable, or holds no certificate;
+- builds a client verifier with that file as its only anchor
+  (`client_ca_root`) and `client_auth_optional(true)`;
+- asks every caller for a certificate. A caller that sends none is accepted.
+  A caller that sends one has it verified: a leaf from another CA, or an
+  expired leaf, is refused;
+- adds the CA file to the rotation watch set.
+
+The mode applies to one listener only: gRPC on 50052. iam's other port is
+the Prometheus endpoint on 9090, plain HTTP, which the mode does not touch.
+iam's own outbound connections (to `iam-db`, to NATS, and to the gateway's
+enrolment address) are client connections and do not change.
+
+**The caller.** `iam` has one caller on its gRPC port, 50052.
+
+| Server | NetworkPolicy admits (port 50052) | Caller presents      | Caller env                               |
+| ------ | --------------------------------- | -------------------- | ---------------------------------------- |
+| `iam`  | `app: gateway` only               | `gateway-client-tls` | `IAM_TLS_CLIENT_CERT_FILE` / `_KEY_FILE` |
+
+`gateway` v0.10.2 reads the `IAM` prefix through `UpstreamTls::from_env`
+and dials `iam` with `connect_iam` → `yadgar_dial::connect_tls(..,
+&tls.options())`; `options()` adds the identity, and dial v0.2.14 hands it to
+tonic as `Identity::from_pem`. gateway's
+`upstream/tests.rs::the_client_certificate_and_its_key_both_arrive` pins the
+`IAM` prefix reading both files. The rendered and live gateway env point
+`IAM_TLS_CLIENT_CERT_FILE` / `_KEY_FILE` at the `client-cert` volume, which
+is `gateway-client-tls`: the same leaf the gateway already presents to
+`project` (B-U8c) and `task` (B-U8d). It is NOT `gateway-tls`, the edge's
+serving leaf from `ClusterIssuer/yadgar-dev-ca`, which is never presented
+to `iam`.
+
+The argocd gates do not pin this env (ledger 1396): they check only that the
+gateway mounts `gateway-client-tls` (`CLIENT_LEAVES`), not that
+`IAM_TLS_CLIENT_CERT_FILE` / `_KEY_FILE` point at it. That gate is deferred
+to before B-U9. For this hop the values were read directly, in the render
+and live on 2026-10-09: `/var/run/secrets/client-cert/client.crt` and
+`/var/run/secrets/client-cert/client.key`, with the `client-cert` volume
+from `gateway-client-tls` (`optional: true`). Before-check 2 below reads
+them again.
+
+`gateway-client-tls` and `iam-tls` both come from
+`Issuer/yadgar-internal-ca`, so the CA in `iam-tls`'s `ca.crt` is the CA
+that issued the gateway's leaf. Read 2026-10-09 (Certificate status only, no
+Secret read): the CA Certificate is at revision 1, `notBefore`
+2026-09-05T12:40:48Z, before both leaves (`gateway-client-tls` and
+`iam-tls`, both 2026-09-05T12:40:52Z, both revision 1), so no CA rotation
+sits between the two issuances. The leaf carries the `client auth` usage.
+
+No other workload dials `iam`. `task` v0.7.0 and `project` v0.3.0 have no
+`iam` upstream (no `IAM_*` env in the render). The four hook Jobs
+(`preflight`, `bootstrap-secrets`, `admin-bootstrap-token`,
+`envoy-gateway-probe`) talk to the Kubernetes API (and `preflight` to
+Prometheus), never to `iam`, and none carries `app: gateway`. The
+`estate-front` and `post-merge-verifier` pods are in other namespaces, and
+`iam-ingress` admits only pods in `yadgar`. The NetworkPolicy is the
+control (enforced per ledger 511). There is no live corroboration for this
+hop (see the passive signal below). The readiness probe (`tcpSocket` on
+`grpc`) and the Prometheus scrape (9090, plain HTTP) do not complete a TLS
+handshake on 50052, so the mode does not touch them.
+
+**`optional` is not a control.** Anyone can send no certificate. This step
+is the first live use of `gateway-client-tls` against `iam` with
+verification on: if the leaf is wrong or expired, this hop fails now. A
+completed call proves only that the handshake completed: either the leaf
+verified, or the gateway sent none. That the gateway sends its leaf is a
+source fact, not an observation. Only `required` (B-U9.5) proves that the
+leaf is on the wire.
+
+**THE BLAST RADIUS IS EVERY AUTHENTICATED REQUEST.** `iam` is the
+authentication plane. The gateway holds ONE channel to `iam`, and every
+authenticated surface uses it:
+
+- every `tools/call` (all five task tools): the gateway attests the bearer
+  token through `iam.ResolveCredential` BEFORE it calls `task`;
+- `POST /auth/login` and `POST /auth/enrol`;
+- `/admin/create-user`, `/admin/issue-enrolment`, `/admin/set-user-admin`,
+  including the bootstrap-token path.
+
+If `iam` refuses the gateway's leaf, all of these fail for every user, at
+once. The gateway's credential cache (`YADGAR_CREDENTIAL_TTL_SECONDS=30`)
+hides the failure for at most 30 s per token per gateway pod; after that
+there is no degraded mode. `server/discover`, `tools/list` and the gateway's
+readiness probe (`tcpSocket`) do not touch `iam`, so the gateway stays
+Ready and keeps answering those. Revert at once.
+
+**Rotation.** The CA file now joins the watch set (`File::read`). A leaf
+renewal rewrites `ca.crt` with the same bytes, so it does not cause a second
+restart. Only a new CA changes the file. The process then drains and exits 0,
+as for a leaf rotation.
+
+**Things that change in the log, and are not faults.** The boot WARN
+"`LISTEN_TLS_CLIENT_CA_FILE` names a client CA but `LISTEN_TLS_CLIENT_AUTH`
+is `off` …" goes away. The `iam listening` line reads `"watching":9` (8
+before: serving certificate and key, the `iam-db` CA, the client
+certificate and key, the NATS password, the enrolment CA, and the shared
+configuration document; the client CA is the ninth file). This is a
+prediction from source, not yet observed: lifecycle v0.2.20's `client_ca()`
+keeps the CA path for every mode except `off`, and its `Material` impl
+watches the path when it is kept. iam v0.10.0's
+`tests/assembly.rs::the_watch_set_holds_every_file_this_deployment_configured`
+pins the nine files under `required`; no iam test pins the count under
+`optional`.
+
+**THE BOOT LINE CARRIES NO `client_auth` FIELD.** iam v0.10.0's
+`iam listening` line logs only `addr`, `tls`, `watching` and the rotation
+and drain settings. The mode is read from the Deployment env, and the log
+evidence is the WARN gone plus `"watching":9`.
+
+### Before this merge — read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. yadgar Synced/Healthy at 0.19.1. Any other state → STOP.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. iam 2/2/2 at `off`, with the CA staged; the gateway presents its
+#    client leaf to iam. Read 2026-10-09: iam 2 2 2 off iam-tls.
+kubectl --context kind-yadgar -n yadgar get deploy iam gateway \
+  -o custom-columns='NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,AUTH:.spec.template.spec.containers[0].env[?(@.name=="LISTEN_TLS_CLIENT_AUTH")].value,CA:.spec.template.spec.volumes[?(@.name=="client-ca")].secret.secretName,LEAF:.spec.template.spec.volumes[?(@.name=="client-cert")].secret.secretName'
+kubectl --context kind-yadgar -n yadgar get deploy gateway \
+  -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}={.value}{"\n"}{end}' \
+  | grep -E '^IAM_|CREDENTIAL'
+
+# 3. The CA and both leaves: one Issuer, and no CA rotation between them.
+#    Certificate objects only: NAMES AND STATUS, no Secret read. Read
+#    2026-10-09: CA revision 1, notBefore 2026-09-05T12:40:48Z; iam-tls and
+#    gateway-client-tls `yadgar-internal-ca` (Issuer), Ready, revision 1,
+#    notBefore 2026-09-05T12:40:52Z. If the CA's revision is above 1, or its
+#    notBefore is later than either leaf's: STOP.
+kubectl --context kind-yadgar -n yadgar get certificate yadgar-internal-ca gateway-client-tls iam-tls \
+  -o custom-columns='NAME:.metadata.name,ISSUER:.spec.issuerRef.name,KIND:.spec.issuerRef.kind,READY:.status.conditions[?(@.type=="Ready")].status,NOTBEFORE:.status.notBefore,REV:.status.revision,USAGES:.spec.usages'
+
+# 4. The boot lines. Read 2026-10-09: "watching":8 and the
+#    "names a client CA but ... is `off`" WARN, on both pods.
+for p in $(kubectl --context kind-yadgar -n yadgar get pod -l app=iam -o name); do
+  kubectl --context kind-yadgar -n yadgar logs "$p" | grep -E "iam listening|names a client CA"
+done
+
+# 5. Unreadable: 0 for all 7. Read 2026-10-09: 0 for all 7.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service)(yadgar_rotation_watched_files_unreadable)'
+
+# 6. The iam and gateway call series. Read 2026-10-09: NO
+#    `service="iam"` series at all, and on the gateway only
+#    `server/discover`, over the whole Prometheus window (retention is
+#    1 day; the oldest sample was 2026-10-08T00:40Z).
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service%2Cpod%2Ctool%2Coutcome)(yadgar_calls_total%7Bservice%3D~%22iam%7Cgateway%22%2Ctool!~%22server%2Fdiscover%22%7D)'
+```
+
+**7. Optional baseline — NEEDS-MAX, operator-run, not required.** B-U8d's
+after-check is one `find_tasks` through the gateway. Sent before this
+merge, that request also crosses `gateway` → `iam` (attestation) while
+`iam` is still at `off`: expect a new
+`service="iam",tool="ResolveCredential",outcome="OK"` sample in the step-6
+query. It is not a precondition. If B-U8e merges first, the first
+post-merge request crosses three unverified hops (`gateway` → `iam`,
+`gateway` → `task`, `task` → `task-db`), and the table under "After this
+merge" still names the broken one, because attestation runs first.
+
+### Live refusal probe — NEEDS-MAX, operator-run
+
+A port-forward and a local `openssl` are a cluster action (`port-forward`
+opens a tunnel into the pod). A throwaway pod in namespace `yadgar` is a
+cluster mutation. Neither is run by an agent. Never use a pod that carries
+`app: gateway`: the edge's Service selects that label, so the pod takes real
+traffic.
+
+```bash
+# Terminal 1: a tunnel to ONE iam pod. Leave it running.
+kubectl --context kind-yadgar -n yadgar port-forward \
+  "$(kubectl --context kind-yadgar -n yadgar get pod -l app=iam -o name | head -1)" 15056:50052
+
+# Terminal 2, BEFORE the merge (mode `off`): the tunnel works, and the server
+# asks for no certificate. Expect CONNECTED, `ALPN protocol: h2`, and NO line
+# "Acceptable client certificate CA names". If the handshake fails here, the
+# tunnel is the problem, not the mode: STOP.
+openssl s_client -connect 127.0.0.1:15056 -servername iam.yadgar.svc -alpn h2 </dev/null 2>&1 \
+  | grep -E 'CONNECTED|ALPN|Acceptable client certificate CA names|No client certificate CA names|alert'
+
+# A leaf from a CA made on the spot (the "wrong anchor"). Local files only.
+cd "$(mktemp -d)"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
+  -subj '/CN=b-u8e-probe-foreign-ca' -keyout ca.key -out ca.crt
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -subj '/CN=b-u8e-probe-leaf' -keyout leaf.key -out leaf.csr
+printf 'keyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n' > leaf.ext
+openssl x509 -req -in leaf.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 \
+  -extfile leaf.ext -out leaf.crt
+```
+
+After the merge, when `iam` is 2/2/2 at `optional` (restart the tunnel:
+the old pods are gone):
+
+```bash
+# P1. No certificate → ACCEPTED. Expect "Acceptable client certificate CA
+#     names" (the server now asks), a cipher, and NO alert.
+openssl s_client -connect 127.0.0.1:15056 -servername iam.yadgar.svc -alpn h2 -tls1_2 </dev/null 2>&1 \
+  | grep -E 'CONNECTED|Acceptable client certificate CA names|Cipher is|alert'
+# P2. A leaf from the wrong anchor → REFUSED. TLS 1.2 refuses inside the
+#     handshake: expect an alert ("unknown ca" or "bad certificate") and
+#     "Cipher is (NONE)".
+openssl s_client -connect 127.0.0.1:15056 -servername iam.yadgar.svc -alpn h2 -tls1_2 \
+  -cert leaf.crt -key leaf.key </dev/null 2>&1 | grep -E 'Cipher is|alert'
+# P2, TLS 1.3. The client finishes its side first, and the refusal arrives
+# as an alert on the first read. Expect an alert line before the timeout.
+# No alert at all means the leaf was ACCEPTED: STOP and revert.
+(sleep 3) | timeout 8 openssl s_client -connect 127.0.0.1:15056 -servername iam.yadgar.svc \
+  -alpn h2 -tls1_3 -cert leaf.crt -key leaf.key -ign_eof 2>&1 | grep -E 'alert|Cipher is'
+```
+
+If `-tls1_2` fails at once with "protocol version" and no other alert, the
+listener accepts TLS 1.3 only. Then use the TLS 1.3 form for P1 as well.
+Stop the tunnel and delete the temp directory afterwards.
+
+### After this merge — read-only
+
+```bash
+# 1. yadgar Synced/Healthy at 0.19.1, and its last operation Succeeded.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. Judge by Deployment readiness, not by the operation phase. Expect
+#    iam 2/2/2 with AUTH `optional` and new pod start times; gateway
+#    2/2/2, NOT rolled.
+kubectl --context kind-yadgar -n yadgar get deploy iam gateway \
+  -o custom-columns='NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,AUTH:.spec.template.spec.containers[0].env[?(@.name=="LISTEN_TLS_CLIENT_AUTH")].value'
+kubectl --context kind-yadgar -n yadgar get pods -l 'app in (iam,gateway)' \
+  -o custom-columns=NAME:.metadata.name,START:.status.startTime,READY:.status.containerStatuses[0].ready
+
+# 3. The CA file is READ and WATCHED. Expect, on both new pods,
+#    "watching":9 and NO "names a client CA" WARN. (No `client_auth` field:
+#    this binary does not log it.)
+for p in $(kubectl --context kind-yadgar -n yadgar get pod -l app=iam -o name); do
+  kubectl --context kind-yadgar -n yadgar logs "$p" | grep -E "iam listening|names a client CA"
+done
+
+# 4. Unreadable: expect 0 for iam (and for all 7).
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service)(yadgar_rotation_watched_files_unreadable)'
+
+# 5. The serving gauge: still 2 for iam.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=count%20by%20(service%2Ckind)(yadgar_tls_certificate_not_after_seconds%7Bkind%3D%22serving%22%7D)'
+```
+
+**The hop — no passive signal.** Nothing calls `iam` on its own. The
+gateway calls `iam` only to serve a user request (attestation, login,
+enrolment, admin); `server/discover` and `tools/list` answer without it,
+and the registry poll calls `project`. iam's own background work
+(the key-identity check) is `iam` → `iam-db`, not into `iam`. Read
+2026-10-09: no `yadgar_calls_total{service="iam"}` series at all in the
+Prometheus window (from 2026-10-08T00:40Z). So a broken hop stays invisible
+until a user sends an authenticated request, and the readiness probe
+(`tcpSocket`) cannot see it either.
+
+- **The after-check is one request, and it is mandatory (NEEDS-MAX,
+  operator-run),** as soon as `iam` is 2/2/2. Read the step-6 query before
+  and after it.
+- **The isolating request: a bearer token that does not exist.** The
+  gateway asks `iam` about the token before anything else, and `iam`
+  answers an unknown token with an empty user, which the gateway turns into
+  HTTP 401. So a 401 proves the `gateway` → `iam` handshake completed, and
+  it touches neither `task` hop. It was built from gateway v0.10.2's source
+  and has NOT been run by an agent:
+
+```bash
+curl -sS -o /dev/stderr -w '\nHTTP %{http_code}\n' https://gateway.yadgar.internal:18443/ \
+  -H 'content-type: application/json' -H 'mcp-protocol-version: 2026-07-28' \
+  -H "authorization: Bearer b-u8e-probe-$(date +%s%N)" -H 'x-yadgar-project: b-u8e-probe' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"find_tasks","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'
+```
+
+- **Pass:** HTTP 401 with "the credential could not be verified", a NEW
+  `yadgar_calls_total{service="iam",tool="ResolveCredential",outcome="OK"}`
+  sample under a NEW `iam` pod name, and the gateway's
+  `yadgar_calls_total{service="gateway",tool="find_tasks",outcome="UNAUTHENTICATED"}`
+  one higher. A real `find_tasks` from your own client is the second
+  request. Use a token the gateway has not resolved in the last 30 s: the
+  gateway caches answers, refusals included, for
+  `YADGAR_CREDENTIAL_TTL_SECONDS` (30 s), and a cached token never reaches
+  `iam`, so it proves nothing about this hop. The curl mints a new token
+  each time.
+  Under `optional` a pass proves the handshake completed, not that the leaf
+  was presented (see above).
+- **The failure shape.** A refused leaf does NOT stop the rollout: the
+  readiness probe is `tcpSocket`, so the new pods go Ready and the old pods
+  are removed. A handshake that `iam` refuses never reaches `iam`'s
+  handler, so `iam` counts NOTHING. The gateway logs WARN
+  `attestation failed` and answers HTTP 503 with "the credential could not
+  be verified". Its `yadgar_calls_total{service="gateway"}` outcome is
+  `UNAVAILABLE` for any gRPC code except `UNAUTHENTICATED`; the code itself
+  is not measured (`UNAVAILABLE` if refused inside the handshake, `UNKNOWN`,
+  `INTERNAL` or `CANCELLED` if the TLS 1.3 alert arrives after it; neither
+  lifecycle nor dial pins a TLS version). Login answers 503 "login is
+  unavailable". Every authenticated request for every user fails the same
+  way: revert at once.
+
+**Which hop broke — read after one post-merge request (operator-run).** In
+B-U8d's table, a gateway `attestation failed` WARN meant "gateway-local, not
+this change". After B-U8e it is THIS change's failure signal, unless `iam`
+itself is down. Attestation runs before `task` is called, so a request that
+fails at attestation never reaches the B-U8d or B-U8a hops.
+
+| Reading after one post-merge request (a token not resolved in the last 30 s)                                                                        | Broken hop                                           |
+| --------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| bogus token: HTTP 401, new `iam` `ResolveCredential` OK on a new pod                                                                                | none, pass                                           |
+| HTTP 503 "the credential could not be verified", gateway WARN `attestation failed`, NO new `service="iam"` sample, `iam` 2/2/2 Ready with endpoints | gateway→iam (B-U8e): revert B-U8e                    |
+| the same 503, and a new `iam` `ResolveCredential` `UNRECORDED` sample with iam ERROR `upstream iam-db call failed`                                  | iam→iam-db (B-U8b), not B-U8e                        |
+| the same 503, and `iam` is not Ready or the `iam` Service has no endpoints                                                                          | `iam` is down (the roll), not the mode: read its log |
+| HTTP 200 (a real token): the request passed attestation; a tool error or a non-OK `FindTasks`                                                       | `task` or `task-db`: use B-U8d's table               |
+
+If the first post-merge request lands in the B-U8e row within a minute of
+the roll, send one more request a minute later before you revert: a gateway
+channel can still be dialling an old pod's address, which shows the same 503.
+
+If an `iam` pod does not become Ready, the rollout stops behind
+`maxUnavailable: 0` and the old pods keep serving. Read the log first: a CA
+file that cannot be read or parsed refuses the boot and names the path.
+
+The estate smoke rows C-01 (iam path) and C-10 (task path) are the card's
+functional acceptance. They CANNOT run today: the estate verdict gate is red
+until the settled-state gate produces a `settled-verdict` artifact (ledger
+675, stage 3). Do not read a red estate run as this change.
+
+### Rollback — a revert
+
+If `yadgar`'s operation is still Running or retrying, end it first:
+
+```bash
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.status.operationState.phase} {.status.operationState.syncResult.revision}{"\n"}'
+```
+
+NEEDS-MAX: `argocd app terminate-op yadgar` against kind-yadgar's Argo CD. A
+revert does not interrupt an operation already running (see "The yadgar pin
+moves to parent chart 0.13.13", Rollback).
+
+Then revert the WHOLE merge commit: the value, the K3 table, the gate test
+and this section move together. A values-only revert reddens K3 and
+`test_every_server_states_its_client_auth_and_stages_its_own_ca`. The revert
+returns `EXPECTED_CLIENT_AUTH` to the five other servers at `optional`; it
+does not touch B-U8a..d. It also restores the two "7 days" claims in the
+B-U8d section to their old text; re-land that fix on its own if wanted.
+`iam` rolls back to `off`: it stops asking for a certificate and drops the
+CA from its watch set. Nothing is created, so nothing is left to prune.
+
+Break-glass, if git cannot merge in time (NEEDS-MAX): suspend auto-sync on
+`yadgar`, then
+`kubectl --context kind-yadgar -n yadgar set env deployment/iam LISTEN_TLS_CLIENT_AUTH=off`.
+`off` is the only valid emergency value. Deleting the variable is a boot
+refusal (ADR-0854). Revert in git afterwards.

@@ -398,13 +398,13 @@ spec:
                     # publish it at `kind="serving"`, and `iam-db` and `task-db`
                     # now do too (see below).
                     #
-                    # FOURTEEN DAYS, ARITHMETIC RATHER THAN TASTE. All eight
+                    # FOURTEEN DAYS, ARITHMETIC RATHER THAN TASTE. All nine
                     # LEAF certificates this repository declares — four serving
-                    # and three client under `infra/internal-tls/`, plus the edge
+                    # and four client under `infra/internal-tls/`, plus the edge
                     # leaf in `infra/tls/` — set `duration: 2160h` (90d). Their
-                    # `renewBefore` values are NO LONGER ALL 720h: the seven
+                    # `renewBefore` values are NO LONGER ALL 720h: the eight
                     # under `infra/internal-tls/` climb a 6-hour ladder from 726h
-                    # to 762h so that no two services renew in the same window,
+                    # to 780h so that no two services renew in the same window,
                     # which is argued at length in `certificates.yaml`. The edge
                     # leaf keeps 720h.
                     #
@@ -418,9 +418,9 @@ spec:
                     # line, and it sits far enough below every `renewBefore` here
                     # that a normal renewal cannot trip it.
                     #
-                    # THIS RULE NOW COVERS FOUR CERTIFICATES OF NINE, and naming
-                    # the other five is the honest half of drawing this
-                    # boundary. A prior revision of this comment measured this
+                    # THIS RULE COVERS FOUR SERVING CERTIFICATES TODAY AND, ONCE
+                    # LEDGER 770 IS LIVE, THE FOUR CLIENT LEAVES TOO; naming the
+                    # rest is the honest half of drawing this boundary. A prior revision of this comment measured this
                     # store on 2026-09-05 against `service="iam"` and
                     # `service="task"` only and named `iam-db-tls` and
                     # `task-db-tls` as PRESENTED-but-uncounted: both pods serve
@@ -442,20 +442,26 @@ spec:
                     # live, because this reference deployment's kind cluster
                     # carries no workloads to scrape.
                     #
-                    # NOTHING PRESENTS THE REMAINING FIVE, so they can never
-                    # appear here at all. The internal root is `duration:
-                    # 87600h` with `renewBefore: 8760h`
+                    # TWO CAN NEVER APPEAR HERE, because no yadgar process
+                    # presents them. The internal root is `duration: 87600h`
+                    # with `renewBefore: 8760h`
                     # (`infra/internal-tls/issuer.yaml`), the one certificate on
                     # a different clock. `gateway-tls` is served by the edge
                     # Gateway's listener rather than by any yadgar process.
-                    # `gateway-client-tls`, `iam-client-tls` and
-                    # `task-client-tls` are issued and mounted into no pod —
-                    # checked against the live manifests in `argocd`, not
-                    # inferred.
+                    #
+                    # THE FOUR CLIENT LEAVES — `gateway-client-tls`,
+                    # `iam-client-tls`, `task-client-tls` and
+                    # `project-client-tls` — were issued and mounted into no pod
+                    # until ledger 770. Its four values in
+                    # `applications/yadgar.yaml` mount each leaf into its
+                    # caller, which then watches it and exports it at
+                    # `kind="client"`. Read that series live after the merge;
+                    # do not assume it.
                     #
                     # SO A QUIET RULE HERE MEANS `iam`, `task`, `iam-db` AND
-                    # `task-db` ARE FINE. It says nothing about the other five.
-                    # It is still worth landing, for the reason below.
+                    # `task-db` ARE FINE, and, once ledger 770 is live, the four
+                    # client leaves too. It says nothing about the root or the
+                    # edge leaf. It is still worth landing, for the reason below.
                     #
                     # It measures what the PROCESS loaded, which is the gap
                     # cert-manager's own metrics cannot see: cert-manager knows
