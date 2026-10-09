@@ -2754,3 +2754,308 @@ Break-glass, if git cannot merge in time (NEEDS-MAX): suspend auto-sync on
 `kubectl --context kind-yadgar -n yadgar set env deployment/task-db LISTEN_TLS_CLIENT_AUTH=off`.
 `off` is the only valid emergency value. Deleting the variable is a boot
 refusal (ADR-0854). Revert in git afterwards.
+
+## iam-db and project-db ask their callers for a client certificate: `clientAuth: "optional"` (B-U8b, ledger 925)
+
+**What the merge does.** It changes two values in `applications/yadgar.yaml`:
+`iam-db.tls.clientAuth` and `project-db.tls.clientAuth`, each from `"off"` to
+`"optional"`. `task-db` stays at `"optional"` (B-U8a). `iam`, `task` and
+`project` stay at `"off"`. The pin stays at 0.19.1. PB-2 already staged both
+client CAs (`client-ca` volume from `<server>-tls`, item `ca.crt`, and
+`LISTEN_TLS_CLIENT_CA_FILE`), so this is a two-key change.
+
+Merging is the deploy: `yadgar` syncs on its own (`selfHeal`, no `prune`).
+Measured 2026-10-09 at base `0b67914` with helm 3.18.4 and 4.3.0
+(byte-identical renders), and with a server-side dry run against
+`kind-yadgar`:
+
+- 90 → 90 objects. 0 added. 0 removed.
+- 2 changed: `Deployment/iam-db` and `Deployment/project-db`. In each, one env
+  value moves: `LISTEN_TLS_CLIENT_AUTH` `off` → `optional`. Nothing else in
+  them moves.
+- The dry run names only those two Deployments (the env value and
+  `generation`). It admits all 77 tracked objects and all 13 hooks. The
+  `yadgar` Application CR diff is the two values.
+
+**What runs.** `iam-db` and `project-db` roll in the same sync, each
+`maxSurge: 1 / maxUnavailable: 0`, 2 replicas. They are two independent hops:
+judge each by its own readiness. No other Deployment rolls. Under `optional`,
+`yadgar_lifecycle::serve_tls` (lifecycle v0.2.20; iam-db v0.10.0, project-db
+v0.6.0):
+
+- reads `LISTEN_TLS_CLIENT_CA_FILE` at boot, and refuses to boot if the file
+  is unreadable, unparsable, or holds no certificate;
+- builds a client verifier with that file as its only anchor
+  (`client_ca_root`) and `client_auth_optional(true)`;
+- asks every caller for a certificate. A caller that sends none is accepted.
+  A caller that sends one has it verified: a leaf from another CA, or an
+  expired leaf, is refused;
+- adds the CA file to the rotation watch set.
+
+**The callers.** Each server has one caller.
+
+| Server       | NetworkPolicy admits (port 50051) | Caller presents      | Caller env                                      |
+| ------------ | --------------------------------- | -------------------- | ----------------------------------------------- |
+| `iam-db`     | `app: iam` only                   | `iam-client-tls`     | `IAM_DB_TLS_CLIENT_CERT_FILE` / `_KEY_FILE`     |
+| `project-db` | `app: project` only               | `project-client-tls` | `PROJECT_DB_TLS_CLIENT_CERT_FILE` / `_KEY_FILE` |
+
+`iam` v0.10.0 and `project` v0.3.0 hand that identity to
+`yadgar_dial::connect_tls` through `UpstreamTls::options()`, and register it
+as `Presented::Client` in their watch sets. Both leaves and both server leaves
+come from `Issuer/yadgar-internal-ca`, so the CA in each server's `ca.crt`
+issued its caller's leaf. Both client leaves carry the `client auth` usage.
+The NetworkPolicy is a render fact. The live proof that no other caller exists
+is the call counter: on both servers, every `yadgar_calls_total` series is an
+RPC that the named caller makes (`GetKeyIdentity`, `SetKeyIdentity` on
+`iam-db`; `ListProjects` on `project-db`).
+
+**`optional` is not a control.** Anyone can send no certificate. This step
+is the first live use of `iam`'s and `project`'s leaves: if a leaf is wrong
+or expired, that hop fails now. Only `required` (B-U9.2) proves that the
+leaf is on the wire.
+
+**Rotation.** The CA file now joins each watch set (`File::read`). Readiness
+does not change: both readiness probes are `tcpSocket` on `grpc`, which no
+client-certificate mode touches. A leaf renewal rewrites `ca.crt` with the
+same bytes, so it does not cause a second restart. Only a new CA changes the
+file. The process then drains and exits 0, as for a leaf rotation.
+
+**Things that change in the log, and are not faults.** The boot WARN
+"`LISTEN_TLS_CLIENT_CA_FILE` names a client CA but `LISTEN_TLS_CLIENT_AUTH`
+is `off` …" goes away on both servers. The `iam-db listening` and
+`project-db listening` lines read `"watching":5` (4 before: serving
+certificate, key, database password and rotation configuration; the CA is the
+fifth file). This is a prediction from source, not yet observed.
+
+**THESE TWO BOOT LINES CARRY NO `client_auth` FIELD.** Unlike `task-db`
+v0.9.0, the `listening` line in iam-db v0.10.0 and project-db v0.6.0 logs
+only `tls` and `watching`. The mode is read from the Deployment env, and the
+log evidence is the WARN gone plus `"watching":5`.
+
+### Before this merge — read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. yadgar Synced/Healthy at 0.19.1. Any other state → STOP.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. iam-db and project-db 2/2/2 at `off`, with the CA staged.
+#    Read 2026-10-09: iam-db 2 2 2 off iam-db-tls; project-db 2 2 2 off project-db-tls.
+kubectl --context kind-yadgar -n yadgar get deploy iam-db project-db iam project \
+  -o custom-columns='NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,AUTH:.spec.template.spec.containers[0].env[?(@.name=="LISTEN_TLS_CLIENT_AUTH")].value,CA:.spec.template.spec.volumes[?(@.name=="client-ca")].secret.secretName'
+
+# 3. The server leaves and the callers' leaves come from one Issuer. NAMES ONLY.
+#    Read 2026-10-09: all four `yadgar-internal-ca` (Issuer), all Ready.
+kubectl --context kind-yadgar -n yadgar get certificate iam-db-tls project-db-tls iam-client-tls project-client-tls \
+  -o custom-columns='NAME:.metadata.name,ISSUER:.spec.issuerRef.name,KIND:.spec.issuerRef.kind,READY:.status.conditions[?(@.type=="Ready")].status,NOTAFTER:.status.notAfter,USAGES:.spec.usages'
+kubectl --context kind-yadgar -n yadgar get secret iam-db-tls project-db-tls iam-client-tls project-client-tls \
+  -o go-template='{{range .items}}{{.metadata.name}} {{index .metadata.annotations "cert-manager.io/issuer-name"}}{{"\n"}}{{end}}'
+
+# 4. The boot lines. Read 2026-10-09: "watching":4 and the
+#    "names a client CA but ... is `off`" WARN, on all four pods.
+for d in iam-db project-db; do
+  for p in $(kubectl --context kind-yadgar -n yadgar get pod -l app=$d -o name); do
+    kubectl --context kind-yadgar -n yadgar logs "$p" | grep -E "$d listening|names a client CA"
+  done
+done
+
+# 5. Unreadable: 0 for all 7. Read 2026-10-09: 0 for all 7.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service)(yadgar_rotation_watched_files_unreadable)'
+
+# 6. The passive call series, per pod. Read 2026-10-09, about 2.7/min for each
+#    iam-db tool and about 2/min for project-db ListProjects, all on the old pods.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service%2Cpod%2Ctool%2Coutcome)(yadgar_calls_total%7Bservice%3D~%22iam-db%7Cproject-db%7Cproject%22%7D)'
+```
+
+### Live refusal probe — NEEDS-MAX, operator-run
+
+A port-forward and a local `openssl` are a cluster action (`port-forward`
+opens a tunnel into the pod). A throwaway pod in namespace `yadgar` is a
+cluster mutation. Neither is run by an agent. Never use a pod that carries
+`app: iam` or `app: project`: the Services select those labels, so the pod
+takes real traffic.
+
+```bash
+# Terminal 1: a tunnel to ONE pod of each server. Leave both running.
+kubectl --context kind-yadgar -n yadgar port-forward \
+  "$(kubectl --context kind-yadgar -n yadgar get pod -l app=iam-db -o name | head -1)" 15052:50051
+# Terminal 2:
+kubectl --context kind-yadgar -n yadgar port-forward \
+  "$(kubectl --context kind-yadgar -n yadgar get pod -l app=project-db -o name | head -1)" 15053:50051
+
+# Terminal 3, BEFORE the merge (mode `off`): each tunnel works, and the server
+# asks for no certificate. Expect CONNECTED, `ALPN protocol: h2`, and NO line
+# "Acceptable client certificate CA names". If a handshake fails here, the
+# tunnel is the problem, not the mode: STOP.
+openssl s_client -connect 127.0.0.1:15052 -servername iam-db.yadgar.svc -alpn h2 </dev/null 2>&1 \
+  | grep -E 'CONNECTED|ALPN|Acceptable client certificate CA names|No client certificate CA names|alert'
+openssl s_client -connect 127.0.0.1:15053 -servername project-db.yadgar.svc -alpn h2 </dev/null 2>&1 \
+  | grep -E 'CONNECTED|ALPN|Acceptable client certificate CA names|No client certificate CA names|alert'
+
+# A leaf from a CA made on the spot (the "wrong anchor"). Local files only.
+cd "$(mktemp -d)"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
+  -subj '/CN=b-u8b-probe-foreign-ca' -keyout ca.key -out ca.crt
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -subj '/CN=b-u8b-probe-leaf' -keyout leaf.key -out leaf.csr
+printf 'keyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n' > leaf.ext
+openssl x509 -req -in leaf.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 \
+  -extfile leaf.ext -out leaf.crt
+```
+
+After the merge, when both servers are 2/2/2 at `optional` (restart both
+tunnels: the old pods are gone). Run each probe against BOTH servers:
+`15052` / `iam-db.yadgar.svc` and `15053` / `project-db.yadgar.svc`.
+
+```bash
+for t in 15052:iam-db 15053:project-db; do
+  port=${t%%:*}; name=${t#*:}.yadgar.svc
+  echo "== $name"
+  # P1. No certificate → ACCEPTED. Expect "Acceptable client certificate CA
+  #     names" (the server now asks), a cipher, and NO alert.
+  openssl s_client -connect 127.0.0.1:$port -servername $name -alpn h2 -tls1_2 </dev/null 2>&1 \
+    | grep -E 'CONNECTED|Acceptable client certificate CA names|Cipher is|alert'
+  # P2. A leaf from the wrong anchor → REFUSED. TLS 1.2 refuses inside the
+  #     handshake: expect an alert ("unknown ca" or "bad certificate") and
+  #     "Cipher is (NONE)".
+  openssl s_client -connect 127.0.0.1:$port -servername $name -alpn h2 -tls1_2 \
+    -cert leaf.crt -key leaf.key </dev/null 2>&1 | grep -E 'Cipher is|alert'
+  # P2, TLS 1.3. The client finishes its side first, and the refusal arrives
+  # as an alert on the first read. Expect an alert line before the timeout.
+  # No alert at all means the leaf was ACCEPTED: STOP and revert.
+  (sleep 3) | timeout 8 openssl s_client -connect 127.0.0.1:$port -servername $name \
+    -alpn h2 -tls1_3 -cert leaf.crt -key leaf.key -ign_eof 2>&1 | grep -E 'alert|Cipher is'
+done
+```
+
+If `-tls1_2` fails at once with "protocol version" and no other alert, the
+listener accepts TLS 1.3 only. Then use the TLS 1.3 forms for P1 as well.
+Stop both tunnels and delete the temp directory afterwards.
+
+### After this merge — read-only
+
+```bash
+# 1. yadgar Synced/Healthy at 0.19.1, and its last operation Succeeded.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
+
+# 2. Judge by Deployment readiness, not by the operation phase. Expect
+#    iam-db and project-db each 2/2/2 with AUTH `optional` and new pod start
+#    times; iam and project 2/2/2 at `off`, NOT rolled.
+kubectl --context kind-yadgar -n yadgar get deploy iam-db project-db iam project \
+  -o custom-columns='NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,AUTH:.spec.template.spec.containers[0].env[?(@.name=="LISTEN_TLS_CLIENT_AUTH")].value'
+kubectl --context kind-yadgar -n yadgar get pods -l 'app in (iam-db,project-db)' \
+  -o custom-columns=NAME:.metadata.name,START:.status.startTime,READY:.status.containerStatuses[0].ready
+
+# 3. The CA file is READ and WATCHED. Expect, on each of the four new pods,
+#    "watching":5 and NO "names a client CA" WARN. (No `client_auth` field:
+#    these two binaries do not log it.)
+for d in iam-db project-db; do
+  for p in $(kubectl --context kind-yadgar -n yadgar get pod -l app=$d -o name); do
+    kubectl --context kind-yadgar -n yadgar logs "$p" | grep -E "$d listening|names a client CA"
+  done
+done
+
+# 4. Unreadable: expect 0 for iam-db and project-db (and for all 7).
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service)(yadgar_rotation_watched_files_unreadable)'
+
+# 5. The serving gauge: still 2 for iam-db and 2 for project-db.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=count%20by%20(service%2Ckind)(yadgar_tls_certificate_not_after_seconds%7Bkind%3D%22serving%22%7D)'
+```
+
+**The two hops — the passive signal for each.** Unlike `task` → `task-db`,
+both hops carry traffic on their own, so each new pod is checked within
+about a minute of becoming Ready, with no operator request. A failed
+handshake never reaches the server's handler, so an `OK` call counted by a
+NEW server pod is a call that crossed the hop after the roll.
+
+- **`iam` → `iam-db`.** Signal: `yadgar_calls_total{service="iam-db",tool="GetKeyIdentity",outcome="OK"}`
+  under the NEW `iam-db` pod names, growing. Its source is a standing defect,
+  not normal traffic: `iam`'s key-identity task retries for ever, because
+  `iam-db` answers `SetKeyIdentity` with `FAILED_PRECONDITION`, reason
+  "the store holds rows and no marker" (read 2026-10-09; `iam` logs an ERROR
+  "the key identity is UNVERIFIED …" every 300 s). Each retry is a
+  `GetKeyIdentity` (OK), then a `SetKeyIdentity` (FAILED_PRECONDITION),
+  about 2.7/min for each. Both are
+  application answers, so both prove the handshake. If the marker defect is
+  fixed first, this signal stops, and the hop has no passive traffic. The
+  failure shape: the `reason` in `iam`'s ERROR line changes from that
+  FAILED_PRECONDITION text to a transport reason, and the new `iam-db` pods
+  count no calls.
+- **`project` → `project-db`.** Signal: `yadgar_calls_total{service="project-db",tool="ListProjects",outcome="OK"}`
+  under the NEW `project-db` pod names, growing. Its source is the gateway's
+  project-registry poll (`YADGAR_PROJECT_REGISTRY_POLL_SECONDS` 60, on each
+  gateway pod): gateway calls `project`'s `ListProjects`, and `project` calls
+  `project-db`'s `ListProjects` once for each one (read 2026-10-09: about
+  2/min on each, 1:1). The failure shape: `project`'s `ListProjects` shows a
+  non-OK outcome (`UNAVAILABLE` is the likely code; not measured), and the
+  gateway logs its registry-load failure.
+- **`yadgar_gateway_project_registry_loaded` does NOT prove this hop after the
+  roll (ledger 1395).** It is a gateway → `project` signal, and the poll does
+  cross `project` → `project-db`. But the gauge means "EVER loaded" (gateway
+  v0.10.2 `src/project/registry.rs`): a later failed reload leaves it at 1.
+  The gateway does not roll here, so the gauge stays 1 whatever the new
+  `project-db` pods do. Read the `project-db` counter above instead.
+- **ledger 1393 is task-db only.** `iam-db` and `project-db` both export
+  `yadgar_calls_total` (and `yadgar_call_duration_seconds`,
+  `yadgar_bytes_returned_total`); `task-db` exports none of them.
+- The estate smoke rows C-01 (iam path) and C-10 (task path) are the card's
+  functional acceptance. They CANNOT run today: the estate verdict gate is red
+  until the settled-state gate produces a `settled-verdict` artifact (ledger
+  675, stage 3). Do not read a red estate run as this change.
+
+```bash
+# Expect NEW pod names on both servers, outcome OK, growing between two reads a
+# few minutes apart; no new non-OK outcome on `project`.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service%2Cpod%2Ctool%2Coutcome)(yadgar_calls_total%7Bservice%3D~%22iam-db%7Cproject-db%7Cproject%22%7D)'
+for p in $(kubectl --context kind-yadgar -n yadgar get pod -l app=iam -o name); do
+  kubectl --context kind-yadgar -n yadgar logs --since=15m "$p" | grep -E 'key identity' | tail -2
+done
+```
+
+If a pod of either server does not become Ready, its rollout stops behind
+`maxUnavailable: 0` and its old pods keep serving. The other server's rollout
+is independent. Read the log first: a CA file that cannot be read or parsed
+refuses the boot and names the path.
+
+### Rollback — a revert
+
+If `yadgar`'s operation is still Running or retrying, end it first:
+
+```bash
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.status.operationState.phase} {.status.operationState.syncResult.revision}{"\n"}'
+```
+
+NEEDS-MAX: `argocd app terminate-op yadgar` against kind-yadgar's Argo CD. A
+revert does not interrupt an operation already running (see "The yadgar pin
+moves to parent chart 0.13.13", Rollback).
+
+Then revert the WHOLE merge commit: the two values, the K3 table, the gate
+test and this section move together. A values-only revert reddens K3 and
+`test_every_server_states_its_client_auth_and_stages_its_own_ca`. The revert
+returns `EXPECTED_CLIENT_AUTH` to `task-db` alone at `optional`; it does not
+touch B-U8a. Both servers roll back to `off`: they stop asking for a
+certificate and drop the CA from their watch sets. Nothing is created, so
+nothing is left to prune. One hop alone cannot be reverted with `git revert`;
+for that, write a new PR that sets one value back to `"off"`, with its own K3
+line and map entry.
+
+Break-glass, if git cannot merge in time (NEEDS-MAX): suspend auto-sync on
+`yadgar`, then, for the failing server or both:
+
+```bash
+kubectl --context kind-yadgar -n yadgar set env deployment/iam-db LISTEN_TLS_CLIENT_AUTH=off
+kubectl --context kind-yadgar -n yadgar set env deployment/project-db LISTEN_TLS_CLIENT_AUTH=off
+```
+
+`off` is the only valid emergency value. Deleting the variable is a boot
+refusal (ADR-0854). Revert in git afterwards.
