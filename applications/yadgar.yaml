@@ -199,6 +199,13 @@ spec:
         # Under `"off"` the server loads no client CA and asks no caller for a
         # certificate. The CA root's own Secret holds the CA private key; it is never
         # named here, and the parent chart refuses it.
+        #
+        # ONE HOP AT A TIME, `"off"` → `"optional"` → `"required"` (ADR-0852, B-U8,
+        # B-U9). Under `"optional"` the server reads the CA file and watches it, asks
+        # every caller for a certificate, accepts a caller that sends none, and
+        # refuses a certificate the CA did not issue. It is a staging step, not a
+        # control: anyone can send no certificate. `task-db` is first (B-U8a), as
+        # its only caller is `task`, which presents `task-client-tls` (ledger 770).
         iam:
           autoscaling: { enabled: true }
           tls:
@@ -288,7 +295,7 @@ spec:
           autoscaling: { enabled: true }
           tls:
             enabled: true
-            clientAuth: "off"
+            clientAuth: "optional"
             clientCaSecret: task-db-tls
             clientCaSecretKey: ca.crt
           networkPolicy:
