@@ -37,6 +37,9 @@ CI job, never in the offline pre-commit hook.
       ADR-0883): 90 objects, none added or removed, 6 changed (the six
       server Deployments: image, `LISTEN_TLS_CLIENT_AUTH`,
       `LISTEN_TLS_CLIENT_CA_FILE`, and a new `client-ca` volume and mount).
+      Re-measured 2026-10-09 with task-db's `clientAuth: "optional"` (B-U8a,
+      ledger 925): 90 objects, none added or removed, 1 changed (the
+      `task-db` Deployment's `LISTEN_TLS_CLIENT_AUTH`, `off` to `optional`).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
@@ -303,7 +306,7 @@ def test_every_issued_client_leaf_is_mounted_by_its_caller() -> None:
     assert {name: leaf for name, leaf in CLIENT_LEAVES.items() if leaf not in mounted.get(name, set())} == {}
 
 
-# ── THE SIX SERVERS' CLIENT CA, STAGED WHILE CLIENT AUTH IS OFF (PB-2) ──────
+# ── THE SIX SERVERS' CLIENT AUTH MODE AND CLIENT CA (PB-2, B-U8, B-U9) ─────
 
 # Each gRPC server and the cert-manager Secret it verifies callers against:
 # its OWN serving leaf, `<server>-tls`, key `ca.crt` (ADR-0883). cert-manager
@@ -312,14 +315,22 @@ def test_every_issued_client_leaf_is_mounted_by_its_caller() -> None:
 # above. The CA root's own Secret holds the CA private key and is never named.
 SERVERS = ("iam", "iam-db", "task", "task-db", "project", "project-db")
 CLIENT_CA_ENV = "LISTEN_TLS_CLIENT_CA_FILE"
+CLIENT_CA_ITEMS = [{"key": "ca.crt", "path": "ca.crt"}]
+
+# The mode each server states, one hop at a time (ADR-0852): off, then
+# optional (B-U8a..e), then required (B-U9.1..5). PB-2 staged all six at
+# `off`. B-U8a moves task-db, whose only caller is task. Each later step edits
+# this one line.
+EXPECTED_CLIENT_AUTH = {server: "off" for server in SERVERS} | {"task-db": "optional"}
 
 
-def test_every_server_states_client_auth_off_and_stages_its_own_ca() -> None:
-    """ADR-0854: `off` is stated, never absent. ADR-0883: the CA is staged now.
+def test_every_server_states_its_client_auth_and_stages_its_own_ca() -> None:
+    """ADR-0854: the mode is stated, never absent. ADR-0883: the CA is staged.
 
     K3 alone cannot hold this: `--write` blesses whatever renders, so a
-    misspelt Secret, a CA staged at the root, or a dropped `clientAuth` would
-    pass K3. Read both the values and the render.
+    misspelt Secret, a CA staged at the root, a wrong `ca.crt` item, or a
+    dropped or unplanned `clientAuth` would pass K3. Read both the values and
+    the render.
     """
     application = yaml.safe_load(APPLICATION.read_text())
     values = application["spec"]["source"]["helm"]["valuesObject"]
@@ -328,24 +339,37 @@ def test_every_server_states_client_auth_off_and_stages_its_own_ca() -> None:
         server: (tls.get("clientAuth"), tls.get("clientCaSecret"), tls.get("clientCaSecretKey"))
         for server, tls in stated.items()
         if (tls.get("clientAuth"), tls.get("clientCaSecret"), tls.get("clientCaSecretKey"))
-        != ("off", f"{server}-tls", "ca.crt")
+        != (EXPECTED_CLIENT_AUTH[server], f"{server}-tls", "ca.crt")
     } == {}
 
     documents = [d for d in parent_render(REPOSITORY) if isinstance(d, dict) and d.get("kind")]
     issued = {d["spec"]["secretName"]: d["spec"]["issuerRef"] for d in documents if d["kind"] == "Certificate"}
     deployments = {d["metadata"]["name"]: d for d in documents if d["kind"] == "Deployment"}
+    # The issuer check below is only as good as its reference. Without these
+    # two lines, a client leaf and a server Certificate that both stopped
+    # rendering compare None == None and pass (ledger 1392).
+    leaf_issuers = {leaf: issued.get(leaf) for leaf in CLIENT_LEAVES.values()}
+    assert {leaf: issuer for leaf, issuer in leaf_issuers.items() if not issuer} == {}, "a client leaf did not render"
+    reference = leaf_issuers[CLIENT_LEAVES["gateway"]]
+    assert {leaf: issuer for leaf, issuer in leaf_issuers.items() if issuer != reference} == {}
     wrong: dict[str, object] = {}
     for server in SERVERS:
         secret = f"{server}-tls"
         # Issued by the same Issuer as every client leaf, so its ca.crt verifies them.
-        if issued.get(secret) != issued.get(CLIENT_LEAVES["gateway"]):
+        if issued.get(secret) != reference:
             wrong[f"{server}: issuer"] = issued.get(secret)
         pod = deployments[server]["spec"]["template"]["spec"]
         env = {e["name"]: e.get("value") for e in pod["containers"][0].get("env", [])}
-        if env.get("LISTEN_TLS_CLIENT_AUTH") != "off":
+        if env.get("LISTEN_TLS_CLIENT_AUTH") != EXPECTED_CLIENT_AUTH[server]:
             wrong[f"{server}: LISTEN_TLS_CLIENT_AUTH"] = env.get("LISTEN_TLS_CLIENT_AUTH")
         volume = next((v for v in pod.get("volumes", []) if v["name"] == "client-ca"), None)
-        if volume is None or volume["secret"].get("secretName") != secret or volume["secret"].get("optional", False):
+        if (
+            volume is None
+            or volume["secret"].get("secretName") != secret
+            or volume["secret"].get("optional", False)
+            # Exactly the CA, at the path the env names, and never tls.key (ledger 1392).
+            or volume["secret"].get("items") != CLIENT_CA_ITEMS
+        ):
             wrong[f"{server}: client-ca volume"] = volume
         mount = {m["name"]: m for m in pod["containers"][0].get("volumeMounts", [])}.get("client-ca") or {}
         if not mount.get("readOnly"):
