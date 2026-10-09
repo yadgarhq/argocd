@@ -211,12 +211,13 @@ spec:
         # `project` is third (B-U8c): its one caller is `gateway`, which presents
         # `gateway-client-tls` (the edge's `gateway-tls` is a different leaf).
         # `task` is fourth (B-U8d): its one caller is `gateway`, which presents
-        # the same `gateway-client-tls`.
+        # the same `gateway-client-tls`. `iam` is fifth and last (B-U8e): its one
+        # caller is `gateway`, which presents the same `gateway-client-tls`.
         iam:
           autoscaling: { enabled: true }
           tls:
             enabled: true
-            clientAuth: "off"
+            clientAuth: "optional"
             clientCaSecret: iam-tls
             clientCaSecretKey: ca.crt
           iamDb: { tls: { enabled: true, clientCertSecret: iam-client-tls } }
