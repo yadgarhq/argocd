@@ -500,13 +500,25 @@ spec:
             # B-N4.3 (ledger 925): THE LISTENER REFUSES PLAINTEXT. `allow_non_tls` is
             # gone, so nats-server sends `TLSRequired` and drops a client that does
             # not upgrade. Re-adding it while no NATS hop is cleartext reddens
-            # `broker_failures`. `verify` and `ca_file` are B-N5's. Each change here
-            # rolls `nats-0` (`configChecksumAnnotation`): `allow_non_tls` is not
-            # hot-reloadable.
-            tls: { enabled: true, clientAuth: "off" }
+            # `broker_failures`.
+            #
+            # B-N5 (ledger 925): THE LISTENER VERIFIES EVERY CLIENT'S LEAF.
+            # `clientAuth: "required"` and the upstream `verify: true` (nats-server's
+            # RequireAndVerifyClientCert) with `ca_file` at the `ca.crt` cert-manager
+            # writes beside the `nats-tls` leaf (`yadgar-internal-ca`, the issuer of
+            # `gateway-client-tls` and `iam-client-tls`). `verify`, not
+            # `verify_and_map`: the password `authorization` users stay the identity;
+            # the leaf is a second control. Platform 0.2.1 refuses `required` without
+            # both upstream keys, and the parent refuses it unless both clients
+            # present a leaf. Each change here rolls `nats-0`
+            # (`configChecksumAnnotation`).
+            tls: { enabled: true, clientAuth: "required" }
             config:
               nats:
-                tls: { enabled: true, secretName: nats-tls }
+                tls:
+                  enabled: true
+                  secretName: nats-tls
+                  merge: { verify: true, ca_file: /etc/nats-certs/nats/ca.crt }
 
           # ── THE EDGE: THE PARENT'S, AS OF STEP 7 ───────────────────────────────────
           # `infra/tls/{certificate,envoyproxy,gatewayclass,gateway}.yaml` were deleted
