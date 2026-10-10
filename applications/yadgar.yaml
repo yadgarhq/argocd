@@ -483,7 +483,21 @@ spec:
             # Platform 0.2.1 refuses `nats.create` without both keys. NATS has no
             # `optional` mode, so the next value after `"off"` is `"required"`
             # (ADR-0854).
-            tls: { enabled: false, clientAuth: "off" }
+            #
+            # B-N4.1 (ledger 925): THE LISTENER SPEAKS TLS AND STILL ADMITS PLAINTEXT.
+            # The platform switch and the upstream keys that do the work are written
+            # side by side; platform 0.2.1 refuses them if they disagree. The serving
+            # leaf is `nats-tls` (issued since 0.13.13). `allow_non_tls` keeps both
+            # clients, still cleartext (`nats.tls.enabled: false` above), connected
+            # until B-N4.2 turns them on; B-N4.3 drops it. `verify` and `ca_file` are
+            # B-N5's. Each change here rolls `nats-0` (`configChecksumAnnotation`):
+            # `allow_non_tls` is not hot-reloadable.
+            tls: { enabled: true, clientAuth: "off" }
+            config:
+              nats:
+                tls: { enabled: true, secretName: nats-tls }
+              merge:
+                allow_non_tls: true
 
           # ── THE EDGE: THE PARENT'S, AS OF STEP 7 ───────────────────────────────────
           # `infra/tls/{certificate,envoyproxy,gatewayclass,gateway}.yaml` were deleted

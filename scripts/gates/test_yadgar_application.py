@@ -79,6 +79,13 @@ CI job, never in the offline pre-commit hook.
       "required"` (B-U9.5, ledger 925): 90 objects, none added or removed, 1
       changed (the `iam` Deployment's `LISTEN_TLS_CLIENT_AUTH`, `optional`
       to `required`).
+      Re-measured 2026-10-10 at 0.23.2 with the broker's TLS listener on and
+      `allow_non_tls` (B-N4.1, ledger 925): 90 objects, none added or
+      removed, 4 changed (`ConfigMap/nats-config` gains `allow_non_tls` and
+      the `tls` cert/key block; `StatefulSet/nats` gains the `nats-tls`
+      volume, its mount in both containers, the reloader's two `-config`
+      args and a new `checksum/config`; `Service/nats` and
+      `Service/nats-headless` move `appProtocol` from `tcp` to `tls`).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
@@ -106,6 +113,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 import urllib.request
 from pathlib import Path
@@ -824,6 +832,109 @@ def test_an_unpinned_hop_on_a_server_names_it(rendered: list) -> None:
     assert client_identity_failures(mutated(rendered, "Deployment", "iam-db", change)) == {
         "Deployment/iam-db/NATS: not in CLIENT_HOPS": "1"
     }
+
+# ── THE BROKER'S TLS LISTENER (B-N4.1, ledger 925, ADR-0852) ─────────────────
+
+# The broker's side of the NATS hop, stated beside the two clients' side above.
+# K3 cannot hold this: `--write` blesses whatever renders, so a values change
+# that dropped `allow_non_tls`, pointed the listener at another Secret, or
+# turned `verify` on early would pass K3. platform 0.2.1's own render check
+# holds that its two sources agree; it cannot know this estate's step.
+#
+# THE STEP IS B-N4.1: the listener speaks TLS with the `nats-tls` serving leaf,
+# AND it still admits plaintext (`allow_non_tls`), because both clients still
+# dial in cleartext (`CLEARTEXT_HOPS` above, until B-N4.2). nats-server has no
+# optional client-certificate mode, so `verify` and `ca_file` stay absent until
+# B-N5 (ADR-0854). `allow_non_tls` is pinned to the hops, not to a literal:
+# while any NATS hop is in `CLEARTEXT_HOPS` it must be true, and B-N4.3 drops it
+# once none is.
+NATS_STATED = {"enabled": True, "clientAuth": "off"}
+NATS_CERT_DIR = "/etc/nats-certs/nats"
+NATS_SECRET = "nats-tls"
+
+
+def nats_conf(document: dict) -> dict:
+    """The rendered `nats.conf`: JSON, except `$VAR` references the server expands, which are quoted here."""
+    return json.loads(re.sub(r":\s*(\$[A-Z_]+)", r': "\1"', document["data"]["nats.conf"]))
+
+
+def broker_failures(documents: list) -> dict[str, object]:
+    """Every way the broker's rendered TLS posture is not B-N4.1's, keyed `nats: <what>`."""
+    by_name = {(d["kind"], d["metadata"]["name"]): d for d in documents}
+    config_map, statefulset = by_name.get(("ConfigMap", "nats-config")), by_name.get(("StatefulSet", "nats"))
+    if config_map is None or statefulset is None:
+        return {"nats: ConfigMap/nats-config and StatefulSet/nats": None}
+    conf = nats_conf(config_map)
+    tls = conf.get("tls") or {}
+    failures: dict[str, object] = {}
+    for key, file in (("cert_file", "tls.crt"), ("key_file", "tls.key")):
+        if tls.get(key) != f"{NATS_CERT_DIR}/{file}":
+            failures[f"nats: tls.{key}"] = tls.get(key)
+    for key in ("verify", "ca_file"):
+        if key in tls:
+            failures[f"nats: tls.{key}"] = tls[key]
+    cleartext_clients = sorted(caller for caller, hops in CLEARTEXT_HOPS.items() if "NATS" in hops)
+    if cleartext_clients and conf.get("allow_non_tls") is not True:
+        failures[f"nats: allow_non_tls while {', '.join(cleartext_clients)} dial in cleartext"] = conf.get(
+            "allow_non_tls"
+        )
+    pod = statefulset["spec"]["template"]["spec"]
+    volume = next((v for v in pod.get("volumes") or [] if v["name"] == NATS_SECRET), None)
+    if (volume or {}).get("secret", {}).get("secretName") != NATS_SECRET:
+        failures["nats: volume nats-tls"] = volume
+    server = next((c for c in pod["containers"] if c["name"] == "nats"), {})
+    mount = {m["name"]: m["mountPath"] for m in server.get("volumeMounts") or []}.get(NATS_SECRET)
+    if mount != NATS_CERT_DIR:
+        failures["nats: mount nats-tls"] = mount
+    return failures
+
+
+def test_the_broker_states_its_tls_posture() -> None:
+    values = committed()["spec"]["source"]["helm"]["valuesObject"]
+    assert values["platform"]["nats"]["tls"] == NATS_STATED
+
+
+def test_the_broker_listens_with_its_leaf_and_still_admits_cleartext(rendered: list) -> None:
+    assert broker_failures(rendered) == {}
+
+
+def with_nats_conf(change):
+    def apply(config_map: dict) -> None:
+        conf = nats_conf(config_map)
+        change(conf)
+        config_map["data"]["nats.conf"] = json.dumps(conf)
+
+    return apply
+
+
+def test_a_dropped_allow_non_tls_names_the_cleartext_clients(rendered: list) -> None:
+    change = with_nats_conf(lambda conf: conf.pop("allow_non_tls", None))
+    assert broker_failures(mutated(rendered, "ConfigMap", "nats-config", change)) == {
+        "nats: allow_non_tls while gateway, iam dial in cleartext": None
+    }
+
+
+def test_a_dropped_tls_block_names_both_files(rendered: list) -> None:
+    change = with_nats_conf(lambda conf: conf.pop("tls", None))
+    assert broker_failures(mutated(rendered, "ConfigMap", "nats-config", change)) == {
+        "nats: tls.cert_file": None,
+        "nats: tls.key_file": None,
+    }
+
+
+def test_an_early_verify_names_it(rendered: list) -> None:
+    change = with_nats_conf(lambda conf: conf["tls"].update(verify=True))
+    assert broker_failures(mutated(rendered, "ConfigMap", "nats-config", change)) == {"nats: tls.verify": True}
+
+
+def test_the_leaf_volume_at_another_secret_names_it(rendered: list) -> None:
+    def change(statefulset: dict) -> None:
+        volume = next(v for v in statefulset["spec"]["template"]["spec"]["volumes"] if v["name"] == NATS_SECRET)
+        volume["secret"]["secretName"] = "valkey-tls"
+
+    failures = broker_failures(mutated(rendered, "StatefulSet", "nats", change))
+    assert list(failures) == ["nats: volume nats-tls"]
+
 
 def write_table() -> None:
     document = committed()
