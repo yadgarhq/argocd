@@ -86,6 +86,12 @@ CI job, never in the offline pre-commit hook.
       volume, its mount in both containers, the reloader's two `-config`
       args and a new `checksum/config`; `Service/nats` and
       `Service/nats-headless` move `appProtocol` from `tcp` to `tls`).
+      Re-measured 2026-10-10 at 0.23.2 with gateway's and iam's
+      `nats.tls.enabled: true` (B-N4.2, ledger 925): 90 objects, none added
+      or removed, 2 changed (the `gateway` and `iam` Deployments:
+      `NATS_TLS_ENABLED` "1", `NATS_TLS_CA_FILE` and the client cert/key
+      env, a `nats-ca` volume and mount from `nats-tls`, and iam's own
+      `nats-client-cert` volume and mount from `iam-client-tls`).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
@@ -500,8 +506,8 @@ def test_every_server_states_its_client_auth_and_stages_its_own_ca() -> None:
 # bump reddens here instead of going unpinned. No container in the render
 # uses `envFrom`; one that did could carry a hop this scan cannot see.
 CLIENT_HOPS = {
-    "gateway": ("TASK", "IAM", "PROJECT"),
-    "iam": ("IAM_DB",),
+    "gateway": ("TASK", "IAM", "PROJECT", "NATS"),
+    "iam": ("IAM_DB", "NATS"),
     "task": ("TASK_DB",),
     "project": ("PROJECT_DB",),
 }
@@ -512,12 +518,13 @@ CLIENT_HOPS = {
 # `CLIENT_HOPS` asserts "1" and a presented leaf, which a hop that is off does
 # not have. ADR-0885's iam/NATS entry lands here first; each hop MOVES to
 # `CLIENT_HOPS` in the values PR that turns it on (B-N4.2 for NATS, B-V4.2 for
-# valkey). While a hop is off its chart renders the `_ENABLED` "0" line and
+# valkey). B-N4.2 (ledger 925, ADR-0890) moved gateway/NATS and iam/NATS: each
+# presents its leaf to the broker, gateway its one shared `gateway-client-tls`
+# and iam its own `nats.tls.clientCertSecret` (ADR-0885). While a hop is off its chart renders the `_ENABLED` "0" line and
 # nothing else: no other `<PREFIX>_TLS_*` env, and no volume projecting the
 # server leaf whose `ca.crt` it would trust (the value named beside each).
 CLEARTEXT_HOPS = {
-    "gateway": {"NATS": "nats-tls", "VALKEY": "valkey-tls"},
-    "iam": {"NATS": "nats-tls"},
+    "gateway": {"VALKEY": "valkey-tls"},
 }
 # The cert-manager Issuer (not its Secret) every client leaf is issued from.
 LEAF_ISSUER = {"group": "cert-manager.io", "kind": "Issuer", "name": "yadgar-internal-ca"}
@@ -752,7 +759,7 @@ def test_a_leaf_from_another_issuer_names_its_caller(rendered: list) -> None:
     }
 
 
-def test_another_secret_on_the_gateway_names_all_three_hops() -> None:
+def test_another_secret_on_the_gateway_names_every_hop() -> None:
     """End to end through the chart: the gateway's one volume carries iam's leaf instead of its own."""
     documents = [
         d
@@ -764,6 +771,27 @@ def test_another_secret_on_the_gateway_names_all_three_hops() -> None:
         f"gateway/{prefix}: {prefix}_TLS_CLIENT_{half}_FILE": f"{path}.{suffix}"
         for prefix in CLIENT_HOPS["gateway"]
         for half, suffix in (("CERT", "crt"), ("KEY", "key"))
+    }
+
+
+def test_another_secret_on_iams_broker_hop_names_that_hop_only() -> None:
+    """End to end through the chart: iam's NATS leaf is its own key, independent of `iamDb.tls` (ADR-0885)."""
+    documents = [
+        d
+        for d in parent_render(REPOSITORY, ("--set", "iam.nats.tls.clientCertSecret=gateway-client-tls"))
+        if isinstance(d, dict) and d.get("kind")
+    ]
+    path = "/var/run/secrets/nats-client-tls/client"
+    assert client_identity_failures(documents) == {
+        "iam/NATS: NATS_TLS_CLIENT_CERT_FILE": f"{path}.pem",
+        "iam/NATS: NATS_TLS_CLIENT_KEY_FILE": f"{path}-key.pem",
+    }
+
+
+def test_a_broker_hop_flipped_to_cleartext_names_its_hop(rendered: list) -> None:
+    change = set_env("NATS_TLS_ENABLED", "0")
+    assert client_identity_failures(mutated(rendered, "Deployment", "iam", change)) == {
+        "iam/NATS: NATS_TLS_ENABLED": "0"
     }
 
 
@@ -789,20 +817,22 @@ def test_a_cleartext_hop_turned_on_names_its_hop(rendered: list) -> None:
 
 
 def test_a_ca_env_on_a_cleartext_hop_names_its_hop(rendered: list) -> None:
-    change = add_env("containers", "NATS_TLS_CA_FILE", "/var/run/secrets/nats-ca/ca.crt")
-    assert cleartext_failures(mutated(rendered, "Deployment", "iam", change)) == {
-        "iam/NATS: NATS_TLS_CA_FILE": "/var/run/secrets/nats-ca/ca.crt"
+    change = add_env("containers", "VALKEY_TLS_CA_FILE", "/var/run/config/valkey-ca/ca.pem")
+    assert cleartext_failures(mutated(rendered, "Deployment", "gateway", change)) == {
+        "gateway/VALKEY: VALKEY_TLS_CA_FILE": "/var/run/config/valkey-ca/ca.pem"
     }
 
 
 def test_a_server_leaf_volume_on_a_cleartext_hop_names_its_hop(rendered: list) -> None:
-    def mount_nats_ca(deployment: dict) -> None:
+    """gateway's own `nats-ca` volume (B-N4.2) projects `nats-tls`, which is not the valkey hop's leaf."""
+
+    def mount_valkey_ca(deployment: dict) -> None:
         deployment["spec"]["template"]["spec"]["volumes"].append(
-            {"name": "nats-ca", "secret": {"secretName": "nats-tls"}}
+            {"name": "valkey-ca", "secret": {"secretName": "valkey-tls"}}
         )
 
-    assert cleartext_failures(mutated(rendered, "Deployment", "gateway", mount_nats_ca)) == {
-        "gateway/NATS: volume nats-ca": "nats-tls"
+    assert cleartext_failures(mutated(rendered, "Deployment", "gateway", mount_valkey_ca)) == {
+        "gateway/VALKEY: volume valkey-ca": "valkey-tls"
     }
 
 
@@ -841,13 +871,14 @@ def test_an_unpinned_hop_on_a_server_names_it(rendered: list) -> None:
 # turned `verify` on early would pass K3. platform 0.2.1's own render check
 # holds that its two sources agree; it cannot know this estate's step.
 #
-# THE STEP IS B-N4.1: the listener speaks TLS with the `nats-tls` serving leaf,
-# AND it still admits plaintext (`allow_non_tls`), because both clients still
-# dial in cleartext (`CLEARTEXT_HOPS` above, until B-N4.2). nats-server has no
-# optional client-certificate mode, so `verify` and `ca_file` stay absent until
-# B-N5 (ADR-0854). `allow_non_tls` is pinned to the hops, not to a literal:
-# while any NATS hop is in `CLEARTEXT_HOPS` it must be true, and B-N4.3 drops it
-# once none is.
+# THE STEP IS B-N4.2: the listener speaks TLS with the `nats-tls` serving leaf
+# and still admits plaintext (`allow_non_tls`, B-N4.1), and both clients now
+# dial it with TLS (`CLIENT_HOPS` above, B-N4.2). nats-server has no optional
+# client-certificate mode, so `verify` and `ca_file` stay absent until B-N5
+# (ADR-0854). `allow_non_tls` is pinned to the hops, not to a literal: while
+# any NATS hop is in `CLEARTEXT_HOPS` it must be true, and B-N4.3 drops it once
+# none is. From B-N4.2 none is, so this gate no longer requires it; K3 still
+# holds the rendered `true` until B-N4.3 changes it on purpose.
 NATS_STATED = {"enabled": True, "clientAuth": "off"}
 NATS_CERT_DIR = "/etc/nats-certs/nats"
 NATS_SECRET = "nats-tls"
@@ -859,7 +890,7 @@ def nats_conf(document: dict) -> dict:
 
 
 def broker_failures(documents: list) -> dict[str, object]:
-    """Every way the broker's rendered TLS posture is not B-N4.1's, keyed `nats: <what>`."""
+    """Every way the broker's rendered TLS posture is not this step's, keyed `nats: <what>`."""
     by_name = {(d["kind"], d["metadata"]["name"]): d for d in documents}
     config_map, statefulset = by_name.get(("ConfigMap", "nats-config")), by_name.get(("StatefulSet", "nats"))
     if config_map is None or statefulset is None:
@@ -907,11 +938,20 @@ def with_nats_conf(change):
     return apply
 
 
-def test_a_dropped_allow_non_tls_names_the_cleartext_clients(rendered: list) -> None:
+def test_a_dropped_allow_non_tls_names_the_cleartext_clients(rendered: list, monkeypatch) -> None:
+    """The clause still reddens while a NATS hop dials in cleartext, as it did before B-N4.2 (or after its revert)."""
+    monkeypatch.setitem(CLEARTEXT_HOPS, "iam", {"NATS": "nats-tls"})
     change = with_nats_conf(lambda conf: conf.pop("allow_non_tls", None))
     assert broker_failures(mutated(rendered, "ConfigMap", "nats-config", change)) == {
-        "nats: allow_non_tls while gateway, iam dial in cleartext": None
+        "nats: allow_non_tls while iam dial in cleartext": None
     }
+
+
+def test_no_nats_hop_in_cleartext_leaves_allow_non_tls_to_b_n4_3(rendered: list) -> None:
+    """B-N4.2 moved both NATS hops to `CLIENT_HOPS`, so dropping `allow_non_tls` (B-N4.3) is permitted here."""
+    assert not any("NATS" in hops for hops in CLEARTEXT_HOPS.values())
+    change = with_nats_conf(lambda conf: conf.pop("allow_non_tls", None))
+    assert broker_failures(mutated(rendered, "ConfigMap", "nats-config", change)) == {}
 
 
 def test_a_dropped_tls_block_names_both_files(rendered: list) -> None:
