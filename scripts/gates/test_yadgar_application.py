@@ -113,6 +113,11 @@ CI job, never in the offline pre-commit hook.
       `VALKEY_TLS_CA_FILE`, `VALKEY_TLS_CLIENT_CERT_FILE` and
       `VALKEY_TLS_CLIENT_KEY_FILE`, and a `valkey-ca` volume and mount from
       `valkey-tls`).
+      Re-measured 2026-10-10 at 0.23.2 with `platform.valkey.tls.plaintext:
+      false` (B-V4.3, ledger 925): 90 objects, none added or removed, 3
+      changed (`Deployment/valkey`: `--port 6379` becomes `--port 0` and the
+      containerPort `valkey` 6379 goes; `Service/valkey` drops port
+      `valkey`; `NetworkPolicy/valkey-ingress` admits 6380 only).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
@@ -846,13 +851,16 @@ def test_no_hop_dials_in_cleartext() -> None:
 
 @pytest.fixture(scope="module")
 def rendered_valkey_off() -> list:
-    """The render a revert of B-V4.2 produces: gateway's `valkey.tls.enabled` false."""
-    overrides = ("--set", "gateway.valkey.tls.enabled=false")
+    """The render a revert of B-V4.3 and B-V4.2 produces: 6379 open, gateway's `valkey.tls.enabled` false.
+
+    The parent refuses `plaintext: false` with gateway's switch off, so B-V4.2 alone no longer reverts.
+    """
+    overrides = ("--set", "gateway.valkey.tls.enabled=false", "--set", "platform.valkey.tls.plaintext=true")
     return [d for d in parent_render(REPOSITORY, overrides) if isinstance(d, dict) and d.get("kind")]
 
 
 def test_a_reverted_valkey_hop_renders_its_switch_off_and_nothing_else(rendered_valkey_off: list, monkeypatch) -> None:
-    """The check still holds a cleartext hop exactly, if B-V4.2 is reverted and gateway/VALKEY comes back."""
+    """The check still holds a cleartext hop exactly, if B-V4.3 and B-V4.2 are reverted and gateway/VALKEY comes back."""
     monkeypatch.setitem(CLEARTEXT_HOPS, "gateway", GATEWAY_VALKEY_CLEARTEXT)
     assert cleartext_failures(rendered_valkey_off) == {}
 
@@ -1116,20 +1124,21 @@ def test_the_leaf_volume_at_another_secret_names_it(rendered: list) -> None:
 # dials it would pass K3. platform 0.2.1's own render checks hold that its keys
 # agree; they cannot know this estate's step.
 #
-# THE STEP IS B-V4.2: valkey listens with TLS on 6380 with the `valkey-tls`
-# serving leaf, beside plaintext 6379 (B-V4.1), and the gateway now dials 6380
-# with TLS (gateway/VALKEY in `CLIENT_HOPS` above, B-V4.2). B-V4.3 closes 6379;
+# THE STEP IS B-V4.3: valkey listens only with TLS, on 6380 with the
+# `valkey-tls` serving leaf (B-V4.1); the gateway dials 6380 with TLS
+# (gateway/VALKEY in `CLIENT_HOPS` above, B-V4.2); 6379 is closed (B-V4.3).
 # B-V5 and B-V6 ask for leaves (`--tls-auth-clients optional`, `yes`).
 # Plaintext is pinned to the hops, not to a literal: while any VALKEY hop is in
 # `CLEARTEXT_HOPS`, 6379 must be open on the Deployment, the Service and
-# `valkey-ingress`. From B-V4.2 none is, so this gate no longer requires 6379;
-# K3 still holds the rendered 6379 until B-V4.3 removes it on purpose. `VALKEY_TLS_AUTH_CLIENTS` is pinned to the literal "no"
+# `valkey-ingress`; while none is, 6379 must be ABSENT from all three and the
+# boot script must say `--port 0` (valkey-server listens on 6379 when `--port`
+# is absent). `VALKEY_TLS_AUTH_CLIENTS` is pinned to the literal "no"
 # (`clientAuth: "off"`); B-V5 moves it. The parent chart also refuses
 # `clientAuth` "optional" or "required" while gateway's `valkey.tls.enabled` is
 # false (its `validate.yaml`). valkey reads its leaf only at boot, so the boot script hashes
 # the files it loaded and the liveness probe re-checks that hash: a renewed
 # leaf restarts the container (one more `Recreate`-sized cache gap).
-VALKEY_STATED = {"enabled": True, "clientAuth": "off", "plaintext": True}
+VALKEY_STATED = {"enabled": True, "clientAuth": "off", "plaintext": False}
 VALKEY_TLS_DIR = "/etc/valkey/tls"
 VALKEY_SECRET = "valkey-tls"
 VALKEY_HASH = "/run/valkey/tls.sha256"
@@ -1141,6 +1150,12 @@ VALKEY_TLS_ARGS = (
     f"--tls-ca-cert-file {VALKEY_TLS_DIR}/ca.crt",
     '--tls-auth-clients "$VALKEY_TLS_AUTH_CLIENTS"',
 )
+
+
+
+def plaintext_ports(script: str) -> list[str]:
+    """Every `--port N` in valkey's boot script; `--tls-port` is not one."""
+    return re.findall(r"(?<![\w-])--port (\d+)", script)
 
 
 def cache_failures(documents: list) -> dict[str, object]:
@@ -1186,6 +1201,16 @@ def cache_failures(documents: list) -> dict[str, object]:
             failures[f"valkey: valkey-ingress port {port}"] = sorted(allowed)
     if cleartext_clients and f"--port {VALKEY_PORTS['valkey']}" not in script:
         failures[f"valkey: --port 6379 while {', '.join(cleartext_clients)} dial in cleartext"] = None
+    if not cleartext_clients:
+        plaintext, closed = VALKEY_PORTS["valkey"], " with no VALKEY hop in cleartext"
+        if "valkey" in container_ports or plaintext in container_ports.values():
+            failures[f"valkey: containerPort 6379{closed}"] = None
+        if "valkey" in service_ports or any(port == plaintext for port, _ in service_ports.values()):
+            failures[f"valkey: Service port 6379{closed}"] = None
+        if plaintext in allowed:
+            failures[f"valkey: valkey-ingress port 6379{closed}"] = None
+        if plaintext_ports(script) != ["0"]:
+            failures[f"valkey: --port{closed}"] = plaintext_ports(script)
     return failures
 
 
@@ -1194,8 +1219,18 @@ def test_the_cache_states_its_tls_posture() -> None:
     assert values["platform"]["valkey"]["tls"] == VALKEY_STATED
 
 
-def test_the_cache_listens_with_its_leaf_beside_plaintext(rendered: list) -> None:
+def test_the_cache_listens_with_its_leaf_and_only_with_tls(rendered: list) -> None:
     assert cache_failures(rendered) == {}
+
+
+def test_the_rendered_cache_has_no_plaintext_port(rendered: list) -> None:
+    """B-V4.3: `--port 0`, and 6379 on none of the Deployment, the Service and `valkey-ingress`."""
+    deployment, service, policy = valkey_objects(rendered)
+    container = valkey_container(deployment)
+    assert plaintext_ports(" ".join(container["args"])) == ["0"]
+    assert [p["containerPort"] for p in container["ports"]] == [6380]
+    assert [p["port"] for p in service["spec"]["ports"]] == [6380]
+    assert {p["port"] for rule in policy["spec"]["ingress"] for p in rule["ports"]} == {6380}
 
 
 def valkey_container(deployment: dict) -> dict:
@@ -1251,26 +1286,73 @@ def test_the_leaf_volume_at_another_secret_names_it_for_the_cache(rendered: list
     assert list(cache_failures(mutated(rendered, "Deployment", "valkey", change))) == ["valkey: volume valkey-tls"]
 
 
+def valkey_objects(documents: list) -> tuple[dict, dict, dict]:
+    by_name = {(d["kind"], d["metadata"]["name"]): d for d in documents}
+    return by_name[("Deployment", "valkey")], by_name[("Service", "valkey")], by_name[("NetworkPolicy", "valkey-ingress")]
+
+
+def reopen_container_port(deployment: dict) -> None:
+    valkey_container(deployment)["ports"].insert(0, {"name": "valkey", "containerPort": 6379})
+
+
+def reopen_service_port(service: dict) -> None:
+    service["spec"]["ports"].insert(0, {"name": "valkey", "port": 6379, "targetPort": "valkey"})
+
+
+def reopen_policy_port(policy: dict) -> None:
+    for rule in policy["spec"]["ingress"]:
+        rule["ports"].insert(0, {"port": 6379, "protocol": "TCP"})
+
+
+def reopen_listener(deployment: dict) -> None:
+    container = valkey_container(deployment)
+    container["args"] = [a.replace("--port 0", "--port 6379") for a in container["args"]]
+
+
+REOPENED = {
+    "valkey: containerPort 6379 with no VALKEY hop in cleartext": ("Deployment", "valkey", reopen_container_port),
+    "valkey: Service port 6379 with no VALKEY hop in cleartext": ("Service", "valkey", reopen_service_port),
+    "valkey: valkey-ingress port 6379 with no VALKEY hop in cleartext": (
+        "NetworkPolicy",
+        "valkey-ingress",
+        reopen_policy_port,
+    ),
+}
+
+
+@pytest.mark.parametrize("failure", sorted(REOPENED))
+def test_a_reopened_plaintext_port_names_it(rendered: list, failure: str) -> None:
+    """With no VALKEY hop in `CLEARTEXT_HOPS`, 6379 must be ABSENT everywhere (B-V4.3)."""
+    kind, name, change = REOPENED[failure]
+    assert list(cache_failures(mutated(rendered, kind, name, change))) == [failure]
+
+
+def test_a_reopened_plaintext_listener_names_it(rendered: list) -> None:
+    assert cache_failures(mutated(rendered, "Deployment", "valkey", reopen_listener)) == {
+        "valkey: --port with no VALKEY hop in cleartext": ["6379"]
+    }
+
+
+def test_a_listener_with_no_port_argument_names_it(rendered: list) -> None:
+    """valkey-server listens on 6379 when `--port` is absent, so only an explicit `--port 0` closes it."""
+    change = with_valkey_script(lambda script: script.replace("  --port 0 \\\n", ""))
+    assert cache_failures(mutated(rendered, "Deployment", "valkey", change)) == {
+        "valkey: --port with no VALKEY hop in cleartext": []
+    }
+
+
+def test_6379_reopened_everywhere_names_every_place(rendered: list) -> None:
+    documents = rendered
+    for kind, name, change in REOPENED.values():
+        documents = mutated(documents, kind, name, change)
+    documents = mutated(documents, "Deployment", "valkey", reopen_listener)
+    assert sorted(cache_failures(documents)) == sorted([*REOPENED, "valkey: --port with no VALKEY hop in cleartext"])
+
+
 def test_a_closed_plaintext_port_names_the_cleartext_clients(rendered: list, monkeypatch) -> None:
-    """The clause still reddens while a VALKEY hop dials in cleartext, as it did before B-V4.2 (or after its revert)."""
+    """The clause still reddens while a VALKEY hop dials in cleartext: this render closes 6379 everywhere."""
     monkeypatch.setitem(CLEARTEXT_HOPS, "gateway", GATEWAY_VALKEY_CLEARTEXT)
-
-    def drop_service_port(service: dict) -> None:
-        service["spec"]["ports"] = [p for p in service["spec"]["ports"] if p["name"] != "valkey"]
-
-    def drop_policy_port(policy: dict) -> None:
-        for rule in policy["spec"]["ingress"]:
-            rule["ports"] = [p for p in rule["ports"] if p["port"] != 6379]
-
-    def drop_container_port(deployment: dict) -> None:
-        container = valkey_container(deployment)
-        container["ports"] = [p for p in container["ports"] if p["name"] != "valkey"]
-        container["args"] = [a.replace("--port 6379", "--port 0") for a in container["args"]]
-
-    documents = mutated(rendered, "Service", "valkey", drop_service_port)
-    documents = mutated(documents, "NetworkPolicy", "valkey-ingress", drop_policy_port)
-    documents = mutated(documents, "Deployment", "valkey", drop_container_port)
-    assert cache_failures(documents) == {
+    assert cache_failures(rendered) == {
         "valkey: containerPort valkey": None,
         "valkey: Service port valkey": None,
         "valkey: valkey-ingress port 6379": [6380],
@@ -1278,26 +1360,10 @@ def test_a_closed_plaintext_port_names_the_cleartext_clients(rendered: list, mon
     }
 
 
-def test_with_no_valkey_hop_in_cleartext_a_closed_plaintext_port_passes(rendered: list) -> None:
-    """B-V4.2 moved gateway/VALKEY to `CLIENT_HOPS`, so closing 6379 everywhere (B-V4.3) is permitted here."""
-    assert not any("VALKEY" in hops for hops in CLEARTEXT_HOPS.values())
-
-    def drop_service_port(service: dict) -> None:
-        service["spec"]["ports"] = [p for p in service["spec"]["ports"] if p["name"] != "valkey"]
-
-    def drop_policy_port(policy: dict) -> None:
-        for rule in policy["spec"]["ingress"]:
-            rule["ports"] = [p for p in rule["ports"] if p["port"] != 6379]
-
-    def drop_container_port(deployment: dict) -> None:
-        container = valkey_container(deployment)
-        container["ports"] = [p for p in container["ports"] if p["name"] != "valkey"]
-        container["args"] = [a.replace("--port 6379", "--port 0") for a in container["args"]]
-
-    documents = mutated(rendered, "Service", "valkey", drop_service_port)
-    documents = mutated(documents, "NetworkPolicy", "valkey-ingress", drop_policy_port)
-    documents = mutated(documents, "Deployment", "valkey", drop_container_port)
-    assert cache_failures(documents) == {}
+def test_a_reverted_cache_with_its_cleartext_client_passes(rendered_valkey_off: list, monkeypatch) -> None:
+    """A revert of B-V4.3 and B-V4.2 reopens 6379 for gateway/VALKEY back in `CLEARTEXT_HOPS`; the gate holds it."""
+    monkeypatch.setitem(CLEARTEXT_HOPS, "gateway", GATEWAY_VALKEY_CLEARTEXT)
+    assert cache_failures(rendered_valkey_off) == {}
 
 
 def test_a_closed_tls_port_on_the_policy_names_it(rendered: list) -> None:
@@ -1306,7 +1372,7 @@ def test_a_closed_tls_port_on_the_policy_names_it(rendered: list) -> None:
             rule["ports"] = [p for p in rule["ports"] if p["port"] != 6380]
 
     assert cache_failures(mutated(rendered, "NetworkPolicy", "valkey-ingress", change)) == {
-        "valkey: valkey-ingress port 6380": [6379]
+        "valkey: valkey-ingress port 6380": []
     }
 
 
