@@ -160,10 +160,10 @@ spec:
           # THE CLIENT LEAF EACH CALLER PRESENTS ON ITS DIALS (ledger 770, ADR-0852).
           # `platform` issues `gateway-client-tls`, `iam-client-tls`, `task-client-tls`
           # and `project-client-tls`. This value and `iamDb`, `taskDb` and `projectDb`
-          # `.tls.clientCertSecret` below mount each into its caller. No server asks
-          # for a client certificate yet: every server renders `LISTEN_TLS_CLIENT_AUTH`
-          # as `off` (see the six services below), so presenting one changes no
-          # handshake.
+          # `.tls.clientCertSecret` below mount each into its caller. EVERY SERVER NOW
+          # REQUIRES ONE: B-U9 (ledger 925) moved all six `tls.clientAuth` from `off`
+          # through `optional` to `required` (see the six services below), so a
+          # caller presenting the wrong leaf, or none, now fails the handshake.
           clientCertificate: { secret: gateway-client-tls }
           networkPolicy:
             enabled: true
@@ -245,7 +245,7 @@ spec:
         # It is the first hop where the gateway's `gateway-client-tls` is required.
         # `task-db` is fourth (B-U9): operator `find_tasks` calls crossed `task` →
         # `task-db` OK under `"optional"` (ADR-0884), so its one caller's
-        # `task-client-tls` has verified there. With no passive traffic, a refused
+        # `task-client-tls` crossed OK under `"optional"` there. With no passive traffic, a refused
         # leaf shows only at the next request, and then every task call fails.
         # `task` is fifth (B-U9.4): its one caller is `gateway`, and operator
         # `find_tasks` calls crossed `gateway` → `task` OK under `"optional"`

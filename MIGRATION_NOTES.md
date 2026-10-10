@@ -4977,7 +4977,7 @@ from the live caller. The leaf and the presenting code did not change:
   → v0.2.17. dial's diff does not touch `src/tls.rs` (`TlsOptions`,
   `Identity`); `src/lib.rs` adds only a `CONNECT_TIMEOUT` constant. task
   v0.7.1 locks rustls 0.23.45 and tonic 0.14.6.
-- The live `task` env, read 2026-10-10: `TASK_DB_TLS_CLIENT_{CERT,KEY}_FILE`
+- The live `task` env, read 2026-10-09: `TASK_DB_TLS_CLIENT_{CERT,KEY}_FILE`
   = `/var/run/secrets/client-cert/client.{crt,key}`, from the `client-cert`
   volume, Secret `task-client-tls`.
 
@@ -5018,11 +5018,11 @@ kubectl --context kind-yadgar -n argocd get application yadgar \
   -o jsonpath='{.spec.source.targetRevision} {.status.sync.status}/{.status.health.status} {.status.operationState.phase}{"\n"}'
 
 # 2. task-db 2/2/2 at `optional`; iam-db, project-db and project at
-#    `required`; task and iam at `optional`. Read 2026-10-10: exactly that.
+#    `required`; task and iam at `optional`. Read 2026-10-09: exactly that.
 kubectl --context kind-yadgar -n yadgar get deploy task-db task iam-db project-db project iam gateway \
   -o custom-columns='NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,AUTH:.spec.template.spec.containers[0].env[?(@.name=="LISTEN_TLS_CLIENT_AUTH")].value'
 
-# 3. The calls, per pod. Read 2026-10-10: task-db ListTasks OK 4 and 1; no
+# 3. The calls, per pod. Read 2026-10-09: task-db ListTasks OK 4 and 1; no
 #    series yet on the task-d4fc9b65b-* pods.
 kubectl --context kind-yadgar get --raw \
   '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service%2Cpod%2Ctool%2Coutcome)(yadgar_calls_total%7Bservice%3D~%22task%7Ctask-db%22%7D)'
@@ -5251,7 +5251,7 @@ raw="$(curl -sS --max-time 20 -w '\n%{http_code}' -H 'content-type: application/
 echo "login HTTP ${raw##*$'\n'}"                       # expect 200
 TOKEN="$(printf '%s' "${raw%$'\n'*}" | jq -er .token)"; raw=''
 # ONE find_tasks. Repeat 6 times, 5 s apart.
-curl -sS --max-time 30 -w '\nHTTP %{http_code}\n' \
+curl -sS --max-time 30 -w '%{stderr}HTTP %{http_code}\n' \
   --config <(printf 'header = "authorization: Bearer %s"\n' "$TOKEN") \
   -H 'content-type: application/json' -H "mcp-protocol-version: $PV" \
   -H 'mcp-method: tools/call' -H 'mcp-name: find_tasks' -H "x-yadgar-project: $CLAIM" \
@@ -5815,18 +5815,24 @@ kubectl --context kind-yadgar -n yadgar get sts nats; kubectl --context kind-yad
 kubectl --context kind-yadgar -n yadgar logs nats-0 -c nats | grep -E "Listening for client|TLS (available|required)"
 kubectl --context kind-yadgar -n yadgar logs nats-0 -c reloader | grep -E "Watching file|files="
 # 3. Gateway consuming again on BOTH pods: value 1 for each, once the roll is over.
+#    `async_nats::Event::Connected` fires on this internal reconnect (NOT a
+#    redial), so the gateway logs "connected to the broker" (`broker.rs:309`),
+#    never "reconnected to the broker" (`redial`, a different path, `broker.rs:478`).
 kubectl --context kind-yadgar get --raw "/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=yadgar_gateway_invalidation_consuming"
-kubectl --context kind-yadgar -n yadgar logs -l app=gateway --since=10m | grep -E "reconnected to the broker|consuming cache invalidation again|still cannot reach the broker"
+kubectl --context kind-yadgar -n yadgar logs -l app=gateway --since=10m | grep -E "connected to the broker|still cannot reach the broker"
 # 4. BOTH iam pods log a reconnect ("connected to the broker") after the roll,
 #    and no lasting "cannot reach the broker" / "disconnected from the broker".
 kubectl --context kind-yadgar -n yadgar logs -l app=iam --since=10m | grep -E "connected to the broker|disconnected from the broker|cannot reach the broker"
 ```
 
 5. Fresh login (`POST /auth/login`, estate C-01) answers 200.
-6. Revocation path: no automated probe exists. An operator action that makes
-   iam publish `yadgar.iam.credential.revoked` (for example `SetUserAdmin` on a
-   test user) must produce `cached identity invalidated (D72)` in one gateway
-   pod's log. NEEDS-MAX; not verified by this PR.
+6. Revocation path: no automated probe exists. `SetUserAdmin` carries no
+   admin check of its own (`iam.proto` puts that at the gateway), so the probe
+   needs an admin credential, not the claude-probe user. An operator action
+   that makes iam publish `yadgar.iam.credential.revoked` (for example
+   `SetUserAdmin` on a test user) must produce `cached identity invalidated
+(D72)` in BOTH gateway pods' logs, each pod holding its own cache.
+   NEEDS-MAX; not verified by this PR.
 
 No-go: nats-0 not Ready, "TLS required for client connections", a gateway pod
 at 0, or an iam pod still logging the broker as unreachable after 2 minutes.
@@ -6364,9 +6370,11 @@ No-go: the new valkey pod not Ready or restarting, a `Ready to accept
 connections tcp` line, or the degraded counter still rising after the first
 count per gateway pod.
 
-**Not verified by an agent.** NEEDS-MAX: from a probe pod labelled
-`app: gateway`, `nc -vz valkey 6379` is refused (connection refused, not a
-timeout), and `nc -vz valkey 6380` connects.
+**Not verified by an agent.** NEEDS-MAX: `kubectl --context kind-yadgar -n
+yadgar port-forward pod/<valkey pod> 16379:6379 16380:6380` (not a probe pod
+labelled `app: gateway`, which joins the gateway Service instead of only
+reaching valkey); then from the host, `nc -vz localhost 16379` is refused
+(connection refused, not a timeout), and `nc -vz localhost 16380` connects.
 
 ### Rollback — a revert
 
