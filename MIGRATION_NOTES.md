@@ -6486,3 +6486,93 @@ back to "no". Break-glass without a release: the env var alone moves valkey's
 mode, but Argo CD self-heal would put it back; a revert is the durable path.
 Revert this before any revert of B-V4.2: the parent refuses `clientAuth`
 "optional" with gateway's `valkey.tls.enabled` false.
+
+## B-V6: the cache requires a client leaf (ledger 925)
+
+**What the merge does.** It sets `platform.valkey.tls.clientAuth: "required"` in
+`applications/yadgar.yaml`. The pin stays 0.23.2 (platform 0.2.1), which maps
+`required` to `VALKEY_TLS_AUTH_CLIENTS` "yes", the value of valkey's
+`--tls-auth-clients`. In valkey 9.1.1 (`tls.c`), "yes" is `SSL_VERIFY_PEER` with
+`SSL_VERIFY_FAIL_IF_NO_PEER_CERT`: a client with no leaf fails the handshake on
+6380, and a presented leaf must verify against `ca.crt` in `valkey-tls`. valkey
+checks no hostname. The gateway, the only valkey client, presents
+`gateway-client-tls` (issuer `yadgar-internal-ca`, the same CA as `valkey-tls`'s
+`ca.crt`, EKU client auth). In the argocd gate, `cache_failures` now requires
+"yes" while no VALKEY hop is in `CLEARTEXT_HOPS`, and "no" while any is.
+
+Measured 2026-10-10 with helm 3.18.4 at 0.23.2 (K3): 90 → 90 objects, 0
+added, 0 removed, 1 changed: `Deployment/valkey` (`VALKEY_TLS_AUTH_CLIENTS`
+"optional" → "yes", nothing else). `kubectl --context kind-yadgar apply
+--dry-run=server` accepts it.
+
+**What runs.** valkey is `Recreate`: the old pod stops, the cache empties, and
+the new pod boots (about 5 s gap, measured at B-V4.1, B-V4.3 and B-V5). The
+gateway does not roll. The first limited call on each gateway replica after the
+restart may count once in `yadgar_gateway_rate_limit_degraded_total`
+(`reason="unreachable"`) while it reconnects. A count still rising after that
+is the no-go: under "yes", a gateway that presents no leaf is refused on every
+reconnect.
+
+**What this proves.** Under B-V5 ("optional") the go/no-go proved that no
+presented leaf failed. Under "yes" a client with no leaf is refused, so limited
+calls that keep succeeding prove the gateway presents its leaf and that the leaf
+verifies.
+
+### Before this merge — read-only (`--context kind-yadgar` on every line)
+
+```bash
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+# B-V5 is live: valkey env "optional", 0 failed handshakes.
+kubectl --context kind-yadgar -n yadgar get deploy valkey \
+  -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="VALKEY_TLS_AUTH_CLIENTS")].value}{"\n"}'
+kubectl --context kind-yadgar -n yadgar logs deploy/valkey | grep -c "Error accepting a client connection"   # 0
+```
+
+### After this merge — go/no-go, read-only
+
+```bash
+# 1. yadgar Synced/Healthy, operation Succeeded; valkey 1/1 on a NEW pod; gateway NOT rolled.
+kubectl --context kind-yadgar -n yadgar get pods -l app.kubernetes.io/name=valkey
+kubectl --context kind-yadgar -n yadgar get pods -l app=gateway
+# 2. The env is "yes"; the pod is ready for tls and unix only.
+kubectl --context kind-yadgar -n yadgar get deploy valkey \
+  -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="VALKEY_TLS_AUTH_CLIENTS")].value}{"\n"}'
+kubectl --context kind-yadgar -n yadgar logs deploy/valkey | grep "Ready to accept connections"
+# 3. No failed handshake on the new pod.
+kubectl --context kind-yadgar -n yadgar logs deploy/valkey | grep -c "Error accepting a client connection"   # 0
+# 4. Degradation: raw value per pod, and increase. At most one more per gateway pod, then flat.
+kubectl --context kind-yadgar get --raw "/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(pod,reason)(yadgar_gateway_rate_limit_degraded_total)"
+kubectl --context kind-yadgar get --raw "/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=increase(yadgar_gateway_rate_limit_degraded_total%5B1m%5D)"
+```
+
+5. Fresh login (`POST /auth/login`, estate C-01) answers 200, and `find_tasks`
+   answers. Both are limited calls. Repeat in 3 rounds and re-read steps 3
+   and 4.
+
+No-go: the new valkey pod not Ready or restarting, an `Error accepting a
+client connection` line, or the degraded counter still rising after the first
+count per gateway pod. Read steps 1-5 BEFORE the probe below: the probe adds
+one such line by design.
+
+**Not verified by an agent.** NEEDS-MAX, a port-forward to the new pod (it
+dials inside the pod, so it tests the listener, not the NetworkPolicy):
+`kubectl --context kind-yadgar -n yadgar port-forward pod/<new-valkey-pod> 16380:6380`.
+Then `openssl s_client -connect 127.0.0.1:16380 -servername valkey
+-CAfile <valkey-tls ca.crt>` with no client cert is refused. Under TLS 1.3 the
+client sends its empty Certificate after the server's Finished, so s_client
+prints `CONNECTED` and the handshake summary first; the refusal is the alert
+that follows (`alert certificate required` or a closed read). The server logs
+one `Error accepting a client connection` line for it (`networking.c`, read,
+not measured). That line is the probe's own and is not a no-go. Do not use the gateway's own key outside its pod.
+
+### Rollback — a revert
+
+If `yadgar`'s operation is still Running or retrying, end it first.
+NEEDS-MAX: `argocd app terminate-op yadgar`. Then revert the merge. The revert
+is another `Recreate` (one more cache gap) and sets `VALKEY_TLS_AUTH_CLIENTS`
+back to "optional". Break-glass without a release: the env var alone moves
+valkey's mode, but Argo CD self-heal would put it back; a revert is the durable
+path. Revert this before any revert of B-V5, and B-V5 before any revert of
+B-V4.2: the parent refuses `clientAuth` "optional" or "required" with gateway's
+`valkey.tls.enabled` false.
