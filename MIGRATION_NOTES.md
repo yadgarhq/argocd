@@ -5667,3 +5667,104 @@ Low: this restores the state measured before B-U9.5. Find out why `gateway-clien
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 ```
+
+## The yadgar pin moves to parent chart 0.23.2, carrying iam's redial fix (ledger 1420)
+
+**What the merge does.** It moves `applications/yadgar.yaml`'s `targetRevision`
+from 0.23.1 to 0.23.2, and `scripts/chart_pin.json`'s `chart_tag` from
+`v0.23.1` to `v0.23.2`. `platform_version` stays `0.2.1`: no platform-sourced
+operator Application moves.
+
+Parent 0.23.2 (`6c091c6`) is the first release that contains chart's
+`ci: pin iam 0.11.1 in the parent chart` commit, itself cut the moment
+`iam`#98 (`40c0aff`, "redial the broker after a failed first connect", ledger 1420) tagged `v0.11.1`. **It is the only module that moves.** Diffed
+`chart/Chart.yaml` between `v0.23.1` and `v0.23.2`: one line, `iam: 0.11.0` →
+`iam: 0.11.1`. Gateway, task, project, the `-db` charts and `platform` are
+unchanged.
+
+iam 0.11.1 adds no new env, arg, probe or volume: `Invalidator::connect`
+still dials once at boot and never blocks it; the only change is a background
+redial (`src/invalidate/redial.rs`) on the outage arm, which this cluster does
+not exercise today (nats is up and both iam pods already log `connected to
+the broker` / `publishing cache invalidation` at their current boot).
+
+Measured 2026-10-10 with helm 3.18.4 against the OCI chart at both tags, this
+organisation's values, and a server-side dry run against `kind-yadgar`:
+
+- `yadgar`: 90 → 90 objects (K3, `scripts/gates/yadgar_render.sha256`). 0
+  added, 0 removed, 1 changed: `apps/Deployment//iam`, and the only field
+  that differs is `image`. Outside hooks: 77 → 77 objects, same single
+  change.
+- The new `iam` image is `ghcr.io/yadgarhq/iam@sha256:f8fa54c3…`, which
+  equals `ghcr.io/yadgarhq/iam:0.11.1`'s own digest (checked against the
+  GHCR package's tag list).
+- `kubectl --context kind-yadgar diff` against the rendered manifest: every
+  object is byte-identical except the six Deployments, which show
+  `argocd.argoproj.io/tracking-id` and `deployment.kubernetes.io/revision`
+  diffs only — expected, since a bare `helm template | kubectl diff` strips
+  the tracking annotation Argo itself carries; stripping those two known
+  lines, the ONLY remaining diff anywhere in the dry run is `iam`'s `image`
+  line. No other Deployment, Service, ConfigMap, Secret, StatefulSet or CRD
+  changes.
+- No new TLS key, no schema change: 0.23.2 needs nothing 0.23.1 did not
+  already require.
+
+**What runs.** Only `iam` rolls (`maxSurge: 1 / maxUnavailable: 0`, 2
+replicas). No other Deployment, the `-db` charts, `nats` or `valkey` restart.
+No migration runs.
+
+**Pre-existing, unrelated to this merge.** Both current `iam` pods log a
+repeating `ERROR` ("the key identity is UNVERIFIED…", ADR-0764/ADR-0765)
+roughly every 5 minutes. This predates 0.23.2 and is not this PR's subject;
+it is named here only so the post-merge watch does not mistake it for a new
+regression.
+
+### Before this merge — read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. yadgar Synced/Healthy at 0.23.1.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase
+
+# 2. Read 2026-10-10: iam 2/2/2 at the old digest.
+kubectl --context kind-yadgar -n yadgar get deploy iam \
+  -o custom-columns=NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,IMAGE:.spec.template.spec.containers[0].image
+
+# 3. Both pods already log the connected/publishing lines (nats is up).
+kubectl --context kind-yadgar -n yadgar logs -l app=iam --tail=50 | grep -E "publishing cache invalidation|connected to the broker|cannot reach the broker"
+```
+
+### After this merge — read-only
+
+```bash
+# 1. yadgar Synced/Healthy at 0.23.2, no operator Application changed.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase
+
+# 2. iam 2/2/2, new pod names, new digest (ghcr.io/yadgarhq/iam@sha256:f8fa54c3…).
+kubectl --context kind-yadgar -n yadgar get deploy iam \
+  -o custom-columns=NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,IMAGE:.spec.template.spec.containers[0].image
+
+# 3. Each new iam pod logs `connected to the broker` / `publishing cache
+#    invalidation` (or the new connected line redial.rs adds) once at boot,
+#    with no repeated `cannot reach the broker` / `still cannot reach the
+#    broker` refusal.
+kubectl --context kind-yadgar -n yadgar logs -l app=iam --tail=50 | grep -E "publishing cache invalidation|connected to the broker|cannot reach the broker|still cannot reach the broker"
+
+# 4. A fresh-login probe (run once by the coordinator) answers normally.
+```
+
+### Rollback — a revert
+
+If `yadgar`'s operation is still Running or retrying, end it first. NEEDS-MAX:
+`argocd app terminate-op yadgar` against kind-yadgar's Argo CD — v3.1.8's
+Application CRD has no `syncPolicy.retry.refresh`, so a revert does not
+interrupt a running operation.
+
+Then revert the merge. `yadgar` syncs back to 0.23.1: `iam`'s image goes
+back to the old digest via client-side apply of the last-applied
+configuration. No other object changes, nothing was created, and no
+migration ran.

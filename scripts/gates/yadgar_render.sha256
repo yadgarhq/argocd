@@ -1,6 +1,6 @@
 # K3: sha256 of each object `applications/yadgar.yaml` renders, as canonical JSON.
 # Regenerate: python3 scripts/gates/test_yadgar_application.py --write
-targetRevision  0.23.1
+targetRevision  0.23.2
 2355fad035bd3696b4fc741ed21eba814d3f4941a75fa16fb16cc73d4a4f0696  /ConfigMap//audit
 d19a8a2ae018718b5fd1626dade2ec71e47cd2516e203491e319a02e4dab0968  /ConfigMap//gateway-knobs
 cb6ae654735654b6b1dba8278b0376e0dd07518fc10a6cac97575ad9f4e08acd  /ConfigMap//nats-config
@@ -26,7 +26,7 @@ a09d6e21f3be46bc1e95a3f81493a41a51535ecba1cea48c44bb1516e64f541a  /ServiceAccoun
 c0e197e038ddb56ee493c89d54a9f31a7a28989db10e6b62499af0d35298bc60  /ServiceAccount//task
 edb82b5473dc6e2170e034831628de8b51bc03c3dbc474c487c285b8e25ee7bb  /ServiceAccount//task-db
 a0fb65ad32e4a75831b6c49a1a9eb9d868ad061cf1285fd9d4e19b1f5b470ecb  apps/Deployment//gateway
-ac11496c7c8c769e315d74148406174ce35d46ae8819b0f5ffa7b39845c81163  apps/Deployment//iam
+38ed0d59d8d87c99ce876c82eea6060f58f79bc0872a281391826548f576e5f0  apps/Deployment//iam
 255aefcc0c3509c830a0ad46dd3dc0d7a1d315448b87dda831d37980dd2b65eb  apps/Deployment//iam-db
 6dddb6f1119a3d3fc97209f67b70c1c65864e337d96f7a98b85c740fb2ef8d85  apps/Deployment//project
 711370d5d4e52716097c5a77c46fffc35b31c94ccf15f5a44ad434292a1e9e34  apps/Deployment//project-db
