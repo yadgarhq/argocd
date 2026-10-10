@@ -490,20 +490,23 @@ spec:
             # `optional` mode, so the next value after `"off"` is `"required"`
             # (ADR-0854).
             #
-            # B-N4.1 (ledger 925): THE LISTENER SPEAKS TLS AND STILL ADMITS PLAINTEXT.
-            # The platform switch and the upstream keys that do the work are written
-            # side by side; platform 0.2.1 refuses them if they disagree. The serving
-            # leaf is `nats-tls` (issued since 0.13.13). `allow_non_tls` kept both
-            # clients, then cleartext, connected until B-N4.2 turned them on
-            # (`nats.tls.enabled: true` above); B-N4.3 drops it. `verify` and `ca_file` are
-            # B-N5's. Each change here rolls `nats-0` (`configChecksumAnnotation`):
-            # `allow_non_tls` is not hot-reloadable.
+            # B-N4.1 (ledger 925): THE LISTENER SPEAKS TLS. The platform switch and the
+            # upstream keys that do the work are written side by side; platform 0.2.1
+            # refuses them if they disagree. The serving leaf is `nats-tls` (issued
+            # since 0.13.13). B-N4.1's `allow_non_tls: true` kept both clients, then
+            # cleartext, connected until B-N4.2 turned them on (`nats.tls.enabled:
+            # true` above).
+            #
+            # B-N4.3 (ledger 925): THE LISTENER REFUSES PLAINTEXT. `allow_non_tls` is
+            # gone, so nats-server sends `TLSRequired` and drops a client that does
+            # not upgrade. Re-adding it while no NATS hop is cleartext reddens
+            # `broker_failures`. `verify` and `ca_file` are B-N5's. Each change here
+            # rolls `nats-0` (`configChecksumAnnotation`): `allow_non_tls` is not
+            # hot-reloadable.
             tls: { enabled: true, clientAuth: "off" }
             config:
               nats:
                 tls: { enabled: true, secretName: nats-tls }
-              merge:
-                allow_non_tls: true
 
           # ── THE EDGE: THE PARENT'S, AS OF STEP 7 ───────────────────────────────────
           # `infra/tls/{certificate,envoyproxy,gatewayclass,gateway}.yaml` were deleted
