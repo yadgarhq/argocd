@@ -1,0 +1,106 @@
+name: settled-dispatch
+
+# DISPATCH THE SETTLED-STATE GATE ON EVERY MAIN MERGE (ledger 1435). The gate
+# is `yadgarhq/argocd-verify` `.github/workflows/settled.yaml`; its 10-minute
+# cron starts only every 2-5 h (GitHub schedule throttling, measured
+# 2026-10-10), while an epoch's deadline is A + 3900 s and estate refuses at
+# deadline + 30 min without a verdict. The cron stays as the backup.
+#
+# THE LOOP IS `scripts/settled_dispatch.py` (its docstring has the design).
+# It runs HERE, on `ubuntu-latest`, so the gate's one runner (`maxRunners: 1`,
+# shared with verify.yaml and project-probe.yaml) only ever runs single
+# stateless polls (ADR-0844 (2)). It sends a plain `workflow_dispatch`
+# (`{"ref": "main"}`, an event estate's `VERDICT_EVENTS` accepts) only while
+# no settled.yaml run is queued or running, and stops at the first verdict for
+# the epoch — immediately, with no dispatch, when the push did not change K.
+#
+# PUSH TO MAIN ONLY, NEVER `pull_request`: this job mints a token from the
+# release App, as ci.yaml's `main` job does, and nothing unreviewed runs on a
+# push to main. The token is scoped to argocd-verify with `actions: write`
+# alone. It lives 60 minutes, and the worst case runs about 90 (A to deadline
+# + 20 min), so the loop runs in two slices with a fresh token each.
+#
+# THESE LOGS ARE PUBLIC, and that token can read every argocd-verify artifact:
+# the script prints the epoch, the result and the run id, never a clause.
+#
+# A NEWER PUSH SUPERSEDES AN OLDER RUN. It reads the epoch again; when the
+# render did not change, that is the same (K, A) and the same deadline.
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: settled-dispatch
+  cancel-in-progress: true
+
+jobs:
+  dispatch:
+    name: dispatch settled-gate until it judges this epoch
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      OUT: ${{ github.workspace }}/../settled-dispatch
+    steps:
+      - name: check out the pushed commit, read-only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Full history: the anchor A is found by walking it.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.x"
+
+      # The version K's shared vectors are measured under (settled_gate.py).
+      - name: install PyYAML
+        run: python3 -m pip install --disable-pip-version-check "pyyaml==6.0.3"
+
+      - name: mint a token for argocd-verify (actions write), slice 1
+        id: token1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: argocd-verify
+          permission-actions: write
+
+      - name: dispatch until judged, slice 1
+        id: slice1
+        env:
+          GITHUB_TOKEN: ${{ steps.token1.outputs.token }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT"
+          python3 scripts/settled_dispatch.py nudge --repo . --sha "$SHA" --out "$OUT/slice1.json"
+          done=$(python3 -c 'import json,sys; print(str(json.load(open(sys.argv[1]))["done"]).lower())' "$OUT/slice1.json")
+          echo "done=$done" >> "$GITHUB_OUTPUT"
+
+      - name: mint a fresh token, slice 2
+        id: token2
+        if: steps.slice1.outputs.done == 'false'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: argocd-verify
+          permission-actions: write
+
+      # Slice 2 reaches past the worst-case window, so it ends done (exit 0
+      # with a verdict, exit 1 with none) and never hands on.
+      - name: dispatch until judged, slice 2
+        if: steps.slice1.outputs.done == 'false'
+        env:
+          GITHUB_TOKEN: ${{ steps.token2.outputs.token }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/settled_dispatch.py nudge --repo . --sha "$SHA" --out "$OUT/slice2.json"
