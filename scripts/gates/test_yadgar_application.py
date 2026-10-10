@@ -101,6 +101,12 @@ CI job, never in the offline pre-commit hook.
       (`ConfigMap/nats-config` gains `tls.verify` true and `tls.ca_file`;
       `StatefulSet/nats` gets a new `checksum/config` and its reloader
       watches `ca.crt` too).
+      Re-measured 2026-10-10 at 0.23.2 with `platform.valkey.tls.enabled:
+      true` (B-V4.1, ledger 925): 90 objects, none added or removed, 3
+      changed (`Deployment/valkey` gains the TLS args, the boot hash, the
+      liveness hash check, `VALKEY_TLS_AUTH_CLIENTS` "no", port `valkey-tls`
+      6380 and the `valkey-tls` volume and mount; `Service/valkey` gains port
+      `valkey-tls`; `NetworkPolicy/valkey-ingress` admits 6380 beside 6379).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
@@ -1049,6 +1055,196 @@ def test_the_leaf_volume_at_another_secret_names_it(rendered: list) -> None:
 
     failures = broker_failures(mutated(rendered, "StatefulSet", "nats", change))
     assert list(failures) == ["nats: volume nats-tls"]
+
+
+# ── THE CACHE'S TLS LISTENER (B-V4.1, ledger 925, ADR-0852) ──────────────────
+
+# The server's side of the valkey hop, stated beside the gateway's side above
+# (`CLEARTEXT_HOPS`). K3 cannot hold this: `--write` blesses whatever renders,
+# so a values change that turned the TLS listener off, pointed it at another
+# Secret, asked for client leaves early or closed 6379 while the gateway still
+# dials it would pass K3. platform 0.2.1's own render checks hold that its keys
+# agree; they cannot know this estate's step.
+#
+# THE STEP IS B-V4.1: valkey listens with TLS on 6380 with the `valkey-tls`
+# serving leaf, beside plaintext 6379. The gateway still dials 6379 in
+# cleartext until B-V4.2 moves gateway/VALKEY to `CLIENT_HOPS`; B-V4.3 closes
+# 6379; B-V5 and B-V6 ask for leaves (`--tls-auth-clients optional`, `yes`).
+# Plaintext is pinned to the hops, not to a literal: while any VALKEY hop is in
+# `CLEARTEXT_HOPS`, 6379 must be open on the Deployment, the Service and
+# `valkey-ingress`. `VALKEY_TLS_AUTH_CLIENTS` is pinned to the literal "no"
+# (`clientAuth: "off"`); B-V5 moves it. The parent chart also refuses
+# `clientAuth` "optional" or "required" while gateway's `valkey.tls.enabled` is
+# false (its `validate.yaml`). valkey reads its leaf only at boot, so the boot script hashes
+# the files it loaded and the liveness probe re-checks that hash: a renewed
+# leaf restarts the container (one more `Recreate`-sized cache gap).
+VALKEY_STATED = {"enabled": True, "clientAuth": "off", "plaintext": True}
+VALKEY_TLS_DIR = "/etc/valkey/tls"
+VALKEY_SECRET = "valkey-tls"
+VALKEY_HASH = "/run/valkey/tls.sha256"
+VALKEY_PORTS = {"valkey": 6379, "valkey-tls": 6380}
+VALKEY_TLS_ARGS = (
+    "--tls-port 6380",
+    f"--tls-cert-file {VALKEY_TLS_DIR}/tls.crt",
+    f"--tls-key-file {VALKEY_TLS_DIR}/tls.key",
+    f"--tls-ca-cert-file {VALKEY_TLS_DIR}/ca.crt",
+    '--tls-auth-clients "$VALKEY_TLS_AUTH_CLIENTS"',
+)
+
+
+def cache_failures(documents: list) -> dict[str, object]:
+    """Every way the cache's rendered TLS posture is not this step's, keyed `valkey: <what>`."""
+    by_name = {(d["kind"], d["metadata"]["name"]): d for d in documents}
+    deployment = by_name.get(("Deployment", "valkey"))
+    service = by_name.get(("Service", "valkey"))
+    policy = by_name.get(("NetworkPolicy", "valkey-ingress"))
+    if deployment is None or service is None or policy is None:
+        return {"valkey: Deployment/valkey, Service/valkey and NetworkPolicy/valkey-ingress": None}
+    failures: dict[str, object] = {}
+    pod = deployment["spec"]["template"]["spec"]
+    server = next((c for c in pod["containers"] if c["name"] == "valkey"), {})
+    script = " ".join(server.get("args") or [])
+    for arg in VALKEY_TLS_ARGS:
+        if arg not in script:
+            failures[f"valkey: arg {arg.split()[0]}"] = None
+    if f"> {VALKEY_HASH}" not in script:
+        failures["valkey: boot hash"] = None
+    liveness = " ".join(((server.get("livenessProbe") or {}).get("exec") or {}).get("command") or [])
+    if f"sha256sum -c --status {VALKEY_HASH}" not in liveness:
+        failures["valkey: liveness hash check"] = liveness
+    env = {e["name"]: e.get("value") for e in server.get("env") or []}
+    cleartext_clients = sorted(caller for caller, hops in CLEARTEXT_HOPS.items() if "VALKEY" in hops)
+    if env.get("VALKEY_TLS_AUTH_CLIENTS") != "no":
+        failures["valkey: VALKEY_TLS_AUTH_CLIENTS"] = env.get("VALKEY_TLS_AUTH_CLIENTS")
+    volume = next((v for v in pod.get("volumes") or [] if v["name"] == VALKEY_SECRET), None)
+    if (volume or {}).get("secret", {}).get("secretName") != VALKEY_SECRET:
+        failures["valkey: volume valkey-tls"] = volume
+    mount = {m["name"]: m["mountPath"] for m in server.get("volumeMounts") or []}.get(VALKEY_SECRET)
+    if mount != VALKEY_TLS_DIR:
+        failures["valkey: mount valkey-tls"] = mount
+    wanted = VALKEY_PORTS if cleartext_clients else {"valkey-tls": VALKEY_PORTS["valkey-tls"]}
+    container_ports = {p.get("name"): p.get("containerPort") for p in server.get("ports") or []}
+    service_ports = {p.get("name"): (p.get("port"), p.get("targetPort")) for p in service["spec"].get("ports") or []}
+    allowed = {p.get("port") for rule in policy["spec"].get("ingress") or [] for p in rule.get("ports") or []}
+    for name, port in wanted.items():
+        if container_ports.get(name) != port:
+            failures[f"valkey: containerPort {name}"] = container_ports.get(name)
+        if service_ports.get(name) != (port, name):
+            failures[f"valkey: Service port {name}"] = service_ports.get(name)
+        if port not in allowed:
+            failures[f"valkey: valkey-ingress port {port}"] = sorted(allowed)
+    if cleartext_clients and f"--port {VALKEY_PORTS['valkey']}" not in script:
+        failures[f"valkey: --port 6379 while {', '.join(cleartext_clients)} dial in cleartext"] = None
+    return failures
+
+
+def test_the_cache_states_its_tls_posture() -> None:
+    values = committed()["spec"]["source"]["helm"]["valuesObject"]
+    assert values["platform"]["valkey"]["tls"] == VALKEY_STATED
+
+
+def test_the_cache_listens_with_its_leaf_beside_plaintext(rendered: list) -> None:
+    assert cache_failures(rendered) == {}
+
+
+def valkey_container(deployment: dict) -> dict:
+    return next(c for c in deployment["spec"]["template"]["spec"]["containers"] if c["name"] == "valkey")
+
+
+def with_valkey_script(change):
+    def apply(deployment: dict) -> None:
+        container = valkey_container(deployment)
+        container["args"] = [change(arg) for arg in container["args"]]
+
+    return apply
+
+
+def test_a_dropped_tls_port_names_it(rendered: list) -> None:
+    change = with_valkey_script(lambda script: script.replace("--tls-port 6380", "--tls-port 0"))
+    assert cache_failures(mutated(rendered, "Deployment", "valkey", change)) == {"valkey: arg --tls-port": None}
+
+
+def test_a_dropped_boot_hash_names_it(rendered: list) -> None:
+    change = with_valkey_script(lambda script: script.replace(f"> {VALKEY_HASH}", "> /dev/null"))
+    assert cache_failures(mutated(rendered, "Deployment", "valkey", change)) == {"valkey: boot hash": None}
+
+
+def test_a_liveness_without_the_hash_check_names_it(rendered: list) -> None:
+    probe = ["sh", "-c", "valkey-cli -s /run/valkey/valkey.sock ping >/dev/null"]
+
+    def change(deployment: dict) -> None:
+        valkey_container(deployment)["livenessProbe"]["exec"]["command"] = probe
+
+    assert cache_failures(mutated(rendered, "Deployment", "valkey", change)) == {
+        "valkey: liveness hash check": " ".join(probe)
+    }
+
+
+def test_an_early_client_auth_names_it(rendered: list) -> None:
+    """B-V5 asks for leaves; while the gateway dials in cleartext it presents none."""
+
+    def change(deployment: dict) -> None:
+        env = valkey_container(deployment)["env"]
+        next(e for e in env if e["name"] == "VALKEY_TLS_AUTH_CLIENTS")["value"] = "optional"
+
+    assert cache_failures(mutated(rendered, "Deployment", "valkey", change)) == {
+        "valkey: VALKEY_TLS_AUTH_CLIENTS": "optional"
+    }
+
+
+def test_the_leaf_volume_at_another_secret_names_it_for_the_cache(rendered: list) -> None:
+    def change(deployment: dict) -> None:
+        volume = next(v for v in deployment["spec"]["template"]["spec"]["volumes"] if v["name"] == VALKEY_SECRET)
+        volume["secret"]["secretName"] = "nats-tls"
+
+    assert list(cache_failures(mutated(rendered, "Deployment", "valkey", change))) == ["valkey: volume valkey-tls"]
+
+
+def test_a_closed_plaintext_port_names_the_cleartext_clients(rendered: list) -> None:
+    """B-V4.3 closes 6379; while gateway/VALKEY is in `CLEARTEXT_HOPS` that cuts the gateway off."""
+    assert "VALKEY" in CLEARTEXT_HOPS["gateway"]
+
+    def drop_service_port(service: dict) -> None:
+        service["spec"]["ports"] = [p for p in service["spec"]["ports"] if p["name"] != "valkey"]
+
+    def drop_policy_port(policy: dict) -> None:
+        for rule in policy["spec"]["ingress"]:
+            rule["ports"] = [p for p in rule["ports"] if p["port"] != 6379]
+
+    def drop_container_port(deployment: dict) -> None:
+        container = valkey_container(deployment)
+        container["ports"] = [p for p in container["ports"] if p["name"] != "valkey"]
+        container["args"] = [a.replace("--port 6379", "--port 0") for a in container["args"]]
+
+    documents = mutated(rendered, "Service", "valkey", drop_service_port)
+    documents = mutated(documents, "NetworkPolicy", "valkey-ingress", drop_policy_port)
+    documents = mutated(documents, "Deployment", "valkey", drop_container_port)
+    assert cache_failures(documents) == {
+        "valkey: containerPort valkey": None,
+        "valkey: Service port valkey": None,
+        "valkey: valkey-ingress port 6379": [6380],
+        "valkey: --port 6379 while gateway dial in cleartext": None,
+    }
+
+
+def test_with_no_valkey_hop_in_cleartext_a_closed_plaintext_port_passes(rendered: list, monkeypatch) -> None:
+    """After B-V4.2 moves gateway/VALKEY to `CLIENT_HOPS`, 6379 may close (B-V4.3)."""
+    monkeypatch.setitem(CLEARTEXT_HOPS, "gateway", {})
+
+    def drop_service_port(service: dict) -> None:
+        service["spec"]["ports"] = [p for p in service["spec"]["ports"] if p["name"] != "valkey"]
+
+    assert cache_failures(mutated(rendered, "Service", "valkey", drop_service_port)) == {}
+
+
+def test_a_closed_tls_port_on_the_policy_names_it(rendered: list) -> None:
+    def change(policy: dict) -> None:
+        for rule in policy["spec"]["ingress"]:
+            rule["ports"] = [p for p in rule["ports"] if p["port"] != 6380]
+
+    assert cache_failures(mutated(rendered, "NetworkPolicy", "valkey-ingress", change)) == {
+        "valkey: valkey-ingress port 6380": [6379]
+    }
 
 
 def write_table() -> None:
