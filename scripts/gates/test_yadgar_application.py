@@ -118,6 +118,10 @@ CI job, never in the offline pre-commit hook.
       changed (`Deployment/valkey`: `--port 6379` becomes `--port 0` and the
       containerPort `valkey` 6379 goes; `Service/valkey` drops port
       `valkey`; `NetworkPolicy/valkey-ingress` admits 6380 only).
+      Re-measured 2026-10-10 at 0.23.2 with `platform.valkey.tls.clientAuth:
+      "optional"` (B-V5, ledger 925): 90 objects, none added or removed, 1
+      changed (`Deployment/valkey`: `VALKEY_TLS_AUTH_CLIENTS` "no" becomes
+      "optional", nothing else).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
@@ -851,16 +855,21 @@ def test_no_hop_dials_in_cleartext() -> None:
 
 @pytest.fixture(scope="module")
 def rendered_valkey_off() -> list:
-    """The render a revert of B-V4.3 and B-V4.2 produces: 6379 open, gateway's `valkey.tls.enabled` false.
+    """The render a revert of B-V5, B-V4.3 and B-V4.2 produces: client auth off, 6379 open, gateway's switch off.
 
-    The parent refuses `plaintext: false` with gateway's switch off, so B-V4.2 alone no longer reverts.
+    The parent refuses `plaintext: false`, and `clientAuth` other than "off", with gateway's switch off, so
+    B-V4.2 alone no longer reverts.
     """
-    overrides = ("--set", "gateway.valkey.tls.enabled=false", "--set", "platform.valkey.tls.plaintext=true")
+    overrides = (
+        *("--set", "gateway.valkey.tls.enabled=false"),
+        *("--set", "platform.valkey.tls.plaintext=true"),
+        *("--set-string", "platform.valkey.tls.clientAuth=off"),
+    )
     return [d for d in parent_render(REPOSITORY, overrides) if isinstance(d, dict) and d.get("kind")]
 
 
 def test_a_reverted_valkey_hop_renders_its_switch_off_and_nothing_else(rendered_valkey_off: list, monkeypatch) -> None:
-    """The check still holds a cleartext hop exactly, if B-V4.3 and B-V4.2 are reverted and gateway/VALKEY comes back."""
+    """The check still holds a cleartext hop exactly, if B-V5, B-V4.3 and B-V4.2 are reverted and gateway/VALKEY comes back."""
     monkeypatch.setitem(CLEARTEXT_HOPS, "gateway", GATEWAY_VALKEY_CLEARTEXT)
     assert cleartext_failures(rendered_valkey_off) == {}
 
@@ -1124,21 +1133,26 @@ def test_the_leaf_volume_at_another_secret_names_it(rendered: list) -> None:
 # dials it would pass K3. platform 0.2.1's own render checks hold that its keys
 # agree; they cannot know this estate's step.
 #
-# THE STEP IS B-V4.3: valkey listens only with TLS, on 6380 with the
-# `valkey-tls` serving leaf (B-V4.1); the gateway dials 6380 with TLS
-# (gateway/VALKEY in `CLIENT_HOPS` above, B-V4.2); 6379 is closed (B-V4.3).
-# B-V5 and B-V6 ask for leaves (`--tls-auth-clients optional`, `yes`).
+# THE STEP IS B-V5: valkey listens only with TLS, on 6380 with the
+# `valkey-tls` serving leaf (B-V4.1); the gateway dials 6380 with TLS and
+# presents its `gateway-client-tls` leaf (gateway/VALKEY in `CLIENT_HOPS`
+# above, B-V4.2); 6379 is closed (B-V4.3); and valkey asks for a client leaf
+# and verifies one that is presented (B-V5, `--tls-auth-clients optional`,
+# against `ca.crt` beside the serving leaf). B-V6 requires it (`yes`).
 # Plaintext is pinned to the hops, not to a literal: while any VALKEY hop is in
 # `CLEARTEXT_HOPS`, 6379 must be open on the Deployment, the Service and
 # `valkey-ingress`; while none is, 6379 must be ABSENT from all three and the
 # boot script must say `--port 0` (valkey-server listens on 6379 when `--port`
-# is absent). `VALKEY_TLS_AUTH_CLIENTS` is pinned to the literal "no"
-# (`clientAuth: "off"`); B-V5 moves it. The parent chart also refuses
-# `clientAuth` "optional" or "required" while gateway's `valkey.tls.enabled` is
-# false (its `validate.yaml`). valkey reads its leaf only at boot, so the boot script hashes
+# is absent). `VALKEY_TLS_AUTH_CLIENTS` is pinned to the hops the same way:
+# "no" while any VALKEY hop is in `CLEARTEXT_HOPS` (a cleartext client presents
+# no leaf, and the parent chart's `validate.yaml` refuses `clientAuth`
+# "optional" or "required" while gateway's `valkey.tls.enabled` is false), and
+# this step's value, `VALKEY_AUTH_CLIENTS`, while none is. B-V6 moves it to
+# "yes". valkey reads its leaf only at boot, so the boot script hashes
 # the files it loaded and the liveness probe re-checks that hash: a renewed
 # leaf restarts the container (one more `Recreate`-sized cache gap).
-VALKEY_STATED = {"enabled": True, "clientAuth": "off", "plaintext": False}
+VALKEY_STATED = {"enabled": True, "clientAuth": "optional", "plaintext": False}
+VALKEY_AUTH_CLIENTS = "optional"
 VALKEY_TLS_DIR = "/etc/valkey/tls"
 VALKEY_SECRET = "valkey-tls"
 VALKEY_HASH = "/run/valkey/tls.sha256"
@@ -1180,8 +1194,12 @@ def cache_failures(documents: list) -> dict[str, object]:
         failures["valkey: liveness hash check"] = liveness
     env = {e["name"]: e.get("value") for e in server.get("env") or []}
     cleartext_clients = sorted(caller for caller, hops in CLEARTEXT_HOPS.items() if "VALKEY" in hops)
-    if env.get("VALKEY_TLS_AUTH_CLIENTS") != "no":
-        failures["valkey: VALKEY_TLS_AUTH_CLIENTS"] = env.get("VALKEY_TLS_AUTH_CLIENTS")
+    if cleartext_clients and env.get("VALKEY_TLS_AUTH_CLIENTS") != "no":
+        failures[f"valkey: VALKEY_TLS_AUTH_CLIENTS while {', '.join(cleartext_clients)} dial in cleartext"] = env.get(
+            "VALKEY_TLS_AUTH_CLIENTS"
+        )
+    if not cleartext_clients and env.get("VALKEY_TLS_AUTH_CLIENTS") != VALKEY_AUTH_CLIENTS:
+        failures["valkey: VALKEY_TLS_AUTH_CLIENTS with no VALKEY hop in cleartext"] = env.get("VALKEY_TLS_AUTH_CLIENTS")
     volume = next((v for v in pod.get("volumes") or [] if v["name"] == VALKEY_SECRET), None)
     if (volume or {}).get("secret", {}).get("secretName") != VALKEY_SECRET:
         failures["valkey: volume valkey-tls"] = volume
@@ -1266,15 +1284,40 @@ def test_a_liveness_without_the_hash_check_names_it(rendered: list) -> None:
     }
 
 
-def test_an_early_client_auth_names_it(rendered: list) -> None:
-    """B-V5 asks for leaves; while the gateway dials in cleartext it presents none."""
-
+def with_auth_clients(value: str):
     def change(deployment: dict) -> None:
         env = valkey_container(deployment)["env"]
-        next(e for e in env if e["name"] == "VALKEY_TLS_AUTH_CLIENTS")["value"] = "optional"
+        next(e for e in env if e["name"] == "VALKEY_TLS_AUTH_CLIENTS")["value"] = value
 
+    return change
+
+
+def test_the_rendered_cache_asks_for_a_leaf_and_verifies_it_against_its_ca(rendered: list) -> None:
+    """B-V5: `--tls-auth-clients optional`, read from the env var, verified against `ca.crt` from `valkey-tls`."""
+    deployment, _, _ = valkey_objects(rendered)
+    container = valkey_container(deployment)
+    env = {e["name"]: e.get("value") for e in container["env"]}
+    assert env["VALKEY_TLS_AUTH_CLIENTS"] == "optional"
+    script = " ".join(container["args"])
+    assert '--tls-auth-clients "$VALKEY_TLS_AUTH_CLIENTS"' in script
+    assert f"--tls-ca-cert-file {VALKEY_TLS_DIR}/ca.crt" in script
+
+
+@pytest.mark.parametrize("value", ["no", "yes", "", "false"])
+def test_another_client_auth_names_it(rendered: list, value: str) -> None:
+    """Off ("no", or the "false" an unquoted `no` coerces to) is a revert, and "yes" is B-V6: neither is this step."""
+    change = with_auth_clients(value)
     assert cache_failures(mutated(rendered, "Deployment", "valkey", change)) == {
-        "valkey: VALKEY_TLS_AUTH_CLIENTS": "optional"
+        "valkey: VALKEY_TLS_AUTH_CLIENTS with no VALKEY hop in cleartext": value
+    }
+
+
+def test_a_client_auth_while_a_hop_is_cleartext_names_the_cleartext_clients(rendered_valkey_off: list, monkeypatch) -> None:
+    """A cleartext client presents no leaf: while gateway/VALKEY is in `CLEARTEXT_HOPS`, only "no" holds."""
+    monkeypatch.setitem(CLEARTEXT_HOPS, "gateway", GATEWAY_VALKEY_CLEARTEXT)
+    change = with_auth_clients("optional")
+    assert cache_failures(mutated(rendered_valkey_off, "Deployment", "valkey", change)) == {
+        "valkey: VALKEY_TLS_AUTH_CLIENTS while gateway dial in cleartext": "optional"
     }
 
 
@@ -1350,18 +1393,19 @@ def test_6379_reopened_everywhere_names_every_place(rendered: list) -> None:
 
 
 def test_a_closed_plaintext_port_names_the_cleartext_clients(rendered: list, monkeypatch) -> None:
-    """The clause still reddens while a VALKEY hop dials in cleartext: this render closes 6379 everywhere."""
+    """The clauses still redden while a VALKEY hop dials in cleartext: this render closes 6379 and asks for leaves."""
     monkeypatch.setitem(CLEARTEXT_HOPS, "gateway", GATEWAY_VALKEY_CLEARTEXT)
     assert cache_failures(rendered) == {
         "valkey: containerPort valkey": None,
         "valkey: Service port valkey": None,
         "valkey: valkey-ingress port 6379": [6380],
         "valkey: --port 6379 while gateway dial in cleartext": None,
+        "valkey: VALKEY_TLS_AUTH_CLIENTS while gateway dial in cleartext": "optional",
     }
 
 
 def test_a_reverted_cache_with_its_cleartext_client_passes(rendered_valkey_off: list, monkeypatch) -> None:
-    """A revert of B-V4.3 and B-V4.2 reopens 6379 for gateway/VALKEY back in `CLEARTEXT_HOPS`; the gate holds it."""
+    """A revert of B-V5, B-V4.3 and B-V4.2 reopens 6379 for gateway/VALKEY back in `CLEARTEXT_HOPS`; the gate holds it."""
     monkeypatch.setitem(CLEARTEXT_HOPS, "gateway", GATEWAY_VALKEY_CLEARTEXT)
     assert cache_failures(rendered_valkey_off) == {}
 

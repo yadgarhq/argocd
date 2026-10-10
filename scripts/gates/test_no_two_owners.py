@@ -1996,6 +1996,12 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # name, as it refuses `enabled: true`, and the parent refuses it beside
 # gateway's switch off. Both sides get `plaintext: true`. The closed port is
 # gated by `cache_failures` and by K3.
+#
+# THE CACHE'S CLIENT AUTH IS RENDERED OFF ON BOTH SIDES, FROM B-V5 ON, for the
+# same reason. 0.19.1's platform refuses `valkey.tls.clientAuth: "optional"`
+# by name, and the parent refuses it beside gateway's switch off. Both sides
+# get `clientAuth: "off"` (`--set-string`: a bare `off` is YAML false). The
+# asked-for leaf is gated by `cache_failures` and by K3.
 PIN_BEFORE_B9 = "0.3.7"
 PREVIOUS_PIN = "0.19.1"
 PIN_ALONE_OVERRIDES: tuple[str, ...] = (
@@ -2016,6 +2022,7 @@ PIN_ALONE_OVERRIDES: tuple[str, ...] = (
     *("--set", "platform.valkey.tls.enabled=false"),
     *("--set", "gateway.valkey.tls.enabled=false"),
     *("--set", "platform.valkey.tls.plaintext=true"),
+    *("--set-string", "platform.valkey.tls.clientAuth=off"),
 )
 PIN_ADDED: set[tuple[str, str]] = set()
 PIN_CHANGES = {

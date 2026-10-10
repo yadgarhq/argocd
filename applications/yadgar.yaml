@@ -450,11 +450,14 @@ spec:
             # B-V4.1 (ledger 925): THE CACHE LISTENS WITH TLS ON 6380 BESIDE PLAINTEXT
             # 6379. The serving leaf is `valkey-tls` (SANs `valkey`, `valkey.yadgar`,
             # ...). The gateway dialled 6379 in cleartext until B-V4.2 turned its
-            # `valkey.tls.enabled` on (above); B-V4.3 set `plaintext: false`; B-V5 and
-            # B-V6 move `clientAuth` to "optional" and "required". valkey loads its
+            # `valkey.tls.enabled` on (above); B-V4.3 set `plaintext: false`. B-V5 sets
+            # `clientAuth: "optional"` (`VALKEY_TLS_AUTH_CLIENTS` "optional"): valkey asks
+            # for a client leaf and verifies one that is presented against `ca.crt` in
+            # `valkey-tls`; the gateway presents `gateway-client-tls`. B-V6 sets
+            # "required". valkey loads its
             # leaf only at boot: the boot script hashes it and liveness re-checks the
             # hash, so a renewal restarts the container (a cache gap, as here).
-            tls: { enabled: true, clientAuth: "off", plaintext: false }
+            tls: { enabled: true, clientAuth: "optional", plaintext: false }
 
           # ── THE INTERNAL CA AND ITS TEN LEAVES: THE PARENT'S, AS OF STEP 5 ─────────
           # `infra/internal-tls-app.yaml` and `infra/internal-tls/` were deleted in the
