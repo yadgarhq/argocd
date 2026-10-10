@@ -188,7 +188,12 @@ spec:
           # the pin that first requires them. `false` is today's posture: each renders
           # `NATS_TLS_ENABLED`/`VALKEY_TLS_ENABLED` as "0" and no CA or certificate
           # mount. The hop steps after PB-3 (B-N4.x, B-V4.x) turn them on one at a time.
-          nats: { tls: { enabled: false } }
+          #
+          # B-N4.2 (ledger 925): THE BROKER HOP DIALS WITH TLS. `NATS_TLS_ENABLED` "1",
+          # the broker's CA from `nats-tls` (`ca.crt`, the chart's default
+          # `nats.tls.caSecret`), and the one shared `clientCertificate.secret` leaf
+          # presented to it. The broker still admits plaintext until B-N4.3.
+          nats: { tls: { enabled: true } }
           valkey: { tls: { enabled: false } }
 
         # ── THE SIX SERVICES ─────────────────────────────────────────────────────────
@@ -263,9 +268,10 @@ spec:
           # `global.hostname` changes exactly this one env value and rolls `iam`.
           enrolment: { gateway: "https://gateway.yadgar.internal:18443" }
           # NO `nats.url`, AS OF B5; see `gateway` above. `nats.tls.enabled` is stated
-          # for the same reason as gateway's (PB-3); iam's NATS client identity, when
-          # it is turned on, is its own `nats.tls.clientCertSecret` (ADR-0885).
-          nats: { tls: { enabled: false } }
+          # for the same reason as gateway's (PB-3); iam's NATS client identity is its
+          # own `nats.tls.clientCertSecret` (ADR-0885), default `iam-client-tls`, on its
+          # own mount. B-N4.2 (ledger 925) turns it on, with the CA from `nats-tls`.
+          nats: { tls: { enabled: true } }
           networkPolicy:
             {
               enabled: true,
@@ -487,9 +493,9 @@ spec:
             # B-N4.1 (ledger 925): THE LISTENER SPEAKS TLS AND STILL ADMITS PLAINTEXT.
             # The platform switch and the upstream keys that do the work are written
             # side by side; platform 0.2.1 refuses them if they disagree. The serving
-            # leaf is `nats-tls` (issued since 0.13.13). `allow_non_tls` keeps both
-            # clients, still cleartext (`nats.tls.enabled: false` above), connected
-            # until B-N4.2 turns them on; B-N4.3 drops it. `verify` and `ca_file` are
+            # leaf is `nats-tls` (issued since 0.13.13). `allow_non_tls` kept both
+            # clients, then cleartext, connected until B-N4.2 turned them on
+            # (`nats.tls.enabled: true` above); B-N4.3 drops it. `verify` and `ca_file` are
             # B-N5's. Each change here rolls `nats-0` (`configChecksumAnnotation`):
             # `allow_non_tls` is not hot-reloadable.
             tls: { enabled: true, clientAuth: "off" }

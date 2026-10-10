@@ -1967,6 +1967,13 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # the upstream listener key off, and no `secretName` or `allow_non_tls`. The
 # broker's posture is gated by `test_yadgar_application.py`'s `broker_failures`
 # and by K3.
+#
+# THE TWO BROKER CLIENTS ARE RENDERED AT THEIR PB-3 POSTURE ON BOTH SIDES, FROM
+# B-N4.2 ON, for the same reason. 0.19.1's gateway and iam each refuse
+# `nats.tls.enabled: true` by name ("this chart version declares the key, but
+# the binary reads NATS_TLS_ENABLED only from B-N3"). Both sides get gateway's
+# and iam's `nats.tls.enabled` off. Their posture is gated by `CLIENT_HOPS` and
+# by K3.
 PIN_BEFORE_B9 = "0.3.7"
 PREVIOUS_PIN = "0.19.1"
 PIN_ALONE_OVERRIDES: tuple[str, ...] = (
@@ -1980,6 +1987,8 @@ PIN_ALONE_OVERRIDES: tuple[str, ...] = (
     *("--set", "platform.nats.config.nats.tls.enabled=false"),
     *("--set", "platform.nats.config.nats.tls.secretName=null"),
     *("--set", "platform.nats.config.merge.allow_non_tls=null"),
+    *("--set", "gateway.nats.tls.enabled=false"),
+    *("--set", "iam.nats.tls.enabled=false"),
 )
 PIN_ADDED: set[tuple[str, str]] = set()
 PIN_CHANGES = {
