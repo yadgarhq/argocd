@@ -107,6 +107,12 @@ CI job, never in the offline pre-commit hook.
       liveness hash check, `VALKEY_TLS_AUTH_CLIENTS` "no", port `valkey-tls`
       6380 and the `valkey-tls` volume and mount; `Service/valkey` gains port
       `valkey-tls`; `NetworkPolicy/valkey-ingress` admits 6380 beside 6379).
+      Re-measured 2026-10-10 at 0.23.2 with gateway's `valkey.tls.enabled:
+      true` (B-V4.2, ledger 925): 90 objects, none added or removed, 1
+      changed (`Deployment/gateway`: `VALKEY_TLS_ENABLED` "1",
+      `VALKEY_TLS_CA_FILE`, `VALKEY_TLS_CLIENT_CERT_FILE` and
+      `VALKEY_TLS_CLIENT_KEY_FILE`, and a `valkey-ca` volume and mount from
+      `valkey-tls`).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
@@ -521,7 +527,7 @@ def test_every_server_states_its_client_auth_and_stages_its_own_ca() -> None:
 # bump reddens here instead of going unpinned. No container in the render
 # uses `envFrom`; one that did could carry a hop this scan cannot see.
 CLIENT_HOPS = {
-    "gateway": ("TASK", "IAM", "PROJECT", "NATS"),
+    "gateway": ("TASK", "IAM", "PROJECT", "NATS", "VALKEY"),
     "iam": ("IAM_DB", "NATS"),
     "task": ("TASK_DB",),
     "project": ("PROJECT_DB",),
@@ -535,12 +541,20 @@ CLIENT_HOPS = {
 # `CLIENT_HOPS` in the values PR that turns it on (B-N4.2 for NATS, B-V4.2 for
 # valkey). B-N4.2 (ledger 925, ADR-0890) moved gateway/NATS and iam/NATS: each
 # presents its leaf to the broker, gateway its one shared `gateway-client-tls`
-# and iam its own `nats.tls.clientCertSecret` (ADR-0885). While a hop is off its chart renders the `_ENABLED` "0" line and
+# and iam its own `nats.tls.clientCertSecret` (ADR-0885). B-V4.2 (ledger 925,
+# ADR-0890) moved gateway/VALKEY: the gateway presents the same shared
+# `gateway-client-tls` leaf to the cache and dials its TLS listener on 6380.
+# While a hop is off its chart renders the `_ENABLED` "0" line and
 # nothing else: no other `<PREFIX>_TLS_*` env, and no volume projecting the
 # server leaf whose `ca.crt` it would trust (the value named beside each).
-CLEARTEXT_HOPS = {
-    "gateway": {"VALKEY": "valkey-tls"},
-}
+#
+# THE MAP IS EMPTY FROM B-V4.2 AND IS KEPT. Every hop now presents a leaf, so
+# the check below has nothing to hold in this render; its tests hold it by
+# putting gateway/VALKEY back, which is the state a revert of B-V4.2 renders.
+# Deleting the map and its check is ADR-0890's own decision, not this step's.
+CLEARTEXT_HOPS: dict[str, dict[str, str]] = {}
+# The hop B-V4.2 moved, as it sat here before; its tests put it back.
+GATEWAY_VALKEY_CLEARTEXT = {"VALKEY": "valkey-tls"}
 # The cert-manager Issuer (not its Secret) every client leaf is issued from.
 LEAF_ISSUER = {"group": "cert-manager.io", "kind": "Issuer", "name": "yadgar-internal-ca"}
 # Each env half and the leaf key the volume must project to that file.
@@ -824,30 +838,66 @@ def test_every_cleartext_hop_renders_its_switch_off_and_nothing_else(rendered: l
     assert cleartext_failures(rendered) == {}
 
 
-def test_a_cleartext_hop_turned_on_names_its_hop(rendered: list) -> None:
-    change = set_env("VALKEY_TLS_ENABLED", "1")
-    assert cleartext_failures(mutated(rendered, "Deployment", "gateway", change)) == {
-        "gateway/VALKEY: VALKEY_TLS_ENABLED": "1"
+def test_no_hop_dials_in_cleartext() -> None:
+    """B-V4.2 moved the last one, gateway/VALKEY, to `CLIENT_HOPS` (ADR-0890)."""
+    assert CLEARTEXT_HOPS == {}
+    assert "VALKEY" in CLIENT_HOPS["gateway"]
+
+
+@pytest.fixture(scope="module")
+def rendered_valkey_off() -> list:
+    """The render a revert of B-V4.2 produces: gateway's `valkey.tls.enabled` false."""
+    overrides = ("--set", "gateway.valkey.tls.enabled=false")
+    return [d for d in parent_render(REPOSITORY, overrides) if isinstance(d, dict) and d.get("kind")]
+
+
+def test_a_reverted_valkey_hop_renders_its_switch_off_and_nothing_else(rendered_valkey_off: list, monkeypatch) -> None:
+    """The check still holds a cleartext hop exactly, if B-V4.2 is reverted and gateway/VALKEY comes back."""
+    monkeypatch.setitem(CLEARTEXT_HOPS, "gateway", GATEWAY_VALKEY_CLEARTEXT)
+    assert cleartext_failures(rendered_valkey_off) == {}
+
+
+def test_this_render_names_every_part_of_the_valkey_hop_as_not_cleartext(rendered: list, monkeypatch) -> None:
+    """With gateway/VALKEY back in `CLEARTEXT_HOPS`, B-V4.2's render is everything the check refuses."""
+    monkeypatch.setitem(CLEARTEXT_HOPS, "gateway", GATEWAY_VALKEY_CLEARTEXT)
+    assert cleartext_failures(rendered) == {
+        "gateway/VALKEY: VALKEY_TLS_ENABLED": "1",
+        "gateway/VALKEY: VALKEY_TLS_CA_FILE": "/var/run/config/valkey-ca/ca.pem",
+        "gateway/VALKEY: VALKEY_TLS_CLIENT_CERT_FILE": "/var/run/secrets/client-cert/client.crt",
+        "gateway/VALKEY: VALKEY_TLS_CLIENT_KEY_FILE": "/var/run/secrets/client-cert/client.key",
+        "gateway/VALKEY: volume valkey-ca": "valkey-tls",
     }
 
 
-def test_a_ca_env_on_a_cleartext_hop_names_its_hop(rendered: list) -> None:
-    change = add_env("containers", "VALKEY_TLS_CA_FILE", "/var/run/config/valkey-ca/ca.pem")
-    assert cleartext_failures(mutated(rendered, "Deployment", "gateway", change)) == {
-        "gateway/VALKEY: VALKEY_TLS_CA_FILE": "/var/run/config/valkey-ca/ca.pem"
-    }
-
-
-def test_a_server_leaf_volume_on_a_cleartext_hop_names_its_hop(rendered: list) -> None:
+def test_a_server_leaf_volume_on_a_cleartext_hop_names_its_hop(rendered_valkey_off: list, monkeypatch) -> None:
     """gateway's own `nats-ca` volume (B-N4.2) projects `nats-tls`, which is not the valkey hop's leaf."""
+    monkeypatch.setitem(CLEARTEXT_HOPS, "gateway", GATEWAY_VALKEY_CLEARTEXT)
 
     def mount_valkey_ca(deployment: dict) -> None:
         deployment["spec"]["template"]["spec"]["volumes"].append(
             {"name": "valkey-ca", "secret": {"secretName": "valkey-tls"}}
         )
 
-    assert cleartext_failures(mutated(rendered, "Deployment", "gateway", mount_valkey_ca)) == {
+    assert cleartext_failures(mutated(rendered_valkey_off, "Deployment", "gateway", mount_valkey_ca)) == {
         "gateway/VALKEY: volume valkey-ca": "valkey-tls"
+    }
+
+
+def test_a_cache_hop_flipped_to_cleartext_names_its_hop(rendered: list) -> None:
+    change = set_env("VALKEY_TLS_ENABLED", "0")
+    assert client_identity_failures(mutated(rendered, "Deployment", "gateway", change)) == {
+        "gateway/VALKEY: VALKEY_TLS_ENABLED": "0"
+    }
+
+
+def test_a_cache_hop_without_its_client_key_names_its_hop(rendered: list) -> None:
+    """gateway 0.12.0 refuses the boot on one half without the other; the gate names it first."""
+
+    def drop(deployment: dict) -> None:
+        env_of(deployment)[:] = [e for e in env_of(deployment) if e["name"] != "VALKEY_TLS_CLIENT_KEY_FILE"]
+
+    assert client_identity_failures(mutated(rendered, "Deployment", "gateway", drop)) == {
+        "gateway/VALKEY: VALKEY_TLS_CLIENT_KEY_FILE": None
     }
 
 
@@ -1066,13 +1116,14 @@ def test_the_leaf_volume_at_another_secret_names_it(rendered: list) -> None:
 # dials it would pass K3. platform 0.2.1's own render checks hold that its keys
 # agree; they cannot know this estate's step.
 #
-# THE STEP IS B-V4.1: valkey listens with TLS on 6380 with the `valkey-tls`
-# serving leaf, beside plaintext 6379. The gateway still dials 6379 in
-# cleartext until B-V4.2 moves gateway/VALKEY to `CLIENT_HOPS`; B-V4.3 closes
-# 6379; B-V5 and B-V6 ask for leaves (`--tls-auth-clients optional`, `yes`).
+# THE STEP IS B-V4.2: valkey listens with TLS on 6380 with the `valkey-tls`
+# serving leaf, beside plaintext 6379 (B-V4.1), and the gateway now dials 6380
+# with TLS (gateway/VALKEY in `CLIENT_HOPS` above, B-V4.2). B-V4.3 closes 6379;
+# B-V5 and B-V6 ask for leaves (`--tls-auth-clients optional`, `yes`).
 # Plaintext is pinned to the hops, not to a literal: while any VALKEY hop is in
 # `CLEARTEXT_HOPS`, 6379 must be open on the Deployment, the Service and
-# `valkey-ingress`. `VALKEY_TLS_AUTH_CLIENTS` is pinned to the literal "no"
+# `valkey-ingress`. From B-V4.2 none is, so this gate no longer requires 6379;
+# K3 still holds the rendered 6379 until B-V4.3 removes it on purpose. `VALKEY_TLS_AUTH_CLIENTS` is pinned to the literal "no"
 # (`clientAuth: "off"`); B-V5 moves it. The parent chart also refuses
 # `clientAuth` "optional" or "required" while gateway's `valkey.tls.enabled` is
 # false (its `validate.yaml`). valkey reads its leaf only at boot, so the boot script hashes
@@ -1200,9 +1251,9 @@ def test_the_leaf_volume_at_another_secret_names_it_for_the_cache(rendered: list
     assert list(cache_failures(mutated(rendered, "Deployment", "valkey", change))) == ["valkey: volume valkey-tls"]
 
 
-def test_a_closed_plaintext_port_names_the_cleartext_clients(rendered: list) -> None:
-    """B-V4.3 closes 6379; while gateway/VALKEY is in `CLEARTEXT_HOPS` that cuts the gateway off."""
-    assert "VALKEY" in CLEARTEXT_HOPS["gateway"]
+def test_a_closed_plaintext_port_names_the_cleartext_clients(rendered: list, monkeypatch) -> None:
+    """The clause still reddens while a VALKEY hop dials in cleartext, as it did before B-V4.2 (or after its revert)."""
+    monkeypatch.setitem(CLEARTEXT_HOPS, "gateway", GATEWAY_VALKEY_CLEARTEXT)
 
     def drop_service_port(service: dict) -> None:
         service["spec"]["ports"] = [p for p in service["spec"]["ports"] if p["name"] != "valkey"]
@@ -1227,14 +1278,26 @@ def test_a_closed_plaintext_port_names_the_cleartext_clients(rendered: list) -> 
     }
 
 
-def test_with_no_valkey_hop_in_cleartext_a_closed_plaintext_port_passes(rendered: list, monkeypatch) -> None:
-    """After B-V4.2 moves gateway/VALKEY to `CLIENT_HOPS`, 6379 may close (B-V4.3)."""
-    monkeypatch.setitem(CLEARTEXT_HOPS, "gateway", {})
+def test_with_no_valkey_hop_in_cleartext_a_closed_plaintext_port_passes(rendered: list) -> None:
+    """B-V4.2 moved gateway/VALKEY to `CLIENT_HOPS`, so closing 6379 everywhere (B-V4.3) is permitted here."""
+    assert not any("VALKEY" in hops for hops in CLEARTEXT_HOPS.values())
 
     def drop_service_port(service: dict) -> None:
         service["spec"]["ports"] = [p for p in service["spec"]["ports"] if p["name"] != "valkey"]
 
-    assert cache_failures(mutated(rendered, "Service", "valkey", drop_service_port)) == {}
+    def drop_policy_port(policy: dict) -> None:
+        for rule in policy["spec"]["ingress"]:
+            rule["ports"] = [p for p in rule["ports"] if p["port"] != 6379]
+
+    def drop_container_port(deployment: dict) -> None:
+        container = valkey_container(deployment)
+        container["ports"] = [p for p in container["ports"] if p["name"] != "valkey"]
+        container["args"] = [a.replace("--port 6379", "--port 0") for a in container["args"]]
+
+    documents = mutated(rendered, "Service", "valkey", drop_service_port)
+    documents = mutated(documents, "NetworkPolicy", "valkey-ingress", drop_policy_port)
+    documents = mutated(documents, "Deployment", "valkey", drop_container_port)
+    assert cache_failures(documents) == {}
 
 
 def test_a_closed_tls_port_on_the_policy_names_it(rendered: list) -> None:

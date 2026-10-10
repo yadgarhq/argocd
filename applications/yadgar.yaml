@@ -194,7 +194,14 @@ spec:
           # `nats.tls.caSecret`), and the one shared `clientCertificate.secret` leaf
           # presented to it. The broker still admits plaintext until B-N4.3.
           nats: { tls: { enabled: true } }
-          valkey: { tls: { enabled: false } }
+          #
+          # B-V4.2 (ledger 925): THE CACHE HOP DIALS WITH TLS. `VALKEY_TLS_ENABLED` "1",
+          # the cache's CA from `valkey-tls` (`ca.crt`, the chart's default
+          # `valkey.tls.caSecret`), and the same shared `clientCertificate.secret`
+          # leaf. gateway 0.12.0 keeps the host of `rateLimit.addr` and dials the TLS
+          # listener on the fixed port 6380, never the 6379 the address names. valkey
+          # still serves plaintext 6379 until B-V4.3.
+          valkey: { tls: { enabled: true } }
 
         # ── THE SIX SERVICES ─────────────────────────────────────────────────────────
         # `scrapeFrom.namespace: observability` is where Prometheus runs; each module's
@@ -436,13 +443,13 @@ spec:
             # THE SERVER'S TLS POSTURE IS STATED, NEVER DEFAULTED (B-L1, B-V2, PB-3).
             # Platform 0.2.1 refuses `valkey.create` without these. `"off"` is quoted:
             # a bare `off` is YAML 1.1's false, which the chart refuses by name.
-            # `plaintext: true` keeps the cleartext port 6379 every client dials today.
+            # `plaintext: true` keeps the cleartext port 6379 open (no client dials it from B-V4.2).
             # The valkey Deployment is `Recreate`, so any change here empties the cache.
             #
             # B-V4.1 (ledger 925): THE CACHE LISTENS WITH TLS ON 6380 BESIDE PLAINTEXT
             # 6379. The serving leaf is `valkey-tls` (SANs `valkey`, `valkey.yadgar`,
-            # ...). The gateway still dials 6379 in cleartext (`valkey.tls.enabled:
-            # false` above) until B-V4.2; B-V4.3 sets `plaintext: false`; B-V5 and
+            # ...). The gateway dialled 6379 in cleartext until B-V4.2 turned its
+            # `valkey.tls.enabled` on (above); B-V4.3 sets `plaintext: false`; B-V5 and
             # B-V6 move `clientAuth` to "optional" and "required". valkey loads its
             # leaf only at boot: the boot script hashes it and liveness re-checks the
             # hash, so a renewal restarts the container (a cache gap, as here).

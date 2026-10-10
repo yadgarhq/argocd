@@ -1984,6 +1984,12 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # ("this chart version declares the key; B-N2 / B-V2 renders it"). Both sides
 # get the switch off. The cache's posture is gated by `test_yadgar_application.py`'s
 # `cache_failures` and by K3.
+#
+# THE CACHE CLIENT IS RENDERED AT ITS PB-3 POSTURE ON BOTH SIDES, FROM B-V4.2 ON,
+# for the same reason. 0.19.1's gateway refuses `valkey.tls.enabled: true` by
+# name ("the binary reads VALKEY_TLS_ENABLED only from B-V3"). Both sides get
+# gateway's `valkey.tls.enabled` off. Its posture is gated by `CLIENT_HOPS` and
+# by K3.
 PIN_BEFORE_B9 = "0.3.7"
 PREVIOUS_PIN = "0.19.1"
 PIN_ALONE_OVERRIDES: tuple[str, ...] = (
@@ -2002,6 +2008,7 @@ PIN_ALONE_OVERRIDES: tuple[str, ...] = (
     *("--set", "gateway.nats.tls.enabled=false"),
     *("--set", "iam.nats.tls.enabled=false"),
     *("--set", "platform.valkey.tls.enabled=false"),
+    *("--set", "gateway.valkey.tls.enabled=false"),
 )
 PIN_ADDED: set[tuple[str, str]] = set()
 PIN_CHANGES = {
