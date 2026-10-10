@@ -38,6 +38,9 @@ PUBLIC LOGS. argocd is public, and the minted token can read every
 argocd-verify artifact. This prints only the result and the run id, never a
 verdict's clause.
 
+A transient GitHub failure (5xx, 429, dropped connection) costs one pass;
+any other API failure ends the run at once with exit 3.
+
 Exit codes: 0 found, no K, or slice over; 1 window closed with no verdict;
 2 usage; 3 infrastructure.
 """
@@ -63,7 +66,7 @@ DISPATCH = f"/repos/{REPOSITORY}/actions/workflows/{WORKFLOW_FILE}/dispatches"
 
 # Under the App token's 60 minutes, with room for the find and the dispatch of the last pass.
 SLICE_SECONDS = 3300
-# A gate run takes about two minutes on the runner (pod start, checkout, derive); Argo CD rolls in two to five.
+# Argo CD syncs and rolls in about two to five minutes after a merge (ledger 1435's measurement).
 INTERVAL_SECONDS = 240
 # Estate refuses at deadline + 30 min; the last dispatch must still be judged and uploaded before that.
 GRACE_SECONDS = 1200
@@ -103,24 +106,49 @@ def nudge(
     interval: int = INTERVAL_SECONDS,
     grace: int = GRACE_SECONDS,
 ) -> dict:
-    """Dispatch until a verdict for `epoch_` exists, the window closes, or the slice ends. Raises InfrastructureError."""
+    """Dispatch until a verdict for `epoch_` exists, the window closes, or the slice ends.
+
+    A transient GitHub failure (a 5xx, a 429, a dropped connection) costs one
+    pass, not the merge: it is logged and the next pass retries. Anything else
+    raises InfrastructureError at once, so a 401/403/404 (the credential or its
+    permission) stays loud rather than quietly running out the window.
+    """
     close = settled_gate.utc(epoch_["deadline"]) + dt.timedelta(seconds=grace)
     stop = now() + dt.timedelta(seconds=slice_seconds)
     end = min(stop, close)
     dispatches = 0
-    while True:
-        found = settled_gate.find_verdict(github, REPOSITORY, WORKFLOW_PATH, epoch_)
-        if found:
-            return {"done": True, "result": found["verdict"].get("result"), "run_id": found["run_id"], "dispatches": dispatches}
-        moment = now()
+
+    def ended(moment: dt.datetime) -> dict | None:
         if moment >= close:
             return {"done": True, "result": None, "run_id": None, "dispatches": dispatches}
         if moment >= stop:
             return {"done": False, "result": None, "run_id": None, "dispatches": dispatches}
-        if not gate_busy(github):
-            github.post(DISPATCH, {"ref": "main"})
-            dispatches += 1
-        sleep(max(0.0, min(interval, (end - moment).total_seconds())))
+        return None
+
+    while True:
+        try:
+            found = settled_gate.find_verdict(github, REPOSITORY, WORKFLOW_PATH, epoch_)
+            if found:
+                return {"done": True, "result": found["verdict"].get("result"), "run_id": found["run_id"], "dispatches": dispatches}
+            if over := ended(now()):
+                return over
+            if not gate_busy(github):
+                github.post(DISPATCH, {"ref": "main"})
+                dispatches += 1
+        except settled_gate.InfrastructureError as error:
+            if not transient(error):
+                raise
+            print(f"transient GitHub failure, the next pass retries: {error}")
+            if over := ended(now()):
+                return over
+        sleep(max(0.0, min(interval, (end - now()).total_seconds())))
+
+
+def transient(error: Exception) -> bool:
+    """A dropped connection, a 429 or a 5xx. Not a 4xx otherwise, and not an unreadable verdict."""
+    if isinstance(error, settled_gate.GitHubError):
+        return error.status == 429 or error.status >= 500
+    return isinstance(error, settled_gate.GitHubUnavailable)
 
 
 def _parser() -> argparse.ArgumentParser:

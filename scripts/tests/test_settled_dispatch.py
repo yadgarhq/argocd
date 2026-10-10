@@ -27,6 +27,7 @@ WHAT IS ASSERTED, and each has a red case below:
 from __future__ import annotations
 
 import datetime as dt
+import http.client
 import importlib.util
 import io
 import json
@@ -301,7 +302,7 @@ def test_cli_closed_without_a_verdict_exits_1(tmp_path: Path, capsys) -> None:
 def test_cli_api_failure_exits_3(tmp_path: Path, capsys) -> None:
     class Broken(FakeGitHub):
         def paginate(self, path: str, key: str | None = None) -> list:
-            raise sg.GitHubError(502, path)
+            raise sg.GitHubError(403, path)
 
     repo = Repo(tmp_path / "argocd")
     head = repo.commit({sg.APPLICATION: application("0.3.38"), sg.TABLE: "targetRevision  0.3.38\n"})
@@ -343,4 +344,84 @@ def test_post_http_error_is_a_github_error_naming_the_method(monkeypatch) -> Non
 
     monkeypatch.setattr(sg.urllib.request, "urlopen", urlopen)
     with pytest.raises(sg.GitHubError, match=r"^POST .*: HTTP 403"):
+        sg.GitHub(token="t").post(DISPATCH, {"ref": "main"})
+
+
+# ── 9. transient GitHub failures ─────────────────────────────────────────────
+
+
+class Flaky(FakeGitHub):
+    """The first `fail` artifact listings answer `error`; later ones answer as FakeGitHub does."""
+
+    def __init__(self, error: Exception, fail: int = 1, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.error = error
+        self.fail = fail
+
+    def paginate(self, path: str, key: str | None = None) -> list:
+        if self.fail > 0:
+            self.fail -= 1
+            raise self.error
+        return super().paginate(path, key)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [sg.GitHubError(502, "/x"), sg.GitHubError(429, "/x"), sg.GitHubUnavailable("GET /x: connection reset")],
+    ids=["5xx", "429", "network"],
+)
+def test_a_transient_failure_is_retried_on_the_next_pass(error: Exception) -> None:
+    github = Flaky(error, verdict_after=0)
+    clock = Clock(AFTER_MERGE)
+    outcome = run(github, clock)
+    assert outcome["done"] is True and outcome["result"] == "green"
+    assert clock.slept == [240]
+
+
+def test_transient_failures_still_end_at_the_close() -> None:
+    github = Flaky(sg.GitHubError(503, "/x"), fail=10**6)
+    clock = Clock(dt.datetime(2026, 10, 10, 13, 0, tzinfo=UTC))
+    outcome = run(github, clock)
+    assert outcome == {"done": True, "result": None, "run_id": None, "dispatches": 0}
+    assert clock.at == dt.datetime(2026, 10, 10, 13, 25, tzinfo=UTC)
+
+
+@pytest.mark.parametrize("status", [401, 403, 404])
+def test_a_credential_or_permission_failure_is_not_retried(status: int) -> None:
+    class Refused(FakeGitHub):
+        def post(self, path: str, body: dict) -> None:
+            raise sg.GitHubError(status, path, "POST")
+
+    clock = Clock(AFTER_MERGE)
+    with pytest.raises(sg.GitHubError):
+        run(Refused(), clock)
+    assert clock.slept == []
+
+
+def test_an_unreadable_verdict_is_not_retried() -> None:
+    class Garbled(FakeGitHub):
+        def download(self, url: str) -> bytes:
+            return b"not a zip"
+
+    with pytest.raises(sg.InfrastructureError):
+        run(Garbled(verdict_after=0), Clock(AFTER_MERGE))
+
+
+@pytest.mark.parametrize("raised", [ConnectionResetError("reset"), http.client.IncompleteRead(b"x"), http.client.RemoteDisconnected("gone")])
+def test_a_dropped_connection_is_github_unavailable(monkeypatch, raised: Exception) -> None:
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            raise raised
+
+    monkeypatch.setattr(sg.urllib.request, "urlopen", lambda request, timeout: Response())
+    with pytest.raises(sg.GitHubUnavailable):
+        sg.GitHub(token="t").get("/repos/x")
+    monkeypatch.setattr(sg.urllib.request, "urlopen", lambda request, timeout: (_ for _ in ()).throw(raised))
+    with pytest.raises(sg.GitHubUnavailable):
         sg.GitHub(token="t").post(DISPATCH, {"ref": "main"})
