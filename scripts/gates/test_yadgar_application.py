@@ -92,6 +92,10 @@ CI job, never in the offline pre-commit hook.
       `NATS_TLS_ENABLED` "1", `NATS_TLS_CA_FILE` and the client cert/key
       env, a `nats-ca` volume and mount from `nats-tls`, and iam's own
       `nats-client-cert` volume and mount from `iam-client-tls`).
+      Re-measured 2026-10-10 at 0.23.2 with `allow_non_tls` dropped
+      (B-N4.3, ledger 925): 90 objects, none added or removed, 2 changed
+      (`ConfigMap/nats-config` loses `allow_non_tls`; `StatefulSet/nats`
+      gets a new `checksum/config`).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
@@ -871,14 +875,13 @@ def test_an_unpinned_hop_on_a_server_names_it(rendered: list) -> None:
 # turned `verify` on early would pass K3. platform 0.2.1's own render check
 # holds that its two sources agree; it cannot know this estate's step.
 #
-# THE STEP IS B-N4.2: the listener speaks TLS with the `nats-tls` serving leaf
-# and still admits plaintext (`allow_non_tls`, B-N4.1), and both clients now
-# dial it with TLS (`CLIENT_HOPS` above, B-N4.2). nats-server has no optional
-# client-certificate mode, so `verify` and `ca_file` stay absent until B-N5
-# (ADR-0854). `allow_non_tls` is pinned to the hops, not to a literal: while
-# any NATS hop is in `CLEARTEXT_HOPS` it must be true, and B-N4.3 drops it once
-# none is. From B-N4.2 none is, so this gate no longer requires it; K3 still
-# holds the rendered `true` until B-N4.3 changes it on purpose.
+# THE STEP IS B-N4.3: the listener speaks TLS with the `nats-tls` serving leaf
+# (B-N4.1), both clients dial it with TLS (`CLIENT_HOPS` above, B-N4.2), and it
+# refuses plaintext (`allow_non_tls` dropped, B-N4.3). nats-server has no
+# optional client-certificate mode, so `verify` and `ca_file` stay absent until
+# B-N5 (ADR-0854). `allow_non_tls` is pinned to the hops, not to a literal:
+# while any NATS hop is in `CLEARTEXT_HOPS` it must be true (a revert of B-N4.2
+# needs it back), and while none is it must be absent or false.
 NATS_STATED = {"enabled": True, "clientAuth": "off"}
 NATS_CERT_DIR = "/etc/nats-certs/nats"
 NATS_SECRET = "nats-tls"
@@ -909,6 +912,8 @@ def broker_failures(documents: list) -> dict[str, object]:
         failures[f"nats: allow_non_tls while {', '.join(cleartext_clients)} dial in cleartext"] = conf.get(
             "allow_non_tls"
         )
+    if not cleartext_clients and conf.get("allow_non_tls", False) is not False:
+        failures["nats: allow_non_tls with no NATS hop in cleartext"] = conf["allow_non_tls"]
     pod = statefulset["spec"]["template"]["spec"]
     volume = next((v for v in pod.get("volumes") or [] if v["name"] == NATS_SECRET), None)
     if (volume or {}).get("secret", {}).get("secretName") != NATS_SECRET:
@@ -925,7 +930,7 @@ def test_the_broker_states_its_tls_posture() -> None:
     assert values["platform"]["nats"]["tls"] == NATS_STATED
 
 
-def test_the_broker_listens_with_its_leaf_and_still_admits_cleartext(rendered: list) -> None:
+def test_the_broker_listens_with_its_leaf_and_refuses_cleartext(rendered: list) -> None:
     assert broker_failures(rendered) == {}
 
 
@@ -947,10 +952,26 @@ def test_a_dropped_allow_non_tls_names_the_cleartext_clients(rendered: list, mon
     }
 
 
-def test_no_nats_hop_in_cleartext_leaves_allow_non_tls_to_b_n4_3(rendered: list) -> None:
-    """B-N4.2 moved both NATS hops to `CLIENT_HOPS`, so dropping `allow_non_tls` (B-N4.3) is permitted here."""
+def test_with_no_nats_hop_in_cleartext_a_kept_allow_non_tls_names_it(rendered: list) -> None:
+    """B-N4.3: with every NATS hop in `CLIENT_HOPS`, the broker must refuse cleartext, so `allow_non_tls` is gone."""
     assert not any("NATS" in hops for hops in CLEARTEXT_HOPS.values())
-    change = with_nats_conf(lambda conf: conf.pop("allow_non_tls", None))
+    change = with_nats_conf(lambda conf: conf.update(allow_non_tls=True))
+    assert broker_failures(mutated(rendered, "ConfigMap", "nats-config", change)) == {
+        "nats: allow_non_tls with no NATS hop in cleartext": True
+    }
+
+
+def test_a_non_boolean_allow_non_tls_names_it(rendered: list) -> None:
+    """Only absent or `false` is the refusing posture; a string the server may read as true is not."""
+    change = with_nats_conf(lambda conf: conf.update(allow_non_tls="true"))
+    assert broker_failures(mutated(rendered, "ConfigMap", "nats-config", change)) == {
+        "nats: allow_non_tls with no NATS hop in cleartext": "true"
+    }
+
+
+def test_an_explicit_false_allow_non_tls_is_the_refusing_posture(rendered: list) -> None:
+    """`false` is nats-server's default, so it states the same refusal as the absent key."""
+    change = with_nats_conf(lambda conf: conf.update(allow_non_tls=False))
     assert broker_failures(mutated(rendered, "ConfigMap", "nats-config", change)) == {}
 
 
