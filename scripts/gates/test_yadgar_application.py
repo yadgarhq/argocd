@@ -545,29 +545,15 @@ CLIENT_HOPS = {
     "task": ("TASK_DB",),
     "project": ("PROJECT_DB",),
 }
-# THE HOPS A CALLER DIALS IN CLEARTEXT, BY DESIGN, UNTIL THEIR HOP STEP (PB-3).
-# gateway 0.12.0 and iam 0.11.0 (parent 0.23.1) render `NATS_TLS_ENABLED` and
-# gateway `VALKEY_TLS_ENABLED`, both "0", from the explicit `tls.enabled:
-# false` this file states. They are pinned here, not in `CLIENT_HOPS`, because
-# `CLIENT_HOPS` asserts "1" and a presented leaf, which a hop that is off does
-# not have. ADR-0885's iam/NATS entry lands here first; each hop MOVES to
-# `CLIENT_HOPS` in the values PR that turns it on (B-N4.2 for NATS, B-V4.2 for
-# valkey). B-N4.2 (ledger 925, ADR-0890) moved gateway/NATS and iam/NATS: each
-# presents its leaf to the broker, gateway its one shared `gateway-client-tls`
-# and iam its own `nats.tls.clientCertSecret` (ADR-0885). B-V4.2 (ledger 925,
-# ADR-0890) moved gateway/VALKEY: the gateway presents the same shared
-# `gateway-client-tls` leaf to the cache and dials its TLS listener on 6380.
-# While a hop is off its chart renders the `_ENABLED` "0" line and
-# nothing else: no other `<PREFIX>_TLS_*` env, and no volume projecting the
-# server leaf whose `ca.crt` it would trust (the value named beside each).
-#
-# THE MAP IS EMPTY FROM B-V4.2 AND IS KEPT. Every hop now presents a leaf, so
-# the check below has nothing to hold in this render; its tests hold it by
-# putting gateway/VALKEY back, which is the state a revert of B-V4.2 renders.
-# Deleting the map and its check is ADR-0890's own decision, not this step's.
-CLEARTEXT_HOPS: dict[str, dict[str, str]] = {}
-# The hop B-V4.2 moved, as it sat here before; its tests put it back.
-GATEWAY_VALKEY_CLEARTEXT = {"VALKEY": "valkey-tls"}
+# A CALLER DIALED EVERY HOP ABOVE IN CLEARTEXT UNTIL ITS HOP STEP (PB-3, ledger
+# 925): `CLEARTEXT_HOPS` and its check (`cleartext_failures`) held that interim
+# posture, and `GATEWAY_VALKEY_CLEARTEXT` was its last entry (gateway/VALKEY,
+# moved to `CLIENT_HOPS` by B-V4.2). ADR-0890 retired both once the ledger 925
+# train closed (B-V4.3, B-N4.3): a caller in this map cannot return without
+# first reverting the hop step that moved it out, so the interim state the map
+# existed to hold is unreachable again. `pinned_hops` below now names every
+# hop (`CLIENT_HOPS` alone), and `cache_failures`/`broker_failures` assert the
+# final posture unconditionally — see ledger 925 post-close cleanup (ADR-0890).
 # The cert-manager Issuer (not its Secret) every client leaf is issued from.
 LEAF_ISSUER = {"group": "cert-manager.io", "kind": "Issuer", "name": "yadgar-internal-ca"}
 # Each env half and the leaf key the volume must project to that file.
@@ -624,42 +610,12 @@ def env_value(documents: list, kind: str, name: str, variable: str) -> object:
 
 
 def pinned_hops() -> set[tuple[str, str, str]]:
-    """Every hop this file names, presented (`CLIENT_HOPS`) or cleartext (`CLEARTEXT_HOPS`)."""
+    """Every hop this file names (`CLIENT_HOPS`)."""
     return {
         ("Deployment", caller, prefix)
-        for hops in (CLIENT_HOPS, CLEARTEXT_HOPS)
-        for caller, prefixes in hops.items()
+        for caller, prefixes in CLIENT_HOPS.items()
         for prefix in prefixes
     }
-
-
-def cleartext_failures(documents: list) -> dict[str, object]:
-    """Every `CLEARTEXT_HOPS` hop that renders more than its "0" switch, keyed `<caller>/<PREFIX>: <what>`."""
-    deployments = {d["metadata"]["name"]: d for d in documents if d["kind"] == "Deployment"}
-    failures: dict[str, object] = {}
-    for caller, hops in CLEARTEXT_HOPS.items():
-        deployment = deployments.get(caller)
-        if deployment is None:
-            failures[f"{caller}: Deployment"] = None
-            continue
-        pod = deployment["spec"]["template"]["spec"]
-        env = {
-            e["name"]: e.get("value")
-            for key in CONTAINER_LISTS
-            for container in pod.get(key) or []
-            for e in container.get("env") or []
-        }
-        for prefix, server_leaf in hops.items():
-            hop = f"{caller}/{prefix}"
-            switch = f"{prefix}_TLS_ENABLED"
-            if env.get(switch) != "0":
-                failures[f"{hop}: {switch}"] = env.get(switch)
-            for name in sorted(n for n in env if n.startswith(f"{prefix}_TLS_") and n != switch):
-                failures[f"{hop}: {name}"] = env[name]
-            for volume in pod.get("volumes") or []:
-                if (volume.get("secret") or {}).get("secretName") == server_leaf:
-                    failures[f"{hop}: volume {volume['name']}"] = server_leaf
-    return failures
 
 
 def client_identity_failures(documents: list) -> dict[str, object]:
@@ -847,63 +803,6 @@ def test_the_rendered_client_hops_are_exactly_the_pinned_hops(rendered: list) ->
     assert rendered_client_hops(rendered) == pinned_hops()
 
 
-def test_every_cleartext_hop_renders_its_switch_off_and_nothing_else(rendered: list) -> None:
-    assert cleartext_failures(rendered) == {}
-
-
-def test_no_hop_dials_in_cleartext() -> None:
-    """B-V4.2 moved the last one, gateway/VALKEY, to `CLIENT_HOPS` (ADR-0890)."""
-    assert CLEARTEXT_HOPS == {}
-    assert "VALKEY" in CLIENT_HOPS["gateway"]
-
-
-@pytest.fixture(scope="module")
-def rendered_valkey_off() -> list:
-    """The render a revert of B-V6, B-V5, B-V4.3 and B-V4.2 produces: client auth off, 6379 open, gateway's switch off.
-
-    The parent refuses `plaintext: false`, and `clientAuth` other than "off", with gateway's switch off, so
-    B-V4.2 alone no longer reverts.
-    """
-    overrides = (
-        *("--set", "gateway.valkey.tls.enabled=false"),
-        *("--set", "platform.valkey.tls.plaintext=true"),
-        *("--set-string", "platform.valkey.tls.clientAuth=off"),
-    )
-    return [d for d in parent_render(REPOSITORY, overrides) if isinstance(d, dict) and d.get("kind")]
-
-
-def test_a_reverted_valkey_hop_renders_its_switch_off_and_nothing_else(rendered_valkey_off: list, monkeypatch) -> None:
-    """The check still holds a cleartext hop exactly, if B-V6 through B-V4.2 are reverted and gateway/VALKEY comes back."""
-    monkeypatch.setitem(CLEARTEXT_HOPS, "gateway", GATEWAY_VALKEY_CLEARTEXT)
-    assert cleartext_failures(rendered_valkey_off) == {}
-
-
-def test_this_render_names_every_part_of_the_valkey_hop_as_not_cleartext(rendered: list, monkeypatch) -> None:
-    """With gateway/VALKEY back in `CLEARTEXT_HOPS`, B-V4.2's render is everything the check refuses."""
-    monkeypatch.setitem(CLEARTEXT_HOPS, "gateway", GATEWAY_VALKEY_CLEARTEXT)
-    assert cleartext_failures(rendered) == {
-        "gateway/VALKEY: VALKEY_TLS_ENABLED": "1",
-        "gateway/VALKEY: VALKEY_TLS_CA_FILE": "/var/run/config/valkey-ca/ca.pem",
-        "gateway/VALKEY: VALKEY_TLS_CLIENT_CERT_FILE": "/var/run/secrets/client-cert/client.crt",
-        "gateway/VALKEY: VALKEY_TLS_CLIENT_KEY_FILE": "/var/run/secrets/client-cert/client.key",
-        "gateway/VALKEY: volume valkey-ca": "valkey-tls",
-    }
-
-
-def test_a_server_leaf_volume_on_a_cleartext_hop_names_its_hop(rendered_valkey_off: list, monkeypatch) -> None:
-    """gateway's own `nats-ca` volume (B-N4.2) projects `nats-tls`, which is not the valkey hop's leaf."""
-    monkeypatch.setitem(CLEARTEXT_HOPS, "gateway", GATEWAY_VALKEY_CLEARTEXT)
-
-    def mount_valkey_ca(deployment: dict) -> None:
-        deployment["spec"]["template"]["spec"]["volumes"].append(
-            {"name": "valkey-ca", "secret": {"secretName": "valkey-tls"}}
-        )
-
-    assert cleartext_failures(mutated(rendered_valkey_off, "Deployment", "gateway", mount_valkey_ca)) == {
-        "gateway/VALKEY: volume valkey-ca": "valkey-tls"
-    }
-
-
 def test_a_cache_hop_flipped_to_cleartext_names_its_hop(rendered: list) -> None:
     change = set_env("VALKEY_TLS_ENABLED", "0")
     assert client_identity_failures(mutated(rendered, "Deployment", "gateway", change)) == {
@@ -962,12 +861,11 @@ def test_an_unpinned_hop_on_a_server_names_it(rendered: list) -> None:
 # (`CLIENT_HOPS` above, B-N4.2), it refuses plaintext (`allow_non_tls`
 # dropped, B-N4.3), and it verifies every client's leaf (B-N5): `verify` a
 # bool true and `ca_file` the `ca.crt` beside the serving leaf. nats-server has
-# no optional client-certificate mode (ADR-0854), so both are pinned to the
-# hops, not to a literal: while any NATS hop is in `CLEARTEXT_HOPS` they must be
-# absent (a cleartext client presents no leaf, so a revert of B-N4.2 needs a
-# revert of B-N5 first), and while none is they must be set.
-# `allow_non_tls` follows the same hops: true while any is cleartext, absent or
-# false while none is.
+# no optional client-certificate mode (ADR-0854). Both were pinned to the
+# hops rather than a literal while any NATS hop could sit in `CLEARTEXT_HOPS`;
+# ADR-0890 retired that map at ledger 925's close (B-N4.3), so both are
+# required unconditionally now, and `allow_non_tls` is unconditionally absent
+# or false.
 NATS_STATED = {"enabled": True, "clientAuth": "required"}
 NATS_CERT_DIR = "/etc/nats-certs/nats"
 NATS_SECRET = "nats-tls"
@@ -990,21 +888,11 @@ def broker_failures(documents: list) -> dict[str, object]:
     for key, file in (("cert_file", "tls.crt"), ("key_file", "tls.key")):
         if tls.get(key) != f"{NATS_CERT_DIR}/{file}":
             failures[f"nats: tls.{key}"] = tls.get(key)
-    cleartext_clients = sorted(caller for caller, hops in CLEARTEXT_HOPS.items() if "NATS" in hops)
-    if cleartext_clients:
-        for key in ("verify", "ca_file"):
-            if key in tls:
-                failures[f"nats: tls.{key} while {', '.join(cleartext_clients)} dial in cleartext"] = tls[key]
-    else:
-        if tls.get("verify") is not True:
-            failures["nats: tls.verify with no NATS hop in cleartext"] = tls.get("verify")
-        if tls.get("ca_file") != f"{NATS_CERT_DIR}/ca.crt":
-            failures["nats: tls.ca_file with no NATS hop in cleartext"] = tls.get("ca_file")
-    if cleartext_clients and conf.get("allow_non_tls") is not True:
-        failures[f"nats: allow_non_tls while {', '.join(cleartext_clients)} dial in cleartext"] = conf.get(
-            "allow_non_tls"
-        )
-    if not cleartext_clients and conf.get("allow_non_tls", False) is not False:
+    if tls.get("verify") is not True:
+        failures["nats: tls.verify with no NATS hop in cleartext"] = tls.get("verify")
+    if tls.get("ca_file") != f"{NATS_CERT_DIR}/ca.crt":
+        failures["nats: tls.ca_file with no NATS hop in cleartext"] = tls.get("ca_file")
+    if conf.get("allow_non_tls", False) is not False:
         failures["nats: allow_non_tls with no NATS hop in cleartext"] = conf["allow_non_tls"]
     pod = statefulset["spec"]["template"]["spec"]
     volume = next((v for v in pod.get("volumes") or [] if v["name"] == NATS_SECRET), None)
@@ -1035,24 +923,8 @@ def with_nats_conf(change):
     return apply
 
 
-def test_a_dropped_allow_non_tls_names_the_cleartext_clients(rendered: list, monkeypatch) -> None:
-    """The clause still reddens while a NATS hop dials in cleartext, as it did before B-N4.2 (or after its revert)."""
-    monkeypatch.setitem(CLEARTEXT_HOPS, "iam", {"NATS": "nats-tls"})
-
-    def change(conf: dict) -> None:
-        conf.pop("allow_non_tls", None)
-        conf["tls"].pop("verify", None)  # a revert of B-N4.2 follows a revert of B-N5
-        conf["tls"].pop("ca_file", None)
-
-    change = with_nats_conf(change)
-    assert broker_failures(mutated(rendered, "ConfigMap", "nats-config", change)) == {
-        "nats: allow_non_tls while iam dial in cleartext": None
-    }
-
-
 def test_with_no_nats_hop_in_cleartext_a_kept_allow_non_tls_names_it(rendered: list) -> None:
     """B-N4.3: with every NATS hop in `CLIENT_HOPS`, the broker must refuse cleartext, so `allow_non_tls` is gone."""
-    assert not any("NATS" in hops for hops in CLEARTEXT_HOPS.values())
     change = with_nats_conf(lambda conf: conf.update(allow_non_tls=True))
     assert broker_failures(mutated(rendered, "ConfigMap", "nats-config", change)) == {
         "nats: allow_non_tls with no NATS hop in cleartext": True
@@ -1085,7 +957,6 @@ def test_a_dropped_tls_block_names_both_files_and_the_verification(rendered: lis
 
 def test_a_dropped_verify_names_it(rendered: list) -> None:
     """B-N5: with every NATS hop in `CLIENT_HOPS`, the broker verifies every client's leaf."""
-    assert not any("NATS" in hops for hops in CLEARTEXT_HOPS.values())
     change = with_nats_conf(lambda conf: conf["tls"].pop("verify", None))
     assert broker_failures(mutated(rendered, "ConfigMap", "nats-config", change)) == {
         "nats: tls.verify with no NATS hop in cleartext": None
@@ -1109,16 +980,6 @@ def test_a_ca_file_other_than_the_leafs_ca_names_it(rendered: list) -> None:
     }
 
 
-def test_verify_while_a_nats_hop_dials_in_cleartext_names_it(rendered: list, monkeypatch) -> None:
-    """A revert of B-N4.2 puts a client back in cleartext; it presents no leaf, so `verify` must go with it."""
-    monkeypatch.setitem(CLEARTEXT_HOPS, "iam", {"NATS": "nats-tls"})
-    change = with_nats_conf(lambda conf: conf.update(allow_non_tls=True))
-    assert broker_failures(mutated(rendered, "ConfigMap", "nats-config", change)) == {
-        "nats: tls.verify while iam dial in cleartext": True,
-        "nats: tls.ca_file while iam dial in cleartext": f"{NATS_CERT_DIR}/ca.crt",
-    }
-
-
 def test_the_leaf_volume_at_another_secret_names_it(rendered: list) -> None:
     def change(statefulset: dict) -> None:
         volume = next(v for v in statefulset["spec"]["template"]["spec"]["volumes"] if v["name"] == NATS_SECRET)
@@ -1130,8 +991,8 @@ def test_the_leaf_volume_at_another_secret_names_it(rendered: list) -> None:
 
 # ── THE CACHE'S TLS LISTENER (B-V4.1, ledger 925, ADR-0852) ──────────────────
 
-# The server's side of the valkey hop, stated beside the gateway's side above
-# (`CLEARTEXT_HOPS`). K3 cannot hold this: `--write` blesses whatever renders,
+# The server's side of the valkey hop, stated beside the gateway's side above.
+# K3 cannot hold this: `--write` blesses whatever renders,
 # so a values change that turned the TLS listener off, pointed it at another
 # Secret, asked for client leaves early or closed 6379 while the gateway still
 # dials it would pass K3. platform 0.2.1's own render checks hold that its keys
@@ -1144,15 +1005,14 @@ def test_the_leaf_volume_at_another_secret_names_it(rendered: list) -> None:
 # and verified one that was presented (B-V5, `--tls-auth-clients optional`);
 # and valkey now requires one (B-V6, `--tls-auth-clients yes`, verified against
 # `ca.crt` beside the serving leaf): a client with no leaf is refused.
-# Plaintext is pinned to the hops, not to a literal: while any VALKEY hop is in
-# `CLEARTEXT_HOPS`, 6379 must be open on the Deployment, the Service and
-# `valkey-ingress`; while none is, 6379 must be ABSENT from all three and the
-# boot script must say `--port 0` (valkey-server listens on 6379 when `--port`
-# is absent). `VALKEY_TLS_AUTH_CLIENTS` is pinned to the hops the same way:
-# "no" while any VALKEY hop is in `CLEARTEXT_HOPS` (a cleartext client presents
-# no leaf, and the parent chart's `validate.yaml` refuses `clientAuth`
-# "optional" or "required" while gateway's `valkey.tls.enabled` is false), and
-# this step's value, `VALKEY_AUTH_CLIENTS`, while none is. valkey reads its leaf only at boot, so the boot script hashes
+# Plaintext was pinned to the hops rather than a literal while any VALKEY hop
+# could sit in `CLEARTEXT_HOPS`; ADR-0890 retired that map at ledger 925's
+# close (B-V4.3), so 6379 must now be ABSENT unconditionally from the
+# Deployment, the Service and `valkey-ingress`, and the boot script must say
+# `--port 0` (valkey-server listens on 6379 when `--port` is absent).
+# `VALKEY_TLS_AUTH_CLIENTS` is required unconditionally too, now that every
+# VALKEY hop presents a leaf: this step's value, `VALKEY_AUTH_CLIENTS`. valkey
+# reads its leaf only at boot, so the boot script hashes
 # the files it loaded and the liveness probe re-checks that hash: a renewed
 # leaf restarts the container (one more `Recreate`-sized cache gap).
 VALKEY_STATED = {"enabled": True, "clientAuth": "required", "plaintext": False}
@@ -1197,12 +1057,7 @@ def cache_failures(documents: list) -> dict[str, object]:
     if f"sha256sum -c --status {VALKEY_HASH}" not in liveness:
         failures["valkey: liveness hash check"] = liveness
     env = {e["name"]: e.get("value") for e in server.get("env") or []}
-    cleartext_clients = sorted(caller for caller, hops in CLEARTEXT_HOPS.items() if "VALKEY" in hops)
-    if cleartext_clients and env.get("VALKEY_TLS_AUTH_CLIENTS") != "no":
-        failures[f"valkey: VALKEY_TLS_AUTH_CLIENTS while {', '.join(cleartext_clients)} dial in cleartext"] = env.get(
-            "VALKEY_TLS_AUTH_CLIENTS"
-        )
-    if not cleartext_clients and env.get("VALKEY_TLS_AUTH_CLIENTS") != VALKEY_AUTH_CLIENTS:
+    if env.get("VALKEY_TLS_AUTH_CLIENTS") != VALKEY_AUTH_CLIENTS:
         failures["valkey: VALKEY_TLS_AUTH_CLIENTS with no VALKEY hop in cleartext"] = env.get("VALKEY_TLS_AUTH_CLIENTS")
     volume = next((v for v in pod.get("volumes") or [] if v["name"] == VALKEY_SECRET), None)
     if (volume or {}).get("secret", {}).get("secretName") != VALKEY_SECRET:
@@ -1210,7 +1065,7 @@ def cache_failures(documents: list) -> dict[str, object]:
     mount = {m["name"]: m["mountPath"] for m in server.get("volumeMounts") or []}.get(VALKEY_SECRET)
     if mount != VALKEY_TLS_DIR:
         failures["valkey: mount valkey-tls"] = mount
-    wanted = VALKEY_PORTS if cleartext_clients else {"valkey-tls": VALKEY_PORTS["valkey-tls"]}
+    wanted = {"valkey-tls": VALKEY_PORTS["valkey-tls"]}
     container_ports = {p.get("name"): p.get("containerPort") for p in server.get("ports") or []}
     service_ports = {p.get("name"): (p.get("port"), p.get("targetPort")) for p in service["spec"].get("ports") or []}
     allowed = {p.get("port") for rule in policy["spec"].get("ingress") or [] for p in rule.get("ports") or []}
@@ -1221,18 +1076,15 @@ def cache_failures(documents: list) -> dict[str, object]:
             failures[f"valkey: Service port {name}"] = service_ports.get(name)
         if port not in allowed:
             failures[f"valkey: valkey-ingress port {port}"] = sorted(allowed)
-    if cleartext_clients and f"--port {VALKEY_PORTS['valkey']}" not in script:
-        failures[f"valkey: --port 6379 while {', '.join(cleartext_clients)} dial in cleartext"] = None
-    if not cleartext_clients:
-        plaintext, closed = VALKEY_PORTS["valkey"], " with no VALKEY hop in cleartext"
-        if "valkey" in container_ports or plaintext in container_ports.values():
-            failures[f"valkey: containerPort 6379{closed}"] = None
-        if "valkey" in service_ports or any(port == plaintext for port, _ in service_ports.values()):
-            failures[f"valkey: Service port 6379{closed}"] = None
-        if plaintext in allowed:
-            failures[f"valkey: valkey-ingress port 6379{closed}"] = None
-        if plaintext_ports(script) != ["0"]:
-            failures[f"valkey: --port{closed}"] = plaintext_ports(script)
+    plaintext, closed = VALKEY_PORTS["valkey"], " with no VALKEY hop in cleartext"
+    if "valkey" in container_ports or plaintext in container_ports.values():
+        failures[f"valkey: containerPort 6379{closed}"] = None
+    if "valkey" in service_ports or any(port == plaintext for port, _ in service_ports.values()):
+        failures[f"valkey: Service port 6379{closed}"] = None
+    if plaintext in allowed:
+        failures[f"valkey: valkey-ingress port 6379{closed}"] = None
+    if plaintext_ports(script) != ["0"]:
+        failures[f"valkey: --port{closed}"] = plaintext_ports(script)
     return failures
 
 
@@ -1316,18 +1168,6 @@ def test_another_client_auth_names_it(rendered: list, value: str) -> None:
     }
 
 
-@pytest.mark.parametrize("value", ["optional", "yes"])
-def test_a_client_auth_while_a_hop_is_cleartext_names_the_cleartext_clients(
-    rendered_valkey_off: list, monkeypatch, value: str
-) -> None:
-    """A cleartext client presents no leaf: while gateway/VALKEY is in `CLEARTEXT_HOPS`, only "no" holds."""
-    monkeypatch.setitem(CLEARTEXT_HOPS, "gateway", GATEWAY_VALKEY_CLEARTEXT)
-    change = with_auth_clients(value)
-    assert cache_failures(mutated(rendered_valkey_off, "Deployment", "valkey", change)) == {
-        "valkey: VALKEY_TLS_AUTH_CLIENTS while gateway dial in cleartext": value
-    }
-
-
 def test_the_leaf_volume_at_another_secret_names_it_for_the_cache(rendered: list) -> None:
     def change(deployment: dict) -> None:
         volume = next(v for v in deployment["spec"]["template"]["spec"]["volumes"] if v["name"] == VALKEY_SECRET)
@@ -1372,7 +1212,7 @@ REOPENED = {
 
 @pytest.mark.parametrize("failure", sorted(REOPENED))
 def test_a_reopened_plaintext_port_names_it(rendered: list, failure: str) -> None:
-    """With no VALKEY hop in `CLEARTEXT_HOPS`, 6379 must be ABSENT everywhere (B-V4.3)."""
+    """6379 must be ABSENT everywhere (B-V4.3)."""
     kind, name, change = REOPENED[failure]
     assert list(cache_failures(mutated(rendered, kind, name, change))) == [failure]
 
@@ -1397,24 +1237,6 @@ def test_6379_reopened_everywhere_names_every_place(rendered: list) -> None:
         documents = mutated(documents, kind, name, change)
     documents = mutated(documents, "Deployment", "valkey", reopen_listener)
     assert sorted(cache_failures(documents)) == sorted([*REOPENED, "valkey: --port with no VALKEY hop in cleartext"])
-
-
-def test_a_closed_plaintext_port_names_the_cleartext_clients(rendered: list, monkeypatch) -> None:
-    """The clauses still redden while a VALKEY hop dials in cleartext: this render closes 6379 and requires leaves."""
-    monkeypatch.setitem(CLEARTEXT_HOPS, "gateway", GATEWAY_VALKEY_CLEARTEXT)
-    assert cache_failures(rendered) == {
-        "valkey: containerPort valkey": None,
-        "valkey: Service port valkey": None,
-        "valkey: valkey-ingress port 6379": [6380],
-        "valkey: --port 6379 while gateway dial in cleartext": None,
-        "valkey: VALKEY_TLS_AUTH_CLIENTS while gateway dial in cleartext": "yes",
-    }
-
-
-def test_a_reverted_cache_with_its_cleartext_client_passes(rendered_valkey_off: list, monkeypatch) -> None:
-    """A revert of B-V6 through B-V4.2 reopens 6379 for gateway/VALKEY back in `CLEARTEXT_HOPS`; the gate holds it."""
-    monkeypatch.setitem(CLEARTEXT_HOPS, "gateway", GATEWAY_VALKEY_CLEARTEXT)
-    assert cache_failures(rendered_valkey_off) == {}
 
 
 def test_a_closed_tls_port_on_the_policy_names_it(rendered: list) -> None:
