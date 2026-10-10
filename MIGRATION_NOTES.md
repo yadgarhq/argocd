@@ -6117,3 +6117,98 @@ Break-glass, NEEDS-MAX, faster than a revert: suspend auto-sync on `yadgar`;
 `kubectl --context kind-yadgar -n yadgar edit cm nats-config` → `verify:
 false` (keep `ca_file`). The `tls` block is hot-reloadable, so the reloader
 applies it without a roll. Then revert in git; that revert rolls nats-0.
+
+## B-V4.1: the cache listens with TLS on 6380 beside plaintext 6379 (ledger 925)
+
+**What the merge does.** In `applications/yadgar.yaml`, `platform.valkey.tls`
+moves to `{ enabled: true, clientAuth: "off", plaintext: true }`. The pin
+stays 0.23.2 (platform 0.2.1). The gateway keeps `valkey.tls.enabled: false`
+and still dials `valkey:6379` in cleartext with the password; B-V4.2 turns it
+on. In the argocd gate, a new `cache_failures` pins the server's posture: the
+TLS args and files under `/etc/valkey/tls` from Secret `valkey-tls`, the boot
+hash and the liveness hash check, `VALKEY_TLS_AUTH_CLIENTS` "no", port
+`valkey-tls` 6380 on the Deployment, the Service and `valkey-ingress`, and,
+while gateway/VALKEY is in `CLEARTEXT_HOPS`, port 6379 on all three.
+
+Measured 2026-10-10 with helm 3.18.4 at 0.23.2 (K3): 90 → 90 objects, 0
+added, 0 removed, 3 changed: `Deployment/valkey` (boot line
+`sha256sum /etc/valkey/tls/tls.crt /etc/valkey/tls/tls.key /etc/valkey/tls/ca.crt > /run/valkey/tls.sha256`;
+`--tls-port 6380`, `--tls-cert-file`, `--tls-key-file`, `--tls-ca-cert-file`,
+`--tls-auth-clients "$VALKEY_TLS_AUTH_CLIENTS"`; env
+`VALKEY_TLS_AUTH_CLIENTS=no`; liveness gains
+`&& sha256sum -c --status /run/valkey/tls.sha256`; containerPort
+`valkey-tls` 6380; the `valkey-tls` Secret volume at `/etc/valkey/tls`),
+`Service/valkey` (port `valkey-tls` 6380) and `NetworkPolicy/valkey-ingress`
+(gateway → 6380 beside 6379). `kubectl --context kind-yadgar apply
+--dry-run=server` accepts all three.
+
+The plan text names `/etc/valkey-tls/{tls.crt,ca.crt}` and `loaded.sha`.
+platform 0.2.1 renders `/etc/valkey/tls/` and `tls.sha256`, and hashes
+`tls.key` too. The render is what runs.
+
+**Pre-merge, measured 2026-10-10 03:08Z (after B-N5 synced):** `yadgar`
+Synced/Healthy. `Certificate/valkey-tls` Ready, issuer `yadgar-internal-ca`,
+SANs `valkey`, `valkey.yadgar`, `valkey.yadgar.svc`,
+`valkey.yadgar.svc.cluster.local`, EKU serverAuth, expires 2027-01-06. Secret
+`valkey-tls` holds `ca.crt`, `tls.crt`, `tls.key`. valkey 1/1, 0 restarts.
+Both gateway pods log `rate limiting enabled (D74)` with `addr` `valkey:6379`,
+`"tls":false`, `"authenticated":true`. `yadgar_gateway_rate_limit_degraded_total`
+is absent (registered lazily on the first degraded call).
+
+**What runs.** `Recreate`: the old valkey pod stops, then the new one starts.
+The cache is empty after. During the gap the gateway's rate limiter degrades
+to its per-replica floor and counts `yadgar_gateway_rate_limit_degraded_total`.
+The gateway's `redis` `ConnectionManager` reconnects on the next call
+(gateway `src/limit/valkey.rs`); the gateway does not roll.
+
+### Before this merge — read-only (`--context kind-yadgar` on every line)
+
+```bash
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o custom-columns=REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase
+kubectl --context kind-yadgar -n yadgar get pods -l app.kubernetes.io/name=valkey
+kubectl --context kind-yadgar -n yadgar get certificate valkey-tls
+kubectl --context kind-yadgar get --raw "/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=yadgar_gateway_rate_limit_degraded_total"
+```
+
+### After this merge — go/no-go, read-only
+
+```bash
+# 1. yadgar Synced/Healthy, operation Succeeded; valkey 1/1 on a NEW pod, 0 restarts.
+kubectl --context kind-yadgar -n yadgar get pods -l app.kubernetes.io/name=valkey
+# 2. The new pod listens on tcp, tls and unix.
+kubectl --context kind-yadgar -n yadgar logs deploy/valkey | grep -E "Ready to accept connections|TLS|tls|Failed|Error"
+# 3. No Unhealthy / BackOff events on the new pod.
+kubectl --context kind-yadgar -n yadgar get events --field-selector involvedObject.kind=Pod --sort-by=.lastTimestamp | grep valkey
+# 4. The gateway still dials 6379 in cleartext (unchanged pods, no roll).
+kubectl --context kind-yadgar -n yadgar logs -l app=gateway --since=6h | grep "rate limiting enabled"
+# 5. Degradation: absent, or no increase within 60 s of the new pod's Ready.
+kubectl --context kind-yadgar get --raw "/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=increase(yadgar_gateway_rate_limit_degraded_total%5B1m%5D)"
+```
+
+6. Fresh login (`POST /auth/login`, estate C-01) answers 200.
+7. TLS listener probe, NEEDS-MAX (never from a pod labelled `app: gateway`;
+   such a pod takes real traffic):
+   ```bash
+   kubectl --context kind-yadgar -n yadgar port-forward pod/<new-valkey-pod> 16380:6380
+   kubectl --context kind-yadgar -n yadgar get secret valkey-tls -o jsonpath='{.data.ca\.crt}' | base64 -d > /tmp/valkey-ca.crt
+   nix shell nixpkgs#openssl -c openssl s_client -connect 127.0.0.1:16380 -servername valkey \
+     -CAfile /tmp/valkey-ca.crt -verify_return_error </dev/null
+   ```
+   Expect `Verify return code: 0 (ok)` and subject `CN=valkey`. Then
+   `valkey-cli --tls --cacert /tmp/valkey-ca.crt --sni valkey -h 127.0.0.1 -p 16380 PING`
+   with no password → `NOAUTH`: the TLS listener answers, and the password
+   still gates it.
+
+No-go: valkey not 1/1 or restarting (a TLS or hash boot failure), an
+Unhealthy event on the new pod, or the degradation counter still increasing
+2 minutes after the new pod's Ready.
+
+### Rollback — a revert
+
+If `yadgar`'s operation is still Running or retrying, end it first.
+NEEDS-MAX: `argocd app terminate-op yadgar`. Then revert the merge. The revert
+is another `Recreate`: one more cache gap. Under `Recreate` the old pod is
+already gone, so a new pod that crash-loops leaves the cache down and the
+gateway on its floor until the revert syncs. Do NOT use the
+`VALKEY_TLS_AUTH_CLIENTS` break-glass here: it does not turn TLS off.

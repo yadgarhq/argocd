@@ -438,7 +438,15 @@ spec:
             # a bare `off` is YAML 1.1's false, which the chart refuses by name.
             # `plaintext: true` keeps the cleartext port 6379 every client dials today.
             # The valkey Deployment is `Recreate`, so any change here empties the cache.
-            tls: { enabled: false, clientAuth: "off", plaintext: true }
+            #
+            # B-V4.1 (ledger 925): THE CACHE LISTENS WITH TLS ON 6380 BESIDE PLAINTEXT
+            # 6379. The serving leaf is `valkey-tls` (SANs `valkey`, `valkey.yadgar`,
+            # ...). The gateway still dials 6379 in cleartext (`valkey.tls.enabled:
+            # false` above) until B-V4.2; B-V4.3 sets `plaintext: false`; B-V5 and
+            # B-V6 move `clientAuth` to "optional" and "required". valkey loads its
+            # leaf only at boot: the boot script hashes it and liveness re-checks the
+            # hash, so a renewal restarts the container (a cache gap, as here).
+            tls: { enabled: true, clientAuth: "off", plaintext: true }
 
           # ── THE INTERNAL CA AND ITS TEN LEAVES: THE PARENT'S, AS OF STEP 5 ─────────
           # `infra/internal-tls-app.yaml` and `infra/internal-tls/` were deleted in the
