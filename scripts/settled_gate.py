@@ -905,7 +905,7 @@ def run_judge(
     return 1 if verdict["result"] == "red" else 0
 
 
-# ── GitHub, read-only: find-verdict and reachable ────────────────────────────
+# ── GitHub: find-verdict and reachable read; settled_dispatch.py posts ───────
 
 GITHUB_API = "https://api.github.com"
 # Estate's verdict job reads at most this many candidates (its MAX_VERDICT_CANDIDATES); the gate matches it.
@@ -916,28 +916,40 @@ VERDICT_EVENTS = frozenset({"schedule", "workflow_dispatch"})
 class GitHubError(InfrastructureError):
     """A GitHub API call that did not answer 2xx."""
 
-    def __init__(self, status: int, path: str) -> None:
-        super().__init__(f"GET {path}: HTTP {status}")
+    def __init__(self, status: int, path: str, method: str = "GET") -> None:
+        super().__init__(f"{method} {path}: HTTP {status}")
         self.status = status
 
 
 class GitHub:
-    """GET-only GitHub REST client. The token (from GITHUB_TOKEN) is never printed and never follows a redirect."""
+    """GitHub REST client: GET, plus the one POST `settled_dispatch.py` sends (a workflow dispatch).
+
+    The token (from GITHUB_TOKEN) is never printed and never follows a redirect.
+    Every command in this file only reads; `post` is used by `settled_dispatch.py` alone.
+    """
 
     def __init__(self, token: str | None = None) -> None:
         self.token = token if token is not None else os.environ.get("GITHUB_TOKEN")
 
-    def _request(self, url: str):
-        request = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+    def _request(self, url: str, body: dict | None = None):
+        method = "GET" if body is None else "POST"
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(url, data=data, method=method, headers={"Accept": "application/vnd.github+json"})
+        if data is not None:
+            request.add_header("Content-Type", "application/json")
         if self.token:
             # Unredirected: an artifact download redirects to blob storage, which must not see the token.
             request.add_unredirected_header("Authorization", f"Bearer {self.token}")
         try:
             return urllib.request.urlopen(request, timeout=30)  # only GITHUB_API and its artifact redirects
         except urllib.error.HTTPError as error:
-            raise GitHubError(error.code, url.removeprefix(GITHUB_API)) from error
+            raise GitHubError(error.code, url.removeprefix(GITHUB_API), method) from error
         except (urllib.error.URLError, TimeoutError) as error:
-            raise InfrastructureError(f"GET {url.removeprefix(GITHUB_API)}: {error}") from error
+            raise InfrastructureError(f"{method} {url.removeprefix(GITHUB_API)}: {error}") from error
+
+    def post(self, path: str, body: dict) -> None:
+        with self._request(GITHUB_API + path, body) as response:
+            response.read()
 
     def get(self, path: str):
         with self._request(GITHUB_API + path) as response:
