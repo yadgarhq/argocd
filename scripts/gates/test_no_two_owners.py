@@ -1965,7 +1965,10 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # ("this chart version declares the key; B-N2 / B-V2 renders it"), so the
 # previous pin cannot render B-N4.1's values. Both sides get the TLS switch and
 # the upstream listener key off, and no `secretName` (B-N4.3 dropped
-# `allow_non_tls` from the values, so it needs no override). The broker's
+# `allow_non_tls` from the values, so it needs no override). From B-N5 both
+# sides also get `clientAuth` "off" and no upstream `verify` or `ca_file`:
+# 0.19.1 refuses `required` by name, and current platform refuses `verify`
+# under "off". The broker's
 # posture is gated by `test_yadgar_application.py`'s `broker_failures`
 # and by K3.
 #
@@ -1987,6 +1990,9 @@ PIN_ALONE_OVERRIDES: tuple[str, ...] = (
     *("--set", "platform.nats.tls.enabled=false"),
     *("--set", "platform.nats.config.nats.tls.enabled=false"),
     *("--set", "platform.nats.config.nats.tls.secretName=null"),
+    *("--set-string", "platform.nats.tls.clientAuth=off"),
+    *("--set", "platform.nats.config.nats.tls.merge.verify=null"),
+    *("--set", "platform.nats.config.nats.tls.merge.ca_file=null"),
     *("--set", "gateway.nats.tls.enabled=false"),
     *("--set", "iam.nats.tls.enabled=false"),
 )

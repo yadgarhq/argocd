@@ -96,6 +96,11 @@ CI job, never in the offline pre-commit hook.
       (B-N4.3, ledger 925): 90 objects, none added or removed, 2 changed
       (`ConfigMap/nats-config` loses `allow_non_tls`; `StatefulSet/nats`
       gets a new `checksum/config`).
+      Re-measured 2026-10-10 at 0.23.2 with `clientAuth: "required"`
+      (B-N5, ledger 925): 90 objects, none added or removed, 2 changed
+      (`ConfigMap/nats-config` gains `tls.verify` true and `tls.ca_file`;
+      `StatefulSet/nats` gets a new `checksum/config` and its reloader
+      watches `ca.crt` too).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
@@ -867,22 +872,26 @@ def test_an_unpinned_hop_on_a_server_names_it(rendered: list) -> None:
         "Deployment/iam-db/NATS: not in CLIENT_HOPS": "1"
     }
 
-# ── THE BROKER'S TLS LISTENER (B-N4.1, ledger 925, ADR-0852) ─────────────────
+# ── THE BROKER'S TLS LISTENER (B-N4.1, B-N5, ledger 925, ADR-0852) ───────────
 
 # The broker's side of the NATS hop, stated beside the two clients' side above.
 # K3 cannot hold this: `--write` blesses whatever renders, so a values change
 # that dropped `allow_non_tls`, pointed the listener at another Secret, or
-# turned `verify` on early would pass K3. platform 0.2.1's own render check
-# holds that its two sources agree; it cannot know this estate's step.
+# dropped `verify` would pass K3. platform 0.2.1's own render check holds that
+# its two sources agree; it cannot know this estate's step.
 #
-# THE STEP IS B-N4.3: the listener speaks TLS with the `nats-tls` serving leaf
-# (B-N4.1), both clients dial it with TLS (`CLIENT_HOPS` above, B-N4.2), and it
-# refuses plaintext (`allow_non_tls` dropped, B-N4.3). nats-server has no
-# optional client-certificate mode, so `verify` and `ca_file` stay absent until
-# B-N5 (ADR-0854). `allow_non_tls` is pinned to the hops, not to a literal:
-# while any NATS hop is in `CLEARTEXT_HOPS` it must be true (a revert of B-N4.2
-# needs it back), and while none is it must be absent or false.
-NATS_STATED = {"enabled": True, "clientAuth": "off"}
+# THE STEP IS B-N5: the listener speaks TLS with the `nats-tls` serving leaf
+# (B-N4.1), both clients dial it with TLS and present their leaves
+# (`CLIENT_HOPS` above, B-N4.2), it refuses plaintext (`allow_non_tls`
+# dropped, B-N4.3), and it verifies every client's leaf (B-N5): `verify` a
+# bool true and `ca_file` the `ca.crt` beside the serving leaf. nats-server has
+# no optional client-certificate mode (ADR-0854), so both are pinned to the
+# hops, not to a literal: while any NATS hop is in `CLEARTEXT_HOPS` they must be
+# absent (a cleartext client presents no leaf, so a revert of B-N4.2 needs a
+# revert of B-N5 first), and while none is they must be set.
+# `allow_non_tls` follows the same hops: true while any is cleartext, absent or
+# false while none is.
+NATS_STATED = {"enabled": True, "clientAuth": "required"}
 NATS_CERT_DIR = "/etc/nats-certs/nats"
 NATS_SECRET = "nats-tls"
 
@@ -904,10 +913,16 @@ def broker_failures(documents: list) -> dict[str, object]:
     for key, file in (("cert_file", "tls.crt"), ("key_file", "tls.key")):
         if tls.get(key) != f"{NATS_CERT_DIR}/{file}":
             failures[f"nats: tls.{key}"] = tls.get(key)
-    for key in ("verify", "ca_file"):
-        if key in tls:
-            failures[f"nats: tls.{key}"] = tls[key]
     cleartext_clients = sorted(caller for caller, hops in CLEARTEXT_HOPS.items() if "NATS" in hops)
+    if cleartext_clients:
+        for key in ("verify", "ca_file"):
+            if key in tls:
+                failures[f"nats: tls.{key} while {', '.join(cleartext_clients)} dial in cleartext"] = tls[key]
+    else:
+        if tls.get("verify") is not True:
+            failures["nats: tls.verify with no NATS hop in cleartext"] = tls.get("verify")
+        if tls.get("ca_file") != f"{NATS_CERT_DIR}/ca.crt":
+            failures["nats: tls.ca_file with no NATS hop in cleartext"] = tls.get("ca_file")
     if cleartext_clients and conf.get("allow_non_tls") is not True:
         failures[f"nats: allow_non_tls while {', '.join(cleartext_clients)} dial in cleartext"] = conf.get(
             "allow_non_tls"
@@ -946,7 +961,13 @@ def with_nats_conf(change):
 def test_a_dropped_allow_non_tls_names_the_cleartext_clients(rendered: list, monkeypatch) -> None:
     """The clause still reddens while a NATS hop dials in cleartext, as it did before B-N4.2 (or after its revert)."""
     monkeypatch.setitem(CLEARTEXT_HOPS, "iam", {"NATS": "nats-tls"})
-    change = with_nats_conf(lambda conf: conf.pop("allow_non_tls", None))
+
+    def change(conf: dict) -> None:
+        conf.pop("allow_non_tls", None)
+        conf["tls"].pop("verify", None)  # a revert of B-N4.2 follows a revert of B-N5
+        conf["tls"].pop("ca_file", None)
+
+    change = with_nats_conf(change)
     assert broker_failures(mutated(rendered, "ConfigMap", "nats-config", change)) == {
         "nats: allow_non_tls while iam dial in cleartext": None
     }
@@ -975,17 +996,50 @@ def test_an_explicit_false_allow_non_tls_is_the_refusing_posture(rendered: list)
     assert broker_failures(mutated(rendered, "ConfigMap", "nats-config", change)) == {}
 
 
-def test_a_dropped_tls_block_names_both_files(rendered: list) -> None:
+def test_a_dropped_tls_block_names_both_files_and_the_verification(rendered: list) -> None:
     change = with_nats_conf(lambda conf: conf.pop("tls", None))
     assert broker_failures(mutated(rendered, "ConfigMap", "nats-config", change)) == {
         "nats: tls.cert_file": None,
         "nats: tls.key_file": None,
+        "nats: tls.verify with no NATS hop in cleartext": None,
+        "nats: tls.ca_file with no NATS hop in cleartext": None,
     }
 
 
-def test_an_early_verify_names_it(rendered: list) -> None:
-    change = with_nats_conf(lambda conf: conf["tls"].update(verify=True))
-    assert broker_failures(mutated(rendered, "ConfigMap", "nats-config", change)) == {"nats: tls.verify": True}
+def test_a_dropped_verify_names_it(rendered: list) -> None:
+    """B-N5: with every NATS hop in `CLIENT_HOPS`, the broker verifies every client's leaf."""
+    assert not any("NATS" in hops for hops in CLEARTEXT_HOPS.values())
+    change = with_nats_conf(lambda conf: conf["tls"].pop("verify", None))
+    assert broker_failures(mutated(rendered, "ConfigMap", "nats-config", change)) == {
+        "nats: tls.verify with no NATS hop in cleartext": None
+    }
+
+
+def test_a_non_boolean_verify_names_it(rendered: list) -> None:
+    """Only a bool `true` is the verifying posture; platform 0.2.1 refuses a quoted one too."""
+    change = with_nats_conf(lambda conf: conf["tls"].update(verify="true"))
+    assert broker_failures(mutated(rendered, "ConfigMap", "nats-config", change)) == {
+        "nats: tls.verify with no NATS hop in cleartext": "true"
+    }
+
+
+def test_a_ca_file_other_than_the_leafs_ca_names_it(rendered: list) -> None:
+    """The broker verifies against the internal CA cert-manager writes beside its leaf, never a public bundle."""
+    bundle = "/etc/ssl/certs/ca-certificates.crt"
+    change = with_nats_conf(lambda conf: conf["tls"].update(ca_file=bundle))
+    assert broker_failures(mutated(rendered, "ConfigMap", "nats-config", change)) == {
+        "nats: tls.ca_file with no NATS hop in cleartext": bundle
+    }
+
+
+def test_verify_while_a_nats_hop_dials_in_cleartext_names_it(rendered: list, monkeypatch) -> None:
+    """A revert of B-N4.2 puts a client back in cleartext; it presents no leaf, so `verify` must go with it."""
+    monkeypatch.setitem(CLEARTEXT_HOPS, "iam", {"NATS": "nats-tls"})
+    change = with_nats_conf(lambda conf: conf.update(allow_non_tls=True))
+    assert broker_failures(mutated(rendered, "ConfigMap", "nats-config", change)) == {
+        "nats: tls.verify while iam dial in cleartext": True,
+        "nats: tls.ca_file while iam dial in cleartext": f"{NATS_CERT_DIR}/ca.crt",
+    }
 
 
 def test_the_leaf_volume_at_another_secret_names_it(rendered: list) -> None:

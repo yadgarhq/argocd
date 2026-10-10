@@ -6009,3 +6009,111 @@ not Ready after the reverted template is applied, NEEDS-MAX:
 `kubectl --context kind-yadgar -n yadgar delete pod nats-0` so the
 StatefulSet recreates it at the reverted revision. Revert this before any
 revert of B-N4.2.
+
+## B-N5: the broker verifies every client's leaf (ledger 925)
+
+**What the merge does.** In `applications/yadgar.yaml`, `platform.nats.tls`
+moves to `clientAuth: "required"` and `config.nats.tls.merge` gains
+`verify: true` and `ca_file: /etc/nats-certs/nats/ca.crt`. The pin stays
+0.23.2. `verify` is nats-server's `RequireAndVerifyClientCert`
+(`server/opts.go:5861-5862`, v2.14.6). It is not `verify_and_map`, so the
+password `authorization` users stay the identity (`server/auth.go:926`
+maps only under `tlsMap`); the leaf is a second control. `ca_file` is the
+`ca.crt` cert-manager writes into `nats-tls` (Issuer `yadgar-internal-ca`,
+also the issuer of `gateway-client-tls` and `iam-client-tls`). Platform 0.2.1
+refuses `required` without both upstream keys. The parent refuses it unless
+gateway and iam have `nats.tls.enabled` true and name a client leaf. In the
+argocd gate, `broker_failures` now requires `verify` true and that `ca_file`
+while no NATS hop is in `CLEARTEXT_HOPS`, and refuses both while one is.
+
+Measured 2026-10-10 with helm 3.18.4 at 0.23.2 (K3): 90 → 90 objects, 0
+added, 0 removed, 2 changed: `ConfigMap/nats-config` (`tls` gains
+`verify: true` and `ca_file`, nothing else) and `StatefulSet/nats`
+(`checksum/config` `d16bbe75…` → `5b75d784…`, and the reloader gains
+`-config /etc/nats-certs/nats/ca.crt`). The `nats-tls` volume has no `items`,
+so `ca.crt` is mounted. `kubectl --context kind-yadgar apply --dry-run=server`
+accepts both.
+
+**Pre-merge, measured 2026-10-10 02:47Z (after B-N4.3):** nats-0 2/2, logs
+"TLS required for client connections". `yadgar_gateway_invalidation_consuming`
+is 1 on both gateway pods. Both gateway and both iam pods log "connected to
+the broker". The only pods with a `NATS_TLS_ENABLED` in any namespace are
+those four, each "1". `gateway-client-tls` (CN `gateway-caller`) and
+`iam-client-tls` (CN `iam-caller`) carry KU digitalSignature and EKU
+clientAuth, and `openssl verify -purpose sslclient` against `nats-tls`
+`ca.crt` returns OK for both (public certs only).
+
+**Not measured: no client has presented its leaf to NATS live.** The broker
+never asked for one before this step, and NATS has no optional mode to
+observe it under. The evidence is the client repos' CI against a
+`--tlsverify` nats-server with a test CA (gateway and iam `tests/nats_tls.rs`:
+a presented leaf connects, no leaf is refused), the leaves' EKU and chain
+above, and the render.
+
+**What runs.** `nats-0` rolls once (one replica). The `tls` block is
+hot-reloadable, so the old pod's reloader may apply `verify` before the roll
+(not measured; harmless either way). gateway and iam do NOT roll; they
+reconnect with TLS and their leaves. **Loss window:** lame duck 30 s plus
+grace 10 s, then until the new nats-0 is Ready. iam's publishes queue in
+async-nats's buffer and flush on reconnect; a flush that lands before the
+gateway resubscribes is lost. The gateway's 30 s credential TTL bounds the
+revocation lag.
+
+### Before this merge — read-only (`--context kind-yadgar` on every line)
+
+```bash
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o custom-columns=REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase
+kubectl --context kind-yadgar -n yadgar logs nats-0 -c nats | grep -E "TLS (available|required) for client connections"
+kubectl --context kind-yadgar get --raw "/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=yadgar_gateway_invalidation_consuming"   # 1 on both gateway pods
+kubectl --context kind-yadgar -n yadgar logs -l app=iam --since=1h | grep "connected to the broker"
+```
+
+### After this merge — go/no-go, read-only
+
+```bash
+# 1. yadgar Synced/Healthy, operation Succeeded; nats 2/2 on a new nats-0.
+kubectl --context kind-yadgar -n yadgar get sts nats; kubectl --context kind-yadgar -n yadgar get pod nats-0
+# 2. The live config verifies, and no client fails the handshake.
+kubectl --context kind-yadgar -n yadgar get cm nats-config -o jsonpath='{.data.nats\.conf}' | grep -o '"tls":{[^}]*}'
+kubectl --context kind-yadgar -n yadgar logs nats-0 -c nats | grep -iE "TLS handshake|certificate required|bad certificate|unknown authority"
+# 3. Gateway consuming on BOTH pods: value 1 for each.
+kubectl --context kind-yadgar get --raw "/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=yadgar_gateway_invalidation_consuming"
+kubectl --context kind-yadgar -n yadgar logs -l app=gateway --since=10m | grep -E "connected to the broker|still cannot reach the broker|disconnected from the broker"
+# 4. BOTH iam pods log "connected to the broker" after the roll.
+kubectl --context kind-yadgar -n yadgar logs -l app=iam --since=10m | grep -iE "io error|connected to the broker|still cannot reach the broker|disconnected from the broker"
+```
+
+5. Fresh login (`POST /auth/login`, estate C-01) answers 200.
+6. Revocation path: NEEDS-MAX. With an administrator's credential,
+   `POST /admin/set-user-admin` with
+   `{"user_id": "<claude-probe's id>", "is_admin": false}`; expect
+   `cached identity invalidated (D72)` with that `user_id` in BOTH gateway
+   pods' logs.
+7. Plan acceptance, NEEDS-MAX (an agent may not start a probe pod). From a
+   pod labelled `app: gateway` or `app: iam` (the only sources `nats-ingress`
+   admits), with the `nats` CLI:
+   - TLS with the `nats-tls` CA but NO client leaf → refused in the
+     handshake (`certificate required`).
+   - TLS with a leaf from a freshly generated CA → refused
+     (`unknown certificate authority` / `bad certificate`).
+
+No-go: nats-0 not Ready, a gateway pod at 0 on the consuming gauge, a
+"TLS handshake error" from a gateway or iam pod IP in nats-0's log, or an
+iam or gateway pod still logging "still cannot reach the broker" after
+2 minutes.
+
+### Rollback — a revert
+
+If `yadgar`'s operation is still Running or retrying, end it first. NEEDS-MAX:
+`argocd app terminate-op yadgar`. Then revert the merge. The revert sets
+`clientAuth: "off"` and drops `verify` and `ca_file`; it is itself a nats-0
+roll with the same loss window. If nats-0 stays at the new revision and not
+Ready after the reverted template is applied, NEEDS-MAX:
+`kubectl --context kind-yadgar -n yadgar delete pod nats-0`. Revert this
+before any revert of B-N4.3 or B-N4.2.
+
+Break-glass, NEEDS-MAX, faster than a revert: suspend auto-sync on `yadgar`;
+`kubectl --context kind-yadgar -n yadgar edit cm nats-config` → `verify:
+false` (keep `ca_file`). The `tls` block is hot-reloadable, so the reloader
+applies it without a roll. Then revert in git; that revert rolls nats-0.
