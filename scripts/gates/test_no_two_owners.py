@@ -1959,6 +1959,14 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # PB-2 measured the fields above with all six at `off`, so pinning `off` on
 # both sides keeps this a measurement of the pin alone. The modes themselves
 # are gated by `test_yadgar_application.py`'s `EXPECTED_CLIENT_AUTH` and by K3.
+#
+# THE BROKER IS RENDERED AT ITS PB-3 POSTURE ON BOTH SIDES, FROM B-N4.1 ON, for
+# the same reason. 0.19.1's platform refuses `nats.tls.enabled: true` by name
+# ("this chart version declares the key; B-N2 / B-V2 renders it"), so the
+# previous pin cannot render B-N4.1's values. Both sides get the TLS switch and
+# the upstream listener key off, and no `secretName` or `allow_non_tls`. The
+# broker's posture is gated by `test_yadgar_application.py`'s `broker_failures`
+# and by K3.
 PIN_BEFORE_B9 = "0.3.7"
 PREVIOUS_PIN = "0.19.1"
 PIN_ALONE_OVERRIDES: tuple[str, ...] = (
@@ -1968,6 +1976,10 @@ PIN_ALONE_OVERRIDES: tuple[str, ...] = (
         for server in ("iam", "iam-db", "task", "task-db", "project", "project-db")
         for argument in ("--set-string", f"{server}.tls.clientAuth=off")
     ),
+    *("--set", "platform.nats.tls.enabled=false"),
+    *("--set", "platform.nats.config.nats.tls.enabled=false"),
+    *("--set", "platform.nats.config.nats.tls.secretName=null"),
+    *("--set", "platform.nats.config.merge.allow_non_tls=null"),
 )
 PIN_ADDED: set[tuple[str, str]] = set()
 PIN_CHANGES = {
