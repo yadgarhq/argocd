@@ -1990,6 +1990,12 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # name ("the binary reads VALKEY_TLS_ENABLED only from B-V3"). Both sides get
 # gateway's `valkey.tls.enabled` off. Its posture is gated by `CLIENT_HOPS` and
 # by K3.
+#
+# THE CACHE'S PLAINTEXT PORT IS RENDERED OPEN ON BOTH SIDES, FROM B-V4.3 ON, for
+# the same reason. 0.19.1's platform refuses `valkey.tls.plaintext: false` by
+# name, as it refuses `enabled: true`, and the parent refuses it beside
+# gateway's switch off. Both sides get `plaintext: true`. The closed port is
+# gated by `cache_failures` and by K3.
 PIN_BEFORE_B9 = "0.3.7"
 PREVIOUS_PIN = "0.19.1"
 PIN_ALONE_OVERRIDES: tuple[str, ...] = (
@@ -2009,6 +2015,7 @@ PIN_ALONE_OVERRIDES: tuple[str, ...] = (
     *("--set", "iam.nats.tls.enabled=false"),
     *("--set", "platform.valkey.tls.enabled=false"),
     *("--set", "gateway.valkey.tls.enabled=false"),
+    *("--set", "platform.valkey.tls.plaintext=true"),
 )
 PIN_ADDED: set[tuple[str, str]] = set()
 PIN_CHANGES = {
