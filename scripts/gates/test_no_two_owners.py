@@ -1999,7 +1999,8 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 #
 # THE CACHE'S CLIENT AUTH IS RENDERED OFF ON BOTH SIDES, FROM B-V5 ON, for the
 # same reason. 0.19.1's platform refuses `valkey.tls.clientAuth: "optional"`
-# by name, and the parent refuses it beside gateway's switch off. Both sides
+# (B-V5) and "required" (B-V6), and the parent refuses either beside
+# gateway's switch off. Both sides
 # get `clientAuth: "off"` (`--set-string`: a bare `off` is YAML false). The
 # asked-for leaf is gated by `cache_failures` and by K3.
 PIN_BEFORE_B9 = "0.3.7"
