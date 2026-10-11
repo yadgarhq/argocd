@@ -131,6 +131,15 @@ CI job, never in the offline pre-commit hook.
       90 objects, none added or removed, 3 changed (the `gateway`, `iam`
       and `task` Deployments, `image` only — each new digest equals its
       module's own GHCR tag digest; no new env, arg or probe).
+      Re-measured 2026-10-11 at 0.23.10, carrying platform 0.2.3 (ledger
+      1437): 90 objects, none added or removed, 1 changed
+      (`Deployment/valkey`: the boot script opens with `set -eu`, hashes
+      `/etc/valkey/auth/password` beside the TLS files into
+      `/run/valkey/watched.sha256` and reads the password from that file;
+      the liveness probe checks the new hash path; the readiness probe reads
+      the file into `VALKEYCLI_AUTH`; `VALKEY_PASSWORD` and `VALKEYCLI_AUTH`
+      leave `env`; `valkey-password` is mounted as a directory at
+      `/etc/valkey/auth`).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
@@ -1128,11 +1137,18 @@ def test_a_reloader_mount_with_a_subpath_names_it(rendered: list) -> None:
 # reads its leaf only at boot, so the boot script hashes
 # the files it loaded and the liveness probe re-checks that hash: a renewed
 # leaf restarts the container (one more `Recreate`-sized cache gap).
+# platform 0.2.3 (ledger 1437) puts the password in the same hash: valkey reads
+# it from `valkey-password` mounted as a directory at `VALKEY_AUTH_DIR`, never
+# from `env`, so a rotated password restarts valkey as it restarts `gateway`.
 VALKEY_STATED = {"enabled": True, "clientAuth": "required", "plaintext": False}
 VALKEY_AUTH_CLIENTS = "yes"
 VALKEY_TLS_DIR = "/etc/valkey/tls"
 VALKEY_SECRET = "valkey-tls"
-VALKEY_HASH = "/run/valkey/tls.sha256"
+VALKEY_HASH = "/run/valkey/watched.sha256"
+VALKEY_AUTH_DIR = "/etc/valkey/auth"
+VALKEY_PASSWORD_SECRET = "valkey-password"
+# ledger 1437: an env copy of the password is fixed at process start and outlives a rotation.
+VALKEY_PASSWORD_ENV = ("VALKEY_PASSWORD", "VALKEYCLI_AUTH")
 VALKEY_PORTS = {"valkey": 6379, "valkey-tls": 6380}
 VALKEY_TLS_ARGS = (
     "--tls-port 6380",
@@ -1141,8 +1157,11 @@ VALKEY_TLS_ARGS = (
     f"--tls-ca-cert-file {VALKEY_TLS_DIR}/ca.crt",
     '--tls-auth-clients "$VALKEY_TLS_AUTH_CLIENTS"',
 )
-# ledger 1429: the files the boot script hashes, in the order it hashes them.
-VALKEY_HASHED_FILES = tuple(f"{VALKEY_TLS_DIR}/{file}" for file in ("tls.crt", "tls.key", "ca.crt"))
+# ledger 1429: the files the boot script hashes, in the order it hashes them;
+# ledger 1437: the password file first.
+VALKEY_HASHED_FILES = (f"{VALKEY_AUTH_DIR}/password",) + tuple(
+    f"{VALKEY_TLS_DIR}/{file}" for file in ("tls.crt", "tls.key", "ca.crt")
+)
 # `valkey-ingress`'s one rule names gateway as its peer (`app: gateway`); the
 # 6380 check must hold for THAT rule, never for "6380 open from some other
 # peer while gateway's own rule stays closed" (ledger 1429).
@@ -1192,6 +1211,14 @@ def cache_failures(documents: list) -> dict[str, object]:
     # file at that whole path, not the directory valkey's args read from.
     if mount is None or mount.get("mountPath") != VALKEY_TLS_DIR or mount.get("subPath"):
         failures["valkey: mount valkey-tls"] = mount
+    # ledger 1437: the password as a mounted directory (kubelet never refreshes
+    # a subPath), and no env copy of it.
+    password_mount = next((m for m in server.get("volumeMounts") or [] if m["name"] == VALKEY_PASSWORD_SECRET), None)
+    if password_mount is None or password_mount.get("mountPath") != VALKEY_AUTH_DIR or password_mount.get("subPath"):
+        failures["valkey: mount valkey-password"] = password_mount
+    for name in VALKEY_PASSWORD_ENV:
+        if name in env:
+            failures[f"valkey: env {name}"] = None
     wanted = {"valkey-tls": VALKEY_PORTS["valkey-tls"]}
     container_ports = {p.get("name"): p.get("containerPort") for p in server.get("ports") or []}
     service_ports = {p.get("name"): (p.get("port"), p.get("targetPort")) for p in service["spec"].get("ports") or []}
@@ -1265,16 +1292,59 @@ def test_a_dropped_boot_hash_names_it(rendered: list) -> None:
 
 
 def test_a_boot_hash_missing_a_file_names_it(rendered: list) -> None:
-    """ledger 1429: the hash must cover `ca.crt` too, not only `tls.crt`/`tls.key`."""
+    """ledger 1429: the hash must cover `ca.crt` too, not only `tls.crt`/`tls.key`.
+
+    ledger 1437: the script now opens with `set -eu`, so the edit targets the
+    hash line itself rather than the script's first line.
+    """
 
     def drop_ca_from_hash(script: str) -> str:
-        first_line, _, rest = script.partition("\n")
-        return first_line.replace(f" {VALKEY_TLS_DIR}/ca.crt", "") + "\n" + rest
+        return "\n".join(
+            line.replace(f" {VALKEY_TLS_DIR}/ca.crt", "") if f"> {VALKEY_HASH}" in line else line
+            for line in script.split("\n")
+        )
 
     change = with_valkey_script(drop_ca_from_hash)
     assert cache_failures(mutated(rendered, "Deployment", "valkey", change)) == {
-        "valkey: boot hash files": [f"{VALKEY_TLS_DIR}/tls.crt", f"{VALKEY_TLS_DIR}/tls.key"]
+        "valkey: boot hash files": [f"{VALKEY_AUTH_DIR}/password", f"{VALKEY_TLS_DIR}/tls.crt", f"{VALKEY_TLS_DIR}/tls.key"]
     }
+
+
+def test_a_boot_hash_without_the_password_names_it(rendered: list) -> None:
+    """ledger 1437: a rotated password must restart valkey, so the hash must cover it."""
+
+    def drop_password_from_hash(script: str) -> str:
+        return "\n".join(
+            line.replace(f" {VALKEY_AUTH_DIR}/password", "") if f"> {VALKEY_HASH}" in line else line
+            for line in script.split("\n")
+        )
+
+    change = with_valkey_script(drop_password_from_hash)
+    assert cache_failures(mutated(rendered, "Deployment", "valkey", change)) == {
+        "valkey: boot hash files": list(VALKEY_HASHED_FILES[1:])
+    }
+
+
+def test_a_valkey_password_mount_with_a_subpath_names_it(rendered: list) -> None:
+    """ledger 1437: kubelet never refreshes a subPath, so a rotation would never reach the file."""
+
+    def change(deployment: dict) -> None:
+        mount = next(m for m in valkey_container(deployment)["volumeMounts"] if m["name"] == VALKEY_PASSWORD_SECRET)
+        mount["subPath"] = "password"
+
+    assert list(cache_failures(mutated(rendered, "Deployment", "valkey", change))) == ["valkey: mount valkey-password"]
+
+
+@pytest.mark.parametrize("name", VALKEY_PASSWORD_ENV)
+def test_a_password_in_the_valkey_env_names_it(rendered: list, name: str) -> None:
+    """ledger 1437: an env copy is fixed at process start and outlives a rotation."""
+
+    def change(deployment: dict) -> None:
+        valkey_container(deployment)["env"].append(
+            {"name": name, "valueFrom": {"secretKeyRef": {"name": VALKEY_PASSWORD_SECRET, "key": "password"}}}
+        )
+
+    assert cache_failures(mutated(rendered, "Deployment", "valkey", change)) == {f"valkey: env {name}": None}
 
 
 def test_a_liveness_without_the_hash_check_names_it(rendered: list) -> None:
