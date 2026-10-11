@@ -879,6 +879,17 @@ def test_an_unpinned_hop_on_a_server_names_it(rendered: list) -> None:
     }
 
 
+def test_every_client_hop_prefix_has_a_pinned_ca_secret() -> None:
+    """`client_identity_failures` indexes `HOP_CA_SECRET[prefix]` unconditionally for every `CLIENT_HOPS` prefix.
+
+    A prefix added to `CLIENT_HOPS` with no matching `HOP_CA_SECRET` entry
+    would raise `KeyError` inside the gate rather than failing with a named
+    key; this holds the two maps to the same prefix set so that shows up
+    here, by name, instead.
+    """
+    assert set(HOP_CA_SECRET) == {prefix for prefixes in CLIENT_HOPS.values() for prefix in prefixes}
+
+
 def test_a_dropped_ca_env_names_its_hop(rendered: list) -> None:
     def drop(deployment: dict) -> None:
         env_of(deployment)[:] = [e for e in env_of(deployment) if e["name"] != "NATS_TLS_CA_FILE"]
