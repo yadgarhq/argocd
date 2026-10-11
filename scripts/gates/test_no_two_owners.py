@@ -1952,6 +1952,13 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # already render them once the keys are written (the B-N3E/B-V3E expand). They
 # show in K3 against `main`'s values.
 #
+# RE-MEASURED AT 0.23.10 (platform 0.2.3, ledger 1437), against the same 0.19.1:
+# one field more, valkey's `env`. valkey reads its password from
+# `valkey-password` mounted at `/etc/valkey/auth`, so `VALKEY_PASSWORD` and
+# `VALKEYCLI_AUTH` leave `env`. Under `PIN_ALONE_OVERRIDES` (TLS off) `env` is
+# then absent altogether. The script, probes, mounts and volumes were already
+# in the set.
+#
 # BOTH SIDES RENDER EVERY SERVER AT `clientAuth: "off"`, FROM B-U8a ON. The
 # 0.13.13 module charts predate the B-U5 contracts, and their render checks
 # refuse `optional` and `required` by name ("not enforced yet"). Once a hop
@@ -2035,6 +2042,7 @@ PIN_CHANGES = {
         ("Deployment", "valkey", f"spec.template.spec.{field}")
         for field in (
             "containers[0].args[0]",
+            "containers[0].env",
             "containers[0].livenessProbe.exec",
             "containers[0].livenessProbe.tcpSocket",
             "containers[0].readinessProbe.exec.command[2]",

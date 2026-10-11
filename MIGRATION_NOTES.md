@@ -6474,7 +6474,8 @@ certificate that VERIFIED. No ACL user is named `gateway-caller`, so the
 connection stays on its password login and valkey adds an `ACL LOG` entry with
 reason `tls-cert` and username `gateway-caller` (`tls.c` `tlsGetPeerUser`,
 `networking.c`, `acl.c`; read, not measured). From inside the valkey pod:
-`valkey-cli -s /run/valkey/valkey.sock` (with `VALKEYCLI_AUTH`), then
+`VALKEYCLI_AUTH="$(cat /etc/valkey/auth/password)" valkey-cli -s /run/valkey/valkey.sock`
+(from platform 0.2.3 the container has no `VALKEYCLI_AUTH` in its `env`; ledger 1437), then
 `CONFIG SET tls-auth-clients-user CN`. valkey reads the CN only when a
 connection is accepted, and the gateway keeps one connection open, so force
 one reconnect: `CLIENT LIST TYPE normal` names the gateway's address, and
@@ -6692,3 +6693,108 @@ Then revert the merge. `yadgar` syncs back to 0.23.2: `gateway`'s,
 `iam`'s and `task`'s images go back to their old digests via client-side
 apply of the last-applied configuration. No other object changes, nothing
 was created, and no migration ran.
+
+## The yadgar pin moves to parent chart 0.23.10: valkey reads its password from a mounted file (ledger 1437)
+
+**What the merge does.** It moves `applications/yadgar.yaml`'s
+`targetRevision` from 0.23.8 to 0.23.10, and `scripts/chart_pin.json` to
+`chart_tag` `v0.23.10`, `platform_version` `0.2.3`. The five platform-sourced
+operator Applications (`cert-manager`, `envoy-gateway`, `keda`,
+`mariadb-operator`, `prometheus`) move from 0.2.1 to 0.2.3 with it, as
+`operator-applications` requires.
+
+`yadgarhq/chart` `v0.23.8..v0.23.10` is two commits, each a `platform` pin
+line and the example pins only: `7eb2758` (platform 0.2.2) and `514378e`
+(platform 0.2.3). platform 0.2.2 (`platform`#41, `2c150c4`, ledger 1425) is a
+README section plus a `values.yaml` comment. platform 0.2.3 (`platform`#42,
+`2318f0c`, ledger 1437) changes `templates/valkey.yaml` only:
+
+- valkey reads its password from `valkey-password` mounted as a directory at
+  `/etc/valkey/auth` (no `subPath`), not from `env`. `VALKEY_PASSWORD` and
+  `VALKEYCLI_AUTH` leave the container's `env`.
+- The boot script opens with `set -eu`, hashes the password file beside the
+  three TLS files into `/run/valkey/watched.sha256` (was
+  `/run/valkey/tls.sha256`), and refuses to start on an empty password.
+- The liveness probe re-checks that hash, so a rotated password restarts
+  valkey, as it already restarts `gateway`.
+- The readiness probe reads the file into `VALKEYCLI_AUTH` and trims a
+  trailing CR.
+
+Measured 2026-10-11 with helm 3.18.4 against the OCI charts:
+
+- `yadgar`: 90 → 90 objects (K3), 0 added, 0 removed, 1 changed:
+  `apps/Deployment//valkey`, the fields above only.
+- The five operator Applications render byte-identically at 0.2.1 and 0.2.3
+  with their committed values.
+- `kubectl --context kind-yadgar apply --dry-run=server` of the new
+  `Deployment/valkey` is accepted. `kubectl diff` against the live object
+  shows the same fields only. Secret `valkey-password` holds key `password`.
+
+**What runs.** `Deployment/valkey` rolls by `Recreate`: one cache gap, and the
+cache is empty after (token buckets and epoch counters included). During the
+gap the gateway's limiter degrades to its per-replica floor and counts
+`yadgar_gateway_rate_limit_degraded_total`. The gateway does not roll. The
+operator Applications sync to the new revision and change no object.
+
+### Before this merge — read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. Read 2026-10-11: yadgar Synced/Healthy at 0.23.8; operators at 0.2.1.
+kubectl --context kind-yadgar -n argocd get applications \
+  -o 'custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status'
+# 2. Read 2026-10-11: valkey 1/1, Recreate.
+kubectl --context kind-yadgar -n yadgar get pods -l app.kubernetes.io/name=valkey
+kubectl --context kind-yadgar get --raw "/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(pod)(yadgar_gateway_rate_limit_degraded_total)"
+```
+
+### After this merge — go/no-go
+
+```bash
+# 1. yadgar Synced/Healthy at 0.23.10, operation Succeeded; the five
+#    operators Synced/Healthy at 0.2.3.
+kubectl --context kind-yadgar -n argocd get applications \
+  -o 'custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+# 2. valkey 1/1 on a NEW pod (Recreate), 0 restarts, Ready.
+kubectl --context kind-yadgar -n yadgar get pods -l app.kubernetes.io/name=valkey
+# 3. Ready listening on tls (6380) and the unix socket only: no 6379.
+kubectl --context kind-yadgar -n yadgar get deploy valkey \
+  -o 'jsonpath={.spec.template.spec.containers[0].ports}{"\n"}'
+kubectl --context kind-yadgar -n yadgar logs deploy/valkey | grep -E "Ready to accept|TLS|tls|unix|Failed|Error"
+# 4. No password in env; the file is mounted.
+kubectl --context kind-yadgar -n yadgar get deploy valkey \
+  -o 'jsonpath={range .spec.template.spec.containers[0].env[*]}{.name}{"\n"}{end}'   # VALKEY_TLS_AUTH_CLIENTS only
+# 5. The hash file is present and matches (the liveness check, rc 0).
+#    NEEDS-MAX (an exec into the pod).
+kubectl --context kind-yadgar -n yadgar exec deploy/valkey -- sh -c 'cat /run/valkey/watched.sha256 | cut -c67-; sha256sum -c --status /run/valkey/watched.sha256; echo rc=$?'
+# 6. Degradation: at most 1 per gateway pod around the gap, then flat.
+kubectl --context kind-yadgar get --raw "/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(pod)(yadgar_gateway_rate_limit_degraded_total)"
+kubectl --context kind-yadgar get --raw "/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=increase(yadgar_gateway_rate_limit_degraded_total%5B2m%5D)"
+# 7. No Unhealthy / BackOff events on the new pod.
+kubectl --context kind-yadgar -n yadgar get events --field-selector involvedObject.kind=Pod --sort-by=.lastTimestamp | grep valkey
+```
+
+Step 5 prints four paths: `/etc/valkey/auth/password` and the three
+`/etc/valkey/tls/` files, then `rc=0`. It prints no secret value.
+
+8. Gateway limited calls answer normally (no 503 from `WRONGPASS`).
+9. Fresh login (`POST /auth/login`, estate C-01) answers 200.
+
+No-go: valkey not 1/1, restarting or not Ready (an empty or unreadable
+password file refuses the boot and names the path in the log); port 6379
+present; `VALKEY_PASSWORD` or `VALKEYCLI_AUTH` still in `env`; step 5 not
+`rc=0`; the degradation counter still increasing 2 minutes after the new
+pod's Ready; or a login that does not answer 200.
+
+### Rollback — a revert
+
+If `yadgar`'s operation is still Running or retrying, end it first.
+NEEDS-MAX: `argocd app terminate-op yadgar` against kind-yadgar's Argo CD.
+
+Then revert the merge. `yadgar` syncs back to 0.23.8: valkey reads its
+password from `env` again (one more `Recreate`, one more cache gap), and a
+password rotation again needs a manual valkey restart. The five operator
+Applications sync back to 0.2.1 and change no object. Nothing was created
+outside `Deployment/valkey`, and no migration ran.
