@@ -58,8 +58,12 @@ jobs:
           python-version: "3.x"
 
       # The version K's shared vectors are measured under (settled_gate.py).
-      - name: install PyYAML
-        run: python3 -m pip install --disable-pip-version-check "pyyaml==6.0.3"
+      # HASH-PINNED, WHEELS ONLY: this job later mints a release-App token, so
+      # nothing installed here may be a package PyPI could swap under the name.
+      - name: install PyYAML (hash-pinned)
+        run: |
+          python3 -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary=:all: -r scripts/settled_dispatch.requirements.txt
 
       - name: mint a token for argocd-verify (actions write), slice 1
         id: token1
