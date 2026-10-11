@@ -126,6 +126,11 @@ CI job, never in the offline pre-commit hook.
       "required"` (B-V6, ledger 925): 90 objects, none added or removed, 1
       changed (`Deployment/valkey`: `VALKEY_TLS_AUTH_CLIENTS` "optional"
       becomes "yes", nothing else).
+      Re-measured 2026-10-11 at 0.23.8, carrying gateway 0.12.2 (ledger
+      1430), iam 0.11.3 (ledgers 1422, 1424) and task 0.7.2 (ledger 1422):
+      90 objects, none added or removed, 3 changed (the `gateway`, `iam`
+      and `task` Deployments, `image` only — each new digest equals its
+      module's own GHCR tag digest; no new env, arg or probe).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
