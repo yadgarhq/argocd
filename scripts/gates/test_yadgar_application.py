@@ -558,6 +558,23 @@ CLIENT_HOPS = {
 LEAF_ISSUER = {"group": "cert-manager.io", "kind": "Issuer", "name": "yadgar-internal-ca"}
 # Each env half and the leaf key the volume must project to that file.
 LEAF_KEYS = {"CERT": "tls.crt", "KEY": "tls.key"}
+# The server leaf Secret whose `ca.crt` each hop's `<PREFIX>_TLS_CA_FILE` must
+# trust (ledger 1428). `iam`/`task`/`project` and their `-db`s are the
+# `<server>-tls` Secret ADR-0883 stages as each server's own `clientCaSecret`;
+# `nats` and `valkey` are the chart's own `tls.caSecret` defaults, `nats-tls`
+# and `valkey-tls`. Before this map existed, `client_identity_failures` read
+# only `LEAF_KEYS` off a hop's env, so a `*_TLS_CA_FILE` pointed at ANY Secret
+# keyed `ca.crt` passed — a caller trusting the wrong server's CA was invisible.
+HOP_CA_SECRET = {
+    "IAM": "iam-tls",
+    "TASK": "task-tls",
+    "PROJECT": "project-tls",
+    "IAM_DB": "iam-db-tls",
+    "TASK_DB": "task-db-tls",
+    "PROJECT_DB": "project-db-tls",
+    "NATS": "nats-tls",
+    "VALKEY": "valkey-tls",
+}
 
 
 CONTAINER_LISTS = ("containers", "initContainers", "ephemeralContainers")
@@ -665,6 +682,19 @@ def client_identity_failures(documents: list) -> dict[str, object]:
                     and {"key": key, "path": file} in (secret.get("items") or [])
                 ):
                     failures[f"{hop}: {name}"] = env.get(name)
+            # ledger 1428: the CA this hop trusts, never checked before. A
+            # `*_TLS_CA_FILE` that mounts `ca.crt` from ANY Secret passed; this
+            # pins it to the server-leaf Secret `HOP_CA_SECRET` names.
+            ca_name = f"{prefix}_TLS_CA_FILE"
+            directory, _, file = (env.get(ca_name) or "").rpartition("/")
+            mount = mounts.get(directory) or {}
+            secret = (volumes.get(mount.get("name")) or {}).get("secret") or {}
+            if not (
+                mount.get("readOnly")
+                and secret.get("secretName") == HOP_CA_SECRET[prefix]
+                and {"key": "ca.crt", "path": file} in (secret.get("items") or [])
+            ):
+                failures[f"{hop}: {ca_name}"] = env.get(ca_name)
     return failures
 
 
@@ -848,6 +878,39 @@ def test_an_unpinned_hop_on_a_server_names_it(rendered: list) -> None:
         "Deployment/iam-db/NATS: not in CLIENT_HOPS": "1"
     }
 
+
+def test_every_client_hop_prefix_has_a_pinned_ca_secret() -> None:
+    """`client_identity_failures` indexes `HOP_CA_SECRET[prefix]` unconditionally for every `CLIENT_HOPS` prefix.
+
+    A prefix added to `CLIENT_HOPS` with no matching `HOP_CA_SECRET` entry
+    would raise `KeyError` inside the gate rather than failing with a named
+    key; this holds the two maps to the same prefix set so that shows up
+    here, by name, instead.
+    """
+    assert set(HOP_CA_SECRET) == {prefix for prefixes in CLIENT_HOPS.values() for prefix in prefixes}
+
+
+def test_a_dropped_ca_env_names_its_hop(rendered: list) -> None:
+    def drop(deployment: dict) -> None:
+        env_of(deployment)[:] = [e for e in env_of(deployment) if e["name"] != "NATS_TLS_CA_FILE"]
+
+    assert client_identity_failures(mutated(rendered, "Deployment", "iam", drop)) == {
+        "iam/NATS: NATS_TLS_CA_FILE": None
+    }
+
+
+def test_a_ca_pointed_at_another_servers_secret_names_its_hop(rendered: list) -> None:
+    """ledger 1428: the regression this closes — before it, any Secret keyed `ca.crt` passed."""
+
+    def change(deployment: dict) -> None:
+        volume = next(v for v in deployment["spec"]["template"]["spec"]["volumes"] if v["name"] == "task-ca")
+        volume["secret"]["secretName"] = "valkey-tls"
+
+    assert client_identity_failures(mutated(rendered, "Deployment", "gateway", change)) == {
+        "gateway/TASK: TASK_TLS_CA_FILE": "/var/run/config/task-ca/ca.pem"
+    }
+
+
 # ── THE BROKER'S TLS LISTENER (B-N4.1, B-N5, ledger 925, ADR-0852) ───────────
 
 # The broker's side of the NATS hop, stated beside the two clients' side above.
@@ -869,6 +932,10 @@ def test_an_unpinned_hop_on_a_server_names_it(rendered: list) -> None:
 NATS_STATED = {"enabled": True, "clientAuth": "required"}
 NATS_CERT_DIR = "/etc/nats-certs/nats"
 NATS_SECRET = "nats-tls"
+# ledger 1427: the reloader watches all three files the broker loaded at
+# boot (B-N4.1's two, `tls.crt`/`tls.key`; B-N5's `ca.crt`), each its own
+# `-config` argument, from the same `nats-tls` mount the server reads.
+RELOADER_CONFIG_FILES = ("tls.crt", "tls.key", "ca.crt")
 
 
 def nats_conf(document: dict) -> dict:
@@ -902,6 +969,22 @@ def broker_failures(documents: list) -> dict[str, object]:
     mount = {m["name"]: m["mountPath"] for m in server.get("volumeMounts") or []}.get(NATS_SECRET)
     if mount != NATS_CERT_DIR:
         failures["nats: mount nats-tls"] = mount
+    reloader = next((c for c in pod["containers"] if c["name"] == "reloader"), None)
+    if reloader is None:
+        failures["nats: reloader"] = None
+    else:
+        args = reloader.get("args") or []
+        for file in RELOADER_CONFIG_FILES:
+            pair = ["-config", f"{NATS_CERT_DIR}/{file}"]
+            if not any(args[index : index + 2] == pair for index in range(len(args) - 1)):
+                failures[f"nats: reloader -config {file}"] = args
+        reloader_mount = next((m for m in reloader.get("volumeMounts") or [] if m["name"] == NATS_SECRET), None)
+        if (
+            reloader_mount is None
+            or reloader_mount.get("mountPath") != NATS_CERT_DIR
+            or reloader_mount.get("subPath")
+        ):
+            failures["nats: reloader mount nats-tls"] = reloader_mount
     return failures
 
 
@@ -989,6 +1072,31 @@ def test_the_leaf_volume_at_another_secret_names_it(rendered: list) -> None:
     assert list(failures) == ["nats: volume nats-tls"]
 
 
+def test_a_dropped_reloader_config_arg_names_it(rendered: list) -> None:
+    """ledger 1427: the reloader must watch `ca.crt` too, not only the two B-N4.1 files."""
+
+    def drop_ca_arg(statefulset: dict) -> None:
+        pod = statefulset["spec"]["template"]["spec"]
+        reloader = next(c for c in pod["containers"] if c["name"] == "reloader")
+        args = reloader["args"]
+        index = args.index(f"{NATS_CERT_DIR}/ca.crt")
+        del args[index - 1 : index + 1]  # the "-config" / path pair
+
+    failures = broker_failures(mutated(rendered, "StatefulSet", "nats", drop_ca_arg))
+    assert list(failures) == ["nats: reloader -config ca.crt"]
+
+
+def test_a_reloader_mount_with_a_subpath_names_it(rendered: list) -> None:
+    def add_subpath(statefulset: dict) -> None:
+        pod = statefulset["spec"]["template"]["spec"]
+        reloader = next(c for c in pod["containers"] if c["name"] == "reloader")
+        mount = next(m for m in reloader["volumeMounts"] if m["name"] == NATS_SECRET)
+        mount["subPath"] = "tls.crt"
+
+    failures = broker_failures(mutated(rendered, "StatefulSet", "nats", add_subpath))
+    assert list(failures) == ["nats: reloader mount nats-tls"]
+
+
 # ── THE CACHE'S TLS LISTENER (B-V4.1, ledger 925, ADR-0852) ──────────────────
 
 # The server's side of the valkey hop, stated beside the gateway's side above.
@@ -1028,6 +1136,12 @@ VALKEY_TLS_ARGS = (
     f"--tls-ca-cert-file {VALKEY_TLS_DIR}/ca.crt",
     '--tls-auth-clients "$VALKEY_TLS_AUTH_CLIENTS"',
 )
+# ledger 1429: the files the boot script hashes, in the order it hashes them.
+VALKEY_HASHED_FILES = tuple(f"{VALKEY_TLS_DIR}/{file}" for file in ("tls.crt", "tls.key", "ca.crt"))
+# `valkey-ingress`'s one rule names gateway as its peer (`app: gateway`); the
+# 6380 check must hold for THAT rule, never for "6380 open from some other
+# peer while gateway's own rule stays closed" (ledger 1429).
+VALKEY_INGRESS_PEER = {"podSelector": {"matchLabels": {"app": "gateway"}}}
 
 
 
@@ -1051,8 +1165,14 @@ def cache_failures(documents: list) -> dict[str, object]:
     for arg in VALKEY_TLS_ARGS:
         if arg not in script:
             failures[f"valkey: arg {arg.split()[0]}"] = None
-    if f"> {VALKEY_HASH}" not in script:
+    hash_line = next((line for line in script.splitlines() if f"> {VALKEY_HASH}" in line), None)
+    if hash_line is None:
         failures["valkey: boot hash"] = None
+    else:
+        # ledger 1429: not just THAT it hashes, but that it hashes all three files.
+        hashed = hash_line.split(">", 1)[0].split()[1:]
+        if hashed != list(VALKEY_HASHED_FILES):
+            failures["valkey: boot hash files"] = hashed
     liveness = " ".join(((server.get("livenessProbe") or {}).get("exec") or {}).get("command") or [])
     if f"sha256sum -c --status {VALKEY_HASH}" not in liveness:
         failures["valkey: liveness hash check"] = liveness
@@ -1062,20 +1182,30 @@ def cache_failures(documents: list) -> dict[str, object]:
     volume = next((v for v in pod.get("volumes") or [] if v["name"] == VALKEY_SECRET), None)
     if (volume or {}).get("secret", {}).get("secretName") != VALKEY_SECRET:
         failures["valkey: volume valkey-tls"] = volume
-    mount = {m["name"]: m["mountPath"] for m in server.get("volumeMounts") or []}.get(VALKEY_SECRET)
-    if mount != VALKEY_TLS_DIR:
+    mount = next((m for m in server.get("volumeMounts") or [] if m["name"] == VALKEY_SECRET), None)
+    # ledger 1429: the mountPath AND no subPath — a subPath would serve one
+    # file at that whole path, not the directory valkey's args read from.
+    if mount is None or mount.get("mountPath") != VALKEY_TLS_DIR or mount.get("subPath"):
         failures["valkey: mount valkey-tls"] = mount
     wanted = {"valkey-tls": VALKEY_PORTS["valkey-tls"]}
     container_ports = {p.get("name"): p.get("containerPort") for p in server.get("ports") or []}
     service_ports = {p.get("name"): (p.get("port"), p.get("targetPort")) for p in service["spec"].get("ports") or []}
     allowed = {p.get("port") for rule in policy["spec"].get("ingress") or [] for p in rule.get("ports") or []}
+    # ledger 1429: the rule naming gateway as its peer, not any rule at all —
+    # 6380 open from another peer while gateway's own rule lacks it must fail.
+    gateway_ports = {
+        p.get("port")
+        for rule in policy["spec"].get("ingress") or []
+        if VALKEY_INGRESS_PEER in (rule.get("from") or [])
+        for p in rule.get("ports") or []
+    }
     for name, port in wanted.items():
         if container_ports.get(name) != port:
             failures[f"valkey: containerPort {name}"] = container_ports.get(name)
         if service_ports.get(name) != (port, name):
             failures[f"valkey: Service port {name}"] = service_ports.get(name)
-        if port not in allowed:
-            failures[f"valkey: valkey-ingress port {port}"] = sorted(allowed)
+        if port not in gateway_ports:
+            failures[f"valkey: valkey-ingress port {port} from app: gateway"] = sorted(gateway_ports)
     plaintext, closed = VALKEY_PORTS["valkey"], " with no VALKEY hop in cleartext"
     if "valkey" in container_ports or plaintext in container_ports.values():
         failures[f"valkey: containerPort 6379{closed}"] = None
@@ -1129,6 +1259,19 @@ def test_a_dropped_boot_hash_names_it(rendered: list) -> None:
     assert cache_failures(mutated(rendered, "Deployment", "valkey", change)) == {"valkey: boot hash": None}
 
 
+def test_a_boot_hash_missing_a_file_names_it(rendered: list) -> None:
+    """ledger 1429: the hash must cover `ca.crt` too, not only `tls.crt`/`tls.key`."""
+
+    def drop_ca_from_hash(script: str) -> str:
+        first_line, _, rest = script.partition("\n")
+        return first_line.replace(f" {VALKEY_TLS_DIR}/ca.crt", "") + "\n" + rest
+
+    change = with_valkey_script(drop_ca_from_hash)
+    assert cache_failures(mutated(rendered, "Deployment", "valkey", change)) == {
+        "valkey: boot hash files": [f"{VALKEY_TLS_DIR}/tls.crt", f"{VALKEY_TLS_DIR}/tls.key"]
+    }
+
+
 def test_a_liveness_without_the_hash_check_names_it(rendered: list) -> None:
     probe = ["sh", "-c", "valkey-cli -s /run/valkey/valkey.sock ping >/dev/null"]
 
@@ -1174,6 +1317,16 @@ def test_the_leaf_volume_at_another_secret_names_it_for_the_cache(rendered: list
         volume["secret"]["secretName"] = "nats-tls"
 
     assert list(cache_failures(mutated(rendered, "Deployment", "valkey", change))) == ["valkey: volume valkey-tls"]
+
+
+def test_a_valkey_tls_mount_with_a_subpath_names_it(rendered: list) -> None:
+    """ledger 1429: a subPath would serve one file, not the directory the boot script reads from."""
+
+    def change(deployment: dict) -> None:
+        mount = next(m for m in valkey_container(deployment)["volumeMounts"] if m["name"] == VALKEY_SECRET)
+        mount["subPath"] = "tls.crt"
+
+    assert list(cache_failures(mutated(rendered, "Deployment", "valkey", change))) == ["valkey: mount valkey-tls"]
 
 
 def valkey_objects(documents: list) -> tuple[dict, dict, dict]:
@@ -1245,7 +1398,27 @@ def test_a_closed_tls_port_on_the_policy_names_it(rendered: list) -> None:
             rule["ports"] = [p for p in rule["ports"] if p["port"] != 6380]
 
     assert cache_failures(mutated(rendered, "NetworkPolicy", "valkey-ingress", change)) == {
-        "valkey: valkey-ingress port 6380": []
+        "valkey: valkey-ingress port 6380 from app: gateway": []
+    }
+
+
+def test_a_valkey_ingress_port_from_another_peer_names_it(rendered: list) -> None:
+    """ledger 1429: 6380 open from a DIFFERENT peer must still fail — the check is gateway's rule, not any rule."""
+
+    def change(policy: dict) -> None:
+        policy["spec"]["ingress"] = [
+            {
+                "from": [{"podSelector": {"matchLabels": {"app": "gateway"}}}],
+                "ports": [{"protocol": "TCP", "port": 9999}],
+            },
+            {
+                "from": [{"podSelector": {"matchLabels": {"app": "not-gateway"}}}],
+                "ports": [{"protocol": "TCP", "port": 6380}],
+            },
+        ]
+
+    assert cache_failures(mutated(rendered, "NetworkPolicy", "valkey-ingress", change)) == {
+        "valkey: valkey-ingress port 6380 from app: gateway": [9999]
     }
 
 
