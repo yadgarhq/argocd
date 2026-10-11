@@ -6584,3 +6584,111 @@ valkey's mode, but Argo CD self-heal would put it back; a revert is the durable
 path. Revert this before any revert of B-V5, and B-V5 before any revert of
 B-V4.2: the parent refuses `clientAuth` "optional" or "required" with gateway's
 `valkey.tls.enabled` false.
+
+## The yadgar pin moves to parent chart 0.23.8, carrying gateway/iam/task fixes (ledgers 1430, 1422, 1424)
+
+**What the merge does.** It moves `applications/yadgar.yaml`'s
+`targetRevision` from 0.23.2 to 0.23.8, and `scripts/chart_pin.json`'s
+`chart_tag` from `v0.23.2` to `v0.23.8`. `platform_version` stays `0.2.1`:
+no platform-sourced operator Application moves. `yadgarhq/chart` main is
+ahead of 0.23.8 (at 0.23.9, which additionally pins `platform` 0.2.2); this
+PR deliberately stops at 0.23.8 because neither of today's other two
+merges needs that platform bump — `platform`#41 is docs-only and
+`lifecycle`#28 is a library crate fix that `gateway`/`iam`/`task` do not
+yet depend on a new version of.
+
+Three modules move, each the first chart release to carry its fix:
+
+- `gateway` 0.12.0 → 0.12.2 (chart `v0.23.7`, `199eeb9`): `gateway`#109
+  (`d4e7d0d`, ledger 1430) retries once on a dropped rate-limit connection
+  and warms the Valkey connection in the background at boot
+  (`Limiter::warm`, spawned and never awaited — a down or slow Valkey is
+  still picked up by the first real call exactly as before). `warm()` logs
+  nothing on success or failure by design; there is no boot log line to
+  watch for it, only the absence of a connect-caused `DEGRADED`
+  (`yadgar_gateway_rate_limit_degraded_total`) tick on the first request.
+- `iam` 0.11.1 → 0.11.3 (chart `v0.23.6`, `30487bc`): `iam`#100 (`48f79e5`,
+  ledgers 1422, 1424) names `client_auth` in the `"iam listening"` boot
+  log and adds a gauge, `yadgar_iam_invalidation_publishing`.
+- `task` 0.7.1 → 0.7.2 (chart `v0.23.5`, `2d50f3d`): `task`#76 (`2b30a48`,
+  ledger 1422) names `client_auth` in the `"task listening"` boot log.
+
+None of the three adds a new required env, arg, probe or volume — each
+change is boot-log/metric-observable only.
+
+Measured 2026-10-11 with helm 3.18.4 against the OCI chart at both tags,
+this organisation's values, and a server-side dry run against
+`kind-yadgar`:
+
+- `yadgar`: 90 → 90 objects (K3, `scripts/gates/yadgar_render.sha256`). 0
+  added, 0 removed, 3 changed: `apps/Deployment//gateway`,
+  `apps/Deployment//iam` and `apps/Deployment//task`, and the only field
+  that differs on each is `image`.
+- The three new images equal their module's own GHCR tag digest
+  (`gateway:0.12.2`, `iam:0.11.3`, `task:0.7.2`, checked against each
+  package's tag list).
+- `kubectl --context kind-yadgar diff` against the rendered manifest: net
+  of the known noise a bare `helm template | kubectl diff` adds on every
+  object (the `argocd.argoproj.io/tracking-id` annotation Argo itself
+  carries, and a `metadata.generation` bump present regardless of this
+  pin), the ONLY remaining diffs anywhere are the same three `image`
+  lines. No other Deployment, Service, ConfigMap, Secret, StatefulSet or
+  CRD changes.
+
+**What runs.** `gateway`, `iam` and `task` each roll (`maxSurge: 1 /
+maxUnavailable: 0`, 2 replicas each). No other Deployment, the `-db`
+charts, `nats` or `valkey` restart. No migration runs.
+
+### Before this merge — read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. yadgar Synced/Healthy at 0.23.2.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+
+# 2. Read 2026-10-11: gateway/iam/task 2/2/2 at the old digests.
+kubectl --context kind-yadgar -n yadgar get deploy gateway iam task \
+  -o 'custom-columns=NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,IMAGE:.spec.template.spec.containers[0].image'
+```
+
+### After this merge — read-only
+
+```bash
+# 1. yadgar Synced/Healthy at 0.23.8, no operator Application changed.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+
+# 2. gateway/iam/task each 2/2/2, new pod names, new digests.
+kubectl --context kind-yadgar -n yadgar get deploy gateway iam task \
+  -o 'custom-columns=NAME:.metadata.name,REPLICAS:.spec.replicas,READY:.status.readyReplicas,UPDATED:.status.updatedReplicas,IMAGE:.spec.template.spec.containers[0].image'
+
+# 3. iam's boot line names client_auth and the new pods expose the gauge.
+kubectl --context kind-yadgar -n yadgar logs -l app=iam --tail=50 | grep -E "iam listening|client_auth"
+kubectl --context kind-yadgar -n yadgar exec deploy/iam -- wget -qO- localhost:9090/metrics 2>/dev/null | grep yadgar_iam_invalidation_publishing
+
+# 4. task's boot line names client_auth.
+kubectl --context kind-yadgar -n yadgar logs -l app=task --tail=50 | grep -E "task listening|client_auth"
+
+# 5. gateway: no distinguishing boot log for the Valkey warm (logs nothing
+#    by design); confirm no connect-caused DEGRADED tick on first use
+#    instead, via the operator's own fresh-login + find_tasks probe.
+kubectl --context kind-yadgar -n yadgar logs -l app=gateway --tail=50
+
+# 6. A fresh-login + find_tasks probe (run once by the coordinator)
+#    answers normally.
+```
+
+### Rollback — a revert
+
+If `yadgar`'s operation is still Running or retrying, end it first.
+NEEDS-MAX: `argocd app terminate-op yadgar` against kind-yadgar's Argo CD
+— v3.1.8's Application CRD has no `syncPolicy.retry.refresh`, so a revert
+does not interrupt a running operation.
+
+Then revert the merge. `yadgar` syncs back to 0.23.2: `gateway`'s,
+`iam`'s and `task`'s images go back to their old digests via client-side
+apply of the last-applied configuration. No other object changes, nothing
+was created, and no migration ran.
