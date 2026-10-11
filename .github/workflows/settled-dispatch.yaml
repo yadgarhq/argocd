@@ -53,9 +53,16 @@ jobs:
           # Full history: the anchor A is found by walking it.
           fetch-depth: 0
 
+      # PINNED, NOT "3.x": the next step installs PyYAML 6.0.3 wheels-only
+      # (`--only-binary=:all:`), and PyPI has no cp315 wheel for it yet. "3.x"
+      # resolves to whatever CPython the hosted toolcache carries that day; the
+      # day it moves to 3.15, the install above has no wheel to install and
+      # fails, taking out this job — the settled gate's primary trigger
+      # (ADR-0894). Move this pin forward only once PyPI publishes a matching
+      # wheel for the version named here.
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.x"
+          python-version: "3.14"
 
       # The version K's shared vectors are measured under (settled_gate.py).
       # HASH-PINNED, WHEELS ONLY: this job later mints a release-App token, so
