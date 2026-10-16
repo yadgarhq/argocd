@@ -1154,6 +1154,9 @@ VALKEY_SECRET = "valkey-tls"
 VALKEY_HASH = "/run/valkey/watched.sha256"
 VALKEY_AUTH_DIR = "/etc/valkey/auth"
 VALKEY_PASSWORD_SECRET = "valkey-password"
+# ledger 1447: platform#42 projects the Secret's one key `password` to a file `password`, in
+# valkey's pod (read at VALKEY_AUTH_DIR) and in gateway's (read at YADGAR_VALKEY_PASSWORD_FILE).
+VALKEY_PASSWORD_ITEMS = [{"key": "password", "path": "password"}]
 # ledger 1437: an env copy of the password is fixed at process start and outlives a rotation.
 VALKEY_PASSWORD_ENV = ("VALKEY_PASSWORD", "VALKEYCLI_AUTH")
 VALKEY_PORTS = {"valkey": 6379, "valkey-tls": 6380}
@@ -1226,6 +1229,26 @@ def cache_failures(documents: list) -> dict[str, object]:
     for name in VALKEY_PASSWORD_ENV:
         if name in env:
             failures[f"valkey: env {name}"] = None
+    # ledger 1447: the mount passes while the volume projects another Secret or key, so check
+    # the volume on both sides of the password: valkey (reads it) and gateway (presents it).
+    gateway = by_name.get(("Deployment", "gateway"))
+    for owner, deploy in (("valkey", deployment), ("gateway", gateway)):
+        volumes = ((deploy or {}).get("spec", {}).get("template", {}).get("spec", {})).get("volumes") or []
+        volume = next((v for v in volumes if v["name"] == VALKEY_PASSWORD_SECRET), None)
+        secret = (volume or {}).get("secret") or {}
+        if secret.get("secretName") != VALKEY_PASSWORD_SECRET or secret.get("items") != VALKEY_PASSWORD_ITEMS:
+            failures[f"{owner}: volume valkey-password"] = volume
+    # ledger 1447/1437, gateway half: the mount has no subPath (kubelet never refreshes one) and the
+    # file env names THE mount's `<mountPath>/password`.
+    if gateway is not None:
+        container = next((c for c in gateway["spec"]["template"]["spec"]["containers"] if c["name"] == "gateway"), {})
+        gateway_mount = next((m for m in container.get("volumeMounts") or [] if m["name"] == VALKEY_PASSWORD_SECRET), None)
+        if gateway_mount is None or gateway_mount.get("subPath"):
+            failures["gateway: mount valkey-password"] = gateway_mount
+        gateway_env = {e["name"]: e.get("value") for e in container.get("env") or []}
+        wanted = f"{gateway_mount['mountPath']}/password" if gateway_mount else None
+        if wanted is None or gateway_env.get("YADGAR_VALKEY_PASSWORD_FILE") != wanted:
+            failures["gateway: env YADGAR_VALKEY_PASSWORD_FILE"] = gateway_env.get("YADGAR_VALKEY_PASSWORD_FILE")
     wanted = {"valkey-tls": VALKEY_PORTS["valkey-tls"]}
     container_ports = {p.get("name"): p.get("containerPort") for p in server.get("ports") or []}
     service_ports = {p.get("name"): (p.get("port"), p.get("targetPort")) for p in service["spec"].get("ports") or []}
@@ -1340,6 +1363,93 @@ def test_a_valkey_password_mount_with_a_subpath_names_it(rendered: list) -> None
         mount["subPath"] = "password"
 
     assert list(cache_failures(mutated(rendered, "Deployment", "valkey", change))) == ["valkey: mount valkey-password"]
+
+
+def password_volume(deployment: dict) -> dict:
+    return next(v for v in deployment["spec"]["template"]["spec"]["volumes"] if v["name"] == VALKEY_PASSWORD_SECRET)
+
+
+@pytest.mark.parametrize(
+    ("kind_name", "failure"),
+    [("valkey", "valkey: volume valkey-password"), ("gateway", "gateway: volume valkey-password")],
+)
+@pytest.mark.parametrize("field", ["secretName", "key", "path"])
+def test_a_wrong_valkey_password_volume_names_it(rendered: list, kind_name: str, failure: str, field: str) -> None:
+    """ledger 1447: the mount alone passes while the volume projects another Secret or key.
+
+    Constructed mutations of the volume platform#42 renders: another
+    `secretName`, another `items[].key`, another `items[].path` (the file
+    `YADGAR_VALKEY_PASSWORD_FILE` and `VALKEY_AUTH_DIR/password` name).
+    """
+
+    def change(deployment: dict) -> None:
+        secret = password_volume(deployment)["secret"]
+        if field == "secretName":
+            secret["secretName"] = "valkey-tls"
+        else:
+            secret["items"][0][field] = "wrong"
+
+    assert list(cache_failures(mutated(rendered, "Deployment", kind_name, change))) == [failure]
+
+
+def gateway_container(deployment: dict) -> dict:
+    return next(c for c in deployment["spec"]["template"]["spec"]["containers"] if c["name"] == "gateway")
+
+
+GATEWAY_PASSWORD_MOUNT_FAILURE = "gateway: mount valkey-password"
+GATEWAY_PASSWORD_ENV_FAILURE = "gateway: env YADGAR_VALKEY_PASSWORD_FILE"
+
+
+def test_the_gateway_reads_the_valkey_password_from_its_mount(rendered: list) -> None:
+    deployment = next(d for d in rendered if d["kind"] == "Deployment" and d["metadata"]["name"] == "gateway")
+    env = {e["name"]: e.get("value") for e in gateway_container(deployment)["env"]}
+    mount = next(m for m in gateway_container(deployment)["volumeMounts"] if m["name"] == VALKEY_PASSWORD_SECRET)
+    assert env["YADGAR_VALKEY_PASSWORD_FILE"] == f"{mount['mountPath']}/password"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "failures"),
+    [
+        ("env removed", [GATEWAY_PASSWORD_ENV_FAILURE]),
+        ("env moved", [GATEWAY_PASSWORD_ENV_FAILURE]),
+        ("mount removed", [GATEWAY_PASSWORD_MOUNT_FAILURE, GATEWAY_PASSWORD_ENV_FAILURE]),
+        ("mountPath moved", [GATEWAY_PASSWORD_ENV_FAILURE]),
+        ("subPath added", [GATEWAY_PASSWORD_MOUNT_FAILURE]),
+    ],
+)
+def test_a_gateway_password_mount_or_env_gone_wrong_names_it(rendered: list, mutation: str, failures: list) -> None:
+    """ledger 1447/1437: the volume can be right while the mount or the file env is not.
+
+    A `subPath` is never refreshed by kubelet, so a rotation would never reach
+    gateway. The env must name `<mountPath>/password` of THE mount, so moving
+    only the mountPath, or only the env, is a failure.
+    """
+
+    def change(deployment: dict) -> None:
+        container = gateway_container(deployment)
+        mount = next(m for m in container["volumeMounts"] if m["name"] == VALKEY_PASSWORD_SECRET)
+        env = container["env"]
+        if mutation == "env removed":
+            env[:] = [e for e in env if e["name"] != "YADGAR_VALKEY_PASSWORD_FILE"]
+        elif mutation == "env moved":
+            next(e for e in env if e["name"] == "YADGAR_VALKEY_PASSWORD_FILE")["value"] = "/elsewhere/password"
+        elif mutation == "mount removed":
+            container["volumeMounts"].remove(mount)
+        elif mutation == "mountPath moved":
+            mount["mountPath"] = "/var/run/secrets/moved"
+        else:
+            mount["subPath"] = "password"
+
+    assert list(cache_failures(mutated(rendered, "Deployment", "gateway", change))) == failures
+
+
+def test_a_valkey_password_volume_with_no_items_names_it(rendered: list) -> None:
+    """Without `items` the Secret mounts every key it holds, not only `password`."""
+
+    def change(deployment: dict) -> None:
+        password_volume(deployment)["secret"].pop("items")
+
+    assert list(cache_failures(mutated(rendered, "Deployment", "valkey", change))) == ["valkey: volume valkey-password"]
 
 
 @pytest.mark.parametrize("name", VALKEY_PASSWORD_ENV)
