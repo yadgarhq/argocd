@@ -67,7 +67,7 @@ jobs:
           python-version: "3.14"
 
       # The version K's shared vectors are measured under (settled_gate.py).
-      # HASH-PINNED, WHEELS ONLY: this job later mints a release-App token, so
+      # HASH-PINNED, WHEELS ONLY: this job later mints a settled-dispatch App token, so
       # nothing installed here may be a package PyPI could swap under the name.
       - name: install PyYAML (hash-pinned)
         run: |
