@@ -147,6 +147,12 @@ CI job, never in the offline pre-commit hook.
       `iam-db`, `project-db` and `task-db` Deployments, `image` only — each
       new digest equals its module's own GHCR tag digest; no new env, arg,
       probe, volume or mount).
+      Re-measured 2026-10-16 at 0.24.9, carrying gateway 0.12.5, iam 0.11.6,
+      iam-db 0.10.3, project 0.3.3, project-db 0.6.3, task 0.7.4 and task-db
+      0.9.3 (config 0.2.1 and platform 0.2.4 render nothing new): 90 objects,
+      none added or removed, 7 changed (the seven module Deployments, `image`
+      only — each new digest equals its module's own GHCR tag digest; no new
+      env, arg, probe, volume or mount).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,

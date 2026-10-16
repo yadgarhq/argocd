@@ -1966,6 +1966,12 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # still ran the images 0.19.1 pinned; their new releases are `Cargo.lock`-only
 # dependency bumps. gateway's and iam's images were already in the set.
 #
+# RE-MEASURED AT 0.24.9 (gateway 0.12.5, iam 0.11.6, iam-db 0.10.3, project
+# 0.3.3, project-db 0.6.3, task 0.7.4, task-db 0.9.3, platform 0.2.4), against
+# the same 0.19.1: 82 objects on both sides, none added, 15 fields, the same
+# set as at 0.23.15. Only image digests moved from 0.23.15; every module was
+# already in PIN_CHANGES.
+#
 # BOTH SIDES RENDER EVERY SERVER AT `clientAuth: "off"`, FROM B-U8a ON. The
 # 0.13.13 module charts predate the B-U5 contracts, and their render checks
 # refuse `optional` and `required` by name ("not enforced yet"). Once a hop

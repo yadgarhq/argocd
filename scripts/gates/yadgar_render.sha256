@@ -1,6 +1,6 @@
 # K3: sha256 of each object `applications/yadgar.yaml` renders, as canonical JSON.
 # Regenerate: python3 scripts/gates/test_yadgar_application.py --write
-targetRevision  0.23.15
+targetRevision  0.24.9
 2355fad035bd3696b4fc741ed21eba814d3f4941a75fa16fb16cc73d4a4f0696  /ConfigMap//audit
 d19a8a2ae018718b5fd1626dade2ec71e47cd2516e203491e319a02e4dab0968  /ConfigMap//gateway-knobs
 a2f6a8433dcff0b94a6031f1dd4f4f2e8dacbcdc77802163b6221755c4b93173  /ConfigMap//nats-config
@@ -25,13 +25,13 @@ a09d6e21f3be46bc1e95a3f81493a41a51535ecba1cea48c44bb1516e64f541a  /ServiceAccoun
 0c1903ade9cc52becb857589671587e1609530a1fc49dae17378212452cdc5db  /ServiceAccount//project-db
 c0e197e038ddb56ee493c89d54a9f31a7a28989db10e6b62499af0d35298bc60  /ServiceAccount//task
 edb82b5473dc6e2170e034831628de8b51bc03c3dbc474c487c285b8e25ee7bb  /ServiceAccount//task-db
-e893fee76a91e495600b0bca337f5118621b54de8484754564216bdd86013f64  apps/Deployment//gateway
-27f91940dbf5ee281a05a3d5a6fa5a8ce27ea8abc88c499915af894d070da4f0  apps/Deployment//iam
-17bc2db6735de63d578f3cdf7f614fb89ede870dbed998604f743cb01791fd8c  apps/Deployment//iam-db
-6dddb6f1119a3d3fc97209f67b70c1c65864e337d96f7a98b85c740fb2ef8d85  apps/Deployment//project
-0b5146f7449e5bf78dc4ca38e4c16011a1779e19d9d68ed8019ae63275cc1bf2  apps/Deployment//project-db
-7affe647bafe28efeb02f99f6edbb1773ddc61ecd339e734f6340aed70cd40bd  apps/Deployment//task
-5c7cc411fa25ff2d38e01885905c16b919fa8ab5df1329f5332d1911d6172dff  apps/Deployment//task-db
+ca2013651923b6c22c74f60945a89806fdd21ca2285baabd84c6d0a27e59cda0  apps/Deployment//gateway
+78c29255bd011957c4db51b953326b7286cb2d2a32cb38e8106d2acfe4480092  apps/Deployment//iam
+827140e88b83fa480cefde7fdd27469deea01daa7d7a734765fa8c3d8e67f769  apps/Deployment//iam-db
+7227e7d5806e8603f658745227181c6b6a46f27d8b9ce08e4ff6d4b6f26d132e  apps/Deployment//project
+5cd7f953945c96b7b1ef04b61833610cb81fa6fdca735aa9fdfb81864d277887  apps/Deployment//project-db
+38c2d7d7e8d2534ee45d6bd38a7db078918ace4de1abaa9376202e13d1bad507  apps/Deployment//task
+cd1d398ce061d1ca08c5b154227ee84eb90a23cb7eb9350f58fd1e9cf76ea3bd  apps/Deployment//task-db
 9ce974ab2ec1355f6db1207010f3ca0ce9e865452a7326abac5b05abf5aae5ab  apps/Deployment//valkey
 2c7803c2bcd04989370050dc77049335d5c24808cc5831b4e5d3748add0f59f3  apps/StatefulSet//nats
 aac3d30b38147f49357856fbda3ec9d299a019c556fad5c73d37a64c48c3c206  batch/Job//admin-bootstrap-token

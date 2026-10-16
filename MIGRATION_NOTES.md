@@ -6963,3 +6963,96 @@ Then revert the merge. `yadgar` syncs back to 0.23.10: the five images go
 back to their old digests by client-side apply of the last-applied
 configuration. No other object changes, nothing was created, and no
 migration ran.
+
+## The yadgar pin moves to parent chart 0.24.9, carrying seven module patch releases and platform 0.2.4
+
+**What the merge does.** It moves `applications/yadgar.yaml`'s
+`targetRevision` from 0.23.15 to 0.24.9, `scripts/chart_pin.json`'s
+`chart_tag` from `v0.23.15` to `v0.24.9` and its `platform_version` from
+0.2.3 to 0.2.4, and the `targetRevision` of the five platform-sourced
+operator Applications (`cert-manager`, `envoy-gateway`, `keda`,
+`mariadb-operator`, `prometheus`) from 0.2.3 to 0.2.4.
+
+`v0.24.0` was a spurious minor bump: a `ci:`-only change was read as
+breaking (ledger 1518). No breaking change happened between `v0.23.15` and
+`v0.24.9`. All 18 commits in `v0.23.15..v0.24.9` are `ci:` commits that move
+one `chart/Chart.yaml` pin or the example pins, plus one prose edit to the
+chart's `ci.yaml` (ledger 1286, `chart`#46).
+
+- `gateway` 0.12.3 → 0.12.5: tests (`tests/valkey_auth.rs`,
+  `tests/valkey_warm_boot.rs`) and `ci.yaml` only. The image digest still
+  changes, because the release rebuilds the image.
+- `iam` 0.11.4 → 0.11.6: `run` split into `run` and `broker_and_watch`
+  (`src/main.rs`, no behaviour change), and `ci.yaml`.
+- `iam-db` 0.10.1 → 0.10.3, `project-db` 0.6.1 → 0.6.3, `task-db` 0.9.1 →
+  0.9.3: rustls 0.23.46 and `yadgar-dial` v0.2.17 (`Cargo.toml`,
+  `Cargo.lock`), and `ci.yaml`.
+- `project` 0.3.1 → 0.3.3, `task` 0.7.2 → 0.7.4: rustls 0.23.46
+  (RUSTSEC-2026-0346 to -0349; `Cargo.lock`), and `ci.yaml`.
+- `config` 0.2.0 → 0.2.1: `ci.yaml` only. It renders nothing.
+- `platform` 0.2.3 → 0.2.4: `Chart.yaml` version and appVersion only. `diff -r`
+  of the two pulled charts shows no other difference, so the five operator
+  Applications render the same objects.
+
+Measured 2026-10-16 with helm 3.20.2 against the OCI chart at both tags and
+this organisation's values:
+
+- `yadgar`: 90 → 90 objects (K3, `scripts/gates/yadgar_render.sha256`). 0
+  added, 0 removed, 7 changed: the `gateway`, `iam`, `iam-db`, `project`,
+  `project-db`, `task` and `task-db` Deployments. The only line that differs
+  on each is `image`.
+- Each new image digest equals its module's own GHCR tag digest, read
+  anonymously from the registry: `gateway:0.12.5` `sha256:b6f06309…`,
+  `iam:0.11.6` `sha256:b743b461…`, `iam-db:0.10.3` `sha256:7a1a2218…`,
+  `project:0.3.3` `sha256:4346019e…`, `project-db:0.6.3` `sha256:4a5ce226…`,
+  `task:0.7.4` `sha256:b623b5b5…`, `task-db:0.9.3` `sha256:82017962…`.
+- Not measured: a server-side dry run against `kind-yadgar`.
+
+**What runs.** The seven module Deployments roll. `nats`, `valkey` and the
+MariaDB instances do not restart. No migration file changed in any module
+(`git diff --stat` of each tag pair shows no migration path).
+
+**The settled epoch moves.** `settled_gate.render_key` gives K `438cd122…` at
+`origin/main` and `aecb5d95…` with this change. So the push to main runs
+`settled-dispatch.yaml`, which dispatches `yadgarhq/argocd-verify`'s
+`settled.yaml` with a token from the App `yadgarhq-settled-dispatch`
+(ADR-0912).
+
+### Before this merge, read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. yadgar Synced/Healthy at 0.23.15 (read 2026-10-16).
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+```
+
+### After this merge, read-only
+
+```bash
+# 1. yadgar Synced/Healthy at 0.24.9.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+
+# 2. Image currency by pod imageID DIGEST (ADR-0553), not by Synced. Expect
+#    gateway b6f06309…, iam b743b461…, iam-db 7a1a2218…, project 4346019e…,
+#    project-db 4a5ce226…, task b623b5b5…, task-db 82017962…
+kubectl --context kind-yadgar -n yadgar get pods \
+  -o 'custom-columns=NAME:.metadata.name,IMAGEID:.status.containerStatuses[0].imageID' \
+  | grep -E '^(gateway|iam|iam-db|project|project-db|task|task-db)-[a-z0-9]{6,10}-[a-z0-9]{5} '
+
+# 3. The settled gate was dispatched by the App on this merge's epoch.
+gh-personal api 'repos/yadgarhq/argocd-verify/actions/workflows/settled.yaml/runs?event=workflow_dispatch&per_page=5' \
+  --jq '.workflow_runs[] | [.id, .event, .triggering_actor.login, .actor.login, .created_at, .conclusion] | @tsv'
+```
+
+### Rollback, a revert
+
+If `yadgar`'s operation is still Running or retrying, end it first.
+NEEDS-MAX: `argocd app terminate-op yadgar` against kind-yadgar's Argo CD.
+
+Then revert the merge. `yadgar` syncs back to 0.23.15: the seven images go
+back to their old digests. The five operator Applications sync back to
+0.2.3 and change no object. Nothing was created, and no migration ran.
