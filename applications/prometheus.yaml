@@ -394,19 +394,20 @@ spec:
                           {{ $labels.pod }}; the log line at boot names the paths.
                     # NOT THE ONLY RULE HERE THAT CAN FIRE TODAY ANY MORE — see
                     # below. `yadgar_tls_certificate_not_after_seconds` is a
-                    # `yadgar_*` series this Prometheus holds; `iam` and `task`
-                    # publish it at `kind="serving"`, and `iam-db` and `task-db`
-                    # now do too (see below).
+                    # `yadgar_*` series this Prometheus holds, for the services
+                    # named below.
                     #
-                    # FOURTEEN DAYS, ARITHMETIC RATHER THAN TASTE. All nine
-                    # LEAF certificates this repository declares — four serving
-                    # and four client under `infra/internal-tls/`, plus the edge
-                    # leaf in `infra/tls/` — set `duration: 2160h` (90d). Their
-                    # `renewBefore` values are NO LONGER ALL 720h: the eight
-                    # under `infra/internal-tls/` climb a 6-hour ladder from 726h
-                    # to 780h so that no two services renew in the same window,
-                    # which is argued at length in `certificates.yaml`. The edge
-                    # leaf keeps 720h.
+                    # FOURTEEN DAYS, ARITHMETIC RATHER THAN TASTE. All thirteen
+                    # LEAF certificates the yadgar parent chart renders — eight
+                    # serving and four client in the internal-tls set, plus the
+                    # edge leaf `gateway-tls` — set `duration: 2160h` (90d). (The
+                    # fourteenth Certificate is the internal root, below.) Their
+                    # `renewBefore` values are NO LONGER ALL 720h: the twelve
+                    # internal ones climb a 6-hour ladder from 726h to 792h so
+                    # that no two services renew in the same window. The edge
+                    # leaf keeps 720h. Counted 2026-10-16 from the render of
+                    # `applications/yadgar.yaml` at 0.23.10 (the helper
+                    # `parent_render` in `scripts/gates/test_no_two_owners.py`).
                     #
                     # THE THRESHOLD IS SIZED AGAINST THE SMALLEST OF THEM, and
                     # the ladder only ever moves a renewal EARLIER, so the floor
@@ -418,50 +419,43 @@ spec:
                     # line, and it sits far enough below every `renewBefore` here
                     # that a normal renewal cannot trip it.
                     #
-                    # THIS RULE COVERS FOUR SERVING CERTIFICATES TODAY AND, ONCE
-                    # LEDGER 770 IS LIVE, THE FOUR CLIENT LEAVES TOO; naming the
-                    # rest is the honest half of drawing this boundary. A prior revision of this comment measured this
-                    # store on 2026-09-05 against `service="iam"` and
-                    # `service="task"` only and named `iam-db-tls` and
-                    # `task-db-tls` as PRESENTED-but-uncounted: both pods serve
-                    # TLS and both are scraped, but `iam-db` and `task-db` took
-                    # `yadgar-lifecycle` with `default-features = false`, which
-                    # gated the whole `rotate` module — the module that owns
-                    # this gauge — off.
+                    # WHAT THIS RULE COVERS, measured read-only on 2026-10-16
+                    # against `kind-yadgar`'s Prometheus
+                    # (`yadgar_tls_certificate_not_after_seconds`, 20 series):
                     #
-                    # `iam-db`#22 and `task-db`#37, "take the rotation watcher
-                    # back", removed that flag in both manifests and wired
-                    # `rotate::watch` into each `main.rs`. Confirmed from
-                    # source on each repository's main: `yadgar-lifecycle` is no
-                    # longer pinned `default-features = false` in either
-                    # `Cargo.toml`, and both watch their own `LISTEN_TLS_*`
-                    # material the same way `iam` and `task` do. So
-                    # `yadgar_tls_certificate_not_after_seconds` should now
-                    # additionally carry `service="iam-db"` and
-                    # `service="task-db"` at `kind="serving"` — NOT re-measured
-                    # live, because this reference deployment's kind cluster
-                    # carries no workloads to scrape.
+                    #   - `kind="serving"` for SIX services: `iam`, `iam-db`,
+                    #     `task`, `task-db`, `project` and `project-db`.
+                    #   - `kind="client"` for FOUR: `gateway`, `iam`, `task` and
+                    #     `project`. Ledger 770 is live. None of those series
+                    #     carries a `name` label yet (see below).
                     #
-                    # TWO CAN NEVER APPEAR HERE, because no yadgar process
-                    # presents them. The internal root is `duration: 87600h`
-                    # with `renewBefore: 8760h`
-                    # (`infra/internal-tls/issuer.yaml`), the one certificate on
-                    # a different clock. `gateway-tls` is served by the edge
-                    # Gateway's listener rather than by any yadgar process.
+                    # FOUR CERTIFICATES CAN NEVER APPEAR HERE: the internal root
+                    # (`yadgar-internal-ca`), the edge leaf `gateway-tls`, and
+                    # `nats-tls` and `valkey-tls`, because no yadgar process
+                    # presents those two: NATS and valkey are not yadgar
+                    # processes. The root is `duration: 87600h` with
+                    # `renewBefore: 8760h`, the one certificate on a different
+                    # clock. `gateway-tls` is served by the edge Gateway's
+                    # listener rather than by any yadgar process.
                     #
-                    # THE FOUR CLIENT LEAVES — `gateway-client-tls`,
+                    # THE FOUR CLIENT CERTIFICATES — `gateway-client-tls`,
                     # `iam-client-tls`, `task-client-tls` and
-                    # `project-client-tls` — were issued and mounted into no pod
-                    # until ledger 770. Its four values in
-                    # `applications/yadgar.yaml` mount each leaf into its
-                    # caller, which then watches it and exports it at
-                    # `kind="client"`. Read that series live after the merge;
-                    # do not assume it.
+                    # `project-client-tls` — are mounted into their callers by
+                    # the values in `applications/yadgar.yaml`, which watch each
+                    # and export it at `kind="client"`. They are still FOUR
+                    # Certificates after iam#101 and are not five: the broker
+                    # leaf that `iam` exports as its own series
+                    # (`service="iam"`, `kind="client"`, `name="broker"`) is the
+                    # SAME `iam-client-tls` it already presents on its `iam-db`
+                    # hop, so one Certificate yields two `iam` series once
+                    # iam#101 rolls. The summary below tells them apart by the
+                    # `name` label; iam's unnamed client series (its `iam-db`
+                    # hop) carries none. The `name="broker"` series is read from
+                    # iam#101's description and has NOT been seen live.
                     #
-                    # SO A QUIET RULE HERE MEANS `iam`, `task`, `iam-db` AND
-                    # `task-db` ARE FINE, and, once ledger 770 is live, the four
-                    # client leaves too. It says nothing about the root or the
-                    # edge leaf. It is still worth landing, for the reason below.
+                    # SO A QUIET RULE HERE MEANS THOSE TEN SERVICE/KIND PAIRS ARE
+                    # FINE. It says nothing about the four certificates above.
+                    # It is still worth landing, for the reason below.
                     #
                     # It measures what the PROCESS loaded, which is the gap
                     # cert-manager's own metrics cannot see: cert-manager knows
@@ -492,7 +486,7 @@ spec:
                         severity: warning
                       annotations:
                         summary: >-
-                          {{ $labels.service }}'s {{ $labels.kind }} certificate
+                          {{ $labels.service }}'s {{ $labels.kind }}{{ if $labels.name }} {{ $labels.name }}{{ end }} certificate
                           expires in under 14 days
                         description: >-
                           The certificate {{ $labels.pod }} actually loaded

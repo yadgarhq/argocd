@@ -287,7 +287,7 @@ PLATFORM_SOURCED: dict[str, dict] = {
         # fc7255aec26edb02827487ecb30f4780343d67504390ba5c3f55fc7948b35435),
         # plus ledger 1210's fifth, `PrometheusSizeRetentionDeletedBlocks`.
         # `platform` carries no rules.
-        "digests": {"serverFiles": "a448774a4fb225a2f4d3a0e75cc5c35d8496f896701334f7e28bb876d56b8a0a"},
+        "digests": {"serverFiles": "7a84989a8b15678bbfc6f39d18c80b3ccdf508177b8362079e3b6a3380db18ba"},
         # deploy's PVC (`platform` defaults `enabled` to false, which renders an
         # emptyDir), and `null` on the reload sidecar's resources, which deletes
         # `platform`'s 10m/32Mi requests. Measured 2026-10-01: without either the
@@ -1151,6 +1151,42 @@ def test_prometheus_values_as_value_object_reddens(copy: Path) -> None:
     helm["valuesObject"] = yaml.safe_load(helm.pop("values"))
     path.write_text(yaml.safe_dump(document))
     assert ("prometheus", "helm") in platform_clause_errors(copy)
+
+
+def tls_expiry_summary(tree: Path) -> str:
+    """The committed `TlsCertificateExpiringSoon` summary template, as one line."""
+    values = yaml.safe_load(
+        yaml.safe_load((tree / "applications" / "prometheus.yaml").read_text())["spec"]["source"]["helm"]["values"]
+    )
+    rules = values["prometheus"]["serverFiles"]["alerting_rules.yml"]["groups"][0]["rules"]
+    rule = next(rule for rule in rules if rule["alert"] == "TlsCertificateExpiringSoon")
+    return " ".join(rule["annotations"]["summary"].split())
+
+
+def tls_summary_failures(summary: str) -> list[str]:
+    """Ledger 1499: iam's broker leaf (`name="broker"`) must not read like its iam-db leaf.
+
+    The name is optional (iam's unnamed client series, its iam-db hop, carries none), so it sits inside an
+    `{{ if $labels.name }}` guard and an unguarded `{{ $labels.name }}` also fails.
+    """
+    guarded = re.search(r"\{\{ if \$labels\.name \}\}.*\{\{ \$labels\.name \}\}.*\{\{ end \}\}", summary)
+    return [] if guarded else ["name"]
+
+
+def test_the_tls_expiry_summary_names_the_leaf_when_it_has_a_name() -> None:
+    assert tls_summary_failures(tls_expiry_summary(REPOSITORY)) == []
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        "{{ $labels.service }}'s {{ $labels.kind }} certificate expires in under 14 days",
+        "{{ $labels.service }}'s {{ $labels.kind }} {{ $labels.name }} certificate expires in under 14 days",
+    ],
+)
+def test_a_tls_expiry_summary_without_a_guarded_name_reddens(summary: str) -> None:
+    """The old text, and a name with no guard (iam's unnamed client series would read `kind  certificate`)."""
+    assert tls_summary_failures(summary) == ["name"]
 
 
 def mariadb_operator_values(tree: Path) -> tuple[Path, dict]:

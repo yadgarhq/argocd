@@ -6779,8 +6779,36 @@ kubectl --context kind-yadgar -n yadgar get events --field-selector involvedObje
 Step 5 prints four paths: `/etc/valkey/auth/password` and the three
 `/etc/valkey/tls/` files, then `rc=0`. It prints no secret value.
 
-8. Gateway limited calls answer normally (no 503 from `WRONGPASS`).
-9. Fresh login (`POST /auth/login`, estate C-01) answers 200.
+8. Gateway limited calls answer normally (no 503 from `WRONGPASS`), and 9.
+   a fresh login (`POST /auth/login`, estate C-01) answers 200. One request
+   covers both. This is the gateway MCP request shape that works (ledger
+   1447; the same shape as the 0.23.1 go/no-go above). The gateway requires
+   `mcp-protocol-version` and it must equal the `_meta` version, or the gateway
+   answers 400 (`mcp::cross_check_headers`). `mcp-method` and `mcp-name` are
+   cross-checked only when present, so the request below sends them to match
+   the body. A request that probes with an unknown bearer token proves a
+   different hop. The password is read without echo and the token is unset at
+   the end.
+
+```bash
+G='https://gateway.yadgar.internal:18443'; PV='2026-07-28'; CLAIM='local/claude/scratch'
+read -rs -p 'claude-probe password: ' PW; echo
+raw="$(curl -sS --max-time 20 -w '\n%{http_code}' -H 'content-type: application/json' \
+  --data-binary @<(P="$PW" jq -nc '{username:"claude-probe",password:env.P,label:"host-curl"}') \
+  "$G/auth/login")"; unset PW
+echo "login HTTP ${raw##*$'\n'}"                       # expect 200
+TOKEN="$(printf '%s' "${raw%$'\n'*}" | jq -er .token)"; raw=''
+curl -sS --max-time 30 -w '%{stderr}HTTP %{http_code}\n' \
+  --config <(printf 'header = "authorization: Bearer %s"\n' "$TOKEN") \
+  -H 'content-type: application/json' -H "mcp-protocol-version: $PV" \
+  -H 'mcp-method: tools/call' -H 'mcp-name: find_tasks' -H "x-yadgar-project: $CLAIM" \
+  --data-binary @<(jq -nc --arg pv "$PV" '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"find_tasks",arguments:{page_size:5},_meta:{"io.modelcontextprotocol/protocolVersion":$pv,"io.modelcontextprotocol/clientCapabilities":{}}}}') \
+  "$G/" | jq -c 'if type=="object" then {error, isError: .result.isError} else . end' 2>/dev/null
+unset TOKEN
+```
+
+Expect login HTTP 200, then HTTP 200 with no JSON-RPC `error` and no
+`isError`.
 
 No-go: valkey not 1/1, restarting or not Ready (an empty or unreadable
 password file refuses the boot and names the path in the log); port 6379
