@@ -6798,3 +6798,140 @@ password from `env` again (one more `Recreate`, one more cache gap), and a
 password rotation again needs a manual valkey restart. The five operator
 Applications sync back to 0.2.1 and change no object. Nothing was created
 outside `Deployment/valkey`, and no migration ran.
+
+## The yadgar pin moves to parent chart 0.23.15, carrying gateway 0.12.3, iam 0.11.4 and three `-db` dependency bumps (ledgers 1438, 1439)
+
+**What the merge does.** It moves `applications/yadgar.yaml`'s
+`targetRevision` from 0.23.10 to 0.23.15, and `scripts/chart_pin.json`'s
+`chart_tag` from `v0.23.10` to `v0.23.15`. `platform_version` stays `0.2.3`:
+no platform-sourced operator Application moves.
+
+`v0.23.15` (`7a6ff6f`) is the first `yadgarhq/chart` tag that carries both
+gateway 0.12.3 and iam 0.11.4. `v0.23.10..v0.23.15` is five commits, one tag
+each, and each moves one `chart/Chart.yaml` pin and the two example pins:
+
+- `project-db` 0.6.0 → 0.6.1 (chart `v0.23.11`, `a37e121`): `project-db`#57
+  (`a3e9c3f`), `Cargo.lock` only (tokio 1.53.1 → 1.53.2, uuid 1.26.1 →
+  1.27.0).
+- `iam-db` 0.10.0 → 0.10.1 (chart `v0.23.12`, `2b54c92`): `iam-db`#87
+  (`5980d80`), the same two `Cargo.lock` bumps.
+- `task-db` 0.9.0 → 0.9.1 (chart `v0.23.13`, `72aae9e`): `task-db`#88
+  (`d226579`), the same two `Cargo.lock` bumps.
+- `iam` 0.11.3 → 0.11.4 (chart `v0.23.14`, `cf104f2`): `iam`#101
+  (`1e9086c`, ledger 1439). The broker hop's client leaf moves onto
+  `yadgar-lifecycle` v0.2.21's `File::named_certificate`, so it exports its
+  own `yadgar_tls_certificate_not_after_seconds{service="iam",kind="client",name="broker"}`
+  series beside iam-db's unnamed client series. It reads the same three
+  files as before (`NATS_TLS_CA_FILE`, `NATS_TLS_CLIENT_CERT_FILE`,
+  `NATS_TLS_CLIENT_KEY_FILE`, from the existing `nats-client-cert` mount).
+  Also: `serve_and_drain` split into helpers (no behaviour change), and
+  rustls 0.23.45 → 0.23.46 in `Cargo.lock`.
+- `gateway` 0.12.2 → 0.12.3 (chart `v0.23.15`, `7a6ff6f`): `gateway`#110
+  (`69cd117`, ledger 1438). `Limiter::warm` now retries until valkey
+  answers: every 5 s after an outage, every 60 s after a rejected
+  credential. Both intervals are constants, not chart values. Each failed
+  attempt logs one line ("the rate-limit cache is unreachable" at warn, or
+  "the rate-limit cache REFUSED this gateway's credential" at error).
+
+Under `chart/` the only changes between the two published artifacts are the
+`Chart.yaml`/`Chart.lock` pins, each vendored subchart's
+`version`/`appVersion`, and the five vendored `image.digest` values. No
+template and no values key changed.
+
+Measured 2026-10-16 with helm 3.18.4 against the OCI chart at both tags,
+this organisation's values, and a server-side dry run against
+`kind-yadgar`:
+
+- `yadgar`: 90 → 90 objects (K3, `scripts/gates/yadgar_render.sha256`). 0
+  added, 0 removed, 5 changed: `apps/Deployment//gateway`, `//iam`,
+  `//iam-db`, `//project-db` and `//task-db`. The only field that differs
+  on each is `spec.template.spec.containers[0].image`.
+- Each new image digest equals its module's own GHCR tag digest, read
+  anonymously from the registry: `gateway:0.12.3` `sha256:ca33483d…`,
+  `iam:0.11.4` `sha256:97b194e6…`, `iam-db:0.10.1` `sha256:91f5022e…`,
+  `project-db:0.6.1` `sha256:38b94356…`, `task-db:0.9.1` `sha256:bd3908ad…`.
+- `kubectl --context kind-yadgar diff` of the five rendered Deployments:
+  at 0.23.10 it is empty; at 0.23.15 it is the five `image` lines and the
+  `metadata.generation` bump that comes with them, nothing else.
+
+**What runs.** `gateway`, `iam`, `iam-db`, `project-db` and `task-db` each
+roll (`RollingUpdate`, `maxSurge: 1 / maxUnavailable: 0`, 2 replicas each,
+read 2026-10-16). `project`, `task`, `nats`, `valkey` and the MariaDB
+instances do not restart. No migration file changed in any `-db` repository
+(`git diff --stat` of each tag pair is `Cargo.lock` only).
+
+**The settled epoch moves.** `settled_gate.render_key` gives K
+`44c4bbcd…` at `origin/main` (the same K the #99 merge's settled-dispatch
+run logged) and `438cd122…` with this change. So the push to main runs
+`settled-dispatch.yaml`, which must dispatch `yadgarhq/argocd-verify`'s
+`settled.yaml` with a token from the App `yadgarhq-settled-dispatch`
+(ADR-0912). The #99 merge's run minted that token but sent 0 dispatches,
+because its epoch already had a verdict. This merge is the first real
+dispatch through that App.
+
+### Before this merge — read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. yadgar Synced/Healthy at 0.23.10.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+
+# 2. Read 2026-10-16: the five Deployments 2/2, at the old digests.
+kubectl --context kind-yadgar -n yadgar get pods \
+  -o 'custom-columns=NAME:.metadata.name,IMAGEID:.status.containerStatuses[0].imageID' \
+  | grep -E '^(gateway|iam|iam-db|project-db|task-db)-[a-z0-9]{6,10}-[a-z0-9]{5} '
+```
+
+### After this merge — read-only
+
+```bash
+# 1. yadgar Synced/Healthy at 0.23.15.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+
+# 2. Image currency by pod imageID DIGEST (ADR-0553), not by Synced. Expect
+#    gateway ca33483d…, iam 97b194e6…, iam-db 91f5022e…, project-db 38b94356…,
+#    task-db bd3908ad…, two pods each.
+kubectl --context kind-yadgar -n yadgar get pods \
+  -o 'custom-columns=NAME:.metadata.name,IMAGEID:.status.containerStatuses[0].imageID' \
+  | grep -E '^(gateway|iam|iam-db|project-db|task-db)-[a-z0-9]{6,10}-[a-z0-9]{5} '
+
+# 3. iam: the broker leaf exports its own series beside iam-db's unnamed one.
+#    Expect two client series per iam pod, one with name="broker".
+kubectl --context kind-yadgar get --raw '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=yadgar_tls_certificate_not_after_seconds%7Bservice%3D%22iam%22%2Ckind%3D%22client%22%7D'
+
+# 4. gateway: no warm-up failure lines once valkey answers. A line or two in
+#    the first seconds of a pod is the retry doing its job; a repeating line
+#    is a cache outage (warn) or a wrong password (error).
+kubectl --context kind-yadgar -n yadgar logs -l app=gateway --tail=100 \
+  | grep -E 'rate-limit cache (is unreachable|REFUSED)'
+
+# 5. The settled gate was dispatched by the App, on this merge's epoch.
+#    Expect event workflow_dispatch and triggering actor
+#    yadgarhq-settled-dispatch[bot], created after the merge.
+gh-personal api 'repos/yadgarhq/argocd-verify/actions/workflows/settled.yaml/runs?event=workflow_dispatch&per_page=5' \
+  --jq '.workflow_runs[] | [.id, .event, .triggering_actor.login, .actor.login, .created_at, .conclusion] | @tsv'
+
+# 6. FALLBACK, only when step 5 shows no workflow_dispatch run by
+#    yadgarhq-settled-dispatch[bot] within about 10 min of the merge. A 403
+#    makes settled_dispatch.py exit 3 (the settled-dispatch run goes red), and
+#    the cron fires only every 2-5 h. Estate refuses at deadline (A + 3900 s)
+#    + 30 min, about 95 min after the merge, so dispatch by hand before then.
+#    NEEDS-MAX (a write to argocd-verify's Actions):
+#    gh-personal workflow run settled.yaml --repo yadgarhq/argocd-verify --ref main
+```
+
+### Rollback — a revert
+
+If `yadgar`'s operation is still Running or retrying, end it first.
+NEEDS-MAX: `argocd app terminate-op yadgar` against kind-yadgar's Argo CD.
+v3.1.8's Application CRD has no `syncPolicy.retry.refresh`, so a revert
+does not interrupt a running operation.
+
+Then revert the merge. `yadgar` syncs back to 0.23.10: the five images go
+back to their old digests by client-side apply of the last-applied
+configuration. No other object changes, nothing was created, and no
+migration ran.

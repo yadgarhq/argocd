@@ -140,6 +140,13 @@ CI job, never in the offline pre-commit hook.
       the file into `VALKEYCLI_AUTH`; `VALKEY_PASSWORD` and `VALKEYCLI_AUTH`
       leave `env`; `valkey-password` is mounted as a directory at
       `/etc/valkey/auth`).
+      Re-measured 2026-10-16 at 0.23.15, carrying gateway 0.12.3 (ledger
+      1438), iam 0.11.4 (ledger 1439), and iam-db 0.10.1, project-db 0.6.1
+      and task-db 0.9.1 (each a `Cargo.lock`-only dependency bump): 90
+      objects, none added or removed, 5 changed (the `gateway`, `iam`,
+      `iam-db`, `project-db` and `task-db` Deployments, `image` only — each
+      new digest equals its module's own GHCR tag digest; no new env, arg,
+      probe, volume or mount).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,

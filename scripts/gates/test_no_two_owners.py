@@ -1959,6 +1959,13 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # then absent altogether. The script, probes, mounts and volumes were already
 # in the set.
 #
+# RE-MEASURED AT 0.23.15 (gateway 0.12.3, iam 0.11.4, iam-db 0.10.1,
+# project-db 0.6.1, task-db 0.9.1; ledgers 1438, 1439), against the same
+# 0.19.1: 82 objects on both sides, none added, 15 fields — three more, the
+# `iam-db`, `project-db` and `task-db` images. Through 0.23.10 those three
+# still ran the images 0.19.1 pinned; their new releases are `Cargo.lock`-only
+# dependency bumps. gateway's and iam's images were already in the set.
+#
 # BOTH SIDES RENDER EVERY SERVER AT `clientAuth: "off"`, FROM B-U8a ON. The
 # 0.13.13 module charts predate the B-U5 contracts, and their render checks
 # refuse `optional` and `required` by name ("not enforced yet"). Once a hop
@@ -2036,7 +2043,7 @@ PIN_ADDED: set[tuple[str, str]] = set()
 PIN_CHANGES = {
     *(
         ("Deployment", module, "spec.template.spec.containers[0].image")
-        for module in ("gateway", "iam", "project", "task")
+        for module in ("gateway", "iam", "iam-db", "project", "project-db", "task", "task-db")
     ),
     *(
         ("Deployment", "valkey", f"spec.template.spec.{field}")
