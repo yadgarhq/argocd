@@ -7056,3 +7056,147 @@ NEEDS-MAX: `argocd app terminate-op yadgar` against kind-yadgar's Argo CD.
 Then revert the merge. `yadgar` syncs back to 0.23.15: the seven images go
 back to their old digests. The five operator Applications sync back to
 0.2.3 and change no object. Nothing was created, and no migration ran.
+
+## The yadgar pin moves to parent chart 0.24.17, carrying per-hop request timeouts, telemetry v0.2.0 and platform 0.2.5
+
+**What the merge does.** It moves `applications/yadgar.yaml`'s
+`targetRevision` from 0.24.9 to 0.24.17, `scripts/chart_pin.json`'s
+`chart_tag` from `v0.24.9` to `v0.24.17` and its `platform_version` from
+0.2.4 to 0.2.5, and the `targetRevision` of the five platform-sourced
+operator Applications (`cert-manager`, `envoy-gateway`, `keda`,
+`mariadb-operator`, `prometheus`) from 0.2.4 to 0.2.5.
+
+All 8 commits in the chart's `v0.24.9..v0.24.17` are `ci:` commits that each
+move one `chart/Chart.yaml` pin.
+
+- `gateway` 0.12.5 → 0.12.6, `iam` 0.11.6 → 0.11.7, `project` 0.3.3 →
+  0.3.4, `task` 0.7.4 → 0.7.5: each backend hop's request timeout is a chart
+  value (ADR-0925 Q-C1). `yadgar-dial` v0.2.20 and `yadgar-telemetry` v0.2.0.
+- `iam-db` 0.10.3 → 0.10.4, `project-db` 0.6.3 → 0.6.4, `task-db` 0.9.3 →
+  0.9.4: `yadgar-telemetry` v0.2.0 and `yadgar-dial` v0.2.20 (`Cargo.toml`,
+  `Cargo.lock` only).
+- `platform` 0.2.4 → 0.2.5: the NATS broker reads both client passwords
+  from mounted files and restarts in place when one rotates (ADR-0924,
+  ledger 1440). A new render check refuses a non-alpine broker image, a
+  disabled or moved monitor port, and an adopter `nats.container.patch` or
+  `nats.podTemplate.patch` list (helm would replace the chart's own list).
+  This organisation's values set none of them, and the render passes.
+- `config` 0.2.1: unchanged.
+
+**New required env at boot, rendered from chart defaults.** The four callers
+now refuse to boot without a request timeout per hop: there is no
+compiled-in default (ADR-0569). This organisation's values set only `tls` in
+the `gateway.{iam,task,project}` and `{iam,project,task}.*Db` blocks, so the
+chart defaults render:
+
+| Deployment | Variable                             | Value |
+| ---------- | ------------------------------------ | ----- |
+| gateway    | `TASK_REQUEST_TIMEOUT_SECONDS`       | 16    |
+| gateway    | `IAM_REQUEST_TIMEOUT_SECONDS`        | 30    |
+| gateway    | `PROJECT_REQUEST_TIMEOUT_SECONDS`    | 30    |
+| iam        | `IAM_DB_REQUEST_TIMEOUT_SECONDS`     | 30    |
+| project    | `PROJECT_DB_REQUEST_TIMEOUT_SECONDS` | 30    |
+| task       | `TASK_DB_REQUEST_TIMEOUT_SECONDS`    | 30    |
+
+The new images under the old chart exit at boot. Chart and images move
+together in this one pin, and a revert moves them back together.
+
+**Behaviour change: gateway → task drops from 30 s to 16 s.** A `task` call
+that has not started its answer after 16 s now fails at the gateway. Task →
+task-db stays at 30 s, with task-db's pool acquire at 25 s, so the inner hop
+can now outlast the outer one. A write still in flight when the gateway gives
+up can commit, and a client retry gets a new idempotency key. This deadline
+inversion is tracked in ledger 1522.
+
+**`yadgar_call_duration_seconds` becomes a histogram** (`yadgar-telemetry`
+v0.2.0, ADR-0925 Q-C2). Its `quantile` series are replaced by `_bucket{le}`.
+No rule or dashboard reads them.
+
+Measured 2026-10-17 with helm 4.3.0 (CI runs 3.18.4; K3 at 0.24.9 matched
+the committed table under 4.3.0) against the OCI chart at both tags and this
+organisation's values:
+
+- `yadgar`: 90 → 90 objects (K3, `scripts/gates/yadgar_render.sha256`). 0
+  added, 0 removed, 8 changed: the seven module Deployments and
+  `StatefulSet/nats`.
+- The seven Deployments change `image`. Four of them also gain the env in
+  the table above. Nothing else differs on them.
+- Each new image digest equals its module's own GHCR tag digest, read
+  anonymously from the registry: `gateway:0.12.6` `sha256:30c51945…`,
+  `iam:0.11.7` `sha256:5cad0b80…`, `iam-db:0.10.4` `sha256:00fe637a…`,
+  `project:0.3.4` `sha256:73ce6237…`, `project-db:0.6.4` `sha256:79ba3a4b…`,
+  `task:0.7.5` `sha256:5128488c…`, `task-db:0.9.4` `sha256:30e788a0…`.
+- `StatefulSet/nats`: `command`/`args` become a `/bin/sh -c` wrapper that
+  hashes both passwords into `/var/run/nats/auth.sha256` and execs
+  nats-server. `NATS_PASSWORD` and `NATS_PASSWORD_GATEWAY` leave `env` as
+  `secretKeyRef`s. The liveness probe is an `exec` that runs `sha256sum -c`
+  before `/healthz`. The volumes `nats-auth-iam` (Secret `nats-auth`) and
+  `nats-auth-gateway` (Secret `nats-auth-gateway`) are added and mounted
+  read-only.
+- The five operator Applications render byte-identical objects at 0.2.4
+  and 0.2.5 (cert-manager 50, envoy-gateway 19, keda 29, mariadb-operator
+  32, prometheus 7).
+- Server-side dry run against `kind-yadgar` (ADR-0881):
+  `kubectl --context kind-yadgar -n yadgar diff` of the 0.24.9 render is
+  empty. The new pin differs on exactly the 8 objects above, with the same
+  fields, and the API server admits them. Argo's tracking annotation
+  `argocd.argoproj.io/tracking-id: yadgar:<group>/<Kind>:yadgar/<name>` is
+  added to each rendered object first. Without it every object reads as
+  changed.
+
+**What runs.** The seven module Deployments roll. `nats-0` rolls once
+(`replicas: 1`): up to 40 s of lame-duck drain, then the clients redial
+within 60 s (ADR-0893). `valkey` and the MariaDB instances do not restart. No
+migration file changed in any module.
+
+**The settled epoch moves.** `settled_gate.render_key` gives K `aecb5d95…` at
+`origin/main` and `e2412b9a…` with this change. So the push to main runs
+`settled-dispatch.yaml`, which dispatches `yadgarhq/argocd-verify`'s
+`settled.yaml` with a token from the App `yadgarhq-settled-dispatch`
+(ADR-0912).
+
+### Before this merge, read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. yadgar Synced/Healthy at 0.24.9 (read 2026-10-17).
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+```
+
+### After this merge, read-only
+
+```bash
+# 1. yadgar Synced/Healthy at 0.24.17.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+
+# 2. Image currency by pod imageID DIGEST (ADR-0553), not by Synced. Expect
+#    gateway 30c51945…, iam 5cad0b80…, iam-db 00fe637a…, project 73ce6237…,
+#    project-db 79ba3a4b…, task 5128488c…, task-db 30e788a0…
+kubectl --context kind-yadgar -n yadgar get pods \
+  -o 'custom-columns=NAME:.metadata.name,IMAGEID:.status.containerStatuses[0].imageID' \
+  | grep -E '^(gateway|iam|iam-db|project|project-db|task|task-db)-[a-z0-9]{6,10}-[a-z0-9]{5} '
+
+# 3. nats-0 restarted once onto the wrapper and is Ready. Expect a recent
+#    start time, READY true, and the exec liveness probe.
+kubectl --context kind-yadgar -n yadgar get pod nats-0 \
+  -o 'custom-columns=START:.status.startTime,READY:.status.containerStatuses[0].ready,PROBE:.spec.containers[0].livenessProbe.exec.command[2]'
+
+# 4. The settled gate was dispatched by the App on this merge's epoch.
+gh-personal api 'repos/yadgarhq/argocd-verify/actions/workflows/settled.yaml/runs?event=workflow_dispatch&per_page=5' \
+  --jq '.workflow_runs[] | [.id, .event, .triggering_actor.login, .actor.login, .created_at, .conclusion] | @tsv'
+```
+
+### Rollback, a revert
+
+If `yadgar`'s operation is still Running or retrying, end it first.
+NEEDS-MAX: `argocd app terminate-op yadgar` against kind-yadgar's Argo CD.
+
+Then revert the merge. `yadgar` syncs back to 0.24.9: the seven images go
+back to their old digests and the request-timeout env leaves. `nats-0` rolls
+a second time, back to the `secretKeyRef` env and the `httpGet` probe. The
+five operator Applications sync back to 0.2.4 and change no object. Nothing
+was created, and no migration ran.
