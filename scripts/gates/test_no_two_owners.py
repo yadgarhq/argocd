@@ -1972,6 +1972,18 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # set as at 0.23.15. Only image digests moved from 0.23.15; every module was
 # already in PIN_CHANGES.
 #
+# RE-MEASURED AT 0.24.17 (gateway 0.12.6, iam 0.11.7, iam-db 0.10.4, project
+# 0.3.4, project-db 0.6.4, task 0.7.5, task-db 0.9.4, platform 0.2.5), against
+# the same 0.19.1: 82 objects on both sides, none added, 26 fields — eleven
+# more. `env` on gateway, iam, project and task: each caller now renders a
+# `*_REQUEST_TIMEOUT_SECONDS` per backend hop from the chart defaults (ADR-0925
+# Q-C1). Seven on nats (ADR-0924): `command` and `args` become a `/bin/sh`
+# wrapper that hashes both mounted passwords and execs nats-server; the two
+# `secretKeyRef` passwords leave `env`; the liveness probe swaps `httpGet` for
+# an `exec` that re-checks the hash beside `/healthz`; both passwords are
+# mounted from two new secret volumes. The new pin is still diffed against
+# 0.19.1, not 0.24.9 (task 1507).
+#
 # BOTH SIDES RENDER EVERY SERVER AT `clientAuth: "off"`, FROM B-U8a ON. The
 # 0.13.13 module charts predate the B-U5 contracts, and their render checks
 # refuse `optional` and `required` by name ("not enforced yet"). Once a hop
@@ -2063,7 +2075,23 @@ PIN_CHANGES = {
             "volumes",
         )
     ),
+    *(
+        ("Deployment", module, "spec.template.spec.containers[0].env")
+        for module in ("gateway", "iam", "project", "task")
+    ),
     ("StatefulSet", "nats", "spec.template.metadata.annotations"),
+    *(
+        ("StatefulSet", "nats", f"spec.template.spec.{field}")
+        for field in (
+            "containers[0].args",
+            "containers[0].command",
+            "containers[0].env",
+            "containers[0].livenessProbe.exec",
+            "containers[0].livenessProbe.httpGet",
+            "containers[0].volumeMounts",
+            "volumes",
+        )
+    ),
     *((kind, name, "<object added or removed>") for kind, name in PIN_ADDED),
 }
 

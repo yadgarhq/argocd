@@ -153,6 +153,23 @@ CI job, never in the offline pre-commit hook.
       none added or removed, 7 changed (the seven module Deployments, `image`
       only — each new digest equals its module's own GHCR tag digest; no new
       env, arg, probe, volume or mount).
+      Re-measured 2026-10-17 at 0.24.17, carrying gateway 0.12.6, iam 0.11.7,
+      iam-db 0.10.4, project 0.3.4, project-db 0.6.4, task 0.7.5, task-db
+      0.9.4 and platform 0.2.5 (config 0.2.1 unchanged): 90 objects, none
+      added or removed, 8 changed. The seven module Deployments change
+      `image` (each new digest equals its module's own GHCR tag digest), and
+      four of them gain request-timeout env from the chart defaults (ADR-0925
+      Q-C1): gateway `TASK_REQUEST_TIMEOUT_SECONDS` "16",
+      `IAM_REQUEST_TIMEOUT_SECONDS` "30", `PROJECT_REQUEST_TIMEOUT_SECONDS`
+      "30"; iam `IAM_DB_REQUEST_TIMEOUT_SECONDS` "30"; project
+      `PROJECT_DB_REQUEST_TIMEOUT_SECONDS` "30"; task
+      `TASK_DB_REQUEST_TIMEOUT_SECONDS` "30". `StatefulSet/nats` (ADR-0924):
+      a `/bin/sh -c` wrapper hashes the two passwords mounted from
+      `nats-auth` and `nats-auth-gateway` into `/var/run/nats/auth.sha256`
+      and execs nats-server; `NATS_PASSWORD` and `NATS_PASSWORD_GATEWAY`
+      leave `env` as `secretKeyRef`s; the liveness probe is an `exec` that
+      runs `sha256sum -c` before `/healthz`; two secret volumes and their
+      read-only mounts are added.
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
