@@ -25,7 +25,14 @@ One constructed case per arm:
   key cannot be resolved (`format!`) and a moved `yadgar-*` crate pin are
   NEEDS-HUMAN; a DaemonSet, an initContainer and a swap inside the registry are
   NEEDS-HUMAN; platform moves and migrations carry the ADR-0948 R5 interim text;
-- E4: a moved `yadgar-store` pin on a -db module is NEEDS-HUMAN;
+- E3 fail-closed tripwires (re-review at aad2e9d): a new shared-crate env entry
+  point, every unknown reader shape (use-as, bare use, module alias, dotenvy,
+  vars scan, generic and boxed `Fn(&str)`, clap `env =`), a new key through a fn
+  or macro wrapper, a duplicate unresolved site in a new fn, an unpinnable or
+  overridden shared crate, a moved Cargo.lock commit, a missing Cargo.lock: each
+  NEEDS-HUMAN; a key rendered on one container of two is not rendered;
+- E4: a moved `yadgar-store` pin on a -db module, a schema change outside the
+  blocks and an `include_str!` are NEEDS-HUMAN;
 - E4: an added migration version is NEEDS-HUMAN; an unchanged schema is green;
 - the body carries the template's five headings and one Conventional Commits
   bullet, a rollback with `argocd app terminate-op`, and no MIGRATION_NOTES.
@@ -433,13 +440,22 @@ def test_an_unresolved_call_site_present_at_both_tags_is_green() -> None:
     assert pb.boot_audit("gateway", both, copy.deepcopy(both), RENDERED) == []
 
 
-def with_cargo(source: dict, lifecycle: str, store: str | None = None) -> dict:
+def with_cargo(
+    source: dict, lifecycle: str, store: str | None = None, commit: str = "0" * 40, extra: str = ""
+) -> dict:
+    """`source` with a Cargo.toml pinning yadgar-lifecycle (and yadgar-store) by tag, and the matching Cargo.lock."""
     lines = ["[package]", 'name = "yadgar-gateway"', "", "[dependencies]"]
     lines.append(f'yadgar-lifecycle = {{ git = "https://github.com/yadgarhq/lifecycle.git", tag = "{lifecycle}" }}')
     if store:
         lines.append(f'yadgar-store = {{ git = "https://github.com/yadgarhq/store.git", tag = "{store}" }}')
     lines.append('serde = "1"')
-    return {**source, "Cargo.toml": "\n".join(lines) + "\n"}
+    lock = ["version = 4", "", "[[package]]", 'name = "yadgar-gateway"', 'version = "0.1.0"', ""]
+    lock += ["[[package]]", 'name = "yadgar-lifecycle"', 'version = "0.2.0"']
+    lock += [f'source = "git+https://github.com/yadgarhq/lifecycle.git?tag={lifecycle}#{commit}"', ""]
+    if store:
+        lock += ["[[package]]", 'name = "yadgar-store"', 'version = "0.4.0"']
+        lock += [f'source = "git+https://github.com/yadgarhq/store.git?tag={store}#{commit}"', ""]
+    return {**source, "Cargo.toml": "\n".join(lines) + "\n" + extra, "Cargo.lock": "\n".join(lock)}
 
 
 def test_a_moved_yadgar_lifecycle_tag_is_needs_human() -> None:
@@ -451,6 +467,141 @@ def test_a_moved_yadgar_lifecycle_tag_is_needs_human() -> None:
 def test_an_unmoved_shared_crate_is_green() -> None:
     old, new = with_cargo(tree("e3-old"), "v0.2.17"), with_cargo(tree("e3-old"), "v0.2.17")
     assert pb.boot_audit("gateway", old, new, RENDERED) == []
+
+
+
+# ── E3 fail-closed tripwires (re-review of argocd#110 at aad2e9d) ──────────
+
+
+def grown(line: str, prelude: str = "") -> list[str]:
+    """E3 on e3-old against e3-old grown by `line` in `boot()` and `prelude` at the top."""
+    return pb.boot_audit("gateway", tree("e3-old"), with_boot_line("e3-old", line, prelude), RENDERED)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "let _tls = yadgar_lifecycle::serve_tls::ServerTls::from_env(LISTEN_KEY, CHART_KEY);",
+        "let _t = yadgar_dial::request_timeout_from_lookup(&env, TIMEOUT_VAR, 5);",
+        "let _c = shared::configure(env, 3);",
+    ],
+    ids=["from_env", "from_lookup", "reader-passed-as-argument"],
+)
+def test_a_new_shared_crate_env_entry_point_is_needs_human(line: str) -> None:
+    """lifecycle's `ServerTls::from_env` reads `{prefix}_TLS_*`; the keys it reads are invisible here."""
+    assert any("entry point" in r for r in grown(line)), grown(line)
+
+
+@pytest.mark.parametrize(
+    ("line", "prelude"),
+    [
+        ('let _g = getenv("ALIASED_KEY");', "use std::env::var as getenv;\n"),
+        ('let _v = var("BARE_KEY");', "use std::env::var;\n"),
+        ('let _e = e::var("MODULE_ALIAS_KEY");', "use std::env as e;\n"),
+        ('let _d = dotenvy::var("DOTENV_KEY");', ""),
+        ("let _all: Vec<(String, String)> = std::env::vars().collect();", ""),
+        ("", "fn read<F: Fn(&str) -> Option<String>>(f: F) -> Option<String> { f(\"GENERIC\") }\n"),
+        ("", "struct Reader { get: Box<dyn Fn(&str) -> Option<String>> }\n"),
+        ("", '#[derive(clap::Parser)]\nstruct Args {\n    #[arg(env = "CLAP_KEY")]\n    key: String,\n}\n'),
+    ],
+    ids=["use-as", "bare-use", "module-alias", "dotenvy", "vars-scan", "generic-fn", "boxed-fn", "clap-env"],
+)
+def test_an_unknown_reader_shape_trips_the_token_tripwire(line: str, prelude: str) -> None:
+    assert any("tripwire" in r for r in grown(line, prelude)), grown(line, prelude)
+
+
+FN_WRAPPER = "fn get(k: &str) -> Option<String> {\n    std::env::var(k).ok()\n}\n"
+MACRO_WRAPPER = "macro_rules! req {\n    ($k:expr) => {\n        env_required($k)\n    };\n}\n"
+
+
+def test_a_new_key_through_a_fn_wrapper_present_at_both_tags_is_needs_human() -> None:
+    old = with_boot_line("e3-old", "", FN_WRAPPER)
+    new = with_boot_line("e3-old", 'let _n = get("NEW_FN_KEY");', FN_WRAPPER)
+    reasons = pb.boot_audit("gateway", old, new, RENDERED)
+    assert any("NEW_FN_KEY" in r for r in reasons), reasons
+
+
+def test_a_new_key_through_a_macro_wrapper_present_at_both_tags_is_needs_human() -> None:
+    old = with_boot_line("e3-old", "", MACRO_WRAPPER)
+    new = with_boot_line("e3-old", 'let _n = req!("NEW_MACRO_KEY");', MACRO_WRAPPER)
+    reasons = pb.boot_audit("gateway", old, new, RENDERED)
+    assert any("NEW_MACRO_KEY" in r and "required" in r for r in reasons), reasons
+
+
+def test_a_duplicate_unresolved_site_in_a_new_fn_is_needs_human() -> None:
+    site = 'std::env::var(&format!("{p}_X")).ok()'
+    first = f"fn first(p: &str) -> Option<String> {{\n    {site}\n}}\n"
+    second = f"fn second(p: &str) -> Option<String> {{\n    {site}\n}}\n"
+    old = with_boot_line("e3-old", "", first)
+    new = with_boot_line("e3-old", "", first + second)
+    reasons = pb.boot_audit("gateway", old, new, RENDERED)
+    assert any("cannot resolve" in r for r in reasons), reasons
+
+
+def test_a_second_argument_const_after_an_upper_snake_first_argument_is_unresolved() -> None:
+    """`env_parsed(K9, D)`: the first argument is the key, so D's value is never taken as it."""
+    source = {"src/boot.rs": 'const K9: &str = "REAL_KEY_FROM_A_VARIABLE";\nconst D: &str = "NOT_THE_KEY";\nfn f() { let _ = env_parsed(K9, D); }\n'}
+    required, reads = pb.env_keys(source)
+    assert "NOT_THE_KEY" not in reads and "NOT_THE_KEY" not in required
+
+
+CARGO_LIFECYCLE = 'yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.2.17" }'
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        "yadgar-lifecycle = { workspace = true }",
+        'yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", branch = "main" }',
+        'yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git" }',
+        'yadgar-lifecycle = { path = "../lifecycle" }',
+    ],
+    ids=["workspace", "branch", "tagless-git", "path"],
+)
+def test_an_unpinnable_shared_crate_spec_is_needs_human(spec: str) -> None:
+    old = with_cargo(tree("e3-old"), "v0.2.17")
+    new = {**old, "Cargo.toml": old["Cargo.toml"].replace(CARGO_LIFECYCLE, spec)}
+    old = {**old, "Cargo.toml": new["Cargo.toml"]}
+    reasons = pb.boot_audit("gateway", old, new, RENDERED)
+    assert any("yadgar-lifecycle" in r and "pin" in r for r in reasons), reasons
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        '\n[patch."https://github.com/yadgarhq/lifecycle.git"]\nyadgar-lifecycle = { path = "../lifecycle" }\n',
+        '\n[replace]\n"yadgar-lifecycle:0.2.0" = { path = "../lifecycle" }\n',
+        '\n[workspace]\nmembers = ["."]\n',
+        '\n[[bin]]\nname = "x"\npath = "build/main.rs"\n',
+    ],
+    ids=["patch", "replace", "workspace", "bin-outside-src"],
+)
+def test_a_cargo_override_or_layout_change_is_needs_human(extra: str) -> None:
+    old = with_cargo(tree("e3-old"), "v0.2.17")
+    new = with_cargo(tree("e3-old"), "v0.2.17", extra=extra)
+    assert pb.boot_audit("gateway", old, new, RENDERED), "an override or layout change passed green"
+
+
+def test_a_moved_shared_crate_commit_in_cargo_lock_is_needs_human() -> None:
+    """The Cargo.toml tag is unchanged, but the lock resolved another commit (a moved tag, or a transitive move)."""
+    old = with_cargo(tree("e3-old"), "v0.2.17", commit="a" * 40)
+    new = with_cargo(tree("e3-old"), "v0.2.17", commit="b" * 40)
+    reasons = pb.boot_audit("gateway", old, new, RENDERED)
+    assert any("Cargo.lock" in r and "yadgar-lifecycle" in r for r in reasons), reasons
+
+
+def test_a_missing_cargo_lock_is_needs_human() -> None:
+    old = with_cargo(tree("e3-old"), "v0.2.17")
+    new = {k: v for k, v in old.items() if k != "Cargo.lock"}
+    assert any("Cargo.lock" in r for r in pb.boot_audit("gateway", old, new, RENDERED))
+
+
+def test_a_key_rendered_on_one_container_only_is_needs_human() -> None:
+    """Two containers run the module's image; each is audited on its own env, not the union."""
+    image = f"ghcr.io/yadgarhq/gateway@{DIGEST[('gateway', '0.12.11')]}"
+    document = deployment("gateway", image, [{"name": "LISTEN", "value": ":1"}, {"name": "DB_HOST", "value": "h"}])
+    document["spec"]["template"]["spec"]["containers"].append({"name": "sidecar", "image": image, "env": [{"name": "LISTEN", "value": ":2"}]})
+    assert pb.rendered_env([document], "gateway") == {"LISTEN"}
 
 
 # ── E4: the migration diff ──────────────────────────────────────────────────
@@ -487,6 +638,26 @@ def test_a_moved_yadgar_store_tag_on_a_db_module_is_needs_human() -> None:
     old, new = with_cargo(tree("e4-old"), "v0.2.20", "v0.4.0"), with_cargo(tree("e4-old"), "v0.2.20", "v0.4.1")
     reasons = pb.migration_audit("iam-db", old, new)
     assert any("yadgar-store" in r and "v0.4.0" in r and "v0.4.1" in r for r in reasons), reasons
+
+
+
+def test_a_schema_change_outside_the_migration_blocks_is_needs_human() -> None:
+    """SQL from a const, or a migration dropped from the set while its block stays, changes the file, not a block."""
+    new = tree("e4-old")
+    new["src/schema.rs"] = new["src/schema.rs"].replace("vec![user(), policy::setting()]", "vec![user()]")
+    reasons = pb.migration_audit("iam-db", tree("e4-old"), new)
+    assert any("schema source" in r for r in reasons), reasons
+
+
+def test_an_included_schema_file_is_needs_human() -> None:
+    new = tree("e4-old")
+    old = copy.deepcopy(new)
+    for source in (old, new):
+        source["src/schema/policy.rs"] = source["src/schema/policy.rs"].replace(
+            '"CREATE TABLE setting (name VARCHAR(64) PRIMARY KEY)"', 'include_str!("setting.sql")'
+        )
+    reasons = pb.migration_audit("iam-db", old, new)
+    assert any("include_str!" in r for r in reasons), reasons
 
 
 # ── the body ────────────────────────────────────────────────────────────────

@@ -49,11 +49,16 @@ with a reason per failure:
   (`std::env::var`, `env::var_os`, a lookup closure) new at the new tag that is
   neither rendered nor a known optional name. An upper-snake literal anywhere
   else, such as an error code, is not an env name and does not count. Fail
-  closed: no env-read call site whose key cannot be resolved is new at the new
-  tag, and no `yadgar-*` crate pin moved in `Cargo.toml`;
+  closed, counted at both tags: no new env-read call site whose key cannot be
+  resolved, no new call into an env entry point (`*from_env*`,
+  `*from_lookup*`, a call handed a reader), no growth of the env token
+  tripwire, and no moved, unpinnable or overridden `yadgar-*` crate in
+  Cargo.toml or Cargo.lock; each container running the module is audited on
+  its own env;
 - E4, the migration diff, finds no added, removed or changed migration in any
-  moved `-db` module (`src/schema.rs` and `src/schema/**`), and no moved
-  `yadgar-store` pin (its migrate.rs owns the ledger DDL).
+  moved `-db` module (`src/schema.rs` and `src/schema/**`), no other change to
+  those files, no `include_str!` in them, and no moved `yadgar-store` pin (its
+  migrate.rs owns the ledger DDL).
 
 The platform and migration blocks are interim: ADR-0948 R5 (Max, 2026-10-18)
 lets both auto-merge when green, and car C10 lifts them.
@@ -87,6 +92,7 @@ import tarfile
 import tomllib
 import tempfile
 import urllib.request
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -503,28 +509,61 @@ def production_sources(source: dict[str, str]) -> dict[str, str]:
 #             gateway's `from_lookup(lookup: …)` reads `lookup(KEY)`, the -db
 #             modules' `boot(env: …)` read `env(KEY)`;
 #   wrapped   a local closure whose body calls one of the above — seeder's
-#             `let required = |var| match lookup(var) …` — is itself a reader,
-#             and a required one when its name says `required` or its body
-#             calls a required reader. Followed to a fixpoint.
+#             `let required = |var| match lookup(var) …` — and a `fn` or
+#             `macro_rules!` whose body calls one keyed on its own parameter
+#             (`fn get(k) { std::env::var(k) }`, `req!($k)`) are readers too,
+#             required ones when the name says `required` or the body calls a
+#             required reader. Followed to a fixpoint.
 #
 # The key is the first or second argument: a string literal, or a `const` of
 # type `&str` defined anywhere in the crate, by bare or path-qualified name
-# (`config::HOST`).
+# (`config::HOST`). When the first argument is itself upper-snake (`f(K9, D)`),
+# the site is unresolved rather than keyed on the second.
 #
-# FAIL-CLOSED ON WHAT IT CANNOT READ. A call site whose key is none of those —
-# `lookup(&format!("{prefix}_{suffix}"))`, a variable, a const from another
-# crate — is collected as its whitespace-normalised text, at both tags. A site
-# that is new at the new tag is NEEDS-HUMAN; one present at both tags read the
-# same key before, which the old image booted on.
+# FAIL-CLOSED ON WHAT IT CANNOT READ, by coarse tripwires counted at both tags
+# (a false NEEDS-HUMAN is cheap; a false ACCEPT deploys something unvetted):
+#
+#   - a call site whose key is none of those (`lookup(&format!(…))`, a
+#     variable, a const from another crate), counted per (file, enclosing fn,
+#     normalised text): any growth is NEEDS-HUMAN;
+#   - a call into an env entry point whose reads happen elsewhere —
+#     `*from_env*`, `*from_lookup*` (lifecycle's `ServerTls::from_env` reads
+#     `{prefix}_TLS_*`, dial's `request_timeout_from_lookup` its own key), or
+#     any call handed a reader as an argument: any growth per callee;
+#   - the token tripwire (`TRIPWIRE` below): `std::env`, `use std::env`,
+#     `env::vars`, `dotenv`, `envy`, `Fn(&str)`, an attribute `env =` (clap):
+#     any growth per token;
+#   - Cargo.toml and Cargo.lock (`crate_findings`): a moved, unpinnable or
+#     overridden `yadgar-*` crate, and any `yadgar-*` change in the lock.
 CONST_STR = re.compile(r'\bconst\s+([A-Z][A-Z0-9_]*)\s*:\s*&(?:\'static\s+)?str\s*=\s*"([^"\\]*)"\s*;')
 LOOKUP_PARAMETER = re.compile(
     r"\b([a-z_][a-z0-9_]*)\s*:\s*&?\s*(?:impl|dyn)\s+Fn\s*\(\s*&str\s*\)\s*->\s*Option\s*<\s*String\s*>"
 )
-LOCAL_CLOSURE = re.compile(r"\blet\s+(?:mut\s+)?([a-z_][a-z0-9_]*)\s*=\s*(?:move\s+)?\|[^|]*\|")
+LOCAL_CLOSURE = re.compile(r"\blet\s+(?:mut\s+)?([a-z_][a-z0-9_]*)\s*=\s*(?:move\s+)?\|([^|]*)\|")
+FN_DEFINITION = re.compile(r"\bfn\s+([a-z_][a-z0-9_]*)\s*(?:<[^>{(]*>)?\s*\(")
+MACRO_DEFINITION = re.compile(r"\bmacro_rules!\s*([a-z_][a-z0-9_]*)\s*\{")
 REQUIRED_READERS = ("env_required\\w*", "env_parsed", "parse_bucket_env")
 KEY_ARGUMENT = re.compile(
-    r'\s*\(\s*(?:[^()";,]*,\s*)?(?:"([A-Z][A-Z0-9_]*)"|(?:[A-Za-z_]\w*::)*([A-Z][A-Z0-9_]*)\b)(?=\s*[,)])'
+    r'\s*\(\s*([^()";,]*,\s*)?(?:"([A-Z][A-Z0-9_]*)"|(?:[A-Za-z_]\w*::)*([A-Z][A-Z0-9_]*)\b)(?=\s*[,)])'
 )
+UPPER_TOKEN = re.compile(r"\b[A-Z][A-Z0-9_]*\b")
+CALL = re.compile(r"(?<![\w.])((?:[A-Za-z_]\w*::)*[A-Za-z_]\w*)\s*\(")
+NOT_CALLS = frozenset({"if", "while", "match", "for", "return", "fn", "Some", "Ok", "Err", "loop", "in"})
+# A call into a shared crate's env read: the keys it reads are not in this source.
+ENTRY_POINT = re.compile(r"(?<![\w.])((?:[A-Za-z_]\w*::)*\w*from_(?:env|lookup)\w*)\s*\(")
+# THE TOKEN TRIPWIRE: every way to reach the environment that the call-site
+# reading above does not model. Counted per tag on the code mask; any count that
+# grows is NEEDS-HUMAN. Coarse on purpose: a false NEEDS-HUMAN is cheap, a false
+# ACCEPT deploys something unvetted.
+TRIPWIRE = {
+    "std::env": re.compile(r"\bstd\s*::\s*env\b"),
+    "use std::env": re.compile(r"\buse\s+std\s*::\s*env\b"),
+    "env::vars": re.compile(r"\benv\s*::\s*vars(?:_os)?\b"),
+    "dotenv": re.compile(r"dotenv"),
+    "envy": re.compile(r"\benvy\b"),
+    "Fn(&str)": re.compile(r"\bFn\s*\(\s*&\s*str\s*\)"),
+    "attribute env =": re.compile(r"#\s*!?\s*\[[^\]]*\benv\s*="),
+}
 
 
 def matching_paren(mask: str, opening: int) -> int:
@@ -537,6 +576,24 @@ def matching_paren(mask: str, opening: int) -> int:
     return len(mask)
 
 
+def arguments(mask: str, opening: int) -> list[str]:
+    """The top-level arguments of the call whose `(` is at `opening`, as masked text."""
+    inner = mask[opening + 1 : matching_paren(mask, opening) - 1]
+    parts, depth, current = [], 0, ""
+    for char in inner:
+        depth += {"(": 1, "[": 1, "{": 1, "<": 1, ")": -1, "]": -1, "}": -1, ">": -1}.get(char, 0)
+        if char == "," and depth == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += char
+    return [part.strip() for part in parts + [current] if part.strip()]
+
+
+def bare(argument: str) -> str:
+    return re.sub(r"^&\s*(?:mut\s+)?", "", argument).strip()
+
+
 def reader_call(required: set[str], read: set[str]) -> re.Pattern:
     names = lambda group: "|".join(sorted(group))  # noqa: E731
     pattern = rf"(?P<required>(?<![\w.])(?:{names(required)}))"
@@ -545,32 +602,66 @@ def reader_call(required: set[str], read: set[str]) -> re.Pattern:
     return re.compile(rf"(?:{pattern})(?=\s*\()")
 
 
+def wrappers(mask: str) -> list[tuple[str, str, set[str], int, int]]:
+    """`(kind, name, parameters, body start, body stop)` of every local closure, fn and macro_rules! in `mask`."""
+    found = []
+    for closure in LOCAL_CLOSURE.finditer(mask):
+        parameters = set(re.findall(r"([a-z_]\w*)\s*(?::|$|,)", closure.group(2)))
+        brace, semicolon = mask.find("{", closure.end()), mask.find(";", closure.end())
+        stop = matching_brace(mask, brace) if 0 <= brace < semicolon or semicolon < 0 <= brace else semicolon
+        found.append(("closure", re.escape(closure.group(1)), parameters, closure.end(), stop if stop > 0 else len(mask)))
+    for function in FN_DEFINITION.finditer(mask):
+        close = matching_paren(mask, function.end() - 1)
+        parameters = set(re.findall(r"(?:^|[,(])\s*(?:mut\s+)?([a-z_]\w*)\s*:", mask[function.end() - 1 : close]))
+        brace = mask.find("{", close)
+        if brace >= 0 and ";" not in mask[close:brace]:
+            found.append(("fn", re.escape(function.group(1)), parameters, brace, matching_brace(mask, brace)))
+    for macro in MACRO_DEFINITION.finditer(mask):
+        stop = matching_brace(mask, macro.end() - 1)
+        parameters = {f"${name}" for name in re.findall(r"\$([a-z_]\w*)\s*:", mask[macro.end() : stop])}
+        found.append(("macro", re.escape(macro.group(1)) + "!", parameters, macro.end(), stop))
+    return found
+
+
 def readers_of(files: dict[str, str], masks: dict[str, str]) -> tuple[set[str], set[str]]:
-    """`(required reader names, plain reader names)`: the fixed ones, lookup parameters and wrapping closures."""
+    """`(required reader names, plain reader names)`: the fixed ones, lookup parameters, and every closure,
+    fn or macro_rules! whose body calls a reader keyed on one of its own parameters (or, for a closure, at all)."""
     required = set(REQUIRED_READERS)
     read = {re.escape(name) for mask in masks.values() for name in LOOKUP_PARAMETER.findall(mask)}
+    every = [(w, mask) for mask in masks.values() for w in wrappers(mask)]
     while True:
         call = reader_call(required, read)
         found = False
-        for mask in masks.values():
-            for closure in LOCAL_CLOSURE.finditer(mask):
-                name = re.escape(closure.group(1))
-                if name in required or name in read:
-                    continue
-                brace, semicolon = mask.find("{", closure.end()), mask.find(";", closure.end())
-                stop = matching_brace(mask, brace) if 0 <= brace < semicolon or semicolon < 0 <= brace else semicolon
-                inner = list(call.finditer(mask, closure.end(), stop if stop > 0 else len(mask)))
-                if not inner:
-                    continue
-                is_required = "required" in closure.group(1) or any(m.group("required") for m in inner)
-                (required if is_required else read).add(name)
-                found = True
+        for (kind, name, parameters, start, stop), mask in every:
+            if name in required or name in read:
+                continue
+            inner = []
+            for match in call.finditer(mask, start, stop):
+                opening = mask.find("(", match.end())
+                keyed = {bare(a) for a in arguments(mask, opening)[:2]} & parameters
+                if keyed or kind == "closure":
+                    inner.append(match)  # a closure counts on any read; a fn or macro on a parameter-keyed one
+            if not inner:
+                continue
+            plain = name.rstrip("!").replace("\\", "")
+            is_required = "required" in plain or any(m.group("required") for m in inner)
+            (required if is_required else read).add(name)
+            found = True
         if not found:
             return required, read
 
 
-def env_sites(source: dict[str, str]) -> tuple[set[str], set[str], set[str]]:
-    """`(required keys, every key read, unresolved call sites)` of the non-test source."""
+def enclosing_fn(mask: str, position: int) -> str:
+    names = [m.group(1) for m in FN_DEFINITION.finditer(mask, 0, position)]
+    return names[-1] if names else "<top>"
+
+
+def env_sites(source: dict[str, str]) -> tuple[set[str], set[str], Counter]:
+    """`(required keys, every key read, unresolved call sites)` of the non-test source.
+
+    An unresolved site is counted per `(file, enclosing fn, normalised text)`, so a
+    duplicate of an existing site in a new fn is a new site.
+    """
     files = production_sources(source)
     masks = {path: code_mask(text) for path, text in files.items()}
     consts: dict[str, set[str]] = {}
@@ -581,18 +672,21 @@ def env_sites(source: dict[str, str]) -> tuple[set[str], set[str], set[str]]:
     call = reader_call(*readers_of(files, masks))
     required: set[str] = set()
     reads: set[str] = set()
-    unresolved: set[str] = set()
+    unresolved: Counter = Counter()
     for path, text in files.items():
         mask = masks[path]
         for match in call.finditer(mask):
-            if re.search(r"\bfn\s*$", mask[max(0, match.start() - 16) : match.start()]):
+            if re.search(r"\b(?:fn|macro_rules!)\s*$", mask[max(0, match.start() - 16) : match.start()]):
                 continue  # the reader's own definition, not a call
             argument = KEY_ARGUMENT.match(text, match.end())
-            literal, constant = argument.groups() if argument else (None, None)
+            prefix, literal, constant = argument.groups() if argument else (None, None, None)
             keys = {literal} if literal else consts.get(constant or "", set())
+            if prefix and UPPER_TOKEN.search(prefix):
+                keys = set()  # `f(K9, D)`: the key is the first argument, never the second
             if not keys:
                 opening = mask.find("(", match.end())
-                unresolved.add(" ".join(text[match.start() : matching_paren(mask, opening)].split()))
+                site = " ".join(text[match.start() : matching_paren(mask, opening)].split())
+                unresolved[(path, enclosing_fn(mask, match.start()), site)] += 1
                 continue
             reads.update(keys)
             if match.group("required"):
@@ -606,37 +700,110 @@ def env_keys(source: dict[str, str]) -> tuple[set[str], set[str]]:
     return required, reads
 
 
-def shared_crates(source: dict[str, str]) -> dict[str, str] | None:
-    """`{yadgar-* crate: its git/tag/rev spec}` of `Cargo.toml`'s non-dev dependencies; None without one."""
-    if "Cargo.toml" not in source:
+def entry_points(source: dict[str, str]) -> Counter:
+    """Calls whose env read happens elsewhere: `*from_env*` / `*from_lookup*`, and any call handed a reader."""
+    files = production_sources(source)
+    masks = {path: code_mask(text) for path, text in files.items()}
+    _, read = readers_of(files, masks)
+    passed = {name.replace("\\", "") for name in read if not name.endswith("!")} | {"std::env::var", "env::var"}
+    counts: Counter = Counter()
+    for mask in masks.values():
+        for match in CALL.finditer(mask):
+            name = match.group(1)
+            if name in NOT_CALLS or re.search(r"\b(?:fn|macro_rules!)\s*$", mask[max(0, match.start() - 16) : match.start()]):
+                continue
+            opening = match.end() - 1
+            if ENTRY_POINT.match(mask, match.start()) or {bare(a) for a in arguments(mask, opening)} & passed:
+                counts[name] += 1
+    return counts
+
+
+def tripwire(source: dict[str, str]) -> Counter:
+    counts: Counter = Counter()
+    for text in production_sources(source).values():
+        mask = code_mask(text)
+        for token, pattern in TRIPWIRE.items():
+            counts[token] += len(pattern.findall(mask))
+    return counts
+
+
+def manifest_of(source: dict[str, str]) -> dict | None:
+    return tomllib.loads(source["Cargo.toml"]) if "Cargo.toml" in source else None
+
+
+def shared_crates(source: dict[str, str]) -> dict[str, dict] | None:
+    """`{yadgar-* crate: its spec}` of `Cargo.toml`'s non-dev dependencies; None without one."""
+    manifest = manifest_of(source)
+    if manifest is None:
         return None
-    manifest = tomllib.loads(source["Cargo.toml"])
     tables = [manifest.get("dependencies") or {}, manifest.get("build-dependencies") or {}]
     tables += [(t or {}).get("dependencies") or {} for t in (manifest.get("target") or {}).values()]
-    crates: dict[str, str] = {}
+    crates: dict[str, dict] = {}
     for table in tables:
         for name, spec in table.items():
             package = spec.get("package", name) if isinstance(spec, dict) else name
             if package.startswith("yadgar-"):
-                fields = spec if isinstance(spec, dict) else {"version": spec}
-                pin = fields.get("tag") or fields.get("rev") or fields.get("branch") or fields.get("version") or "?"
-                crates[package] = f"{pin} ({fields.get('git') or fields.get('path') or 'registry'})"
+                crates[package] = spec if isinstance(spec, dict) else {"version": spec}
     return crates
 
 
-def crate_moves(module: str, old_source: dict, new_source: dict, only: str | None = None) -> list[str]:
-    """Each `yadgar-*` crate whose pin moved between the module's two tags (`only`: that crate alone)."""
+def pin_of(spec: dict) -> str:
+    return f"{spec.get('tag') or spec.get('rev') or '?'} ({spec.get('git') or 'no git'})"
+
+
+def locked_crates(source: dict[str, str]) -> set[tuple[str, str, str]] | None:
+    """`{(name, version, source)}` of every `yadgar-*` package in Cargo.lock but the crate itself."""
+    if "Cargo.lock" not in source:
+        return None
+    own = ((manifest_of(source) or {}).get("package") or {}).get("name")
+    packages = tomllib.loads(source["Cargo.lock"]).get("package") or []
+    return {
+        (p["name"], str(p.get("version")), str(p.get("source")))
+        for p in packages
+        if p.get("name", "").startswith("yadgar-") and p["name"] != own
+    }
+
+
+def crate_findings(module: str, old_source: dict, new_source: dict) -> list[tuple[str | None, str]]:
+    """`(crate or None, reason)` for every shared-crate pin that moved, cannot be pinned, or is overridden."""
     old, new = shared_crates(old_source), shared_crates(new_source)
     if old is None and new is None:
         return []
     if old is None or new is None:
-        return [f"{module}: Cargo.toml present at only one of the two tags, so shared crates cannot be compared"]
-    names = sorted((old.keys() | new.keys()) & ({only} if only else old.keys() | new.keys()))
-    return [
-        f"{module}: shared crate {name} moved {old.get(name, 'absent')} -> {new.get(name, 'absent')}"
-        for name in names
-        if old.get(name) != new.get(name)
-    ]
+        return [(None, f"{module}: Cargo.toml present at only one of the two tags, so shared crates cannot be compared")]
+    findings: list[tuple[str | None, str]] = []
+    for name in sorted(old.keys() | new.keys()):
+        if old.get(name) != new.get(name):
+            moved = f"{pin_of(old[name]) if name in old else 'absent'} -> {pin_of(new[name]) if name in new else 'absent'}"
+            findings.append((name, f"{module}: shared crate {name} moved {moved}"))
+        spec = new.get(name)
+        if spec is not None and (
+            spec.get("workspace") or spec.get("branch") or spec.get("path") or not spec.get("git")
+            or not (spec.get("tag") or spec.get("rev"))
+        ):
+            findings.append((name, f"{module}: shared crate {name} has no immutable git tag or rev pin ({spec})"))
+    manifest = manifest_of(new_source) or {}
+    for table in ("patch", "replace", "workspace"):
+        if manifest.get(table):
+            findings.append((None, f"{module}: Cargo.toml carries [{table}], which can redirect a shared crate"))
+    for kind in ("lib", "bin", "example"):
+        targets = manifest.get(kind) or []
+        for target in targets if isinstance(targets, list) else [targets]:
+            if str(target.get("path", "src/")).split("/")[0] != "src":
+                findings.append((None, f"{module}: Cargo.toml [{kind}] path {target.get('path')} is outside src/"))
+    old_lock, new_lock = locked_crates(old_source), locked_crates(new_source)
+    if old_lock is None or new_lock is None:
+        findings.append((None, f"{module}: Cargo.lock missing at one of the two tags, so locked shared crates cannot be compared"))
+    else:
+        for entry in sorted(old_lock ^ new_lock):
+            side = "now locks" if entry in new_lock else "no longer locks"
+            findings.append((entry[0], f"{module}: Cargo.lock {side} {entry[0]} {entry[1]} from {entry[2]}"))
+    return findings
+
+
+def crate_moves(module: str, old_source: dict, new_source: dict, only: str | None = None) -> list[str]:
+    """The reasons of `crate_findings` (`only`: those naming that crate alone)."""
+    return [reason for name, reason in crate_findings(module, old_source, new_source) if only is None or name == only]
 
 
 def optional(name: str) -> bool:
@@ -662,16 +829,26 @@ def boot_audit(module: str, old_source: dict, new_source: dict, rendered: set[st
         if name not in rendered and not optional(name)
     ]
     reasons += [
-        f"{module}: an env read at a new call site whose key E3 cannot resolve: `{site}`"
-        for site in sorted(new_unresolved - old_unresolved)
+        f"{module}: an env read at a new call site whose key E3 cannot resolve: `{site}` ({path}, fn {function})"
+        for (path, function, site) in sorted(new_unresolved - old_unresolved)
+    ]
+    grown_entries = entry_points(new_source) - entry_points(old_source)
+    reasons += [
+        f"{module}: a new call to shared-crate env entry point `{name}` (x{count}); the keys it reads are not visible here"
+        for name, count in sorted(grown_entries.items())
+    ]
+    grown_tokens = tripwire(new_source) - tripwire(old_source)
+    reasons += [
+        f"{module}: env tripwire `{token}` grew by {count}; a reader shape E3 does not model may have been added"
+        for token, count in sorted(grown_tokens.items())
     ]
     return reasons + crate_moves(module, old_source, new_source)
 
 
 def rendered_env(documents: list, module: str) -> set[str] | None | bool:
-    """Env names the render sets on `module`'s containers; None if one takes envFrom; False if none runs it."""
-    names: set[str] = set()
-    seen = False
+    """Env names the render sets on EVERY container running `module`'s image (each is audited on its own env);
+    None if one takes envFrom; False if none runs it."""
+    per_container: list[set[str]] = []
     for document in documents:
         if not isinstance(document, dict) or document.get("kind") not in WORKLOAD_KINDS:
             continue
@@ -679,11 +856,10 @@ def rendered_env(documents: list, module: str) -> set[str] | None | bool:
         for container in (pod.get("containers") or []) + (pod.get("initContainers") or []):
             if split_image(str(container.get("image", "")))[0] != REGISTRY + module:
                 continue
-            seen = True
             if container.get("envFrom"):
                 return None
-            names.update(entry["name"] for entry in container.get("env") or [])
-    return names if seen else False
+            per_container.append({entry["name"] for entry in container.get("env") or []})
+    return set.intersection(*per_container) if per_container else False
 
 
 # ── E4: the migration diff ──────────────────────────────────────────────────
@@ -722,6 +898,19 @@ def migration_audit(module: str, old_source: dict, new_source: dict) -> list[str
     if removed := sorted(old.keys() - new.keys()):
         reasons.append(f"{module}: migration(s) {', '.join(map(str, removed))} removed")
     reasons += [f"{module}: migration {v} changed" for v in sorted(old.keys() & new.keys()) if old[v] != new[v]]
+    # COARSE: any change to a schema file outside the blocks (SQL from a const, a migration dropped from the
+    # set) and any file the schema includes are not readable here.
+    old_files, new_files = schema_sources(old_source), schema_sources(new_source)
+    reasons += [
+        f"{module}: schema source {path} changed"
+        for path in sorted(old_files.keys() | new_files.keys())
+        if " ".join(old_files.get(path, "").split()) != " ".join(new_files.get(path, "").split())
+    ]
+    reasons += [
+        f"{module}: schema source {path} uses include_str!/include_bytes!, which E4 cannot read"
+        for path, text in sorted(new_files.items())
+        if re.search(r"\binclude_(?:str|bytes)!", code_mask(text))
+    ]
     # yadgar-store's migrate.rs owns the migration ledger's own DDL, so its move is a schema change too.
     reasons += [
         f"{r}; store's migrate.rs owns the ledger DDL; interim block; lifted by car C10 per ADR-0948 R5"
@@ -786,7 +975,7 @@ class Net:
             return response.headers["Docker-Content-Digest"]
 
     def source(self, module: str, version: str) -> dict[str, str]:
-        """`{src/…: text, "Cargo.toml": text}` of `yadgarhq/<module>@v<version>`, read in memory, never extracted."""
+        """`{src/…: text, "Cargo.toml": text, "Cargo.lock": text}` of `yadgarhq/<module>@v<version>`, read in memory, never extracted."""
         if (module, version) not in self.sources:
             url = f"https://codeload.github.com/yadgarhq/{module}/tar.gz/refs/tags/v{version}"
             with self.get(url) as response:
@@ -794,7 +983,7 @@ class Net:
             files = {}
             for member in archive.getmembers():
                 relative = member.name.split("/", 1)[-1]
-                wanted = relative == "Cargo.toml" or (relative.startswith("src/") and relative.endswith(".rs"))
+                wanted = relative in ("Cargo.toml", "Cargo.lock") or (relative.startswith("src/") and relative.endswith(".rs"))
                 if member.isfile() and wanted:
                     files[relative] = archive.extractfile(member).read().decode("utf-8", "replace")
             self.sources[(module, version)] = files
