@@ -7566,3 +7566,100 @@ If `yadgar`'s operation is Running or retrying, NEEDS-MAX `argocd app
 terminate-op yadgar` first. Then a revert: no migration ran, so the gateway
 returns to its 0.12.10 image cleanly, and the seeder re-runs with every row
 `unchanged`.
+
+## The yadgar pin moves to parent chart 0.25.27: the ADR-0945 credential-revoke route and six dependency-only module releases
+
+**What the merge does.** It moves `applications/yadgar.yaml`'s
+`targetRevision` from 0.25.14 to 0.25.27 and `scripts/chart_pin.json`'s
+`chart_tag` from `v0.25.14` to `v0.25.27`. `platform_version` stays 0.2.6, so
+the operator Applications do not move.
+
+The chart's `v0.25.14..v0.25.27` is fifteen commits. Only `chart/Chart.yaml`
+dependency versions reach this render:
+
+- chart#52 (v0.25.15): `bootstrap/kind-up.sh` and its tests. Not packaged.
+- `ci: pin the examples at v0.25.15`, and again at v0.25.16: `example/*` only.
+- chart#53 (v0.25.16): `bootstrap/tools.lock`, `kind-up.sh`, `README.md`.
+  Not packaged.
+- Eleven `ci: pin <module> <version> in the parent chart` commits
+  (v0.25.17..v0.25.27), each `chart/Chart.yaml` plus the examples. The
+  intermediate gateway 0.12.12, iam 0.11.9 and iam-db 0.10.7 are dependabot
+  releases that the next pin supersedes.
+
+| Module     | From    | To      | Carries                                                                                                             |
+| ---------- | ------- | ------- | ------------------------------------------------------------------------------------------------------------------- |
+| gateway    | 0.12.11 | 0.12.13 | gateway#120: `POST /admin/revoke-credentials` (ADR-0945); tokio 1.53.2, uuid 1.28.0                                 |
+| iam        | 0.11.8  | 0.11.10 | iam#107: `RevokeAllCredentials` relays the actor and publishes CREDENTIAL_REVOKED; tokio, uuid, zeroize patch bumps |
+| iam-db     | 0.10.6  | 0.10.8  | iam-db#94: `RevokeAllCredentials` tombstones every live credential of a user; serde_json, uuid patch bumps          |
+| project    | 0.3.6   | 0.3.7   | `Cargo.lock` only: serde_json 1.0.152, tokio 1.53.2                                                                 |
+| project-db | 0.7.2   | 0.7.3   | `Cargo.lock` only: serde_json 1.0.152, uuid 1.28.0                                                                  |
+| task       | 0.7.5   | 0.7.6   | `Cargo.lock` only: tokio 1.53.2                                                                                     |
+| task-db    | 0.9.4   | 0.9.5   | `Cargo.lock` only: uuid 1.28.0                                                                                      |
+| seeder     | 0.1.0   | 0.1.1   | `Cargo.lock` only: serde_json 1.0.152, tokio 1.53.2                                                                 |
+
+Unchanged: `config` 0.2.1, `platform` 0.2.6.
+
+**No migration, no new env.** No module changed a migration: the
+`MigrationSet` in each `-db`'s `src/schema.rs` is byte-identical across its
+range (iam-db 15 migrations, project-db and task-db unchanged), and
+`yadgar-store` did not move. iam-db's new verb runs the existing
+`revoked_at IS NULL` tombstone `UPDATE`. No module changed a chart file, an
+env read or its config parser.
+
+Measured 2026-10-18 (helm 3.18.4 and 4.3.0 render the same objects; the text
+differs only in 96 blank lines):
+
+- `yadgar`: 94 → 94 objects, none added or removed, 8 changed, `image` only:
+  the `gateway`, `iam`, `iam-db`, `project`, `project-db`, `task` and
+  `task-db` Deployments, and `Job/seeder`. Each digest equals its module's
+  GHCR tag digest.
+- Server-side `kubectl diff` against `kind-yadgar` (ADR-0881), tracking
+  annotation added, the 13 hook objects left out. At 0.25.14, all 81 objects:
+  empty diff. At 0.25.27, the 80 objects other than `Job/seeder`: the seven
+  Deployments differ, `image` and `generation` only. `Job/seeder` alone is
+  refused, `spec.template: field is immutable`; its sync option
+  `Replace=true,Force=true` is why Argo deletes and re-creates it.
+
+**Live state before the merge, read 2026-10-18.** `yadgar` 0.25.14 Synced,
+Healthy, last operation Succeeded at 14:20:08Z. All seven module Deployments
+are 2/2 ready with 0 restarts. `Job/seeder` succeeded at 14:19:48Z and logged
+`inserted 0, updated 0, archived 0, reactivated 0, unchanged 25`.
+
+**What runs.** Seven Deployments roll (`maxUnavailable: 0`). While they roll,
+the new route can answer `UNIMPLEMENTED` from an older `iam` or `iam-db`
+pod; every existing route is unaffected. Argo re-syncs, and
+`Replace=true,Force=true` deletes and re-creates `Job/seeder` on its 0.1.1
+image, taking the previous run's log with it. The re-run converges with
+nothing to change.
+
+**What is new.** `POST /admin/revoke-credentials` on the edge (`PathPrefix
+/`). It runs the same `Origin` check and admin throttle as the other three
+`/admin` routes, and it needs an administrator's credential: the bootstrap
+token is never admitted for it (`Verb::RevokeCredentials => false`).
+
+### After this merge, read-only
+
+```bash
+# 1. yadgar Synced/Healthy at 0.25.27, and every module ready.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+kubectl --context kind-yadgar -n yadgar get deploy
+
+# 2. The seeder re-ran on 0.1.1 and changed nothing. Expect SUCCEEDED 1 and
+#    inserted 0, updated 0, archived 0, reactivated 0, unchanged 25.
+kubectl --context kind-yadgar -n yadgar get job seeder \
+  -o 'custom-columns=SUCCEEDED:.status.succeeded,FAILED:.status.failed,IMAGE:.spec.template.spec.containers[0].image'
+kubectl --context kind-yadgar -n yadgar logs job/seeder | tail -1
+
+# 3. No pod restarting after the roll.
+kubectl --context kind-yadgar -n yadgar get pods
+```
+
+### Rollback
+
+If `yadgar`'s operation is Running or retrying, NEEDS-MAX `argocd app
+terminate-op yadgar` first. Then a revert: no migration ran, so all seven
+Deployments return to their 0.25.14 images cleanly, `Job/seeder` is
+re-created on 0.1.0, and it re-runs with every row `unchanged`. A credential
+already revoked through the new route stays revoked; the revert does not
+restore it.
