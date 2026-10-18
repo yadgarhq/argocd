@@ -1,26 +1,33 @@
 #!/usr/bin/env python3
-"""The pre-flip refusal gate: the plan's window legs (a) and (b) for the counting -> enforcing flip.
+"""The pre-flip refusal gate: the plan's legs (a), (b) and (c) for the counting -> enforcing flip.
 
 Ledgers 1608 and 1618; yadgarhq/docs `plans/project-validation.md` stage 5 and
 `plans/the-d35-seeder.md` errata E2. The operator's condition is a clean
 observation window: 0 refusals. It runs on the argocd-verify runner (ADR-0840),
 from `preflip.yaml` there, which executes argocd main's copy (ADR-0844).
 
-    preflip_gate.py --start ISO [--end ISO] [--min-resolutions N]
+    preflip_gate.py --start ISO [--end ISO] [--min-resolutions N] [--leg-c-max-age S]
 
-WHAT A PASS MEANS, AND WHAT IT DOES NOT. The plan's stage 5 gate has three
-legs, in order: (c) one deliberate probe per reason class, observed to
-increment its counter BEFORE the window opens; then, over the window, (a) the
-refusal counter rose by 0 and (b) the resolution counter rose. This script
-checks (a) and (b) only (legs 5 and 6 below, with the guards 1-4 that make
-them readable). LEG (c) IS NOT CHECKED HERE and must be proved separately
-before the flip. It is not derived from the run history because that history
-cannot prove it: the only probe that exists (argocd `scripts/project_probe.py`)
-covers two reason classes, `PROJECT_UNRESOLVABLE` routinely and
-`PROJECT_UNREGISTERED_PERSONAL` as a trial. Nothing probes
-`PROJECT_UNREGISTERED_ORG` or `PROJECT_ARCHIVED`, so no reading of its runs
-and of Prometheus could show "every class was observed to count". A PASS says
-so in its own output.
+WHAT A PASS MEANS. The plan's stage 5 gate has three legs, in order: (c) one
+deliberate probe per reason class, observed to increment its counter BEFORE
+the window opens; then, over the window, (a) the refusal counter rose by 0 and
+(b) the resolution counter rose. Legs 5 and 6 below are (a) and (b), with the
+guards 1-4 that make them readable; leg 7 is (c).
+
+LEG (C) IS READ FROM THE PROBE'S OWN VERDICT, NOT FROM PROMETHEUS AGAIN
+(ledger 1624). `project_probe.py --leg-c` sends one call per probeable reason
+class (`PROJECT_UNRESOLVABLE`, `PROJECT_UNREGISTERED_PERSONAL`,
+`PROJECT_UNREGISTERED_ORG`, `PROJECT_INVALID`, `PROJECT_ARCHIVED`) and exits 0
+only when every one of their counters rose per pod; it is red when
+inconclusive. argocd-verify's `project-probe.yaml` names such a run
+`project-probe leg-c` (`run-name`; the runs listing carries no dispatch
+inputs). Leg 7 passes when the NEWEST such run whose job completed at or
+before `start - probe_slack`, and no earlier than `start - leg_c_max_age`,
+concluded `success`. A newer red run is not masked by an older green one.
+Re-reading the counter here instead would need the run, the slack and the
+window inside Prometheus' 1d retention together, which caps the window.
+`PROJECT_REGISTRY_UNAVAILABLE` has no probe (it needs the registry down); legs
+(a) and 4 cover it inside the window.
 
 THE PROBE IS SERIALIZED OUT OF THE WINDOW, NOT SUBTRACTED. The refusal counter
 has one label, `reason`, and no claim label, so the ADR-0841 probe's
@@ -52,6 +59,7 @@ THE LEGS, all read, all reported, any one failing fails the gate:
   6. `yadgar_gateway_project_resolution_total` rose by at least
      `--min-resolutions` (default 1): zero traffic yields zero refusals for
      free, so a silent window proves nothing.
+  7. Leg (c), as above.
 
 PER SERIES, FROM RAW SAMPLES, NEVER A BARE `increase()` (ADR-0620). The gateway
 registers its counters lazily, so a pod's first refusal makes the series appear
@@ -123,6 +131,7 @@ UP_SELECTOR = 'up{namespace="yadgar",app="gateway"}'
 PROBE_REPO = "yadgarhq/argocd-verify"
 PROBE_WORKFLOW = "project-probe.yaml"
 PROBE_JOB_TIMEOUT = 20 * 60  # project-probe.yaml `timeout-minutes: 20`
+LEG_C_TITLE = "project-probe leg-c"  # project-probe.yaml `run-name` with `leg_c: true`
 
 EXIT_PASS, EXIT_FAIL = 0, 1
 
@@ -330,6 +339,42 @@ def probe_overlaps(transport: "Transport", start: float, end: float) -> list[str
         page += 1
 
 
+def leg_c(transport: "Transport", start: float, slack: float, max_age: float) -> tuple[bool, str]:
+    """Leg (c): the newest finished `project-probe leg-c` run before the window, and its verdict."""
+    since = iso(start - max_age - PROBE_JOB_TIMEOUT - 600)
+    finished: list[tuple[float, int, str]] = []
+    page = 1
+    while True:
+        q = urllib.parse.urlencode({"per_page": 100, "page": page, "created": f">={since}"})
+        body = transport.github_get(f"/repos/{PROBE_REPO}/actions/workflows/{PROBE_WORKFLOW}/runs?{q}")
+        runs = body.get("workflow_runs")
+        if runs is None:
+            raise GateError(f"github: no workflow_runs in the {PROBE_WORKFLOW} listing")
+        for run in runs:
+            if run.get("display_title") != LEG_C_TITLE or run.get("status") != "completed":
+                continue
+            jobs = transport.github_get(f"/repos/{PROBE_REPO}/actions/runs/{run['id']}/jobs?per_page=100")
+            for job in jobs.get("jobs", []):
+                completed = parse_time(job.get("completed_at"))
+                if completed is not None and completed <= start - slack:
+                    finished.append((completed, run["id"], str(job.get("conclusion"))))
+        if len(runs) < 100:
+            break
+        page += 1
+    if not finished:
+        return False, (
+            f"no project-probe leg-c run finished before {iso(start - slack)}: dispatch project-probe.yaml "
+            "with leg_c: true while PROJECT_PROBE_ENABLED is true, then switch the probe off"
+        )
+    completed, run_id, conclusion = max(finished)
+    where = f"project-probe run {run_id} (job ended {iso(completed)})"
+    if completed < start - max_age:
+        return False, f"leg (c): the newest leg-c run, {where}, is older than {max_age:.0f}s before the start"
+    if conclusion != "success":
+        return False, f"leg (c): the newest leg-c run, {where}, concluded {conclusion}"
+    return True, f"leg (c): {where} concluded success"
+
+
 # --- the network ------------------------------------------------------------------
 
 
@@ -378,6 +423,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--lookback", type=float, default=300.0, help="seconds before start read for each baseline")
     p.add_argument("--max-gap", type=float, default=120.0, help="longest tolerated scrape gap, seconds")
     p.add_argument("--probe-slack", type=float, default=300.0, help="a probe job ending this close before start overlaps")
+    p.add_argument("--leg-c-max-age", type=float, default=86400.0, help="the leg-c run must end within this many seconds before start")
     p.add_argument("--prometheus-url", default="http://prometheus-server.observability.svc:80")
     return p.parse_args(argv)
 
@@ -412,6 +458,7 @@ def run(
     enabled = env.get("PROJECT_PROBE_ENABLED")
     if enabled != "false":
         failures.append(f"PROJECT_PROBE_ENABLED is {enabled!r}, not 'false': the probe is not serialized out of the window")
+    leg_c_line = "leg (c): not read"
     if not env.get("GITHUB_TOKEN"):
         failures.append("GITHUB_TOKEN is empty: the probe's run history cannot be read")
     else:
@@ -421,6 +468,14 @@ def run(
             for hit in hits:
                 failures.append(f"{hit} overlaps the window (or its {args.probe_slack:.0f}s slack)")
             say(f"project-probe jobs overlapping: {len(hits)}")
+        except GateError as e:
+            failures.append(str(e))
+        # Leg 7: leg (c).
+        try:
+            ok, leg_c_line = leg_c(transport, start, args.probe_slack, args.leg_c_max_age)
+            say(leg_c_line)
+            if not ok:
+                failures.append(leg_c_line)
         except GateError as e:
             failures.append(str(e))
 
@@ -492,7 +547,7 @@ def run(
     if failures:
         say(f"FAIL: {tally}")
     else:
-        say(f"PASS: legs (a)+(b) passed ({tally}); leg (c) is NOT checked here and must be proved separately")
+        say(f"PASS: legs (a)+(b)+(c) passed ({tally}); {leg_c_line}")
     return EXIT_PASS if not failures else EXIT_FAIL
 
 

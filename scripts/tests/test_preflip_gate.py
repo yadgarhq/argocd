@@ -106,9 +106,12 @@ def up_series(pod: str, steps: list[tuple[float, float]]) -> dict:
 TRAFFIC = resolution("a", [(START - LOOKBACK, 3), (START + 3600, 9)])
 
 
-def run_record(run_id: int, started: float, completed: float | None, conclusion: str = "success") -> tuple[dict, dict]:
+def run_record(
+    run_id: int, started: float, completed: float | None, conclusion: str = "success", title: str = "project-probe"
+) -> tuple[dict, dict]:
     run = {
         "id": run_id,
+        "display_title": title,
         "status": "completed" if completed is not None else "in_progress",
         "created_at": iso(started - 5),
         "updated_at": iso(completed if completed is not None else started),
@@ -123,6 +126,10 @@ def run_record(run_id: int, started: float, completed: float | None, conclusion:
     return run, {"jobs": [job]}
 
 
+LEG_C = "project-probe leg-c"
+LEG_C_GREEN = run_record(900, START - 3600, START - 3500, title=LEG_C)
+
+
 class FakeTransport:
     def __init__(
         self,
@@ -130,11 +137,14 @@ class FakeTransport:
         lowest: float = START - 86000,
         runs: list[tuple[dict, dict]] = (),
         up: dict | None = None,
+        leg_c: tuple[tuple[dict, dict], ...] | None = None,
     ):
         self.body = body
         self.up = up if up is not None else derived_up(body)
         self.lowest = lowest
-        self.runs = list(runs)
+        # Every case carries a green leg (c) sweep an hour before the window,
+        # unless it states its own: the gate now requires one.
+        self.runs = list(runs) + list((LEG_C_GREEN,) if leg_c is None else leg_c)
         self.queries: list[dict] = []
         self.prom_down = False
         self.github_down = False
@@ -482,10 +492,11 @@ def test_min_resolutions_must_be_an_integer(value: str) -> None:
         pg.parse_args(["--start", iso(START), "--min-resolutions", value])
 
 
-def test_a_pass_says_leg_c_is_not_checked_here() -> None:
+def test_a_pass_names_the_leg_c_run_it_relied_on() -> None:
     code, out = gate(FakeTransport(matrix(gauge("a"), TRAFFIC)))
     assert code == pg.EXIT_PASS, out
-    assert "leg (c) is NOT checked here" in out
+    assert "legs (a)+(b)+(c) passed" in out
+    assert "leg (c): project-probe run 900" in out
     assert "may move" not in out
 
 
@@ -513,3 +524,74 @@ def test_a_second_job_scraping_the_same_pod_on_its_own_clock_is_no_restart() -> 
     body = matrix(gauge("a"), dup, refusal("a", [(START - LOOKBACK, 4)]), TRAFFIC)
     code, out = gate(FakeTransport(body))
     assert code == pg.EXIT_PASS, out
+
+
+# --- leg (c): one deliberate probe per reason class, before the window (ledger 1624)
+#
+# The gate trusts the newest `project-probe leg-c` run that ended before the
+# window's slack: the probe itself exits 0 in that mode only when every probed
+# reason's counter rose per pod, and is red when inconclusive. Re-reading the
+# counter here would tie the run, the slack and the window to Prometheus' 1d
+# retention together.
+
+FLAT = matrix(gauge("a"), TRAFFIC)
+
+
+def test_no_leg_c_run_fails() -> None:
+    code, out = gate(FakeTransport(FLAT, leg_c=()))
+    assert code == pg.EXIT_FAIL, out
+    assert "no project-probe leg-c run" in out
+
+
+def test_a_routine_green_run_is_not_leg_c_evidence() -> None:
+    code, out = gate(FakeTransport(FLAT, runs=[run_record(5, START - 3000, START - 2950)], leg_c=()))
+    assert code == pg.EXIT_FAIL, out
+    assert "no project-probe leg-c run" in out
+
+
+def test_the_newest_leg_c_run_red_fails_even_with_an_older_green_one() -> None:
+    red = run_record(901, START - 1800, START - 1700, conclusion="failure", title=LEG_C)
+    code, out = gate(FakeTransport(FLAT, leg_c=(LEG_C_GREEN, red)))
+    assert code == pg.EXIT_FAIL, out
+    assert "run 901" in out and "failure" in out
+
+
+def test_a_leg_c_run_older_than_the_max_age_fails() -> None:
+    old = run_record(902, START - 90000, START - 89900, title=LEG_C)
+    code, out = gate(FakeTransport(FLAT, leg_c=(old,)))
+    assert code == pg.EXIT_FAIL, out
+    assert "older than" in out
+
+
+def test_the_max_age_is_the_operators() -> None:
+    old = run_record(902, START - 90000, START - 89900, title=LEG_C)
+    argv = ["--start", iso(START), "--end", iso(END), "--leg-c-max-age", "100000"]
+    code, out = gate(FakeTransport(FLAT, leg_c=(old,)), argv=argv)
+    assert code == pg.EXIT_PASS, out
+
+
+def test_a_leg_c_run_inside_the_slack_is_no_evidence_and_overlaps() -> None:
+    late = run_record(903, START - 120, START - 60, title=LEG_C)
+    code, out = gate(FakeTransport(FLAT, leg_c=(late,)))
+    assert code == pg.EXIT_FAIL, out
+    assert "overlaps the window" in out
+    assert "no project-probe leg-c run" in out
+
+
+def test_a_leg_c_run_still_running_is_no_evidence() -> None:
+    running = run_record(904, START - 3600, None, title=LEG_C)
+    code, out = gate(FakeTransport(FLAT, leg_c=(running,)))
+    assert code == pg.EXIT_FAIL, out
+    assert "no project-probe leg-c run" in out
+
+
+def test_the_newest_leg_c_run_is_chosen_by_its_end_not_by_list_order() -> None:
+    red = run_record(905, START - 7200, START - 7100, conclusion="failure", title=LEG_C)
+    code, out = gate(FakeTransport(FLAT, leg_c=(LEG_C_GREEN, red)))
+    assert code == pg.EXIT_PASS, out
+
+
+def test_the_leg_c_title_is_the_workflows_run_name() -> None:
+    # argocd-verify `project-probe.yaml` sets `run-name` to this exact string
+    # when dispatched with `leg_c: true`; the runs listing carries no inputs.
+    assert pg.LEG_C_TITLE == LEG_C

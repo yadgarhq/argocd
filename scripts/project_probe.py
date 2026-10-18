@@ -2,13 +2,14 @@
 """The 785 refusal-counter probe: front-door coverage of gateway -> project -> project-db.
 
 ADR-0841 keeps `gateway.projectValidation.mode` at `counting` and covers the
-project path with this probe instead: one authenticated, read-only MCP call
-carrying a project claim nobody registered, then a check that the matching
-`yadgar_gateway_project_refusal_total{reason}` rose in Prometheus. The plan is
+project path with this probe instead. The routine run sends one authenticated,
+read-only MCP call carrying a project claim nobody registered, then checks that
+the matching `yadgar_gateway_project_refusal_total{reason}` rose in Prometheus
+(`--leg-c` sends one call per reason class; see below). The plan is
 yadgarhq/docs `plans/settled-state-smoke-gate.md`, stage 6. It runs on the
 argocd-verify runner (ADR-0840), from `project-probe.yaml` there.
 
-    project_probe.py --edge-ca ROOT_PEM [--trial unregistered-personal | --trial no-token]
+    project_probe.py --edge-ca ROOT_PEM [--trial unregistered-personal | --trial no-token | --leg-c]
 
 THE STEPS, in order:
   1. Read estate's `smoke.yaml` runs. A `smoke` job already running makes the
@@ -62,6 +63,41 @@ THE TRIALS (stage 6 acceptance 2 and 3):
       reset, unknown or vanished pod: exit 3 (red, as designed). Any other
       status, or any counter movement, is exit 2. A read that fails is exit 1.
 
+LEG (C), `--leg-c` (ledger 1624; yadgarhq/docs `plans/project-validation.md`
+stage 5). The flip's gate needs one deliberate probe per reason class, observed
+to count, before its window opens. This mode sends one call per class that a
+probe can reach, in one login, then polls until every class's counter rose:
+
+  PROJECT_UNRESOLVABLE           find_tasks   probe-unregistered/never-registered
+  PROJECT_UNREGISTERED_PERSONAL  find_tasks   local/probe-never-registered
+  PROJECT_UNREGISTERED_ORG       find_tasks   yadgarhq/probe-never-registered
+  PROJECT_INVALID                find_tasks   probe-invalid/
+  PROJECT_ARCHIVED               create_task  yadgarhq/probe-archived
+
+  - ORG needs the root `yadgarhq` declared and the claim itself undeclared:
+    the walk then lands on the anchor (`classify.rs`, ADR-0673).
+  - INVALID: a trailing `/` fails the grammar before any resolution.
+  - ARCHIVED needs `yadgarhq/probe-archived` to be an ARCHIVED row, which the
+    seeder makes by declaring the path once and then removing it (ADR-0934).
+    Until both argocd changes have synced, this arm counts ORG (never
+    declared) or resolves (declared and active), and leg (c) is red.
+  - ARCHIVED is the only class decided by the call (ADR-0941): only a WRITE
+    counts it. The call is `create_task` WITHOUT `title`. The gateway counts
+    the claim during attestation, before any tool work (`http/dispatch.rs`),
+    and in `counting` mode then runs the tool, which refuses the missing
+    title (`tools.rs`, `ToolError::Invalid`) before `task` is dialled. So the
+    call writes nothing and is safe to repeat. A SERVED success on this arm
+    means a task WAS written; the run fails and prints the task's id.
+  - `PROJECT_REGISTRY_UNAVAILABLE` is not probed: it needs the registry down.
+
+An arm's answer passes when it is the expected one for `counting` (served, or
+for ARCHIVED the title refusal) or, under `enforcing`, a JSON-RPC error whose
+`data.reason` is that arm's class. Exit 0 only when every arm answered as
+expected AND every class's counter rose per pod. Anything else is exit 1,
+INCONCLUSIVE included (a smoke overlap, a reset or a vanished pod): leg (c)
+needs a clean proof, so dispatch again. `project-probe.yaml` names these runs
+`project-probe leg-c`, and `preflip_gate.py` reads the newest one.
+
 NEVER PRINTED: the password and the bearer token.
 
 Standard library only: the pre-commit hook that runs the tests installs pytest
@@ -90,18 +126,46 @@ REFUSALS = "yadgar_gateway_project_refusal_total"
 LOADED = "yadgar_gateway_project_registry_loaded"
 UNRESOLVABLE = "PROJECT_UNRESOLVABLE"
 PERSONAL = "PROJECT_UNREGISTERED_PERSONAL"
-REASONS = (UNRESOLVABLE, PERSONAL)
+UNREGISTERED_ORG = "PROJECT_UNREGISTERED_ORG"
+INVALID = "PROJECT_INVALID"
+ARCHIVED = "PROJECT_ARCHIVED"
+REASONS = (UNRESOLVABLE, PERSONAL, UNREGISTERED_ORG, INVALID, ARCHIVED)
 
 # No ancestor of either claim is registered. `classify` (gateway
 # `src/project/classify.rs`) returns `Unresolvable` for the first and
 # `UnregisteredPersonal` for the second, whose root is the reserved `local`.
 CLAIM = "probe-unregistered/never-registered"
 TRIAL_CLAIM = "local/probe-never-registered"
+# Leg (c)'s three further claims; see the docstring for why each reaches its
+# class. `scripts/gates/test_probe_claims.py` binds the first to the declared
+# registry, and `test_yadgar_application.py` binds the last.
+ORG_CLAIM = "yadgarhq/probe-never-registered"
+INVALID_CLAIM = "probe-invalid/"
+ARCHIVED_CLAIM = "yadgarhq/probe-archived"
 
 QUERY = f'{{__name__=~"{REFUSALS}|{LOADED}",namespace="yadgar",app="gateway"}}'
 
 PROTOCOL_VERSION = "2026-07-28"  # gateway `src/mcp.rs` PROTOCOL_VERSION
 TOOL = "find_tasks"
+WRITE_TOOL = "create_task"
+
+
+@dataclasses.dataclass(frozen=True)
+class Arm:
+    reason: str
+    claim: str
+    tool: str
+    arguments: dict
+
+
+LEG_C_ARMS = (
+    Arm(UNRESOLVABLE, CLAIM, TOOL, {"page_size": 1}),
+    Arm(PERSONAL, TRIAL_CLAIM, TOOL, {"page_size": 1}),
+    Arm(UNREGISTERED_ORG, ORG_CLAIM, TOOL, {"page_size": 1}),
+    Arm(INVALID, INVALID_CLAIM, TOOL, {"page_size": 1}),
+    # NO `title`: the one argument whose absence makes the write a no-op.
+    Arm(ARCHIVED, ARCHIVED_CLAIM, WRITE_TOOL, {}),
+)
 
 PASS, FAIL, INCONCLUSIVE = "PASS", "FAIL", "INCONCLUSIVE"
 EXIT_PASS, EXIT_FAIL, EXIT_TRIAL_INVALID, EXIT_TRIAL_RED = 0, 1, 2, 3
@@ -317,11 +381,13 @@ class Network:
             conn.close()
 
 
-def mcp_call(token: str | None, claim: str) -> tuple[dict[str, str], bytes]:
+def mcp_call(token: str | None, claim: str, tool: str = TOOL, arguments: dict | None = None) -> tuple[dict[str, str], bytes]:
+    # `mcp-name` and the body's `name` are ONE value: the gateway cross-checks
+    # the mirror header against the body (`http/gate.rs`).
     headers = {
         "mcp-protocol-version": PROTOCOL_VERSION,
         "mcp-method": "tools/call",
-        "mcp-name": TOOL,
+        "mcp-name": tool,
         "x-yadgar-project": claim,
     }
     if token is not None:
@@ -331,8 +397,8 @@ def mcp_call(token: str | None, claim: str) -> tuple[dict[str, str], bytes]:
         "id": 1,
         "method": "tools/call",
         "params": {
-            "name": TOOL,
-            "arguments": {"page_size": 1},
+            "name": tool,
+            "arguments": {"page_size": 1} if arguments is None else arguments,
             "_meta": {
                 "io.modelcontextprotocol/protocolVersion": PROTOCOL_VERSION,
                 "io.modelcontextprotocol/clientCapabilities": {},
@@ -357,7 +423,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--smoke-workflow", default="smoke.yaml")
     p.add_argument("--poll-interval", type=float, default=15.0)
     p.add_argument("--poll-timeout", type=float, default=120.0)
-    p.add_argument("--trial", choices=["unregistered-personal", "no-token"])
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--trial", choices=["unregistered-personal", "no-token"])
+    mode.add_argument("--leg-c", action="store_true", help="one call per reason class (leg (c), dispatch only)")
     return p.parse_args(argv)
 
 
@@ -374,6 +442,8 @@ def run(
     now: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
 ) -> int:
+    if args.leg_c:
+        return run_leg_c(args, transport, env, now, sleep)
     claim = TRIAL_CLAIM if args.trial == "unregistered-personal" else CLAIM
     send_token = args.trial != "no-token"
     password = env.get("ESTATE_PROBE_PASSWORD", "")
@@ -454,6 +524,108 @@ def run(
         say(f"trial: INVALID — needs {PERSONAL} to rise and {UNRESOLVABLE} not to; moved: {moved(deltas)}")
         return EXIT_TRIAL_INVALID
     return EXIT_FAIL if verdict.kind == FAIL else EXIT_PASS
+
+
+def answer_ok(arm: Arm, status: int, answer: dict) -> tuple[bool, str]:
+    """Whether one leg (c) call answered as its arm expects, and what it said.
+
+    Never echoes a served payload except the ARCHIVED arm's written task id,
+    which is what someone needs to find and remove the row.
+    """
+    error = answer.get("error")
+    if isinstance(error, dict):
+        reason = (error.get("data") or {}).get("reason") if isinstance(error.get("data"), dict) else None
+        if reason == arm.reason:
+            return True, f"HTTP {status} refused {reason} (enforcing)"
+        return False, f"HTTP {status} error {error.get('code')} reason {reason!r}, expected {arm.reason} or a served call"
+    if not 200 <= status < 300:
+        return False, f"HTTP {status}"
+    result = answer.get("result") if isinstance(answer.get("result"), dict) else {}
+    if arm.tool != WRITE_TOOL:
+        return True, f"HTTP {status} ({'isError' if result.get('isError') else 'served'})"
+    text = " ".join(str(c.get("text", "")) for c in result.get("content", []) if isinstance(c, dict))
+    if result.get("isError") and "title" in text:
+        return True, f"HTTP {status} tool refused the missing title; nothing written"
+    if not result.get("isError"):
+        written = result.get("structuredContent") or {}
+        return False, (
+            f"HTTP {status} SERVED: a task was WRITTEN under {arm.claim} "
+            f"(id {written.get('id')!r}, number {written.get('number')!r}); remove it"
+        )
+    return False, f"HTTP {status} isError, but not the missing-title refusal: {text[:200]!r}"
+
+
+def run_leg_c(
+    args: argparse.Namespace,
+    transport: Transport,
+    env: dict[str, str],
+    now: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> int:
+    """Leg (c): one call per reason class; exit 0 only on a clean, complete proof."""
+    password = env.get("ESTATE_PROBE_PASSWORD", "")
+    if not password:
+        say("FAIL: ESTATE_PROBE_PASSWORD is not set")
+        return EXIT_FAIL
+    failures: list[str] = []
+    try:
+        start = now()
+        overlap = smoke_overlaps(transport, args.estate_repo, args.smoke_workflow, start, start)
+        if overlap:
+            say(f"FAIL: inconclusive: estate smoke run {overlap[0]} overlapped (already running); nothing sent; dispatch again")
+            return EXIT_FAIL
+        before = read(transport, "before")
+
+        status, raw = transport.edge_post(
+            "/auth/login", {}, json.dumps({"username": args.username, "password": password}).encode()
+        )
+        say(f"login: HTTP {status}")
+        token = _json(raw).get("token") if status == 200 else None
+        if not token:
+            say(f"FAIL: login as {args.username} answered HTTP {status} with no token")
+            return EXIT_FAIL
+
+        for arm in LEG_C_ARMS:
+            headers, body = mcp_call(token, arm.claim, arm.tool, arm.arguments)
+            status, raw = transport.edge_post("/", headers, body)
+            ok, detail = answer_ok(arm, status, _json(raw))
+            say(f"call {arm.reason}: tools/call {arm.tool} claim={arm.claim} -> {detail}")
+            if not ok:
+                failures.append(f"{arm.reason} arm: {detail}")
+
+        after, deltas = before, {r: Delta() for r in REASONS}
+        for attempt in range(1, math.ceil(args.poll_timeout / args.poll_interval) + 1):
+            sleep(args.poll_interval)
+            after = read(transport, f"poll {attempt}")
+            deltas = {r: compare(before, after, r) for r in REASONS}
+            if all(d.rise >= 1 for d in deltas.values()):
+                break
+        end = now()
+        say("deltas: " + "; ".join(f"{r} +{d.rise:g} resets={d.resets} unknown={d.unknown} missing={d.missing}" for r, d in deltas.items()))
+
+        overlap = smoke_overlaps(transport, args.estate_repo, args.smoke_workflow, start, end)
+        if overlap:
+            failures.append(f"inconclusive: estate smoke run {overlap[0]} overlapped; dispatch again")
+    except ProbeError as e:
+        say(f"FAIL: {e}")
+        return EXIT_FAIL
+
+    for reason, d in deltas.items():
+        verdict = evaluate(reason, deltas)
+        if verdict.kind == PASS:
+            continue
+        if verdict.kind == INCONCLUSIVE:
+            failures.append(f"{verdict.message}; leg (c) needs a clean proof, dispatch again")
+        else:
+            failures.append(f"{reason} did not rise: {verdict.message}")
+
+    for f in failures:
+        say(f"FAIL: {f}")
+    if failures:
+        say(f"FAIL: leg (c) not proved; moved: {moved(deltas)}")
+        return EXIT_FAIL
+    say(f"PASS: leg (c): every probed reason class counted ({moved(deltas)})")
+    return EXIT_PASS
 
 
 def _json(raw: bytes) -> dict:
