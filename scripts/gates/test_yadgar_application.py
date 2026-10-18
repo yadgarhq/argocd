@@ -1180,15 +1180,16 @@ DECLARED_REPOSITORIES = (
 # The namespace anchors (ADR-0673) and the estate's one landing path, ledger
 # 1244 option B: smoke runs claim `estate/smoke`, a project under the root
 # `estate`, because the store refuses a root that contains `/`.
-#
-# `yadgarhq/probe-archived` is NO REPOSITORY. It is the pre-flip gate's leg (c)
-# probe row (ledger 1624, Max's ruling): declared once so the seeder inserts
-# it, then removed by the next registry change so the seeder ARCHIVES it
-# (ADR-0934); argocd's `project_probe.py --leg-c` then writes to it to count
-# `PROJECT_ARCHIVED`. Its `sourceRepo` is this repository, whose PR flow
-# declares and removes it.
 DECLARED_ROOTS = {"yadgarhq": "yadgarhq/argocd", "estate": "yadgarhq/estate"}
-DECLARED_EXTRA_PROJECTS = {"estate/smoke": "yadgarhq/estate", "yadgarhq/probe-archived": "yadgarhq/argocd"}
+DECLARED_EXTRA_PROJECTS = {"estate/smoke": "yadgarhq/estate"}
+# ARCHIVED ON PURPOSE, AND THEREFORE NEVER DECLARED AGAIN (ledger 1624, Max's
+# ruling). `yadgarhq/probe-archived` is no repository: it is the pre-flip
+# gate's leg (c) probe row. argocd#112 declared it once so the seeder inserted
+# it; it is now absent, so the seeder archived it (ADR-0934). argocd's
+# `project_probe.py --leg-c` writes to it to count `PROJECT_ARCHIVED`.
+# Declaring it again REACTIVATES the row and silently turns that arm into a
+# resolution.
+ARCHIVED_ON_PURPOSE = ("yadgarhq/probe-archived",)
 
 
 def registry_failures(registry: object) -> dict[str, object]:
@@ -1225,6 +1226,12 @@ def test_the_rendered_registry_is_the_declaration(rendered: list) -> None:
     """The ConfigMap the Job reads carries exactly the declared rows and the guard."""
     configmap = next(d for d in rendered if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "seeder-registry")
     assert registry_failures(json.loads(configmap["data"]["registry.json"])) == {}
+
+
+def test_the_probe_row_archived_on_purpose_is_not_declared() -> None:
+    registry = declared_registry()
+    declared = {p["path"].lower() for p in registry["projects"]} | {r["path"].lower() for r in registry["roots"]}
+    assert declared.isdisjoint(ARCHIVED_ON_PURPOSE)
 
 
 def test_a_mass_archive_flag_names_it() -> None:
