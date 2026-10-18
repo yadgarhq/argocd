@@ -46,7 +46,11 @@ def iso(t: float) -> str:
     return pg.iso(t)
 
 
+# Every fixture time sits on one 15 s grid anchored at START - LOOKBACK, as a
+# real target's samples do: one scrape stamps every series of a pod alike, and
+# the gate reads a gauge scrape with no counter sample as a restart.
 def ticks(first: float, last: float) -> list[float]:
+    assert (first - (START - LOOKBACK)) % STEP == 0, f"{first} is off the scrape grid"
     out, t = [], first
     while t <= last:
         out.append(t)
@@ -83,6 +87,22 @@ def matrix(*series: dict) -> dict:
     return {"status": "success", "data": {"resultType": "matrix", "result": list(series)}}
 
 
+def derived_up(body: dict | None) -> dict:
+    """`up` as Prometheus records it beside healthy gauges: 1 at every gauge scrape."""
+    if not body or body.get("status") != "success":
+        return matrix()
+    rows = [
+        {"metric": {"__name__": "up", "app": "gateway", "namespace": "yadgar", "pod": r["metric"]["pod"]}, "values": [[t, "1"] for t, _ in r["values"]]}
+        for r in body["data"]["result"]
+        if r["metric"].get("__name__") == pg.LOADED
+    ]
+    return matrix(*rows)
+
+
+def up_series(pod: str, steps: list[tuple[float, float]]) -> dict:
+    return counter("up", pod, ("app", "gateway"), steps)
+
+
 TRAFFIC = resolution("a", [(START - LOOKBACK, 3), (START + 3600, 9)])
 
 
@@ -104,8 +124,15 @@ def run_record(run_id: int, started: float, completed: float | None, conclusion:
 
 
 class FakeTransport:
-    def __init__(self, body: dict | None, lowest: float = START - 86000, runs: list[tuple[dict, dict]] = ()):
+    def __init__(
+        self,
+        body: dict | None,
+        lowest: float = START - 86000,
+        runs: list[tuple[dict, dict]] = (),
+        up: dict | None = None,
+    ):
         self.body = body
+        self.up = up if up is not None else derived_up(body)
         self.lowest = lowest
         self.runs = list(runs)
         self.queries: list[dict] = []
@@ -121,6 +148,8 @@ class FakeTransport:
                 "status": "success",
                 "data": {"resultType": "vector", "result": [{"metric": {}, "value": [NOW, str(self.lowest)]}]},
             }
+        if params["query"].startswith("up{"):
+            return self.up
         return self.body
 
     def github_get(self, path: str) -> dict:
@@ -150,7 +179,7 @@ def test_probe_increments_before_the_window_are_in_the_baseline_and_pass() -> No
     # increment (4 -> 5) is in the baseline, and the window itself is flat.
     body = matrix(
         gauge("a"),
-        refusal("a", [(START - LOOKBACK, 4), (START - 200, 5)]),
+        refusal("a", [(START - LOOKBACK, 4), (START - 195, 5)]),
         TRAFFIC,
     )
     runs = [run_record(1, START - 2400, START - 2350)]
@@ -204,7 +233,7 @@ def test_a_refusal_on_a_replacement_pod_is_counted() -> None:
         gauge("a", last=START + 7200),
         gauge("b", first=START + 7200 - 30),
         refusal("a", [(START - LOOKBACK, 6)], last=START + 7200),
-        refusal("b", [(START + 7300, 1)]),
+        refusal("b", [(START + 7305, 1)]),
         TRAFFIC,
     )
     code, out = gate(FakeTransport(body))
@@ -357,12 +386,130 @@ def test_an_end_in_the_future_or_before_the_start_is_refused() -> None:
 def test_the_matrix_read_spans_the_lookback_and_is_evaluated_at_the_end() -> None:
     t = FakeTransport(matrix(gauge("a"), TRAFFIC))
     gate(t)
-    q = next(p for p in t.queries if p["query"] != pg.LOWEST_QUERY)
+    q = next(p for p in t.queries if p["query"].startswith("{"))
     assert q["time"] == f"{END:.3f}"
     assert q["query"].endswith(f"[{int(END - START + LOOKBACK)}s]")
-    assert 'namespace="yadgar"' in q["query"] and 'app="gateway"' in q["query"]
+    assert 'namespace="yadgar"' in q["query"]
 
 
 def test_the_report_never_prints_the_token() -> None:
     _, out = gate(FakeTransport(matrix(gauge("a"), TRAFFIC)), env={"PROJECT_PROBE_ENABLED": "false", "GITHUB_TOKEN": "s3cr3t"})
     assert "s3cr3t" not in out
+
+
+# --- review round 1 (argocd#108) -------------------------------------------------
+
+
+def gauge_steps(pod: str, steps: list[tuple[float, float]]) -> dict:
+    return counter(pg.LOADED, pod, ("pod", pod), steps)
+
+
+def test_a_restart_back_to_the_same_value_is_a_reset_and_is_counted() -> None:
+    # Pod a's series reads 1 before the window. The container restarts at
+    # 01:00: the gauge keeps being scraped, the lazily registered counter is
+    # gone for those scrapes, then one real refusal brings it back at 1.
+    # Value-only reset detection sees 1 -> 1 and counts 0.
+    gone_from, back_at = START + 3600, START + 3660
+    body = matrix(
+        gauge("a"),
+        {
+            "metric": {"__name__": pg.REFUSALS, "app": "gateway", "namespace": "yadgar", "pod": "a", "reason": U},
+            "values": [[t, "1"] for t in ticks(START - LOOKBACK, END) if not gone_from <= t < back_at],
+        },
+        TRAFFIC,
+    )
+    code, out = gate(FakeTransport(body))
+    assert code == pg.EXIT_FAIL, out
+    assert "refusals in window: 1" in out
+
+
+def test_a_gauge_drop_to_zero_resets_every_series_of_that_pod() -> None:
+    # registry_loaded 1 -> 0 is a fresh process that has not loaded yet; the
+    # refusal series after it belongs to the new process and counts in full.
+    body = matrix(
+        gauge_steps("a", [(START - LOOKBACK, 1), (START + 3600, 0), (START + 3630, 1)]),
+        refusal("a", [(START - LOOKBACK, 1)]),
+        TRAFFIC,
+    )
+    code, out = gate(FakeTransport(body))
+    assert code == pg.EXIT_FAIL, out
+    assert "refusals in window: 1" in out
+
+
+def test_one_pod_unscraped_while_another_keeps_going_fails() -> None:
+    # Pod b stops being scraped at 01:00 (up == 0) while pod a scrapes on. The
+    # merged timeline has no gap; pod b is blind.
+    body = matrix(gauge("a"), gauge("b", last=START + 3600), TRAFFIC)
+    up = matrix(
+        up_series("a", [(START - LOOKBACK, 1)]),
+        up_series("b", [(START - LOOKBACK, 1), (START + 3615, 0)]),
+    )
+    code, out = gate(FakeTransport(body, up=up))
+    assert code == pg.EXIT_FAIL, out
+    assert "up == 0" in out and "b" in out
+
+
+def test_a_gap_in_one_pods_own_gauge_fails_even_when_another_pod_covers_it() -> None:
+    gap = [[t, "1"] for t in ticks(START - LOOKBACK, END) if not START + 3600 <= t < START + 7200]
+    body = matrix(
+        gauge("a"),
+        {"metric": {"__name__": pg.LOADED, "app": "gateway", "namespace": "yadgar", "pod": "b"}, "values": gap},
+        TRAFFIC,
+    )
+    code, out = gate(FakeTransport(body))
+    assert code == pg.EXIT_FAIL, out
+    assert "scrape gap" in out and "b" in out
+
+
+def test_no_up_series_at_all_fails_closed() -> None:
+    code, out = gate(FakeTransport(matrix(gauge("a"), TRAFFIC), up=matrix()))
+    assert code == pg.EXIT_FAIL, out
+    assert "up" in out
+
+
+@pytest.mark.parametrize("value", ["0", "-3"])
+def test_min_resolutions_below_one_is_refused(value: str) -> None:
+    body = matrix(gauge("a"), resolution("a", [(START - LOOKBACK, 3)]))
+    argv = ["--start", iso(START), "--end", iso(END), "--min-resolutions", value]
+    code, out = gate(FakeTransport(body), argv=argv)
+    assert code == pg.EXIT_FAIL, out
+    assert "--min-resolutions" in out
+
+
+@pytest.mark.parametrize("value", ["nan", "1.5"])
+def test_min_resolutions_must_be_an_integer(value: str) -> None:
+    with pytest.raises(SystemExit):
+        pg.parse_args(["--start", iso(START), "--min-resolutions", value])
+
+
+def test_a_pass_says_leg_c_is_not_checked_here() -> None:
+    code, out = gate(FakeTransport(matrix(gauge("a"), TRAFFIC)))
+    assert code == pg.EXIT_PASS, out
+    assert "leg (c) is NOT checked here" in out
+    assert "may move" not in out
+
+
+def test_the_retention_is_read_at_now_not_at_the_window_end() -> None:
+    t = FakeTransport(matrix(gauge("a"), TRAFFIC))
+    gate(t)
+    q = next(p for p in t.queries if p["query"] == pg.LOWEST_QUERY)
+    assert q["time"] == f"{NOW:.3f}"
+
+
+def test_a_timestamp_without_a_timezone_is_refused() -> None:
+    body = matrix(gauge("a"), TRAFFIC)
+    code, out = gate(FakeTransport(body), argv=["--start", "2026-10-18T00:00:00", "--end", iso(END)])
+    assert code == pg.EXIT_FAIL, out
+    assert "timezone" in out
+
+
+def test_a_second_job_scraping_the_same_pod_on_its_own_clock_is_no_restart() -> None:
+    # Restart evidence is read per scrape target. A duplicate scrape job stamps
+    # its gauge 7 s off the counter's clock; that is not the counter's absence.
+    dup = {
+        "metric": {"__name__": pg.LOADED, "app": "gateway", "namespace": "yadgar", "pod": "a", "job": "dup"},
+        "values": [[t + 7, "1"] for t in ticks(START - LOOKBACK, END)],
+    }
+    body = matrix(gauge("a"), dup, refusal("a", [(START - LOOKBACK, 4)]), TRAFFIC)
+    code, out = gate(FakeTransport(body))
+    assert code == pg.EXIT_PASS, out

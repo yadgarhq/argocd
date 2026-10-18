@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The pre-flip refusal gate: may gateway project validation move from counting to enforcing?
+"""The pre-flip refusal gate: the plan's window legs (a) and (b) for the counting -> enforcing flip.
 
 Ledgers 1608 and 1618; yadgarhq/docs `plans/project-validation.md` stage 5 and
 `plans/the-d35-seeder.md` errata E2. The operator's condition is a clean
@@ -7,6 +7,20 @@ observation window: 0 refusals. It runs on the argocd-verify runner (ADR-0840),
 from `preflip.yaml` there, which executes argocd main's copy (ADR-0844).
 
     preflip_gate.py --start ISO [--end ISO] [--min-resolutions N]
+
+WHAT A PASS MEANS, AND WHAT IT DOES NOT. The plan's stage 5 gate has three
+legs, in order: (c) one deliberate probe per reason class, observed to
+increment its counter BEFORE the window opens; then, over the window, (a) the
+refusal counter rose by 0 and (b) the resolution counter rose. This script
+checks (a) and (b) only (legs 5 and 6 below, with the guards 1-4 that make
+them readable). LEG (c) IS NOT CHECKED HERE and must be proved separately
+before the flip. It is not derived from the run history because that history
+cannot prove it: the only probe that exists (argocd `scripts/project_probe.py`)
+covers two reason classes, `PROJECT_UNRESOLVABLE` routinely and
+`PROJECT_UNREGISTERED_PERSONAL` as a trial. Nothing probes
+`PROJECT_UNREGISTERED_ORG` or `PROJECT_ARCHIVED`, so no reading of its runs
+and of Prometheus could show "every class was observed to count". A PASS says
+so in its own output.
 
 THE PROBE IS SERIALIZED OUT OF THE WINDOW, NOT SUBTRACTED. The refusal counter
 has one label, `reason`, and no claim label, so the ADR-0841 probe's
@@ -24,9 +38,15 @@ THE LEGS, all read, all reported, any one failing fails the gate:
   2. No non-skipped `project-probe` job overlaps [start - slack, end].
   3. The window starts inside Prometheus' retention
      (`prometheus_tsdb_lowest_timestamp_seconds` <= start - lookback).
-  4. No scrape gap: across all gateway pods, `registry_loaded` samples cover
-     [start, end] with no gap longer than `--max-gap`. An empty answer is a
-     dead scrape, never zero refusals.
+  4. No scrape gap, read three ways, because one healthy pod must not hide a
+     blind one:
+     - across all gateway pods, `registry_loaded` samples cover [start, end]
+       with no gap longer than `--max-gap`. An empty answer is a dead scrape,
+       never zero refusals;
+     - no single pod's own gauge has a gap longer than `--max-gap` between its
+       own first and last sample;
+     - `up{namespace="yadgar",app="gateway"}` exists and is never 0 in
+       [start, end].
   5. `yadgar_gateway_project_refusal_total`, summed over EVERY reason
      (including `PROJECT_REGISTRY_UNAVAILABLE`) and every pod, rose by 0.
   6. `yadgar_gateway_project_resolution_total` rose by at least
@@ -38,8 +58,15 @@ registers its counters lazily, so a pod's first refusal makes the series appear
 at 1, which `increase()` reads as 0. The gate reads the raw matrix over
 [start - lookback, end] and walks each series (one per pod and reason):
   - the baseline is the last sample at or before `start`;
-  - a decrease is a reset (a container restart under the same pod name), and
-    the value after it counts in full;
+  - a reset (a container restart under the same pod name) counts the value
+    after it in full. A reset is any of: a decrease; the series ABSENT at a
+    scrape where the same target's `registry_loaded` gauge was sampled (one
+    scrape stamps all of a target's series alike; target = pod, instance,
+    job), then back
+    (a counter never unregisters, so absence means a new process, and the
+    value it returns at can EQUAL the old one: 1, restart, one refusal, 1);
+    or that target's gauge dropping from 1 to 0 (a fresh process that has
+    not loaded the registry yet), which resets every series of the target;
   - a series with no sample at or before `start` has an unknown baseline. For
     refusals that counts the first value in full (fail closed). For
     resolutions it counts the first value only when the same pod's
@@ -47,9 +74,15 @@ at 1, which `increase()` reads as 0. The gate reads the raw matrix over
     boot, so the counter's absence then was a real 0); otherwise it counts
     nothing (fail closed in the other direction).
 
-KNOWN BLIND SPOT, stated rather than hidden: a refusal in the last scrape
-interval (15 s) of a pod that then died is never scraped. Leg 4 bounds how
-long nobody was looking; it cannot see inside a single interval.
+KNOWN BLIND SPOTS, stated rather than hidden. Leg 4 bounds how long nobody was
+looking; it cannot see inside a single scrape interval (15 s) or outside
+Prometheus' discovery:
+  - a refusal in the last scrape interval of a pod that then died is never
+    scraped;
+  - a container restart AND a climb back to the same value inside one scrape
+    interval leaves no absent scrape and no gauge 0, so it reads as no change;
+  - a pod Prometheus never discovers (never scraped, so no `up` series) is not
+    covered at all.
 
 THE WINDOW LENGTH IS THE OPERATOR'S (plan open question 3). This gate takes it
 as input. Prometheus on kind-yadgar keeps 1d (measured 2026-10-18), so a
@@ -65,6 +98,7 @@ and PyYAML and nothing else.
 from __future__ import annotations
 
 import argparse
+import bisect
 import dataclasses
 import datetime as dt
 import json
@@ -81,7 +115,10 @@ REFUSALS = "yadgar_gateway_project_refusal_total"
 RESOLUTIONS = "yadgar_gateway_project_resolution_total"
 LOADED = "yadgar_gateway_project_registry_loaded"
 LOWEST_QUERY = 'min(prometheus_tsdb_lowest_timestamp_seconds{job="prometheus"})'
-SELECTOR = f'{{__name__=~"{REFUSALS}|{RESOLUTIONS}|{LOADED}",namespace="yadgar",app="gateway"}}'
+# The metric names are the gateway's own, so the counters need no `app` label:
+# a relabelled pod still counts. `up` carries no gateway-specific name and does.
+SELECTOR = f'{{__name__=~"{REFUSALS}|{RESOLUTIONS}|{LOADED}",namespace="yadgar"}}'
+UP_SELECTOR = 'up{namespace="yadgar",app="gateway"}'
 
 PROBE_REPO = "yadgarhq/argocd-verify"
 PROBE_WORKFLOW = "project-probe.yaml"
@@ -101,7 +138,10 @@ def iso(t: float) -> str:
 def parse_time(value: str | None) -> float | None:
     if not value:
         return None
-    return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError(f"{value!r} has no timezone; give UTC as a trailing Z")
+    return parsed.timestamp()
 
 
 # --- the samples ----------------------------------------------------------------
@@ -114,6 +154,11 @@ class Series:
     label: str  # `reason` for refusals, `outcome` for resolutions, "" for the gauge
     instance: str
     samples: tuple[tuple[float, float], ...]
+    job: str = ""
+
+    def target(self) -> tuple[str, str, str]:
+        """The scrape target: one scrape stamps all of its series with one timestamp."""
+        return (self.pod, self.instance, self.job)
 
     def key(self) -> str:
         return f"{self.pod}{{{self.label}}}" if self.label else self.pod
@@ -137,7 +182,7 @@ def parse_matrix(body: dict) -> list[Series]:
         label = metric.get("reason") or metric.get("outcome") or ""
         if name == REFUSALS and not metric.get("reason"):
             raise GateError(f"a refusal series without a reason: {metric}")
-        out.append(Series(name, pod, label, metric.get("instance", ""), tuple(sorted(samples))))
+        out.append(Series(name, pod, label, metric.get("instance", ""), tuple(sorted(samples)), metric.get("job", "")))
     return out
 
 
@@ -147,31 +192,70 @@ class Count:
     events: list[str] = dataclasses.field(default_factory=list)
 
 
-def count(series: Series, start: float, unknown_baseline_counts: bool, born_after: float | None = None) -> Count:
+@dataclasses.dataclass(frozen=True)
+class Restarts:
+    """One pod's restart evidence: its gauge's scrape times, and the times it fell 1 -> 0."""
+
+    scrapes: tuple[float, ...] = ()
+    drops: tuple[float, ...] = ()
+
+    def between(self, a: float, b: float) -> bool:
+        """A restart between two consecutive samples of a series at `a` and `b`."""
+        i = bisect.bisect_right(self.scrapes, a)
+        if i < len(self.scrapes) and self.scrapes[i] < b:
+            return True  # the gauge was scraped and the series was absent
+        j = bisect.bisect_right(self.drops, a)
+        return j < len(self.drops) and self.drops[j] <= b
+
+
+def restarts_by_target(gauges: list[Series]) -> dict[tuple[str, str, str], Restarts]:
+    """Keyed by scrape target, so a second job scraping the same pod on its own
+    clock can never be read as the counter's absence."""
+    scrapes: dict[tuple[str, str, str], set[float]] = {}
+    drops: dict[tuple[str, str, str], set[float]] = {}
+    for g in gauges:
+        scrapes.setdefault(g.target(), set()).update(t for t, _ in g.samples)
+        for (_, v0), (t1, v1) in zip(g.samples, g.samples[1:]):
+            if v0 == 1 and v1 == 0:
+                drops.setdefault(g.target(), set()).add(t1)
+    return {
+        target: Restarts(tuple(sorted(scrapes[target])), tuple(sorted(drops.get(target, ()))))
+        for target in scrapes
+    }
+
+
+def count(
+    series: Series,
+    start: float,
+    unknown_baseline_counts: bool,
+    born_after: float | None = None,
+    restarts: Restarts = Restarts(),
+) -> Count:
     """The series' rise over (start, end], per the module docstring."""
     c = Count()
-    before = [v for t, v in series.samples if t <= start]
+    before = [(t, v) for t, v in series.samples if t <= start]
     inside = [(t, v) for t, v in series.samples if t > start]
     if not inside:
         return c
+    prev_t: float | None
     if before:
-        prev = before[-1]
+        prev_t, prev = before[-1]
     else:
         t1, v1 = inside[0]
         if unknown_baseline_counts or (born_after is not None and born_after < t1):
-            prev = 0.0  # born in the window (or no baseline, read as born: fail closed)
+            prev_t, prev = None, 0.0  # born in the window (or no baseline, read as born: fail closed)
         else:
-            prev = v1
+            prev_t, prev = t1, v1
             c.events.append(f"{iso(t1)} {series.key()} first sample {v1:g} has no baseline; not counted")
     for t, v in inside:
-        if v >= prev:
+        if v < prev or (prev_t is not None and restarts.between(prev_t, t)):
+            c.events.append(f"{iso(t)} {series.key()} reset {prev:g} -> {v:g}, counted {v:g}")
+            c.total += v
+        else:
             if v > prev:
                 c.events.append(f"{iso(t)} {series.key()} {prev:g} -> {v:g}")
             c.total += v - prev
-        else:
-            c.events.append(f"{iso(t)} {series.key()} reset {prev:g} -> {v:g}, counted {v:g}")
-            c.total += v
-        prev = v
+        prev_t, prev = t, v
     return c
 
 
@@ -184,7 +268,28 @@ def scrape_gaps(gauges: list[Series], start: float, end: float, max_gap: float) 
     for a, b in zip(edges, edges[1:]):
         if b - a > max_gap:
             gaps.append(f"scrape gap {iso(a)} .. {iso(b)} ({b - a:.0f}s > {max_gap:.0f}s)")
+    # Per pod, between its own first and last sample: one healthy pod must not
+    # hide a blind one in the merged timeline above.
+    per_pod: dict[str, set[float]] = {}
+    for g in gauges:
+        per_pod.setdefault(g.pod, set()).update(t for t, _ in g.samples)
+    for pod in sorted(per_pod):
+        own = sorted(per_pod[pod])
+        for a, b in zip(own, own[1:]):
+            if b - a > max_gap and b > start and a < end:
+                gaps.append(f"scrape gap on pod {pod} {iso(a)} .. {iso(b)} ({b - a:.0f}s > {max_gap:.0f}s)")
     return gaps
+
+
+def up_failures(ups: list[Series], start: float, end: float) -> list[str]:
+    if not ups:
+        return [f"no {UP_SELECTOR} series: the gateway's scrape targets are not discovered, so nothing is covered"]
+    out = []
+    for u in sorted(ups, key=lambda u: (u.pod, u.instance)):
+        down = [t for t, v in u.samples if start <= t <= end and v == 0]
+        if down:
+            out.append(f"up == 0 on pod {u.pod} ({len(down)} scrape(s) from {iso(down[0])} to {iso(down[-1])}): that pod was blind")
+    return out
 
 
 # --- the probe's runs -------------------------------------------------------------
@@ -269,7 +374,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--start", required=True, help="window start, ISO 8601 UTC (when the probe was already off)")
     p.add_argument("--end", help="window end, ISO 8601 UTC; default now")
-    p.add_argument("--min-resolutions", type=float, default=1, help="the traffic leg's floor")
+    p.add_argument("--min-resolutions", type=int, default=1, help="the traffic leg's floor, an integer >= 1")
     p.add_argument("--lookback", type=float, default=300.0, help="seconds before start read for each baseline")
     p.add_argument("--max-gap", type=float, default=120.0, help="longest tolerated scrape gap, seconds")
     p.add_argument("--probe-slack", type=float, default=300.0, help="a probe job ending this close before start overlaps")
@@ -299,6 +404,9 @@ def run(
         say(f"FAIL: the window must satisfy start < end <= now; got {args.start} .. {args.end or 'now'}")
         return EXIT_FAIL
     say(f"window {iso(start)} .. {iso(end)} ({(end - start) / 3600:.2f}h)")
+    if args.min_resolutions < 1:
+        say(f"FAIL: --min-resolutions must be at least 1, got {args.min_resolutions}: 0 lets a window with no traffic pass")
+        return EXIT_FAIL
 
     # Leg 1: the switch.
     enabled = env.get("PROJECT_PROBE_ENABLED")
@@ -320,7 +428,7 @@ def run(
     resolutions = Count()
     try:
         # Leg 3: retention.
-        lowest_body = transport.prom_query({"query": LOWEST_QUERY, "time": f"{end:.3f}"})
+        lowest_body = transport.prom_query({"query": LOWEST_QUERY, "time": f"{now():.3f}"})
         if lowest_body.get("status") != "success" or not lowest_body.get("data", {}).get("result"):
             raise GateError(f"prometheus answered {lowest_body.get('status')!r} to the retention read: {lowest_body.get('error', 'empty')}")
         lowest = float(lowest_body["data"]["result"][0]["value"][1])
@@ -336,6 +444,9 @@ def run(
 
         # Leg 4: coverage.
         failures.extend(scrape_gaps(gauges, start, end, args.max_gap))
+        ups = parse_matrix(transport.prom_query({"query": f"{UP_SELECTOR}[{span}s]", "time": f"{end:.3f}"}))
+        failures.extend(up_failures(ups, start, end))
+        restarts = restarts_by_target(gauges)
 
         first_gauge: dict[str, float] = {}
         for g in gauges:
@@ -345,11 +456,17 @@ def run(
         # Legs 5 and 6.
         for s in series:
             if s.name == REFUSALS:
-                c = count(s, start, unknown_baseline_counts=True)
+                c = count(s, start, unknown_baseline_counts=True, restarts=restarts.get(s.target(), Restarts()))
                 refusals.total += c.total
                 refusals.events += c.events
             elif s.name == RESOLUTIONS:
-                c = count(s, start, unknown_baseline_counts=False, born_after=first_gauge.get(s.pod))
+                c = count(
+                    s,
+                    start,
+                    unknown_baseline_counts=False,
+                    born_after=first_gauge.get(s.pod),
+                    restarts=restarts.get(s.target(), Restarts()),
+                )
                 resolutions.total += c.total
                 resolutions.events += c.events
         say(f"gateway pods seen: {sorted({s.pod for s in series})}")
@@ -371,8 +488,11 @@ def run(
 
     for f in failures:
         say(f"FAIL: {f}")
-    verdict = "PASS" if not failures else "FAIL"
-    say(f"{verdict}: refusals {refusals.total:g}, resolutions {resolutions.total:g}, window {iso(start)} .. {iso(end)}")
+    tally = f"refusals {refusals.total:g}, resolutions {resolutions.total:g}, window {iso(start)} .. {iso(end)}"
+    if failures:
+        say(f"FAIL: {tally}")
+    else:
+        say(f"PASS: legs (a)+(b) passed ({tally}); leg (c) is NOT checked here and must be proved separately")
     return EXIT_PASS if not failures else EXIT_FAIL
 
 
