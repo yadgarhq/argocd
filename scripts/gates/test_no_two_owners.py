@@ -2008,6 +2008,12 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # same 0.19.1: 82 -> 86 objects and 30 changes, the same set as at 0.25.12.
 # gateway's image was already in PIN_CHANGES.
 #
+# RE-MEASURED AT 0.25.27 (gateway 0.12.13, iam 0.11.10, iam-db 0.10.8, project
+# 0.3.7, project-db 0.7.3, task 0.7.6, task-db 0.9.5, seeder 0.1.1), against the
+# same 0.19.1: 82 -> 86 objects and 30 changes, the same set as at 0.25.14.
+# Every moved Deployment image was already in PIN_CHANGES, and `Job/seeder` is
+# in PIN_ADDED, so its new image is inside an added object.
+#
 # BOTH SIDES RENDER EVERY SERVER AT `clientAuth: "off"`, FROM B-U8a ON. The
 # 0.13.13 module charts predate the B-U5 contracts, and their render checks
 # refuse `optional` and `required` by name ("not enforced yet"). Once a hop

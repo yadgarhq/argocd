@@ -202,6 +202,14 @@ CI job, never in the offline pre-commit hook.
       digest equals `gateway:0.12.11`'s GHCR tag digest). The parent's
       v0.25.13 example and `chart/ci` changes (chart#51) reach no object
       here: this Application states its own `valuesObject`.
+      Re-measured 2026-10-18 at 0.25.27, carrying gateway 0.12.13, iam
+      0.11.10 and iam-db 0.10.8 (ADR-0945's credential-revoke route), and
+      project 0.3.7, project-db 0.7.3, task 0.7.6, task-db 0.9.5 and seeder
+      0.1.1 (`Cargo.lock` only); config 0.2.1 and platform 0.2.6 unchanged:
+      94 objects, none added or removed, 8 changed (the seven module
+      Deployments and `Job/seeder`, `image` only; each new digest equals its
+      module's own GHCR tag digest; no new env, arg, probe, volume or mount,
+      and no migration).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
