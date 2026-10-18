@@ -7663,3 +7663,52 @@ Deployments return to their 0.25.14 images cleanly, `Job/seeder` is
 re-created on 0.1.0, and it re-runs with every row `unchanged`. A credential
 already revoked through the new route stays revoked; the revert does not
 restore it.
+
+## The seeder declares `yadgarhq/probe-archived`, step 1 of 2 of the leg (c) ARCHIVED probe row (ledger 1624)
+
+**What the merge does.** It adds one project to `seeder.registry` in
+`applications/yadgar.yaml`: `yadgarhq/probe-archived` (sourceRepo
+`yadgarhq/argocd`). It is no repository. It is the row argocd's
+`project_probe.py --leg-c` writes to, to count `PROJECT_ARCHIVED` for the
+pre-flip gate's leg (c). Step 2, a later PR, removes the line, and the seeder
+then archives the row (ADR-0934). The pin does not move.
+
+Measured 2026-10-18 (helm 3.18.4 and 4.3.0 write the same K3 table):
+
+- `yadgar`: 94 → 94 objects. One changed: `ConfigMap/seeder-registry`, whose
+  `registry.json` gains the one project.
+- Server-side `kubectl diff` against `kind-yadgar` (ADR-0881), tracking
+  annotation added, the 13 hook objects left out, all 81 objects. At
+  `origin/main`: empty diff. On this branch: `ConfigMap/seeder-registry` only.
+- Settled-gate K moves (`59cd9f43…` → `f8f6dc28…`), so the merge dispatches a
+  settled run.
+
+**What runs.** Argo syncs the ConfigMap. `Replace=true,Force=true` deletes and
+re-creates `Job/seeder`, which sends the declaration: `inserted 1`,
+`unchanged 25`. Nothing archives. Within one registry poll (60 s) the
+gateways load 26 paths. In `counting` mode no caller sees a difference.
+
+### After this merge, read-only
+
+```bash
+# 1. yadgar Synced/Healthy.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+
+# 2. The seeder inserted the row. Expect inserted 1, archived 0, unchanged 25.
+kubectl --context kind-yadgar -n yadgar logs job/seeder | tail -1
+
+# 3. Both gateways loaded it. Expect "paths":26 on each, after the sync.
+for p in $(kubectl --context kind-yadgar -n yadgar get pods -l app=gateway -o name); do
+  kubectl --context kind-yadgar -n yadgar logs "$p" | grep 'registry is loaded' | tail -1
+done
+```
+
+If step 2 still shows the previous run (`unchanged 25`, no insert), the Job
+was not re-created. NEEDS-MAX: `argocd app sync yadgar`.
+
+### Rollback
+
+Revert. The next sync then omits the path, and the seeder ARCHIVES the row,
+which is step 2's outcome anyway. An archived row is never deleted
+(ADR-0934).
