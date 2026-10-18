@@ -678,3 +678,12 @@ def test_the_routine_probe_still_sends_exactly_one_call() -> None:
     fake = Arms([BEFORE, ROSE_U])
     assert run(fake) == 0
     assert [p[0] for p in fake.posts] == ["/auth/login", "/"]
+
+
+
+def test_leg_c_archived_arm_needs_the_gateways_exact_title_refusal() -> None:
+    # gateway tools.rs:327: ToolError::Invalid("`title` is required"). Another
+    # tool failure that merely mentions a title is not that refusal.
+    near = (200, {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "title service unavailable"}], "isError": True}})
+    assert run(Arms([BEFORE, rose(*ALL)], answers={pp.ARCHIVED_CLAIM: near}), "--leg-c") == pp.EXIT_FAIL
+    assert pp.TITLE_REQUIRED == "`title` is required"

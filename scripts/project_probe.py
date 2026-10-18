@@ -138,7 +138,9 @@ CLAIM = "probe-unregistered/never-registered"
 TRIAL_CLAIM = "local/probe-never-registered"
 # Leg (c)'s three further claims; see the docstring for why each reaches its
 # class. `scripts/gates/test_probe_claims.py` binds the first to the declared
-# registry, and `test_yadgar_application.py` binds the last.
+# registry. The last is bound by argocd#113 (the step that archives the row):
+# its `ARCHIVED_ON_PURPOSE` in `test_yadgar_application.py` is imported from
+# this `ARCHIVED_CLAIM`, so the declaration can never re-declare it.
 ORG_CLAIM = "yadgarhq/probe-never-registered"
 INVALID_CLAIM = "probe-invalid/"
 ARCHIVED_CLAIM = "yadgarhq/probe-archived"
@@ -148,6 +150,10 @@ QUERY = f'{{__name__=~"{REFUSALS}|{LOADED}",namespace="yadgar",app="gateway"}}'
 PROTOCOL_VERSION = "2026-07-28"  # gateway `src/mcp.rs` PROTOCOL_VERSION
 TOOL = "find_tasks"
 WRITE_TOOL = "create_task"
+# The gateway's exact refusal for a missing title (gateway `src/tools.rs`,
+# `ToolError::Invalid`). Matched whole: another failure that merely mentions a
+# title is not proof that nothing was written.
+TITLE_REQUIRED = "`title` is required"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -544,7 +550,7 @@ def answer_ok(arm: Arm, status: int, answer: dict) -> tuple[bool, str]:
     if arm.tool != WRITE_TOOL:
         return True, f"HTTP {status} ({'isError' if result.get('isError') else 'served'})"
     text = " ".join(str(c.get("text", "")) for c in result.get("content", []) if isinstance(c, dict))
-    if result.get("isError") and "title" in text:
+    if result.get("isError") and text.strip() == TITLE_REQUIRED:
         return True, f"HTTP {status} tool refused the missing title; nothing written"
     if not result.get("isError"):
         written = result.get("structuredContent") or {}

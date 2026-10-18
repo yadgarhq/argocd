@@ -22,8 +22,10 @@ only when every one of their counters rose per pod; it is red when
 inconclusive. argocd-verify's `project-probe.yaml` names such a run
 `project-probe leg-c` (`run-name`; the runs listing carries no dispatch
 inputs). Only a `workflow_dispatch` of that workflow's path on this
-repository's default branch, with this repository as head, counts: a
-branch's copy of the workflow could set the same name and exit 0. Leg 7
+repository's default branch, with this repository as head and a `head_sha`
+the default branch contains, counts: a branch's or a tag's copy of the
+workflow could set the same name and exit 0. Only the probe job's own
+conclusion is read. `--leg-c-max-age` is finite, above 0, at most 7 days. Leg 7
 passes when the NEWEST such run whose job completed at or
 before `start - probe_slack`, and no earlier than `start - leg_c_max_age`,
 concluded `success`. A newer red run is not masked by an older green one.
@@ -115,6 +117,7 @@ import datetime as dt
 import json
 import math
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -136,12 +139,19 @@ PROBE_WORKFLOW = "project-probe.yaml"
 PROBE_JOB_TIMEOUT = 20 * 60  # project-probe.yaml `timeout-minutes: 20`
 LEG_C_TITLE = "project-probe leg-c"  # project-probe.yaml `run-name` with `leg_c: true`
 PROBE_PATH = f".github/workflows/{PROBE_WORKFLOW}"
+PROBE_JOB_NAME = "785 refusal-counter probe"  # project-probe.yaml `jobs.probe.name`
+FULL_SHA = re.compile(r"[0-9a-f]{40}")
+LEG_C_MAX_AGE_CAP = 7 * 86400.0
 
 EXIT_PASS, EXIT_FAIL = 0, 1
 
 
 class GateError(Exception):
     """A read that could not be made, or an answer that cannot be trusted. Always a FAIL."""
+
+
+class GitHubNotFound(GateError):
+    """A GitHub 404. Only `on_default_branch` reads it as an answer ("not on it")."""
 
 
 def iso(t: float) -> str:
@@ -343,6 +353,32 @@ def probe_overlaps(transport: "Transport", start: float, end: float) -> list[str
         page += 1
 
 
+def on_default_branch(transport: "Transport", sha: object, branch: str) -> bool:
+    """Whether `sha` is the default branch's head or an ancestor of it.
+
+    `head_branch` is not enough: a TAG run reports its bare tag name there
+    (argocd run 39155132593, head_branch=v0.25.27), so a dispatch on a tag
+    named `main` reads head_branch "main" while running the tag's copy of the
+    workflow. `compare/{branch}...{sha}` reads `behind` or `identical` exactly
+    when `sha` is on the branch, and 404s for a sha it does not know.
+
+    THE SAME TEST AS `settled_gate.reachable`, restricted to the one branch, and
+    written here rather than imported: settled_gate imports PyYAML at module
+    level, and `preflip.yaml` installs nothing, so the import would break the
+    job while every test (the hook installs PyYAML) stayed green. Never
+    `commits/{sha}`: GitHub serves the whole fork network's commits there.
+    """
+    if not isinstance(sha, str) or not FULL_SHA.fullmatch(sha):
+        return False
+    try:
+        status = transport.github_get(
+            f"/repos/{PROBE_REPO}/compare/{urllib.parse.quote(branch, safe='/')}...{sha}"
+        ).get("status")
+    except GitHubNotFound:
+        return False
+    return status in {"behind", "identical"}
+
+
 def leg_c(transport: "Transport", start: float, slack: float, max_age: float) -> tuple[bool, str]:
     """Leg (c): the newest finished `project-probe leg-c` run before the window, and its verdict."""
     since = iso(start - max_age - PROBE_JOB_TIMEOUT - 600)
@@ -371,10 +407,15 @@ def leg_c(transport: "Transport", start: float, slack: float, max_age: float) ->
                 or run.get("path") != PROBE_PATH
                 or (run.get("repository") or {}).get("id") != own["id"]
                 or (run.get("head_repository") or {}).get("id") != own["id"]
+                or not on_default_branch(transport, run.get("head_sha"), own["default_branch"])
             ):
                 continue
             jobs = transport.github_get(f"/repos/{PROBE_REPO}/actions/runs/{run['id']}/jobs?per_page=100")
+            # The PROBE job by name: another job in the workflow that ends green
+            # later must not stand in for a red probe job.
             for job in jobs.get("jobs", []):
+                if job.get("name") != PROBE_JOB_NAME:
+                    continue
                 completed = parse_time(job.get("completed_at"))
                 if completed is not None and completed <= start - slack:
                     finished.append((completed, run["id"], str(job.get("conclusion"))))
@@ -387,7 +428,7 @@ def leg_c(transport: "Transport", start: float, slack: float, max_age: float) ->
             "with leg_c: true while PROJECT_PROBE_ENABLED is true, then switch the probe off"
         )
     completed, run_id, conclusion = max(finished)
-    where = f"project-probe run {run_id} (job ended {iso(completed)})"
+    where = f"project-probe run {run_id} (job ended {iso(completed)}, max age {max_age:.0f}s)"
     if completed < start - max_age:
         return False, f"leg (c): the newest leg-c run, {where}, is older than {max_age:.0f}s before the start"
     if conclusion != "success":
@@ -428,11 +469,29 @@ class Network:
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 return json.load(response)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise GitHubNotFound(f"github {path.split('?')[0]}: HTTP 404") from e
+            raise GateError(f"github {path.split('?')[0]}: HTTP {e.code}") from e
         except (urllib.error.URLError, OSError, ValueError) as e:
             raise GateError(f"github {path.split('?')[0]}: {e}") from e
 
 
 # --- the run ----------------------------------------------------------------------
+
+
+def max_age(value: str) -> float:
+    """`--leg-c-max-age`: finite, above 0, at most 7 days. `inf` would accept a
+    leg-c run of any age and `nan` compares false to everything."""
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a number of seconds") from None
+    if not math.isfinite(seconds) or not 0 < seconds <= LEG_C_MAX_AGE_CAP:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} must be finite, above 0 and at most {LEG_C_MAX_AGE_CAP:.0f} (7 days)"
+        )
+    return seconds
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -443,7 +502,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--lookback", type=float, default=300.0, help="seconds before start read for each baseline")
     p.add_argument("--max-gap", type=float, default=120.0, help="longest tolerated scrape gap, seconds")
     p.add_argument("--probe-slack", type=float, default=300.0, help="a probe job ending this close before start overlaps")
-    p.add_argument("--leg-c-max-age", type=float, default=86400.0, help="the leg-c run must end within this many seconds before start")
+    p.add_argument(
+        "--leg-c-max-age",
+        type=max_age,
+        default=86400.0,
+        help="the leg-c run must end within this many seconds before start: finite, > 0, at most 7 days",
+    )
     p.add_argument("--prometheus-url", default="http://prometheus-server.observability.svc:80")
     return p.parse_args(argv)
 
