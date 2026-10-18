@@ -7342,4 +7342,82 @@ Degraded. So a rollback of those two is a forward fix. `gateway`, `iam` and
 To stop the seeder only, remove the `seeder.registry` block in a PR: the
 Job, ConfigMap and ServiceAccount stop rendering (no automated prune, so
 Argo shows them OutOfSync until pruned by hand). Rows already written stay;
-they are inert while gateway validation is `counting`.
+they are inert while gateway validation is `counting`. This works ONLY while
+the block is optional: seeder 0.1.0 is ADR-0857's expand step, and once a
+later parent makes `seeder.registry` required, removing it fails the render
+(ledger 1598).
+
+## The yadgar pin moves to parent chart 0.25.9, carrying project-db 0.7.1's migration 6 so the seeder's first sync can apply
+
+**What the merge does.** It moves `applications/yadgar.yaml`'s
+`targetRevision` from 0.25.8 to 0.25.9 and `scripts/chart_pin.json`'s
+`chart_tag` from `v0.25.8` to `v0.25.9`. `platform_version` stays 0.2.6, so
+the operator Applications do not move.
+
+The chart's `v0.25.8..v0.25.9` moves one pin:
+
+- `project-db` 0.7.0 → 0.7.1 (project-db#64): **migration 6,
+  `project_class_columns`**, append-only. It adds `source_repo`,
+  `owner_user_id` and `visibility` and the two class CHECKs with `IF NOT
+EXISTS`, so on a store created by v0.2.0 or later it is a no-op.
+- Unchanged: `config` 0.2.1, `gateway` 0.12.9, `iam` 0.11.8, `iam-db`
+  0.10.6, `project` 0.3.5, `seeder` 0.1.0, `task` 0.7.5, `task-db` 0.9.4,
+  `platform` 0.2.6.
+
+**Why.** After #104 synced, `Job/seeder` failed (3 pods, backoff limit):
+`project refused the sync with Internal: storage error`. The cause was
+project-db 0.7.0's `SyncProjects` hitting `1054 Unknown column
+'source_repo'`. kind-yadgar's store was migrated by v0.1.x before #33
+edited migration 1 in place, so its ledger read 1–4 (then 5) and it never
+got the class columns. `yadgar` reads `Degraded` only because of that Job
+(the sync operation's one non-Synced task is `Job/seeder`, "Job has reached
+the specified backoff limit"). The store holds no rows, so migration 6's
+CHECK has nothing to refuse.
+
+Measured 2026-10-18 (helm 4.3.0 and 3.18.4 render the same table):
+
+- `yadgar`: 94 → 94 objects, none added or removed, 1 changed:
+  `Deployment/project-db`, `image` only, `sha256:4bf83393…` →
+  `sha256:7db5a1b8…`, which equals `project-db:0.7.1`'s GHCR tag digest.
+- Server-side dry run against `kind-yadgar` (ADR-0881), tracking annotation
+  added, the 13 hook objects left out: the 0.25.8 render is an empty diff,
+  failed `Job/seeder` included (its spec equals the render). The 0.25.9
+  render differs on `Deployment/project-db` alone: `image`, and
+  `generation` 45 → 46.
+
+**What runs.** `project-db` rolls and runs migration 6 on boot. Each new pod
+logs `schema at migration 6`. Argo re-runs the sync; wave 1 waits for
+`project-db` to be healthy, then `Replace=true,Force=true` deletes the
+failed `Job/seeder` and re-creates it. **The deletion takes the failed run's
+pods and logs with it**, so read them now if they are wanted. The new run
+sends one `SyncProjects`.
+
+**The settled epoch moves.** K `99f5fb04…` at `origin/main`, `6390eb94…`
+with this change.
+
+### After this merge, read-only
+
+```bash
+# 1. yadgar Synced/Healthy at 0.25.9.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+
+# 2. project-db migrated. Expect "schema at migration 6" once per pod.
+for p in $(kubectl --context kind-yadgar -n yadgar get pods -l app=project-db -o name); do
+  kubectl --context kind-yadgar -n yadgar logs "$p" | grep -o 'schema at migration [0-9]*'
+done
+
+# 3. The seeder Job succeeded. Expect SUCCEEDED 1, and the log line with
+#    inserted 25, updated 0, archived 0, reactivated 0, unchanged 0.
+kubectl --context kind-yadgar -n yadgar get job seeder \
+  -o 'custom-columns=SUCCEEDED:.status.succeeded,FAILED:.status.failed'
+kubectl --context kind-yadgar -n yadgar logs job/seeder
+```
+
+### Rollback
+
+If `yadgar`'s operation is Running or retrying, NEEDS-MAX `argocd app
+terminate-op yadgar` first. Once a 0.7.1 pod has migrated, a revert to 0.7.0
+crash-loops (`check_not_ahead`: store at 6, binary knows 5), so the rollback
+is a forward fix. Before migration 6 has run, a revert returns to the
+failing-seeder state of 0.25.8.
