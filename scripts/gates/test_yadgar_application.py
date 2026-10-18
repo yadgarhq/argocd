@@ -27,8 +27,9 @@ CI job, never in the offline pre-commit hook.
       pin, not in a log here (ledger 1632, car C2).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
-      ON PURPOSE. Re-measure in the same pull request, read the named objects,
-      and rewrite the table:
+      ON PURPOSE. `scripts/pin_bump.py --write` rewrites the table in the same
+      pull request, and its PR body names the changed objects. A values change
+      rewrites it by hand:
 
           python3 scripts/gates/test_yadgar_application.py --write
 

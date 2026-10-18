@@ -1918,7 +1918,7 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # `Deployment/gateway`'s image (gateway 0.9.53 → 0.9.54, gateway#96). Measured
 # 2026-10-01: 80 objects on both sides, 79 byte-identical. The old pin is a
 # constant rather than read out of git, for the depth-1 reason the valkey
-# constants above give. The next pin bump re-measures this, which is the point.
+# constants above give.
 #
 # Each later pin's measurement is in the pull request body that moved the pin,
 # not in a log here (ledger 1632, car C2). `PIN_BEFORE_B9` stays 0.3.7:
@@ -1929,7 +1929,7 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # 0.13.13 module charts predate the B-U5 contracts, and their render checks
 # refuse `optional` and `required` by name ("not enforced yet"). Once a hop
 # moves past `off`, the previous pin cannot render the current values at all.
-# PB-2 measured the fields above with all six at `off`, so pinning `off` on
+# PB-2 measured with all six at `off`, so pinning `off` on
 # both sides keeps this a measurement of the pin alone. The modes themselves
 # are gated by `test_yadgar_application.py`'s `EXPECTED_CLIENT_AUTH` and by K3.
 #
