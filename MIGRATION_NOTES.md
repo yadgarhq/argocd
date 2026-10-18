@@ -7200,3 +7200,143 @@ back to their old digests and the request-timeout env leaves. `nats-0` rolls
 a second time, back to the `secretKeyRef` env and the `httpGet` probe. The
 five operator Applications sync back to 0.2.4 and change no object. Nothing
 was created, and no migration ran.
+
+## The yadgar pin moves to parent chart 0.25.8, and the D35 seeder writes this organisation's project registry
+
+**What the merge does.** It moves `applications/yadgar.yaml`'s
+`targetRevision` from 0.24.17 to 0.25.8, `scripts/chart_pin.json`'s
+`chart_tag` from `v0.24.17` to `v0.25.8` and its `platform_version` from
+0.2.5 to 0.2.6, and the `targetRevision` of the five platform-sourced
+operator Applications from 0.2.5 to 0.2.6. It declares `seeder.registry`
+(plans/the-d35-seeder.md stage 7) and adds `seeder` to
+`project.networkPolicy.clients`. `project-db.networkPolicy.clients` stays
+`[project]`.
+
+Module versions in the chart's `v0.24.17..v0.25.8`:
+
+- `gateway` 0.12.6 → 0.12.9: `/admin` routes need no `x-yadgar-project`
+  (ledgers 1545, 1550); `/admin/issue-enrolment` accepts and echoes
+  `revoke_existing_credentials` (ADR-0943, ledger 1579).
+- `iam` 0.11.7 → 0.11.8: relays `revoke_existing_credentials` and evicts on a
+  revoking redemption (ADR-0943).
+- `iam-db` 0.10.4 → 0.10.6: revokes every credential on a flagged
+  re-enrolment's redemption (ADR-0943). **Migration 15**: `ALTER TABLE
+iam_enrolment ADD COLUMN revoke_existing_credentials TINYINT(1) NOT NULL
+DEFAULT 0`.
+- `project` 0.3.4 → 0.3.5: serves `SyncProjects` for the seeder only
+  (common name `seeder-caller`, principal `yadgar:system:seeder`), relayed to
+  `project-db` (ADR-0936, ADR-0942).
+- `project-db` 0.6.4 → 0.7.0: `SyncProjects` applies the declaration in one
+  transaction; refuses roots containing `/`; refuses to archive more than
+  half of the active org rows unless `allowMassArchive` (ADR-0939);
+  `RegisterProject` refuses org-class paths. **Migration 5**: `CREATE TABLE
+IF NOT EXISTS project_sync_lock` with its one sentinel row.
+- `seeder` 0.1.0: new. A Job (sync-wave 1, `Replace=true,Force=true`, no
+  CronJob, ADR-0940), its ConfigMap `seeder-registry` and ServiceAccount.
+- `platform` 0.2.5 → 0.2.6: issues `seeder-client-tls`, common name
+  `seeder-caller`.
+- `config` 0.2.1, `task` 0.7.5, `task-db` 0.9.4: unchanged.
+
+**The declaration.** Roots `yadgarhq` (sourceRepo `yadgarhq/argocd`) and
+`estate` (sourceRepo `yadgarhq/estate`). Projects: every non-archived
+yadgarhq repository, 22 rows `yadgarhq/<repo>`, plus `estate/smoke` (ledger
+1244 option B). `deploy` is archived and left out. `allowMassArchive: false`.
+
+**The registry is empty before this merge.** Read 2026-10-18, read-only:
+each gateway replica logged `the project registry is loaded … paths: 0` at
+its last boot (2026-10-17 17:35/17:36 UTC); that load is `ListProjects`
+through `project`. Since the `project-db` pods started, `yadgar_calls_total`
+on `project-db` carries `tool="ListProjects"` only: no write reached the
+store. So the first sync inserts 24 rows and archives nothing, and the
+ADR-0939 guard cannot trip.
+
+**Behaviour change: estate smoke claims move refusal class.** Estate runs
+claim `estate/<run-id>-<attempt>`. Today they count as
+`PROJECT_UNRESOLVABLE`. After this merge they resolve to the anchor
+`estate` and count as `PROJECT_UNREGISTERED_ORG` (ADR-0673). Counting mode
+refuses nobody (ADR-0841). The estate PR that claims `estate/smoke` is ledger
+1244's remaining step. `project_probe.py`'s `probe-unregistered/…` claim has
+no root and stays `PROJECT_UNRESOLVABLE`.
+
+Measured 2026-10-18 with helm 4.3.0 and helm 3.18.4 (both render the same
+table) against the OCI chart at both tags and this organisation's values:
+
+- `yadgar`: 90 → 94 objects. Added: `Certificate/seeder-client-tls`,
+  `Job/seeder`, `ConfigMap/seeder-registry`, `ServiceAccount/seeder`.
+  Changed: the `gateway`, `iam`, `iam-db`, `project` and `project-db`
+  Deployments (`image` only) and `NetworkPolicy/project-ingress` (admits
+  `app: seeder` on 50052). Nothing removed.
+- Each new image digest equals its GHCR tag digest, read anonymously:
+  `gateway:0.12.9` `sha256:4a42f8b2…`, `iam:0.11.8` `sha256:e6f857c2…`,
+  `iam-db:0.10.6` `sha256:7cdf4dfa…`, `project:0.3.5` `sha256:1b0d7fb2…`,
+  `project-db:0.7.0` `sha256:4bf83393…`, `seeder:0.1.0` `sha256:861f8021…`.
+- Boot audit: no module's env reads changed between the two pins; the
+  seeder binary's nine required env names (`src/config.rs` at v0.1.0) are
+  all in the rendered Job.
+- The five operator Applications render byte-identical objects at 0.2.5
+  and 0.2.6 (cert-manager 50, envoy-gateway 19, keda 29, mariadb-operator
+  32, prometheus 7).
+- Server-side dry run against `kind-yadgar` (ADR-0881), with Argo's
+  tracking annotation added and the 13 hook objects left out:
+  `kubectl --context kind-yadgar -n yadgar diff` of the 0.24.17 render is
+  empty. The new render differs on exactly the 10 objects above, and the API
+  server admits them.
+
+**What runs.** Five Deployments roll. `iam-db` and `project-db` run their
+migrations on boot. In wave 1, the seeder Job sends one `SyncProjects`.
+
+**The settled epoch moves.** `settled_gate.render_key` gives K `e2412b9a…` at
+`origin/main` and `99f5fb04…` with this change.
+
+### Before this merge, read-only
+
+`--context kind-yadgar` on every line. This host's default context is a
+production cluster.
+
+```bash
+# 1. yadgar Synced/Healthy at 0.24.17 (read 2026-10-18).
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+```
+
+### After this merge, read-only
+
+```bash
+# 1. yadgar Synced/Healthy at 0.25.8.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+
+# 2. The seeder Job completed, and its log carries the five counts.
+#    Expect inserted 24, updated 0, archived 0, reactivated 0, unchanged 0.
+kubectl --context kind-yadgar -n yadgar get job seeder \
+  -o 'custom-columns=SUCCEEDED:.status.succeeded,FAILED:.status.failed'
+kubectl --context kind-yadgar -n yadgar logs job/seeder
+
+# 3. Within one registry poll (60 s), each gateway replica's registry holds
+#    the rows. The debug-level refresh line is not logged at info, so read
+#    the resolution counter after an estate run or an operator call:
+#    yadgar_gateway_project_resolution_total{outcome="exact"} appears.
+
+# 4. Image currency by pod imageID DIGEST (ADR-0553).
+kubectl --context kind-yadgar -n yadgar get pods \
+  -o 'custom-columns=NAME:.metadata.name,IMAGEID:.status.containerStatuses[0].imageID' \
+  | grep -E '^(gateway|iam|iam-db|project|project-db)-[a-z0-9]{6,10}-[a-z0-9]{5} '
+```
+
+### Rollback
+
+If `yadgar`'s operation is still Running or retrying, end it first.
+NEEDS-MAX: `argocd app terminate-op yadgar` against kind-yadgar's Argo CD.
+
+**A plain revert does not bring back `iam-db` 0.10.4 or `project-db` 0.6.4
+once their new pods have migrated.** `yadgar-store` refuses to boot a binary
+against a database that is ahead of it (`check_not_ahead`): iam-db would be
+at migration 15 against a binary that knows 14, project-db at 5 against 4.
+The new pods keep serving while the reverted pods fail, and `yadgar` reads
+Degraded. So a rollback of those two is a forward fix. `gateway`, `iam` and
+`project` revert cleanly.
+
+To stop the seeder only, remove the `seeder.registry` block in a PR: the
+Job, ConfigMap and ServiceAccount stop rendering (no automated prune, so
+Argo shows them OutOfSync until pruned by hand). Rows already written stay;
+they are inert while gateway validation is `counting`.
