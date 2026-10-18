@@ -495,7 +495,7 @@ def test_a_tracking_id_naming_another_application_is_drift(repo: Path) -> None:
 def test_a_cluster_scoped_object_is_read_without_a_namespace(repo: Path) -> None:
     kubectl = Kubectl()
     run(repo, pin_branch(repo), kubectl=kubectl)
-    gatewayclasses = [c for c in kubectl.calls if "gatewayclasses.gateway.networking.k8s.io" in c]
+    gatewayclasses = [c for c in kubectl.calls if c[4] == "gatewayclasses.gateway.networking.k8s.io"]
     assert gatewayclasses and all("-n" not in c for c in gatewayclasses)
 
 

@@ -21,9 +21,13 @@ spec:
         app.kubernetes.io/name: gateway
     spec:
       serviceAccountName: gateway
+      securityContext:
+        runAsNonRoot: true
       initContainers:
         - name: wait-for-nats
           image: ghcr.io/yadgarhq/wait:0.1.0@sha256:1111111111111111111111111111111111111111111111111111111111111111
+          securityContext:
+            readOnlyRootFilesystem: true
       containers:
         - name: gateway
           image: ghcr.io/yadgarhq/gateway:0.12.13@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -39,7 +43,8 @@ spec:
               memory: 1024Mi
             limits:
               memory: 1024Mi
-          securityContext: {}
+          securityContext:
+            readOnlyRootFilesystem: true
           volumeMounts: []
 ---
 apiVersion: apps/v1
@@ -57,9 +62,15 @@ spec:
       labels:
         app.kubernetes.io/name: nats
     spec:
+      nodeSelector: {}
+      securityContext:
+        runAsNonRoot: true
       containers:
         - name: nats
           image: docker.io/library/nats:2.12.1@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+          resources: {}
+          securityContext:
+            readOnlyRootFilesystem: true
 ---
 apiVersion: batch/v1
 kind: Job
@@ -72,9 +83,13 @@ spec:
   template:
     spec:
       restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
       containers:
         - name: seeder
           image: ghcr.io/yadgarhq/seeder:0.1.1@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+          securityContext:
+            readOnlyRootFilesystem: true
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -119,6 +134,10 @@ spec:
   template:
     spec:
       restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
       containers:
         - name: preflight
           image: ghcr.io/yadgarhq/preflight:0.1.0@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+          securityContext:
+            readOnlyRootFilesystem: true
