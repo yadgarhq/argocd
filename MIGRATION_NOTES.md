@@ -7496,3 +7496,73 @@ If `yadgar`'s operation is Running or retrying, NEEDS-MAX `argocd app
 terminate-op yadgar` first. Then a revert: no migration ran, so all three
 Deployments return to their 0.25.9 images cleanly, and the seeder re-runs
 with every row `unchanged`.
+
+## The yadgar pin moves to parent chart 0.25.14: the gateway's registry poll sends `x-yadgar-request-id` (ledger 1254)
+
+**What the merge does.** It moves `applications/yadgar.yaml`'s
+`targetRevision` from 0.25.12 to 0.25.14 and `scripts/chart_pin.json`'s
+`chart_tag` from `v0.25.12` to `v0.25.14`. `platform_version` stays 0.2.6, so
+the operator Applications do not move.
+
+The chart's `v0.25.12..v0.25.14` is three commits:
+
+- chart#51 (v0.25.13): the examples and `chart/ci/values.yaml` declare a
+  placeholder `seeder.registry`, and the three example sources hold every
+  server at `clientAuth: "required"`. `chart/ci` stays at `"off"`. No
+  template, `chart/values.yaml` or dependency changed, so nothing reaches
+  this Application, which states its own `valuesObject`.
+- `ci: pin the examples at v0.25.13`.
+- `gateway` 0.12.10 → 0.12.11 (gateway#119, ledger 1254): the project
+  registry poll mints one `x-yadgar-request-id` per load and sends it, so
+  `project` and `project-db` can join their records for it.
+- Unchanged: `config` 0.2.1, `iam` 0.11.8, `iam-db` 0.10.6, `project` 0.3.6,
+  `project-db` 0.7.2, `seeder` 0.1.0, `task` 0.7.5, `task-db` 0.9.4,
+  `platform` 0.2.6.
+
+**No migration, no new env.** The gateway holds no schema. gateway#119
+changes `src/project/registry.rs` and `src/upstream/request_id.rs` only: no
+env read, chart template or values default changed.
+
+Measured 2026-10-18 (helm 4.3.0 and 3.18.4 render the same table):
+
+- `yadgar`: 94 → 94 objects, none added or removed, 1 changed: the `gateway`
+  Deployment, `image` only. The digest equals `gateway:0.12.11`'s GHCR tag
+  digest, `sha256:2c966881…`.
+- Server-side dry run against `kind-yadgar` (ADR-0881), tracking annotation
+  added, the 13 hook objects left out: the 0.25.12 render is an empty diff.
+  The 0.25.14 render differs on `Deployment/gateway` only, `image` and
+  `generation`.
+
+**Live state before the merge, read 2026-10-18.** `yadgar` 0.25.12 Synced,
+Healthy, last operation Succeeded. `gateway`, `project` and `project-db` are
+2/2 ready. `Job/seeder` succeeded at 12:27:39Z and logged `inserted 0,
+updated 0, archived 0, reactivated 0, unchanged 25`.
+
+**What runs.** The `gateway` Deployment rolls. Argo re-syncs, and
+`Replace=true,Force=true` deletes and re-creates `Job/seeder`, taking the
+previous run's log with it. The re-run converges with nothing to change.
+
+### After this merge, read-only
+
+```bash
+# 1. yadgar Synced/Healthy at 0.25.14, and the gateway ready.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+kubectl --context kind-yadgar -n yadgar get deploy gateway
+
+# 2. The seeder re-ran and changed nothing. Expect SUCCEEDED 1 and
+#    inserted 0, updated 0, archived 0, reactivated 0, unchanged 25.
+kubectl --context kind-yadgar -n yadgar get job seeder \
+  -o 'custom-columns=SUCCEEDED:.status.succeeded,FAILED:.status.failed'
+kubectl --context kind-yadgar -n yadgar logs job/seeder
+
+# 3. Each gateway pod logged `the project registry is loaded` after its boot.
+kubectl --context kind-yadgar -n yadgar logs deploy/gateway | grep -i registry | tail -3
+```
+
+### Rollback
+
+If `yadgar`'s operation is Running or retrying, NEEDS-MAX `argocd app
+terminate-op yadgar` first. Then a revert: no migration ran, so the gateway
+returns to its 0.12.10 image cleanly, and the seeder re-runs with every row
+`unchanged`.

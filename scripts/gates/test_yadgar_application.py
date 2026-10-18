@@ -196,6 +196,12 @@ CI job, never in the offline pre-commit hook.
       `gateway`, `project` and `project-db` Deployments, `image` only; each
       new digest equals its module's own GHCR tag digest; no new env, arg,
       probe, volume or mount, and no migration).
+      Re-measured 2026-10-18 at 0.25.14, carrying gateway 0.12.11 (every
+      other module and platform 0.2.6 unchanged): 94 objects, none added or
+      removed, 1 changed (the `gateway` Deployment, `image` only; the new
+      digest equals `gateway:0.12.11`'s GHCR tag digest). The parent's
+      v0.25.13 example and `chart/ci` changes (chart#51) reach no object
+      here: this Application states its own `valuesObject`.
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
