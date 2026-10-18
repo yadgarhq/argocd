@@ -20,7 +20,12 @@ One constructed case per arm:
   key rendered is green; a new `env::var` / `var_os` / lookup-closure read and a
   new const passed to `env_required` are NEEDS-HUMAN; a new error-code literal
   is green; braces inside string, char and comment text do not cut a
-  `#[cfg(test)] mod` wrong;
+  `#[cfg(test)] mod` wrong; a local closure wrapping a lookup (seeder's
+  `required`) and a path-qualified const are followed; a new call site whose
+  key cannot be resolved (`format!`) and a moved `yadgar-*` crate pin are
+  NEEDS-HUMAN; a DaemonSet, an initContainer and a swap inside the registry are
+  NEEDS-HUMAN; platform moves and migrations carry the ADR-0948 R5 interim text;
+- E4: a moved `yadgar-store` pin on a -db module is NEEDS-HUMAN;
 - E4: an added migration version is NEEDS-HUMAN; an unchanged schema is green;
 - the body carries the template's five headings and one Conventional Commits
   bullet, a rollback with `argocd app terminate-op`, and no MIGRATION_NOTES.
@@ -44,6 +49,9 @@ _spec = importlib.util.spec_from_file_location("pin_bump", REPOSITORY / "scripts
 pb = importlib.util.module_from_spec(_spec)
 sys.modules["pin_bump"] = pb
 _spec.loader.exec_module(pb)
+
+
+R5 = "interim block; lifted by car C10 per ADR-0948 R5"
 
 
 # ── versions ────────────────────────────────────────────────────────────────
@@ -248,6 +256,54 @@ def test_a_changed_config_map_is_needs_human() -> None:
     assert any("/ConfigMap//audit" in r for r in verdict.reasons), verdict.reasons
 
 
+
+def test_a_platform_move_is_an_interim_block() -> None:
+    """ADR-0948 R5 (Max, 2026-10-18): platform moves auto-merge when green, once car C10 lands."""
+    old = {**OLD_MODULES, "platform": "0.2.4"}
+    new = {**NEW_MODULES, "platform": "0.2.5"}
+    verdict = classify(two_helms(render_at("0.12.10"), render_at("0.12.11")), new_modules=new, old_modules=old)
+    assert any("platform moved" in r and R5 in r for r in verdict.reasons), verdict.reasons
+
+
+def workload(kind: str, name: str, image: str, container_list: str = "containers") -> dict:
+    document = deployment(name, image)
+    document["kind"] = kind
+    pod = document["spec"]["template"]["spec"]
+    if container_list != "containers":
+        pod[container_list] = pod.pop("containers")
+        pod["containers"] = [{"name": "main", "image": "busybox:1.37"}]
+    return document
+
+
+def test_a_daemon_set_image_change_is_needs_human() -> None:
+    """Only a Deployment, StatefulSet or Job may change image, even to the moved module's own tag digest."""
+    old = render_at("0.12.10")[1:] + [workload("DaemonSet", "gateway", f"ghcr.io/yadgarhq/gateway@{DIGEST[('gateway', '0.12.10')]}")]
+    new = render_at("0.12.10")[1:] + [workload("DaemonSet", "gateway", f"ghcr.io/yadgarhq/gateway@{DIGEST[('gateway', '0.12.11')]}")]
+    verdict = classify(two_helms(old, new))
+    assert not verdict.accept
+    assert any("DaemonSet" in r for r in verdict.reasons), verdict.reasons
+
+
+def test_a_swap_inside_the_registry_is_needs_human() -> None:
+    """iam's Deployment takes gateway's image at gateway's new tag digest: the repository moved, so red."""
+    head = render_at("0.12.10")
+    head[1]["spec"]["template"]["spec"]["containers"][0]["image"] = f"ghcr.io/yadgarhq/gateway@{DIGEST[('gateway', '0.12.11')]}"
+    verdict = classify(two_helms(render_at("0.12.10"), head))
+    assert not verdict.accept
+    assert any("apps/Deployment//iam" in r and "repository" in r for r in verdict.reasons), verdict.reasons
+
+
+def test_an_init_container_image_change_is_needs_human() -> None:
+    """Only `containers[*].image` may change (the C1 dispatch), not an initContainer's."""
+    def gateway_init(version: str) -> list:
+        image = f"ghcr.io/yadgarhq/gateway@{DIGEST[('gateway', version)]}"
+        return render_at("0.12.10")[1:] + [workload("Deployment", "gateway", image, "initContainers")]
+
+    verdict = classify(two_helms(gateway_init("0.12.10"), gateway_init("0.12.11")))
+    assert not verdict.accept
+    assert any("initContainers" in r for r in verdict.reasons), verdict.reasons
+
+
 # ── E3: the boot audit ──────────────────────────────────────────────────────
 
 
@@ -323,6 +379,80 @@ def test_braces_inside_literals_and_comments_do_not_cut_the_test_module_wrong() 
     assert reads == {"AFTER_TEST_MODULE", "AFTER_CONST_KEY", "LOOKUP_KEY"}
 
 
+
+SEEDER_PRELUDE = """pub const REGISTRY_FILE: &str = "SEEDER_REGISTRY_FILE";
+pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<(), String> {
+    let required = |var: &'static str| -> Result<String, String> {
+        match lookup(var) {
+            None => Err(format!("{var} is required")),
+            Some(v) => Ok(v),
+        }
+    };
+    let _file = required(REGISTRY_FILE)?;
+    Ok(())
+}
+"""
+
+
+def test_a_local_closure_wrapping_a_lookup_yields_required_keys() -> None:
+    """seeder's `Config::from_lookup` reads through `let required = |var| match lookup(var) …`."""
+    source = {"src/config.rs": SEEDER_PRELUDE}
+    required, reads = pb.env_keys(source)
+    assert required == {"SEEDER_REGISTRY_FILE"} and reads == {"SEEDER_REGISTRY_FILE"}
+
+
+def test_a_new_seeder_required_key_is_needs_human() -> None:
+    old = {"src/config.rs": SEEDER_PRELUDE}
+    new = {
+        "src/config.rs": SEEDER_PRELUDE.replace(
+            "    let _file = required(REGISTRY_FILE)?;\n",
+            "    let _file = required(REGISTRY_FILE)?;\n    let _x = required(NEW_SEEDER_KEY)?;\n",
+        ).replace("pub fn", 'pub const NEW_SEEDER_KEY: &str = "SEEDER_NEW_KEY";\npub fn', 1)
+    }
+    reasons = pb.boot_audit("seeder", old, new, {"SEEDER_REGISTRY_FILE"})
+    assert any("SEEDER_NEW_KEY" in r and "required" in r for r in reasons), reasons
+
+
+def test_a_path_qualified_const_resolves_within_the_crate() -> None:
+    source = {
+        "src/config.rs": 'pub const HOST: &str = "QUALIFIED_HOST";\n',
+        "src/boot.rs": "fn boot() -> Result<(), String> {\n    let _h = env_required(config::HOST)?;\n    Ok(())\n}\n",
+    }
+    assert pb.env_keys(source)[0] == {"QUALIFIED_HOST"}
+
+
+def test_a_format_built_key_at_a_new_call_site_is_needs_human() -> None:
+    new = with_boot_line("e3-old", 'let _t = std::env::var(&format!("{prefix}_NEW_TIMEOUT")).ok();', 'const prefix: &str = "X";\n')
+    reasons = pb.boot_audit("gateway", tree("e3-old"), new, RENDERED)
+    assert any("cannot resolve" in r and "format!" in r for r in reasons), reasons
+
+
+def test_an_unresolved_call_site_present_at_both_tags_is_green() -> None:
+    """The diff against the old tag is what keeps #107 and #109 green: their unresolved sites did not move."""
+    both = with_boot_line("e3-old", 'let _t = std::env::var(&format!("{prefix}_TIMEOUT")).ok();')
+    assert pb.boot_audit("gateway", both, copy.deepcopy(both), RENDERED) == []
+
+
+def with_cargo(source: dict, lifecycle: str, store: str | None = None) -> dict:
+    lines = ["[package]", 'name = "yadgar-gateway"', "", "[dependencies]"]
+    lines.append(f'yadgar-lifecycle = {{ git = "https://github.com/yadgarhq/lifecycle.git", tag = "{lifecycle}" }}')
+    if store:
+        lines.append(f'yadgar-store = {{ git = "https://github.com/yadgarhq/store.git", tag = "{store}" }}')
+    lines.append('serde = "1"')
+    return {**source, "Cargo.toml": "\n".join(lines) + "\n"}
+
+
+def test_a_moved_yadgar_lifecycle_tag_is_needs_human() -> None:
+    old, new = with_cargo(tree("e3-old"), "v0.2.17"), with_cargo(tree("e3-old"), "v0.2.18")
+    reasons = pb.boot_audit("gateway", old, new, RENDERED)
+    assert any("yadgar-lifecycle" in r and "v0.2.17" in r and "v0.2.18" in r for r in reasons), reasons
+
+
+def test_an_unmoved_shared_crate_is_green() -> None:
+    old, new = with_cargo(tree("e3-old"), "v0.2.17"), with_cargo(tree("e3-old"), "v0.2.17")
+    assert pb.boot_audit("gateway", old, new, RENDERED) == []
+
+
 # ── E4: the migration diff ──────────────────────────────────────────────────
 
 
@@ -344,6 +474,19 @@ def test_a_changed_migration_is_needs_human() -> None:
 
 def test_the_migration_versions_read_both_files_and_skip_tests() -> None:
     assert set(pb.migration_blocks(tree("e4-new"))) == {1, 2, 7}
+
+
+
+def test_an_added_migration_is_an_interim_block() -> None:
+    reasons = pb.migration_audit("iam-db", tree("e4-old"), tree("e4-new"))
+    assert any(R5 in r for r in reasons), reasons
+
+
+def test_a_moved_yadgar_store_tag_on_a_db_module_is_needs_human() -> None:
+    """yadgar-store's migrate.rs owns the ledger DDL, so its move is a schema change for the -db module."""
+    old, new = with_cargo(tree("e4-old"), "v0.2.20", "v0.4.0"), with_cargo(tree("e4-old"), "v0.2.20", "v0.4.1")
+    reasons = pb.migration_audit("iam-db", old, new)
+    assert any("yadgar-store" in r and "v0.4.0" in r and "v0.4.1" in r for r in reasons), reasons
 
 
 # ── the body ────────────────────────────────────────────────────────────────
