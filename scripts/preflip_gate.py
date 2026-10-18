@@ -1,26 +1,38 @@
 #!/usr/bin/env python3
-"""The pre-flip refusal gate: the plan's window legs (a) and (b) for the counting -> enforcing flip.
+"""The pre-flip refusal gate: the plan's legs (a), (b) and (c) for the counting -> enforcing flip.
 
 Ledgers 1608 and 1618; yadgarhq/docs `plans/project-validation.md` stage 5 and
 `plans/the-d35-seeder.md` errata E2. The operator's condition is a clean
 observation window: 0 refusals. It runs on the argocd-verify runner (ADR-0840),
 from `preflip.yaml` there, which executes argocd main's copy (ADR-0844).
 
-    preflip_gate.py --start ISO [--end ISO] [--min-resolutions N]
+    preflip_gate.py --start ISO [--end ISO] [--min-resolutions N] [--leg-c-max-age S]
 
-WHAT A PASS MEANS, AND WHAT IT DOES NOT. The plan's stage 5 gate has three
-legs, in order: (c) one deliberate probe per reason class, observed to
-increment its counter BEFORE the window opens; then, over the window, (a) the
-refusal counter rose by 0 and (b) the resolution counter rose. This script
-checks (a) and (b) only (legs 5 and 6 below, with the guards 1-4 that make
-them readable). LEG (c) IS NOT CHECKED HERE and must be proved separately
-before the flip. It is not derived from the run history because that history
-cannot prove it: the only probe that exists (argocd `scripts/project_probe.py`)
-covers two reason classes, `PROJECT_UNRESOLVABLE` routinely and
-`PROJECT_UNREGISTERED_PERSONAL` as a trial. Nothing probes
-`PROJECT_UNREGISTERED_ORG` or `PROJECT_ARCHIVED`, so no reading of its runs
-and of Prometheus could show "every class was observed to count". A PASS says
-so in its own output.
+WHAT A PASS MEANS. The plan's stage 5 gate has three legs, in order: (c) one
+deliberate probe per reason class, observed to increment its counter BEFORE
+the window opens; then, over the window, (a) the refusal counter rose by 0 and
+(b) the resolution counter rose. Legs 5 and 6 below are (a) and (b), with the
+guards 1-4 that make them readable; leg 7 is (c).
+
+LEG (C) IS READ FROM THE PROBE'S OWN VERDICT, NOT FROM PROMETHEUS AGAIN
+(ledger 1624). `project_probe.py --leg-c` sends one call per probeable reason
+class (`PROJECT_UNRESOLVABLE`, `PROJECT_UNREGISTERED_PERSONAL`,
+`PROJECT_UNREGISTERED_ORG`, `PROJECT_INVALID`, `PROJECT_ARCHIVED`) and exits 0
+only when every one of their counters rose per pod; it is red when
+inconclusive. argocd-verify's `project-probe.yaml` names such a run
+`project-probe leg-c` (`run-name`; the runs listing carries no dispatch
+inputs). Only a `workflow_dispatch` of that workflow's path on this
+repository's default branch, with this repository as head and a `head_sha`
+the default branch contains, counts: a branch's or a tag's copy of the
+workflow could set the same name and exit 0. Only the probe job's own
+conclusion is read. `--leg-c-max-age` is finite, above 0, at most 7 days. Leg 7
+passes when the NEWEST such run whose job completed at or
+before `start - probe_slack`, and no earlier than `start - leg_c_max_age`,
+concluded `success`. A newer red run is not masked by an older green one.
+Re-reading the counter here instead would need the run, the slack and the
+window inside Prometheus' 1d retention together, which caps the window.
+`PROJECT_REGISTRY_UNAVAILABLE` has no probe (it needs the registry down); legs
+(a) and 4 cover it inside the window.
 
 THE PROBE IS SERIALIZED OUT OF THE WINDOW, NOT SUBTRACTED. The refusal counter
 has one label, `reason`, and no claim label, so the ADR-0841 probe's
@@ -52,6 +64,7 @@ THE LEGS, all read, all reported, any one failing fails the gate:
   6. `yadgar_gateway_project_resolution_total` rose by at least
      `--min-resolutions` (default 1): zero traffic yields zero refusals for
      free, so a silent window proves nothing.
+  7. Leg (c), as above.
 
 PER SERIES, FROM RAW SAMPLES, NEVER A BARE `increase()` (ADR-0620). The gateway
 registers its counters lazily, so a pod's first refusal makes the series appear
@@ -104,6 +117,7 @@ import datetime as dt
 import json
 import math
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -123,12 +137,21 @@ UP_SELECTOR = 'up{namespace="yadgar",app="gateway"}'
 PROBE_REPO = "yadgarhq/argocd-verify"
 PROBE_WORKFLOW = "project-probe.yaml"
 PROBE_JOB_TIMEOUT = 20 * 60  # project-probe.yaml `timeout-minutes: 20`
+LEG_C_TITLE = "project-probe leg-c"  # project-probe.yaml `run-name` with `leg_c: true`
+PROBE_PATH = f".github/workflows/{PROBE_WORKFLOW}"
+PROBE_JOB_NAME = "785 refusal-counter probe"  # project-probe.yaml `jobs.probe.name`
+FULL_SHA = re.compile(r"[0-9a-f]{40}")
+LEG_C_MAX_AGE_CAP = 7 * 86400.0
 
 EXIT_PASS, EXIT_FAIL = 0, 1
 
 
 class GateError(Exception):
     """A read that could not be made, or an answer that cannot be trusted. Always a FAIL."""
+
+
+class GitHubNotFound(GateError):
+    """A GitHub 404. Only `on_default_branch` reads it as an answer ("not on it")."""
 
 
 def iso(t: float) -> str:
@@ -330,6 +353,89 @@ def probe_overlaps(transport: "Transport", start: float, end: float) -> list[str
         page += 1
 
 
+def on_default_branch(transport: "Transport", sha: object, branch: str) -> bool:
+    """Whether `sha` is the default branch's head or an ancestor of it.
+
+    `head_branch` is not enough: a TAG run reports its bare tag name there
+    (argocd run 39155132593, head_branch=v0.25.27), so a dispatch on a tag
+    named `main` reads head_branch "main" while running the tag's copy of the
+    workflow. `compare/{branch}...{sha}` reads `behind` or `identical` exactly
+    when `sha` is on the branch, and 404s for a sha it does not know.
+
+    THE SAME TEST AS `settled_gate.reachable`, restricted to the one branch, and
+    written here rather than imported: settled_gate imports PyYAML at module
+    level, and `preflip.yaml` installs nothing, so the import would break the
+    job while every test (the hook installs PyYAML) stayed green. Never
+    `commits/{sha}`: GitHub serves the whole fork network's commits there.
+    """
+    if not isinstance(sha, str) or not FULL_SHA.fullmatch(sha):
+        return False
+    try:
+        status = transport.github_get(
+            f"/repos/{PROBE_REPO}/compare/{urllib.parse.quote(branch, safe='/')}...{sha}"
+        ).get("status")
+    except GitHubNotFound:
+        return False
+    return status in {"behind", "identical"}
+
+
+def leg_c(transport: "Transport", start: float, slack: float, max_age: float) -> tuple[bool, str]:
+    """Leg (c): the newest finished `project-probe leg-c` run before the window, and its verdict."""
+    since = iso(start - max_age - PROBE_JOB_TIMEOUT - 600)
+    finished: list[tuple[float, int, str]] = []
+    # THE TITLE ALONE IS SPOOFABLE. A dispatch can name any branch, and that
+    # branch's copy of the workflow can set the same `run-name` and exit 0.
+    # So only a `workflow_dispatch` of this workflow's path, on this
+    # repository's default branch, with this repository as head, is evidence:
+    # `settled_gate.find_verdict`'s filters for a verdict.
+    own = transport.github_get(f"/repos/{PROBE_REPO}")
+    if "id" not in own or not own.get("default_branch"):
+        raise GateError(f"github: /repos/{PROBE_REPO} carries no id or default_branch")
+    page = 1
+    while True:
+        q = urllib.parse.urlencode({"per_page": 100, "page": page, "created": f">={since}"})
+        body = transport.github_get(f"/repos/{PROBE_REPO}/actions/workflows/{PROBE_WORKFLOW}/runs?{q}")
+        runs = body.get("workflow_runs")
+        if runs is None:
+            raise GateError(f"github: no workflow_runs in the {PROBE_WORKFLOW} listing")
+        for run in runs:
+            if (
+                run.get("display_title") != LEG_C_TITLE
+                or run.get("status") != "completed"
+                or run.get("event") != "workflow_dispatch"
+                or run.get("head_branch") != own["default_branch"]
+                or run.get("path") != PROBE_PATH
+                or (run.get("repository") or {}).get("id") != own["id"]
+                or (run.get("head_repository") or {}).get("id") != own["id"]
+                or not on_default_branch(transport, run.get("head_sha"), own["default_branch"])
+            ):
+                continue
+            jobs = transport.github_get(f"/repos/{PROBE_REPO}/actions/runs/{run['id']}/jobs?per_page=100")
+            # The PROBE job by name: another job in the workflow that ends green
+            # later must not stand in for a red probe job.
+            for job in jobs.get("jobs", []):
+                if job.get("name") != PROBE_JOB_NAME:
+                    continue
+                completed = parse_time(job.get("completed_at"))
+                if completed is not None and completed <= start - slack:
+                    finished.append((completed, run["id"], str(job.get("conclusion"))))
+        if len(runs) < 100:
+            break
+        page += 1
+    if not finished:
+        return False, (
+            f"no project-probe leg-c run finished before {iso(start - slack)}: dispatch project-probe.yaml "
+            "with leg_c: true while PROJECT_PROBE_ENABLED is true, then switch the probe off"
+        )
+    completed, run_id, conclusion = max(finished)
+    where = f"project-probe run {run_id} (job ended {iso(completed)}, max age {max_age:.0f}s)"
+    if completed < start - max_age:
+        return False, f"leg (c): the newest leg-c run, {where}, is older than {max_age:.0f}s before the start"
+    if conclusion != "success":
+        return False, f"leg (c): the newest leg-c run, {where}, concluded {conclusion}"
+    return True, f"leg (c): {where} concluded success"
+
+
 # --- the network ------------------------------------------------------------------
 
 
@@ -363,11 +469,29 @@ class Network:
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 return json.load(response)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise GitHubNotFound(f"github {path.split('?')[0]}: HTTP 404") from e
+            raise GateError(f"github {path.split('?')[0]}: HTTP {e.code}") from e
         except (urllib.error.URLError, OSError, ValueError) as e:
             raise GateError(f"github {path.split('?')[0]}: {e}") from e
 
 
 # --- the run ----------------------------------------------------------------------
+
+
+def max_age(value: str) -> float:
+    """`--leg-c-max-age`: finite, above 0, at most 7 days. `inf` would accept a
+    leg-c run of any age and `nan` compares false to everything."""
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a number of seconds") from None
+    if not math.isfinite(seconds) or not 0 < seconds <= LEG_C_MAX_AGE_CAP:
+        raise argparse.ArgumentTypeError(
+            f"{value!r} must be finite, above 0 and at most {LEG_C_MAX_AGE_CAP:.0f} (7 days)"
+        )
+    return seconds
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -378,6 +502,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--lookback", type=float, default=300.0, help="seconds before start read for each baseline")
     p.add_argument("--max-gap", type=float, default=120.0, help="longest tolerated scrape gap, seconds")
     p.add_argument("--probe-slack", type=float, default=300.0, help="a probe job ending this close before start overlaps")
+    p.add_argument(
+        "--leg-c-max-age",
+        type=max_age,
+        default=86400.0,
+        help="the leg-c run must end within this many seconds before start: finite, > 0, at most 7 days",
+    )
     p.add_argument("--prometheus-url", default="http://prometheus-server.observability.svc:80")
     return p.parse_args(argv)
 
@@ -412,6 +542,7 @@ def run(
     enabled = env.get("PROJECT_PROBE_ENABLED")
     if enabled != "false":
         failures.append(f"PROJECT_PROBE_ENABLED is {enabled!r}, not 'false': the probe is not serialized out of the window")
+    leg_c_line = "leg (c): not read"
     if not env.get("GITHUB_TOKEN"):
         failures.append("GITHUB_TOKEN is empty: the probe's run history cannot be read")
     else:
@@ -421,6 +552,14 @@ def run(
             for hit in hits:
                 failures.append(f"{hit} overlaps the window (or its {args.probe_slack:.0f}s slack)")
             say(f"project-probe jobs overlapping: {len(hits)}")
+        except GateError as e:
+            failures.append(str(e))
+        # Leg 7: leg (c).
+        try:
+            ok, leg_c_line = leg_c(transport, start, args.probe_slack, args.leg_c_max_age)
+            say(leg_c_line)
+            if not ok:
+                failures.append(leg_c_line)
         except GateError as e:
             failures.append(str(e))
 
@@ -492,7 +631,7 @@ def run(
     if failures:
         say(f"FAIL: {tally}")
     else:
-        say(f"PASS: legs (a)+(b) passed ({tally}); leg (c) is NOT checked here and must be proved separately")
+        say(f"PASS: legs (a)+(b)+(c) passed ({tally}); {leg_c_line}")
     return EXIT_PASS if not failures else EXIT_FAIL
 
 

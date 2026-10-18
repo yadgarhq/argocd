@@ -106,9 +106,20 @@ def up_series(pod: str, steps: list[tuple[float, float]]) -> dict:
 TRAFFIC = resolution("a", [(START - LOOKBACK, 3), (START + 3600, 9)])
 
 
-def run_record(run_id: int, started: float, completed: float | None, conclusion: str = "success") -> tuple[dict, dict]:
+def run_record(
+    run_id: int, started: float, completed: float | None, conclusion: str = "success", title: str = "project-probe"
+) -> tuple[dict, dict]:
     run = {
         "id": run_id,
+        "display_title": title,
+        # Where the run came from: a dispatch of main's own workflow file, in
+        # this repository. Leg (c) refuses anything else as evidence.
+        "event": "workflow_dispatch",
+        "head_branch": "main",
+        "path": ".github/workflows/project-probe.yaml",
+        "repository": {"id": 4242},
+        "head_repository": {"id": 4242},
+        "head_sha": f"{run_id:040x}",
         "status": "completed" if completed is not None else "in_progress",
         "created_at": iso(started - 5),
         "updated_at": iso(completed if completed is not None else started),
@@ -123,6 +134,10 @@ def run_record(run_id: int, started: float, completed: float | None, conclusion:
     return run, {"jobs": [job]}
 
 
+LEG_C = "project-probe leg-c"
+LEG_C_GREEN = run_record(900, START - 3600, START - 3500, title=LEG_C)
+
+
 class FakeTransport:
     def __init__(
         self,
@@ -130,12 +145,18 @@ class FakeTransport:
         lowest: float = START - 86000,
         runs: list[tuple[dict, dict]] = (),
         up: dict | None = None,
+        leg_c: tuple[tuple[dict, dict], ...] | None = None,
     ):
         self.body = body
         self.up = up if up is not None else derived_up(body)
         self.lowest = lowest
-        self.runs = list(runs)
+        # Every case carries a green leg (c) sweep an hour before the window,
+        # unless it states its own: the gate now requires one.
+        self.runs = list(runs) + list((LEG_C_GREEN,) if leg_c is None else leg_c)
         self.queries: list[dict] = []
+        self.compares: list[str] = []
+        self.unreachable: set[str] = set()
+        self.compare_status: dict[str, str] = {}
         self.prom_down = False
         self.github_down = False
 
@@ -155,6 +176,18 @@ class FakeTransport:
     def github_get(self, path: str) -> dict:
         if self.github_down:
             raise pg.GateError("github: 502")
+        if path == f"/repos/{pg.PROBE_REPO}":
+            return {"id": 4242, "default_branch": "main"}
+        if "/compare/" in path:
+            # `compare/main...{sha}`: every fixture run's sha is on main unless
+            # a case says otherwise; an unknown sha is GitHub's 404.
+            self.compares.append(path)
+            sha = path.rsplit("...", 1)[1]
+            if sha in self.compare_status:
+                return {"status": self.compare_status[sha]}
+            if sha in self.unreachable:
+                raise pg.GitHubNotFound(f"github {path}: HTTP 404")
+            return {"status": "behind"}
         if "/jobs" in path:
             run_id = int(path.split("/runs/")[1].split("/")[0])
             return next(jobs for run, jobs in self.runs if run["id"] == run_id)
@@ -482,10 +515,11 @@ def test_min_resolutions_must_be_an_integer(value: str) -> None:
         pg.parse_args(["--start", iso(START), "--min-resolutions", value])
 
 
-def test_a_pass_says_leg_c_is_not_checked_here() -> None:
+def test_a_pass_names_the_leg_c_run_it_relied_on() -> None:
     code, out = gate(FakeTransport(matrix(gauge("a"), TRAFFIC)))
     assert code == pg.EXIT_PASS, out
-    assert "leg (c) is NOT checked here" in out
+    assert "legs (a)+(b)+(c) passed" in out
+    assert "leg (c): project-probe run 900" in out
     assert "may move" not in out
 
 
@@ -513,3 +547,229 @@ def test_a_second_job_scraping_the_same_pod_on_its_own_clock_is_no_restart() -> 
     body = matrix(gauge("a"), dup, refusal("a", [(START - LOOKBACK, 4)]), TRAFFIC)
     code, out = gate(FakeTransport(body))
     assert code == pg.EXIT_PASS, out
+
+
+# --- leg (c): one deliberate probe per reason class, before the window (ledger 1624)
+#
+# The gate trusts the newest `project-probe leg-c` run that ended before the
+# window's slack: the probe itself exits 0 in that mode only when every probed
+# reason's counter rose per pod, and is red when inconclusive. Re-reading the
+# counter here would tie the run, the slack and the window to Prometheus' 1d
+# retention together.
+
+FLAT = matrix(gauge("a"), TRAFFIC)
+
+
+def test_no_leg_c_run_fails() -> None:
+    code, out = gate(FakeTransport(FLAT, leg_c=()))
+    assert code == pg.EXIT_FAIL, out
+    assert "no project-probe leg-c run" in out
+
+
+def test_a_routine_green_run_is_not_leg_c_evidence() -> None:
+    code, out = gate(FakeTransport(FLAT, runs=[run_record(5, START - 3000, START - 2950)], leg_c=()))
+    assert code == pg.EXIT_FAIL, out
+    assert "no project-probe leg-c run" in out
+
+
+def test_the_newest_leg_c_run_red_fails_even_with_an_older_green_one() -> None:
+    red = run_record(901, START - 1800, START - 1700, conclusion="failure", title=LEG_C)
+    code, out = gate(FakeTransport(FLAT, leg_c=(LEG_C_GREEN, red)))
+    assert code == pg.EXIT_FAIL, out
+    assert "run 901" in out and "failure" in out
+
+
+def test_a_leg_c_run_older_than_the_max_age_fails() -> None:
+    old = run_record(902, START - 90000, START - 89900, title=LEG_C)
+    code, out = gate(FakeTransport(FLAT, leg_c=(old,)))
+    assert code == pg.EXIT_FAIL, out
+    assert "older than" in out
+
+
+def test_the_max_age_is_the_operators() -> None:
+    old = run_record(902, START - 90000, START - 89900, title=LEG_C)
+    argv = ["--start", iso(START), "--end", iso(END), "--leg-c-max-age", "100000"]
+    code, out = gate(FakeTransport(FLAT, leg_c=(old,)), argv=argv)
+    assert code == pg.EXIT_PASS, out
+
+
+def test_a_leg_c_run_inside_the_slack_is_no_evidence_and_overlaps() -> None:
+    late = run_record(903, START - 120, START - 60, title=LEG_C)
+    code, out = gate(FakeTransport(FLAT, leg_c=(late,)))
+    assert code == pg.EXIT_FAIL, out
+    assert "overlaps the window" in out
+    assert "no project-probe leg-c run" in out
+
+
+def test_a_leg_c_run_still_running_is_no_evidence() -> None:
+    running = run_record(904, START - 3600, None, title=LEG_C)
+    code, out = gate(FakeTransport(FLAT, leg_c=(running,)))
+    assert code == pg.EXIT_FAIL, out
+    assert "no project-probe leg-c run" in out
+
+
+def test_the_newest_leg_c_run_is_chosen_by_its_end_not_by_list_order() -> None:
+    red = run_record(905, START - 7200, START - 7100, conclusion="failure", title=LEG_C)
+    code, out = gate(FakeTransport(FLAT, leg_c=(LEG_C_GREEN, red)))
+    assert code == pg.EXIT_PASS, out
+
+
+def test_the_leg_c_title_is_the_workflows_run_name() -> None:
+    # argocd-verify `project-probe.yaml` sets `run-name` to this exact string
+    # when dispatched with `leg_c: true`; the runs listing carries no inputs.
+    assert pg.LEG_C_TITLE == LEG_C
+
+
+# --- leg (c) evidence must come from main's own workflow, dispatched here -------
+#
+# A `workflow_dispatch` can name any branch, and a branch's copy of
+# `project-probe.yaml` can set the same `run-name` and simply exit 0. So the
+# title alone is spoofable by anyone who can push a branch. The gate accepts a
+# run only when it is a `workflow_dispatch` on this repository's default
+# branch, of this workflow's path, with this repository as its head
+# repository: the filters `settled_gate.find_verdict` applies to a verdict.
+
+
+def spoofed(**override) -> tuple[dict, dict]:
+    run, jobs = run_record(950, START - 1800, START - 1700, title=LEG_C)
+    run.update(override)
+    return run, jobs
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"head_branch": "evil-branch"},
+        {"event": "push"},
+        {"event": "schedule"},
+        {"path": ".github/workflows/other.yaml"},
+        {"head_repository": {"id": 1}},
+        {"repository": {"id": 1}},
+    ],
+)
+def test_leg_c_evidence_from_anywhere_but_mains_dispatch_is_ignored(override) -> None:
+    code, out = gate(FakeTransport(FLAT, leg_c=(spoofed(**override),)))
+    assert code == pg.EXIT_FAIL, out
+    assert "no project-probe leg-c run" in out
+
+
+def test_a_spoofed_green_run_cannot_mask_a_real_red_one() -> None:
+    red = run_record(951, START - 3000, START - 2900, conclusion="failure", title=LEG_C)
+    code, out = gate(FakeTransport(FLAT, leg_c=(red, spoofed(head_branch="evil-branch"))))
+    assert code == pg.EXIT_FAIL, out
+    assert "run 951" in out and "failure" in out
+
+
+# --- review round 1 (argocd#111): a tag named `main`, job conclusions, the max age
+
+# S1. A tag run reports its bare tag name as `head_branch` (argocd run
+# 39155132593: head_branch=v0.25.27), so a dispatch with ref refs/tags/main
+# reports head_branch "main" and runs the TAG's copy of the workflow, which can
+# forge the run-name and exit 0. The gate therefore also requires the run's
+# head_sha to be on the default branch: compare main...sha reads `behind` or
+# `identical`.
+
+
+def test_a_tag_named_main_with_a_sha_off_main_is_no_evidence() -> None:
+    forged, jobs = run_record(960, START - 1800, START - 1700, title=LEG_C)
+    t = FakeTransport(FLAT, leg_c=((forged, jobs),))
+    t.unreachable.add(forged["head_sha"])
+    code, out = gate(t)
+    assert code == pg.EXIT_FAIL, out
+    assert "no project-probe leg-c run" in out
+    assert t.compares == [f"/repos/{pg.PROBE_REPO}/compare/main...{forged['head_sha']}"]
+
+
+@pytest.mark.parametrize("status", ["ahead", "diverged"])
+def test_a_sha_main_does_not_contain_is_no_evidence(status) -> None:
+    forged, jobs = run_record(961, START - 1800, START - 1700, title=LEG_C)
+    t = FakeTransport(FLAT, leg_c=((forged, jobs),))
+    t.compare_status[forged["head_sha"]] = status
+    code, out = gate(t)
+    assert code == pg.EXIT_FAIL, out
+    assert "no project-probe leg-c run" in out
+
+
+@pytest.mark.parametrize("sha", [None, "", "abc", "Z" * 40])
+def test_a_run_without_a_full_sha_is_no_evidence(sha) -> None:
+    run, jobs = run_record(962, START - 1800, START - 1700, title=LEG_C)
+    run["head_sha"] = sha
+    code, out = gate(FakeTransport(FLAT, leg_c=((run, jobs),)))
+    assert code == pg.EXIT_FAIL, out
+    assert "no project-probe leg-c run" in out
+
+
+def test_a_forged_tag_run_cannot_mask_a_real_red_run() -> None:
+    red = run_record(963, START - 3000, START - 2900, conclusion="failure", title=LEG_C)
+    forged, jobs = run_record(964, START - 1800, START - 1700, title=LEG_C)
+    t = FakeTransport(FLAT, leg_c=(red, (forged, jobs)))
+    t.unreachable.add(forged["head_sha"])
+    code, out = gate(t)
+    assert code == pg.EXIT_FAIL, out
+    assert "run 963" in out and "failure" in out
+
+
+def test_the_gate_imports_no_yaml_and_no_settled_gate() -> None:
+    # preflip.yaml installs nothing: setup-python, then the script. settled_gate
+    # imports PyYAML at module level, so importing it here would break the job
+    # while every test (the hook installs PyYAML) stays green.
+    imports = [
+        line.split()[1]
+        for line in (REPOSITORY / "scripts" / "preflip_gate.py").read_text().splitlines()
+        if line.startswith(("import ", "from "))
+    ]
+    assert "yaml" not in imports and "settled_gate" not in imports, imports
+
+
+# G1. Every conclusion but `success` on the newest leg-c run fails leg (c).
+# `skipped` is the realistic one: with PROJECT_PROBE_ENABLED not true, the
+# job's `if:` skips it.
+
+
+@pytest.mark.parametrize("conclusion", ["cancelled", "skipped", "timed_out", None, "failure", "neutral"])
+def test_any_conclusion_but_success_on_the_newest_leg_c_run_fails(conclusion) -> None:
+    run, jobs = run_record(965, START - 1800, START - 1700, title=LEG_C)
+    jobs["jobs"][0]["conclusion"] = conclusion
+    code, out = gate(FakeTransport(FLAT, leg_c=(LEG_C_GREEN, (run, jobs))))
+    assert code == pg.EXIT_FAIL, out
+    assert "run 965" in out
+
+
+# The probe job is read by its name: a second job in the workflow (a
+# diagnostic, say) that ends green later must not mask a red probe job.
+
+
+def test_another_job_in_the_run_cannot_mask_a_red_probe_job() -> None:
+    run, jobs = run_record(966, START - 1800, START - 1700, conclusion="failure", title=LEG_C)
+    jobs["jobs"].append(
+        {"name": "egress proof", "status": "completed", "conclusion": "success", "started_at": iso(START - 1700), "completed_at": iso(START - 1650)}
+    )
+    code, out = gate(FakeTransport(FLAT, leg_c=((run, jobs),)))
+    assert code == pg.EXIT_FAIL, out
+    assert "run 966" in out and "failure" in out
+
+
+def test_the_probe_job_name_is_the_workflows() -> None:
+    # argocd-verify project-probe.yaml `jobs.probe.name`.
+    assert pg.PROBE_JOB_NAME == "785 refusal-counter probe"
+
+
+# G2. The max age is finite, positive and at most 7 days; the PASS line names it.
+
+
+@pytest.mark.parametrize("value", ["inf", "nan", "1e9", "0", "-5", "604801", "x"])
+def test_an_unusable_max_age_is_refused(value, capsys) -> None:
+    with pytest.raises(SystemExit):
+        pg.parse_args(["--start", iso(START), "--leg-c-max-age", value])
+    assert "--leg-c-max-age" in capsys.readouterr().err
+
+
+def test_seven_days_is_the_largest_max_age() -> None:
+    assert pg.parse_args(["--start", iso(START), "--leg-c-max-age", "604800"]).leg_c_max_age == 604800.0
+
+
+def test_the_pass_line_names_the_max_age_used() -> None:
+    code, out = gate(FakeTransport(FLAT))
+    assert code == pg.EXIT_PASS, out
+    pass_line = next(line for line in out.splitlines() if "PASS" in line)
+    assert "max age 86400s" in pass_line
