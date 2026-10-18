@@ -1920,99 +1920,10 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # constant rather than read out of git, for the depth-1 reason the valkey
 # constants above give. The next pin bump re-measures this, which is the point.
 #
-# RE-MEASURED AT THE NEXT BUMP, 0.3.13 → 0.3.38 (ledger 1266), with the same
-# shape: the previous pin against the current one, preflight off on both sides.
-# 80 objects on both sides, 13 fields in 8 objects. Six module images (task's
-# is unchanged); the three `-db` Deployments gain
-# `DB_MIGRATION_LOCK_TIMEOUT_SECONDS` (ledger 814); and both bootstrap Jobs
-# gain `activeDeadlineSeconds` and a bounded script (platform#24).
-# `PIN_BEFORE_B9` stays 0.3.7: `test_the_old_pin_names_both_probe_defects`
-# needs a pin whose probes are defective.
-#
-# RE-MEASURED AT THE NEXT BUMP, 0.3.38 → 0.13.13, same shape. The first bump
-# here that ADDS objects, so the count no longer holds on both sides: 80 → 82,
-# and the two added are exactly `PIN_ADDED`, platform 0.1.36's serving leaves
-# for the broker and the cache (platform#36). Nothing mounts them at this pin.
-# The fields: all seven module images; the three `-db` Deployments gain the
-# four store v0.4.0 pool knobs (ADR-0837); and `Prune=false` on the four edge
-# objects (platform#31, ADR-0851). The two bootstrap Jobs do not move.
-#
-# RE-MEASURED AT THE NEXT BUMP, 0.13.13 → 0.19.1 (PB-2, ledger 925), same
-# shape. 82 objects on both sides, none added. The six server images only
-# (iam, iam-db, task, task-db, project and project-db: the B-U5 contracts);
-# gateway and platform keep their pins. The `clientAuth` and client-CA values
-# do NOT show here: both sides render them, because the 0.13.13 module charts
-# already carried the B-U5E expand. They show in K3 against `main`'s values.
-#
-# RE-MEASURED AT THE NEXT BUMP, 0.19.1 → 0.23.1 (PB-3, ledger 925), same
-# shape. 82 objects on both sides, none added: `Certificate/nats-tls` and
-# `Certificate/valkey-tls` were already added at 0.13.13. 11 fields in 6
-# objects. Four images (gateway 0.12.0, iam 0.11.0, task 0.7.1, project
-# 0.3.1). valkey (platform 0.2.1, B-V2): the unix-socket args, the socket-based
-# exec liveness replacing `tcpSocket`, the socket-based readiness, and the
-# `/run/valkey` `emptyDir` with its mount. nats (B-N2): the pod template's
-# `checksum/config` annotation. The `NATS_TLS_ENABLED` / `VALKEY_TLS_ENABLED`
-# "0" lines on gateway and iam do NOT show here: the 0.19.1 client charts
-# already render them once the keys are written (the B-N3E/B-V3E expand). They
-# show in K3 against `main`'s values.
-#
-# RE-MEASURED AT 0.23.10 (platform 0.2.3, ledger 1437), against the same 0.19.1:
-# one field more, valkey's `env`. valkey reads its password from
-# `valkey-password` mounted at `/etc/valkey/auth`, so `VALKEY_PASSWORD` and
-# `VALKEYCLI_AUTH` leave `env`. Under `PIN_ALONE_OVERRIDES` (TLS off) `env` is
-# then absent altogether. The script, probes, mounts and volumes were already
-# in the set.
-#
-# RE-MEASURED AT 0.23.15 (gateway 0.12.3, iam 0.11.4, iam-db 0.10.1,
-# project-db 0.6.1, task-db 0.9.1; ledgers 1438, 1439), against the same
-# 0.19.1: 82 objects on both sides, none added, 15 fields — three more, the
-# `iam-db`, `project-db` and `task-db` images. Through 0.23.10 those three
-# still ran the images 0.19.1 pinned; their new releases are `Cargo.lock`-only
-# dependency bumps. gateway's and iam's images were already in the set.
-#
-# RE-MEASURED AT 0.24.9 (gateway 0.12.5, iam 0.11.6, iam-db 0.10.3, project
-# 0.3.3, project-db 0.6.3, task 0.7.4, task-db 0.9.3, platform 0.2.4), against
-# the same 0.19.1: 82 objects on both sides, none added, 15 fields, the same
-# set as at 0.23.15. Only image digests moved from 0.23.15; every module was
-# already in PIN_CHANGES.
-#
-# RE-MEASURED AT 0.24.17 (gateway 0.12.6, iam 0.11.7, iam-db 0.10.4, project
-# 0.3.4, project-db 0.6.4, task 0.7.5, task-db 0.9.4, platform 0.2.5), against
-# the same 0.19.1: 82 objects on both sides, none added, 26 fields — eleven
-# more. `env` on gateway, iam, project and task: each caller now renders a
-# `*_REQUEST_TIMEOUT_SECONDS` per backend hop from the chart defaults (ADR-0925
-# Q-C1). Seven on nats (ADR-0924): `command` and `args` become a `/bin/sh`
-# wrapper that hashes both mounted passwords and execs nats-server; the two
-# `secretKeyRef` passwords leave `env`; the liveness probe swaps `httpGet` for
-# an `exec` that re-checks the hash beside `/healthz`; both passwords are
-# mounted from two new secret volumes. The new pin is still diffed against
-# 0.19.1, not 0.24.9 (task 1507).
-#
-# RE-MEASURED AT 0.25.8 (gateway 0.12.9, iam 0.11.8, iam-db 0.10.6, project
-# 0.3.5, project-db 0.7.0, platform 0.2.6, and the new seeder 0.1.0), against
-# the same 0.19.1: 82 -> 86 objects, the four added exactly `PIN_ADDED` (the
-# seeder's leaf, Job, ConfigMap and ServiceAccount), none removed, 30 changes —
-# the 26 fields as at 0.24.17 plus the four added objects. Every module whose
-# field moves was already in PIN_CHANGES. The previous pin's side renders the
-# values without `seeder`, which 0.19.1's schema refuses (see `PIN_ADDED`).
-#
-# RE-MEASURED AT 0.25.9 (project-db 0.7.1; nothing else moved), against the
-# same 0.19.1: 82 -> 86 objects and 30 changes, the same set as at 0.25.8.
-# project-db's image was already in PIN_CHANGES.
-#
-# RE-MEASURED AT 0.25.12 (gateway 0.12.10, project 0.3.6, project-db 0.7.2),
-# against the same 0.19.1: 82 -> 86 objects and 30 changes, the same set as at
-# 0.25.9. All three images were already in PIN_CHANGES.
-#
-# RE-MEASURED AT 0.25.14 (gateway 0.12.11; nothing else moved), against the
-# same 0.19.1: 82 -> 86 objects and 30 changes, the same set as at 0.25.12.
-# gateway's image was already in PIN_CHANGES.
-#
-# RE-MEASURED AT 0.25.27 (gateway 0.12.13, iam 0.11.10, iam-db 0.10.8, project
-# 0.3.7, project-db 0.7.3, task 0.7.6, task-db 0.9.5, seeder 0.1.1), against the
-# same 0.19.1: 82 -> 86 objects and 30 changes, the same set as at 0.25.14.
-# Every moved Deployment image was already in PIN_CHANGES, and `Job/seeder` is
-# in PIN_ADDED, so its new image is inside an added object.
+# Each later pin's measurement is in the pull request body that moved the pin,
+# not in a log here (ledger 1632, car C2). `PIN_BEFORE_B9` stays 0.3.7:
+# `test_the_old_pin_names_both_probe_defects` needs a pin whose probes are
+# defective.
 #
 # BOTH SIDES RENDER EVERY SERVER AT `clientAuth: "off"`, FROM B-U8a ON. The
 # 0.13.13 module charts predate the B-U5 contracts, and their render checks
