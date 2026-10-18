@@ -518,15 +518,13 @@ spec:
               - path: estate/smoke
                 displayName: estate smoke
                 sourceRepo: yadgarhq/estate
-              # NO REPOSITORY, AND DECLARED ONLY UNTIL THE SEEDER HAS INSERTED IT (ledger
-              # 1624, Max's ruling). The one exception to "every repo": the pre-flip
-              # gate's leg (c) probe row. The next registry change removes this entry so
-              # the seeder ARCHIVES the row (ADR-0934), and argocd's
-              # `project_probe.py --leg-c` writes to it to count `PROJECT_ARCHIVED`.
-              # Archiving 1 of 26 active org rows does not trip the guard (ADR-0939).
-              - path: yadgarhq/probe-archived
-                displayName: probe-archived (leg (c) probe, archived on purpose)
-                sourceRepo: yadgarhq/argocd
+              # ABSENT ON PURPOSE: `yadgarhq/probe-archived` (ledger 1624, Max's ruling).
+              # No repository: the pre-flip gate's leg (c) probe row. argocd#112 declared
+              # it once so the seeder inserted it; leaving it out here makes the seeder
+              # ARCHIVE it (ADR-0934; 1 of 26 active org rows, under ADR-0939's guard).
+              # argocd's `project_probe.py --leg-c` writes to it to count
+              # `PROJECT_ARCHIVED`. DO NOT DECLARE IT AGAIN: that reactivates the row.
+              # `ARCHIVED_ON_PURPOSE` in the gate holds this.
             allowMassArchive: false
 
         # ── THE PLATFORM LAYER, COMING ON ONE OBJECT AT A TIME ───────────────────────
