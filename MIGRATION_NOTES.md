@@ -7421,3 +7421,78 @@ terminate-op yadgar` first. Once a 0.7.1 pod has migrated, a revert to 0.7.0
 crash-loops (`check_not_ahead`: store at 6, binary knows 5), so the rollback
 is a forward fix. Before migration 6 has run, a revert returns to the
 failing-seeder state of 0.25.8.
+
+## The yadgar pin moves to parent chart 0.25.12: gateway refuses writes to archived projects (ADR-0941), and project and project-db carry the gateway's request id
+
+**What the merge does.** It moves `applications/yadgar.yaml`'s
+`targetRevision` from 0.25.9 to 0.25.12 and `scripts/chart_pin.json`'s
+`chart_tag` from `v0.25.9` to `v0.25.12`. `platform_version` stays 0.2.6, so
+the operator Applications do not move.
+
+The chart's `v0.25.9..v0.25.12` is three `ci: pin` commits:
+
+- `gateway` 0.12.9 → 0.12.10 (gateway#118, ADR-0941, ledger 1612): the
+  loaded registry keeps each path's and alias's status. A write claim that
+  lands on an `ARCHIVED` project counts as `PROJECT_ARCHIVED` in `counting`
+  mode and is refused in `enforcing`. Reads still answer.
+- `project` 0.3.5 → 0.3.6 (project#38, ledgers 1254, 764, 762): reads and
+  forwards the gateway's `x-yadgar-request-id`; drops aliases under the
+  reserved root.
+- `project-db` 0.7.1 → 0.7.2 (project-db#65, ledgers 1254, 762): records the
+  forwarded `x-yadgar-request-id` when the `Scope` carries none.
+- Unchanged: `config` 0.2.1, `iam` 0.11.8, `iam-db` 0.10.6, `seeder` 0.1.0,
+  `task` 0.7.5, `task-db` 0.9.4, `platform` 0.2.6.
+
+**No migration.** None of the three changes `src/schema.rs`; project-db stays
+at migration 6. No env read, chart template or values default changed.
+
+Measured 2026-10-18 (helm 4.3.0 and 3.18.4 render the same table):
+
+- `yadgar`: 94 → 94 objects, none added or removed, 3 changed: the
+  `gateway`, `project` and `project-db` Deployments, `image` only. Each
+  digest equals its GHCR tag digest: `gateway:0.12.10` `sha256:51b67c2a…`,
+  `project:0.3.6` `sha256:c2f81e46…`, `project-db:0.7.2` `sha256:b25cf02e…`.
+- Server-side dry run against `kind-yadgar` (ADR-0881), tracking annotation
+  added, the 13 hook objects left out: the 0.25.9 render is an empty diff.
+  The 0.25.12 render differs on exactly those 3 Deployments, `image` and
+  `generation` only.
+
+**Live state before the merge, read 2026-10-18.** `yadgar` 0.25.9 Synced,
+Healthy, last operation Succeeded. `Job/seeder` succeeded at 10:59:56Z and
+logged `inserted 25, updated 0, archived 0, reactivated 0, unchanged 0`. Both
+project-db pods log `schema at migration 6`. Prometheus:
+`yadgar_gateway_project_resolution_total{outcome="exact"}` 12, and
+`yadgar_gateway_project_refusal_total` has one series,
+`reason="PROJECT_UNRESOLVABLE"` 1. No row is archived.
+
+**What runs.** Three Deployments roll. Argo re-syncs, and `Replace=true,Force=true`
+deletes and re-creates `Job/seeder`, taking the previous run's log with it.
+The re-run converges with nothing to change.
+
+### After this merge, read-only
+
+```bash
+# 1. yadgar Synced/Healthy at 0.25.12, and the three Deployments ready.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+kubectl --context kind-yadgar -n yadgar get deploy gateway project project-db
+
+# 2. The seeder re-ran and changed nothing. Expect SUCCEEDED 1 and
+#    inserted 0, updated 0, archived 0, reactivated 0, unchanged 25.
+kubectl --context kind-yadgar -n yadgar get job seeder \
+  -o 'custom-columns=SUCCEEDED:.status.succeeded,FAILED:.status.failed'
+kubectl --context kind-yadgar -n yadgar logs job/seeder
+
+# 3. Gateway refusals: no PROJECT_ARCHIVED series (no row is archived), and
+#    no rise in the other reasons beyond the deliberate probe's
+#    PROJECT_UNRESOLVABLE. Each gateway pod restarts, so its counters start
+#    from zero; read per pod.
+#    sum by (reason)(yadgar_gateway_project_refusal_total)
+```
+
+### Rollback
+
+If `yadgar`'s operation is Running or retrying, NEEDS-MAX `argocd app
+terminate-op yadgar` first. Then a revert: no migration ran, so all three
+Deployments return to their 0.25.9 images cleanly, and the seeder re-runs
+with every row `unchanged`.

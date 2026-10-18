@@ -190,6 +190,12 @@ CI job, never in the offline pre-commit hook.
       append-only migration 6, `project_class_columns`, which a store
       migrated by v0.1.x never received (the 2026-10-18 seeder failure,
       `1054 Unknown column 'source_repo'`).
+      Re-measured 2026-10-18 at 0.25.12, carrying gateway 0.12.10, project
+      0.3.6 and project-db 0.7.2 (every other module and platform 0.2.6
+      unchanged): 94 objects, none added or removed, 3 changed (the
+      `gateway`, `project` and `project-db` Deployments, `image` only; each
+      new digest equals its module's own GHCR tag digest; no new env, arg,
+      probe, volume or mount, and no migration).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
