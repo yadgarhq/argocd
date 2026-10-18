@@ -7246,9 +7246,12 @@ yadgarhq repository, 22 rows `yadgarhq/<repo>`, plus `estate/smoke` (ledger
 each gateway replica logged `the project registry is loaded … paths: 0` at
 its last boot (2026-10-17 17:35/17:36 UTC); that load is `ListProjects`
 through `project`. Since the `project-db` pods started, `yadgar_calls_total`
-on `project-db` carries `tool="ListProjects"` only: no write reached the
-store. So the first sync inserts 24 rows and archives nothing, and the
-ADR-0939 guard cannot trip.
+on `project-db` carries `tool="ListProjects"` only: no row reached the store
+through its RPCs. A direct-database write after the last gateway boot is not
+observable this way. So the first sync inserts 25 rows (2 roots, 23
+projects) and archives nothing. If exactly one undeclared row did exist,
+archiving 1 of 1 active rows is more than half: the ADR-0939 guard refuses,
+the Job fails and `yadgar` reads Degraded, and nothing is archived.
 
 **Behaviour change: estate smoke claims move refusal class.** Estate runs
 claim `estate/<run-id>-<attempt>`. Today they count as
@@ -7307,7 +7310,7 @@ kubectl --context kind-yadgar -n argocd get application yadgar \
   -o 'custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
 
 # 2. The seeder Job completed, and its log carries the five counts.
-#    Expect inserted 24, updated 0, archived 0, reactivated 0, unchanged 0.
+#    Expect inserted 25, updated 0, archived 0, reactivated 0, unchanged 0.
 kubectl --context kind-yadgar -n yadgar get job seeder \
   -o 'custom-columns=SUCCEEDED:.status.succeeded,FAILED:.status.failed'
 kubectl --context kind-yadgar -n yadgar logs job/seeder
