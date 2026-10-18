@@ -21,7 +21,10 @@ class (`PROJECT_UNRESOLVABLE`, `PROJECT_UNREGISTERED_PERSONAL`,
 only when every one of their counters rose per pod; it is red when
 inconclusive. argocd-verify's `project-probe.yaml` names such a run
 `project-probe leg-c` (`run-name`; the runs listing carries no dispatch
-inputs). Leg 7 passes when the NEWEST such run whose job completed at or
+inputs). Only a `workflow_dispatch` of that workflow's path on this
+repository's default branch, with this repository as head, counts: a
+branch's copy of the workflow could set the same name and exit 0. Leg 7
+passes when the NEWEST such run whose job completed at or
 before `start - probe_slack`, and no earlier than `start - leg_c_max_age`,
 concluded `success`. A newer red run is not masked by an older green one.
 Re-reading the counter here instead would need the run, the slack and the
@@ -132,6 +135,7 @@ PROBE_REPO = "yadgarhq/argocd-verify"
 PROBE_WORKFLOW = "project-probe.yaml"
 PROBE_JOB_TIMEOUT = 20 * 60  # project-probe.yaml `timeout-minutes: 20`
 LEG_C_TITLE = "project-probe leg-c"  # project-probe.yaml `run-name` with `leg_c: true`
+PROBE_PATH = f".github/workflows/{PROBE_WORKFLOW}"
 
 EXIT_PASS, EXIT_FAIL = 0, 1
 
@@ -343,6 +347,14 @@ def leg_c(transport: "Transport", start: float, slack: float, max_age: float) ->
     """Leg (c): the newest finished `project-probe leg-c` run before the window, and its verdict."""
     since = iso(start - max_age - PROBE_JOB_TIMEOUT - 600)
     finished: list[tuple[float, int, str]] = []
+    # THE TITLE ALONE IS SPOOFABLE. A dispatch can name any branch, and that
+    # branch's copy of the workflow can set the same `run-name` and exit 0.
+    # So only a `workflow_dispatch` of this workflow's path, on this
+    # repository's default branch, with this repository as head, is evidence:
+    # `settled_gate.find_verdict`'s filters for a verdict.
+    own = transport.github_get(f"/repos/{PROBE_REPO}")
+    if "id" not in own or not own.get("default_branch"):
+        raise GateError(f"github: /repos/{PROBE_REPO} carries no id or default_branch")
     page = 1
     while True:
         q = urllib.parse.urlencode({"per_page": 100, "page": page, "created": f">={since}"})
@@ -351,7 +363,15 @@ def leg_c(transport: "Transport", start: float, slack: float, max_age: float) ->
         if runs is None:
             raise GateError(f"github: no workflow_runs in the {PROBE_WORKFLOW} listing")
         for run in runs:
-            if run.get("display_title") != LEG_C_TITLE or run.get("status") != "completed":
+            if (
+                run.get("display_title") != LEG_C_TITLE
+                or run.get("status") != "completed"
+                or run.get("event") != "workflow_dispatch"
+                or run.get("head_branch") != own["default_branch"]
+                or run.get("path") != PROBE_PATH
+                or (run.get("repository") or {}).get("id") != own["id"]
+                or (run.get("head_repository") or {}).get("id") != own["id"]
+            ):
                 continue
             jobs = transport.github_get(f"/repos/{PROBE_REPO}/actions/runs/{run['id']}/jobs?per_page=100")
             for job in jobs.get("jobs", []):

@@ -112,6 +112,13 @@ def run_record(
     run = {
         "id": run_id,
         "display_title": title,
+        # Where the run came from: a dispatch of main's own workflow file, in
+        # this repository. Leg (c) refuses anything else as evidence.
+        "event": "workflow_dispatch",
+        "head_branch": "main",
+        "path": ".github/workflows/project-probe.yaml",
+        "repository": {"id": 4242},
+        "head_repository": {"id": 4242},
         "status": "completed" if completed is not None else "in_progress",
         "created_at": iso(started - 5),
         "updated_at": iso(completed if completed is not None else started),
@@ -165,6 +172,8 @@ class FakeTransport:
     def github_get(self, path: str) -> dict:
         if self.github_down:
             raise pg.GateError("github: 502")
+        if path == f"/repos/{pg.PROBE_REPO}":
+            return {"id": 4242, "default_branch": "main"}
         if "/jobs" in path:
             run_id = int(path.split("/runs/")[1].split("/")[0])
             return next(jobs for run, jobs in self.runs if run["id"] == run_id)
@@ -595,3 +604,43 @@ def test_the_leg_c_title_is_the_workflows_run_name() -> None:
     # argocd-verify `project-probe.yaml` sets `run-name` to this exact string
     # when dispatched with `leg_c: true`; the runs listing carries no inputs.
     assert pg.LEG_C_TITLE == LEG_C
+
+
+# --- leg (c) evidence must come from main's own workflow, dispatched here -------
+#
+# A `workflow_dispatch` can name any branch, and a branch's copy of
+# `project-probe.yaml` can set the same `run-name` and simply exit 0. So the
+# title alone is spoofable by anyone who can push a branch. The gate accepts a
+# run only when it is a `workflow_dispatch` on this repository's default
+# branch, of this workflow's path, with this repository as its head
+# repository: the filters `settled_gate.find_verdict` applies to a verdict.
+
+
+def spoofed(**override) -> tuple[dict, dict]:
+    run, jobs = run_record(950, START - 1800, START - 1700, title=LEG_C)
+    run.update(override)
+    return run, jobs
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"head_branch": "evil-branch"},
+        {"event": "push"},
+        {"event": "schedule"},
+        {"path": ".github/workflows/other.yaml"},
+        {"head_repository": {"id": 1}},
+        {"repository": {"id": 1}},
+    ],
+)
+def test_leg_c_evidence_from_anywhere_but_mains_dispatch_is_ignored(override) -> None:
+    code, out = gate(FakeTransport(FLAT, leg_c=(spoofed(**override),)))
+    assert code == pg.EXIT_FAIL, out
+    assert "no project-probe leg-c run" in out
+
+
+def test_a_spoofed_green_run_cannot_mask_a_real_red_one() -> None:
+    red = run_record(951, START - 3000, START - 2900, conclusion="failure", title=LEG_C)
+    code, out = gate(FakeTransport(FLAT, leg_c=(red, spoofed(head_branch="evil-branch"))))
+    assert code == pg.EXIT_FAIL, out
+    assert "run 951" in out and "failure" in out
