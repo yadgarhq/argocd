@@ -54,7 +54,9 @@ WHAT `run` DOES, in order. Every refusal comes before any cluster read.
 THE COMPARATOR. Rendered fields only, so `managedFields`, `resourceVersion`,
 `generation`, `status`, uids, server defaults and extra live annotations never
 count. A rendered `null`, `{}` or `[]` matches an absent live field (the API
-server drops them). Lists compare by index and must have the same length. A
+server drops them), and so does a rendered `value: ""` of a container env entry
+(EnvVar.value is `omitempty`); no other zero value is matched to an absent
+field. Lists compare by index and must have the same length. A
 bool never equals a number. Quantities are normalised only where the path is a
 resource quantity (a key under `limits` or `requests`, or `sizeLimit`): `1000m`
 equals `1`, `1024Mi` equals `1Gi`. Elsewhere a quantity-looking string is a
@@ -66,7 +68,8 @@ policy whose rules match `apps` or `batch` workloads, so a reviewer sees which
 admission it did not run. ADR-0948 R2 lets a pin auto-merge on this evidence.
 No client-side dry run either: it is not a `get`, and kubectl skips its own
 schema check when the server supports field validation, so a client dry run
-would add a write-shaped verb and validate nothing. A head diff limited to the
+would add a write-shaped verb and validate nothing (reasoned from kubectl's
+validator code, NOT measured on kind-yadgar). A head diff limited to the
 image of objects that already passed admission at the current pin needs no
 schema check.
 
@@ -317,6 +320,11 @@ SUFFIX = {
     "Ki": Decimal(2**10), "Mi": Decimal(2**20), "Gi": Decimal(2**30), "Ti": Decimal(2**40), "Pi": Decimal(2**50), "Ei": Decimal(2**60),
 }  # fmt: skip
 SEGMENT = re.compile(r"[^.\[\]]+|\[\d+\]")
+# EnvVar.value is `omitempty`: the API server drops a rendered `value: ""`
+# (measured in the 0.25.27 render: gateway env[43] and env[44]). Only this
+# path. A rendered `false` or `0` is NOT matched to an absent field: on a
+# pointer field (`automountServiceAccountToken`) absent means the default.
+ENV_VALUE = re.compile(r"(?:^|\.)(?:containers|initContainers)\[\d+\]\.env\[\d+\]\.value$")
 
 
 def quantity(value) -> Decimal | None:
@@ -359,6 +367,8 @@ def differences(rendered, live, path: str = "") -> list[str]:
         if not isinstance(live, list) or len(live) != len(rendered):
             return [path or "<root>"]
         return [found for i, (a, b) in enumerate(zip(rendered, live, strict=True)) for found in differences(a, b, f"{path}[{i}]")]
+    if rendered == "" and live is None and ENV_VALUE.search(path):
+        return []
     if isinstance(rendered, bool) != isinstance(live, bool):
         return [path]
     if rendered == live:

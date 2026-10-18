@@ -420,6 +420,45 @@ def test_a_quantity_looking_string_outside_resources_is_not_normalised(repo: Pat
     assert any("/ConfigMap//shared" in p and "data.CPU_HINT" in p for p in result["problems"]), result["problems"]
 
 
+def _with_empty_env_value(documents: list) -> list:
+    container = by_kind_name(documents, "Deployment", "gateway")["spec"]["template"]["spec"]["containers"][0]
+    container["env"].append({"name": "EMPTY_ON_PURPOSE", "value": ""})
+    return documents
+
+
+def test_an_empty_env_value_matches_the_absent_field_the_server_keeps(repo: Path) -> None:
+    # MEASURED IN THE 0.25.27 RENDER: gateway env[43] and env[44] carry
+    # `value: ""`. EnvVar.value is `omitempty`, so the API server drops it.
+    render = Render({PIN: _with_empty_env_value(base_documents()), TARGET: _with_empty_env_value(head_documents())})
+    live = live_objects()
+    items(live, "deployments.apps -n yadgar")[0]["spec"]["template"]["spec"]["containers"][0]["env"].append({"name": "EMPTY_ON_PURPOSE"})
+    sha = pin_branch(repo, table_docs=_with_empty_env_value(head_documents()))
+    result = run(repo, sha, kubectl=Kubectl(live), render=render)
+    assert result["result"] == "green", result["problems"]
+
+
+def test_an_empty_env_value_against_a_live_value_is_drift(repo: Path) -> None:
+    render = Render({PIN: _with_empty_env_value(base_documents()), TARGET: _with_empty_env_value(head_documents())})
+    live = live_objects()
+    env = items(live, "deployments.apps -n yadgar")[0]["spec"]["template"]["spec"]["containers"][0]["env"]
+    env.append({"name": "EMPTY_ON_PURPOSE", "value": "set-by-hand"})
+    sha = pin_branch(repo, table_docs=_with_empty_env_value(head_documents()))
+    result = run(repo, sha, kubectl=Kubectl(live), render=render)
+    assert result["result"] == "red"
+    assert any("containers[0].env[1].value" in p for p in result["problems"]), result["problems"]
+
+
+def test_a_false_pointer_field_absent_live_is_drift(repo: Path) -> None:
+    # `automountServiceAccountToken: false` absent live means the default true.
+    documents = [base_documents(), head_documents()]
+    for docs in documents:
+        by_kind_name(docs, "ServiceAccount", "gateway")["automountServiceAccountToken"] = False
+    sha = pin_branch(repo, table_docs=documents[1])
+    result = run(repo, sha, render=Render({PIN: documents[0], TARGET: documents[1]}))
+    assert result["result"] == "red"
+    assert any("/ServiceAccount//gateway automountServiceAccountToken" in p for p in result["problems"]), result["problems"]
+
+
 def test_an_object_missing_live_is_red(repo: Path) -> None:
     live = live_objects()
     live["serviceaccounts -n yadgar"]["items"] = []
