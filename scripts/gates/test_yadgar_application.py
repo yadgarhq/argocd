@@ -236,6 +236,7 @@ adopted the file measured both, and both were 0-diff.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import re
 import sys
@@ -1188,8 +1189,14 @@ DECLARED_EXTRA_PROJECTS = {"estate/smoke": "yadgarhq/estate"}
 # it; it is now absent, so the seeder archived it (ADR-0934). argocd's
 # `project_probe.py --leg-c` writes to it to count `PROJECT_ARCHIVED`.
 # Declaring it again REACTIVATES the row and silently turns that arm into a
-# resolution.
-ARCHIVED_ON_PURPOSE = ("yadgarhq/probe-archived",)
+# resolution. IMPORTED from the probe, never retyped: the guard must name the
+# path the probe actually writes to.
+_probe_spec = importlib.util.spec_from_file_location("project_probe", REPOSITORY / "scripts" / "project_probe.py")
+project_probe = sys.modules.get("project_probe") or importlib.util.module_from_spec(_probe_spec)
+if "project_probe" not in sys.modules:
+    sys.modules["project_probe"] = project_probe
+    _probe_spec.loader.exec_module(project_probe)
+ARCHIVED_ON_PURPOSE = (project_probe.ARCHIVED_CLAIM.lower(),)
 
 
 def registry_failures(registry: object) -> dict[str, object]:
@@ -1232,6 +1239,14 @@ def test_the_probe_row_archived_on_purpose_is_not_declared() -> None:
     registry = declared_registry()
     declared = {p["path"].lower() for p in registry["projects"]} | {r["path"].lower() for r in registry["roots"]}
     assert declared.isdisjoint(ARCHIVED_ON_PURPOSE)
+
+
+def test_the_row_archived_on_purpose_is_the_probes_own_claim_not_a_copy() -> None:
+    # Imported, never retyped: a rename of the probe's claim must move this
+    # guard with it, or the guard protects a path nothing writes to.
+    assert ARCHIVED_ON_PURPOSE == (project_probe.ARCHIVED_CLAIM.lower(),)
+    (assignment,) = [line for line in Path(__file__).read_text().splitlines() if line.startswith("ARCHIVED_ON_PURPOSE =")]
+    assert "project_probe.ARCHIVED_CLAIM" in assignment and '"' not in assignment, assignment
 
 
 def test_a_mass_archive_flag_names_it() -> None:
