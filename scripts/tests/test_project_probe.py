@@ -537,3 +537,153 @@ def test_the_internet_rule_is_443_only_and_excepts_every_cluster_range() -> None
     assert ports == [443]
     (theirs,) = [peer["ipBlock"] for rule in estate_rules() for peer in rule["to"] if peer.get("ipBlock", {}).get("cidr") == "0.0.0.0/0"]
     assert sorted(block["except"]) == sorted(theirs["except"])
+
+
+# --- leg (c): one deliberate call per reason class (ledger 1624) --------------
+#
+# `--leg-c` is dispatch-only. It sends one call per probeable reason class and
+# passes only when every class's counter rose. The ARCHIVED arm is a write
+# (`create_task`) that must never write: it omits `title`, so the gateway counts
+# the claim during attestation and the tool then refuses before `task` is
+# dialled. A served success there means a task WAS written, and that fails loud.
+
+O = pp.UNREGISTERED_ORG
+I = pp.INVALID
+A = pp.ARCHIVED
+ALL = (U, P, O, I, A)
+
+
+class Arms(Fake):
+    """A scripted network that answers each call by the claim it carries."""
+
+    def __init__(self, readings, answers=None, **kw):
+        super().__init__(readings, **kw)
+        self.answers = answers or {}
+
+    def edge_post(self, path, headers, body):
+        if path == "/auth/login":
+            return super().edge_post(path, headers, body)
+        self.posts.append((path, headers, json.loads(body)))
+        claim = headers["x-yadgar-project"]
+        status, payload = self.answers.get(claim, (200, served(claim)))
+        return status, json.dumps(payload).encode()
+
+
+TITLE_REQUIRED = {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "`title` is required"}], "isError": True}}
+TASK_WRITTEN = {"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": {"id": "yadgar:task:01", "number": 7, "version": 1}}}
+
+
+def served(claim: str) -> dict:
+    if claim == pp.ARCHIVED_CLAIM:
+        return TITLE_REQUIRED
+    return {"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": {"tasks": []}}}
+
+
+def rose(*reasons: str) -> dict:
+    return vector({"a": 1, "b": 1}, {("a", r): 1 for r in reasons})
+
+
+def test_leg_c_sends_one_call_per_reason_class_with_matching_mirror_headers(capsys) -> None:
+    fake = Arms([BEFORE, rose(*ALL)])
+    assert run(fake, "--leg-c") == pp.EXIT_PASS, capsys.readouterr().out
+    calls = fake.posts[1:]
+    by_claim = {h["x-yadgar-project"]: (h, b) for _, h, b in calls}
+    assert set(by_claim) == {pp.CLAIM, pp.TRIAL_CLAIM, pp.ORG_CLAIM, pp.INVALID_CLAIM, pp.ARCHIVED_CLAIM}
+    assert len(calls) == 5
+    for headers, body in by_claim.values():
+        # The gateway cross-checks Mcp-Name against the body's tool name.
+        assert headers["mcp-name"] == body["params"]["name"]
+    assert by_claim[pp.ARCHIVED_CLAIM][1]["params"]["name"] == "create_task"
+    # No title: the tool refuses before `task` is dialled, so nothing is written.
+    assert "title" not in by_claim[pp.ARCHIVED_CLAIM][1]["params"]["arguments"]
+    for claim in (pp.CLAIM, pp.TRIAL_CLAIM, pp.ORG_CLAIM, pp.INVALID_CLAIM):
+        assert by_claim[claim][1]["params"]["name"] == "find_tasks"
+
+
+def test_leg_c_claims_reach_the_classes_the_gateway_assigns() -> None:
+    # gateway `src/project/classify.rs`: a trailing `/` fails the grammar; a
+    # claim under the registered root `yadgarhq` lands on the anchor (ORG); the
+    # archived claim is its own declared row; the other two have no ancestor.
+    assert pp.INVALID_CLAIM.endswith("/")
+    assert pp.ORG_CLAIM.split("/")[0] == "yadgarhq" and pp.ORG_CLAIM != pp.ARCHIVED_CLAIM
+    assert pp.ARCHIVED_CLAIM == "yadgarhq/probe-archived"
+
+
+def test_leg_c_passes_only_when_every_reason_rose(capsys) -> None:
+    assert run(Arms([BEFORE, rose(U, P, O, I)]), "--leg-c") == pp.EXIT_FAIL
+    out = capsys.readouterr().out
+    assert A in out and "did not rise" in out
+
+
+def test_leg_c_waits_for_every_reason_before_it_stops_polling() -> None:
+    assert run(Arms([BEFORE, rose(U, P), rose(*ALL)]), "--leg-c") == pp.EXIT_PASS
+
+
+def test_leg_c_fails_loud_when_the_archived_write_was_served(capsys) -> None:
+    fake = Arms([BEFORE, rose(*ALL)], answers={pp.ARCHIVED_CLAIM: (200, TASK_WRITTEN)})
+    assert run(fake, "--leg-c") == pp.EXIT_FAIL
+    out = capsys.readouterr().out
+    assert "a task was WRITTEN" in out and "yadgar:task:01" in out
+
+
+def test_leg_c_fails_when_the_archived_write_failed_for_another_reason() -> None:
+    other = (200, {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "unavailable"}], "isError": True}})
+    assert run(Arms([BEFORE, rose(*ALL)], answers={pp.ARCHIVED_CLAIM: other}), "--leg-c") == pp.EXIT_FAIL
+
+
+def test_leg_c_accepts_an_enforcing_refusal_with_the_expected_reason() -> None:
+    refused = (400, {"jsonrpc": "2.0", "id": 1, "error": {"code": -32602, "message": "x", "data": {"reason": A}}})
+    assert run(Arms([BEFORE, rose(*ALL)], answers={pp.ARCHIVED_CLAIM: refused}), "--leg-c") == pp.EXIT_PASS
+
+
+def test_leg_c_fails_on_a_refusal_with_another_reason() -> None:
+    refused = (400, {"jsonrpc": "2.0", "id": 1, "error": {"code": -32602, "message": "x", "data": {"reason": O}}})
+    assert run(Arms([BEFORE, rose(*ALL)], answers={pp.ARCHIVED_CLAIM: refused}), "--leg-c") == pp.EXIT_FAIL
+
+
+@pytest.mark.parametrize("status", [401, 500, 503])
+def test_leg_c_fails_on_a_non_2xx_read(status) -> None:
+    assert run(Arms([BEFORE, rose(*ALL)], answers={pp.ORG_CLAIM: (status, {"error": "x"})}), "--leg-c") == pp.EXIT_FAIL
+
+
+def test_leg_c_is_never_green_when_inconclusive(capsys) -> None:
+    # A reset that could hide a rise is green for the routine probe, but leg (c)
+    # needs proof that every class counted, so it is red and says dispatch again.
+    before = vector({"a": 1, "b": 1}, {("a", U): 5})
+    after = vector({"a": 1, "b": 1}, {("a", U): 1, ("b", P): 1, ("b", O): 1, ("b", I): 1, ("b", A): 1})
+    assert run(Arms([before, after]), "--leg-c") == pp.EXIT_FAIL
+    assert "dispatch again" in capsys.readouterr().out
+
+
+def test_leg_c_with_a_smoke_job_running_sends_nothing_and_is_red() -> None:
+    runs = {"workflow_runs": [{"id": 77, "status": "in_progress", "updated_at": T0}]}
+    jobs = {"/repos/yadgarhq/estate/actions/runs/77/jobs?per_page=100": {"jobs": [job(status="in_progress", started="2026-10-03T09:59:00Z")]}}
+    fake = Arms([BEFORE, rose(*ALL)], runs=runs, jobs=jobs)
+    assert run(fake, "--leg-c") == pp.EXIT_FAIL
+    assert fake.posts == []
+
+
+def test_leg_c_and_a_trial_cannot_both_be_given() -> None:
+    with pytest.raises(SystemExit):
+        pp.parse_args(["--edge-ca", "/dev/null", "--leg-c", "--trial", "no-token"])
+
+
+def test_leg_c_never_prints_the_password_or_the_token(capsys) -> None:
+    run(Arms([BEFORE, rose(*ALL)]), "--leg-c")
+    captured = capsys.readouterr()
+    assert "SECRET" not in captured.out + captured.err
+
+
+def test_the_routine_probe_still_sends_exactly_one_call() -> None:
+    fake = Arms([BEFORE, ROSE_U])
+    assert run(fake) == 0
+    assert [p[0] for p in fake.posts] == ["/auth/login", "/"]
+
+
+
+def test_leg_c_archived_arm_needs_the_gateways_exact_title_refusal() -> None:
+    # gateway tools.rs:327: ToolError::Invalid("`title` is required"). Another
+    # tool failure that merely mentions a title is not that refusal.
+    near = (200, {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "title service unavailable"}], "isError": True}})
+    assert run(Arms([BEFORE, rose(*ALL)], answers={pp.ARCHIVED_CLAIM: near}), "--leg-c") == pp.EXIT_FAIL
+    assert pp.TITLE_REQUIRED == "`title` is required"
