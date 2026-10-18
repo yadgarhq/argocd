@@ -2000,6 +2000,10 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # same 0.19.1: 82 -> 86 objects and 30 changes, the same set as at 0.25.8.
 # project-db's image was already in PIN_CHANGES.
 #
+# RE-MEASURED AT 0.25.12 (gateway 0.12.10, project 0.3.6, project-db 0.7.2),
+# against the same 0.19.1: 82 -> 86 objects and 30 changes, the same set as at
+# 0.25.9. All three images were already in PIN_CHANGES.
+#
 # BOTH SIDES RENDER EVERY SERVER AT `clientAuth: "off"`, FROM B-U8a ON. The
 # 0.13.13 module charts predate the B-U5 contracts, and their render checks
 # refuse `optional` and `required` by name ("not enforced yet"). Once a hop
