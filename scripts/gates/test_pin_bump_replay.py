@@ -73,11 +73,11 @@ def test_the_write_reproduces_the_hand_pin(tmp_path: Path, pull_request: str) ->
     assert differing == []
 
 
-# ── the classifier, live, on the #107 range ─────────────────────────────────
+# ── the classifier, live, on the #107 and #109 ranges ───────────────────────
 
 # #107's hand evidence (argocd#107's body): 94 objects, one changed, the
 # gateway Deployment's image only, at gateway 0.12.11's GHCR tag digest; the
-# gateway's literal set unchanged; no -db module moved.
+# gateway's env reads unchanged; no -db module moved.
 GATEWAY_0_12_11 = "sha256:2c966881ee3ac27671818517ed7cd6fd3a72898b0a93e6bdb34a339848793d22"
 ONE_HELM = "only one helm version rendered"
 
@@ -97,6 +97,42 @@ def test_the_107_range_classifies_as_its_hand_evidence(tmp_path: Path) -> None:
     assert evidence["objects"] == 94
     assert evidence["boot_audit"] == {"gateway": {"status": "green", "reasons": []}}
     assert evidence["migrations"] == {}
+    if len(helms) > 1:
+        assert evidence["reasons"] == [] and evidence["accept"] is True
+    else:
+        assert [r[: len(ONE_HELM)] for r in evidence["reasons"]] == [ONE_HELM] and evidence["accept"] is False
+
+
+# #109's hand evidence (argocd#109's body): 94 objects, 8 changed (the seven
+# module Deployments and `Job/seeder`, `image` only, each at its module's GHCR
+# tag digest), no new env and no migration. Gateway 0.12.13 adds the error code
+# `NOT_FOUND`, which is no env name: under the narrowed E3 rule it is green.
+CHANGED_AT_0_25_27 = [
+    "apps/Deployment//gateway",
+    "apps/Deployment//iam",
+    "apps/Deployment//iam-db",
+    "apps/Deployment//project",
+    "apps/Deployment//project-db",
+    "apps/Deployment//task",
+    "apps/Deployment//task-db",
+    "batch/Job//seeder",
+]
+
+
+def test_the_109_range_classifies_as_its_hand_evidence(tmp_path: Path) -> None:
+    (tmp_path / "applications").mkdir()
+    (tmp_path / pb.APPLICATION).write_bytes(raw("36059be", pb.APPLICATION))
+    helms = pb.discover_helms()
+
+    evidence = pb.check(tmp_path, "0.25.27", pb.Net(), helms)
+
+    print(f"[classify] 0.25.14 -> 0.25.27 on helm {', '.join(evidence['helms'])}: reasons {evidence['reasons']}")
+    assert [c["object"] for c in evidence["changed"]] == CHANGED_AT_0_25_27
+    assert evidence["objects"] == 94
+    assert {m: r["status"] for m, r in evidence["boot_audit"].items()} == {
+        m: "green" for m in ("gateway", "iam", "iam-db", "project", "project-db", "seeder", "task", "task-db")
+    }
+    assert {m: r["status"] for m, r in evidence["migrations"].items()} == {m: "green" for m in ("iam-db", "project-db", "task-db")}
     if len(helms) > 1:
         assert evidence["reasons"] == [] and evidence["accept"] is True
     else:

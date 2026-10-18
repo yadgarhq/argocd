@@ -17,7 +17,10 @@ One constructed case per arm:
   changed under a matching digest, a helm disagreement, a single helm, a
   platform move, and a module image changed with no module version moved;
 - E3: a new `env_required` key the render lacks is NEEDS-HUMAN, and the same
-  key rendered is green;
+  key rendered is green; a new `env::var` / `var_os` / lookup-closure read and a
+  new const passed to `env_required` are NEEDS-HUMAN; a new error-code literal
+  is green; braces inside string, char and comment text do not cut a
+  `#[cfg(test)] mod` wrong;
 - E4: an added migration version is NEEDS-HUMAN; an unchanged schema is green;
 - the body carries the template's five headings and one Conventional Commits
   bullet, a rollback with `argocd app terminate-op`, and no MIGRATION_NOTES.
@@ -254,9 +257,9 @@ def tree(name: str) -> dict[str, str]:
 
 
 def test_the_boot_audit_reads_required_keys_in_every_call_shape_and_skips_tests() -> None:
-    required, literals = pb.env_keys(tree("e3-new"))
+    required, reads = pb.env_keys(tree("e3-new"))
     assert required == {"LISTEN", "DB_HOST", "NEW_KEY"}
-    assert "NATS_TLS_DOMAIN" in literals and "YADGAR_TEST_ONLY_KEY" not in literals
+    assert "NATS_TLS_DOMAIN" in reads and "YADGAR_TEST_ONLY_KEY" not in reads
 
 
 def test_a_new_required_key_the_render_lacks_is_needs_human() -> None:
@@ -270,6 +273,54 @@ def test_a_new_required_key_the_render_carries_is_green() -> None:
 
 def test_an_unchanged_source_is_green() -> None:
     assert pb.boot_audit("gateway", tree("e3-old"), tree("e3-old"), {"LISTEN", "DB_HOST"}) == []
+
+
+def with_boot_line(name: str, line: str, prelude: str = "") -> dict[str, str]:
+    """`name`'s tree with `line` added to `boot()` and `prelude` added at the top of the file."""
+    source = tree(name)
+    text = source["src/boot.rs"].replace("    Ok(())\n}", f"    {line}\n    Ok(())\n}}", 1)
+    source["src/boot.rs"] = prelude + text
+    return source
+
+
+RENDERED = {"LISTEN", "DB_HOST"}
+
+
+def test_a_new_error_code_literal_is_green() -> None:
+    """Coordinator ruling, ledger 1632: NOT_FOUND (gateway 0.12.13) and PROJECT_ARCHIVED (0.12.10) are error
+    codes, not env names; only a name at an env-read call site counts."""
+    new = with_boot_line("e3-old", 'let _ = ("NOT_FOUND", "PROJECT_ARCHIVED");')
+    assert pb.boot_audit("gateway", tree("e3-old"), new, RENDERED) == []
+
+
+def test_a_new_env_var_read_the_render_lacks_is_needs_human() -> None:
+    new = with_boot_line("e3-old", 'let _read = std::env::var("NEW_READ").ok();')
+    reasons = pb.boot_audit("gateway", tree("e3-old"), new, RENDERED)
+    assert reasons and any("NEW_READ" in r for r in reasons), reasons
+
+
+def test_a_new_env_var_os_read_the_render_lacks_is_needs_human() -> None:
+    new = with_boot_line("e3-old", 'let _read = std::env::var_os("NEW_READ_OS");')
+    assert any("NEW_READ_OS" in r for r in pb.boot_audit("gateway", tree("e3-old"), new, RENDERED))
+
+
+def test_a_new_const_passed_to_env_required_is_needs_human() -> None:
+    new = with_boot_line("e3-old", "let _c = env_required(NEW_CONST_KEY)?;", 'const NEW_CONST_KEY: &str = "NEW_CONST";\n')
+    reasons = pb.boot_audit("gateway", tree("e3-old"), new, RENDERED)
+    assert reasons and any("NEW_CONST" in r and "required" in r for r in reasons), reasons
+
+
+def test_a_new_key_read_through_a_lookup_closure_is_needs_human() -> None:
+    """gateway's `from_lookup(lookup: impl Fn(&str) -> Option<String>)` reads `lookup(KEY)`."""
+    prelude = 'const TRUST: &str = "NEW_LOOKUP";\nfn from_lookup(lookup: impl Fn(&str) -> Option<String>) {\n    let _ = lookup(TRUST);\n}\n'
+    new = with_boot_line("e3-old", "", prelude)
+    assert any("NEW_LOOKUP" in r for r in pb.boot_audit("gateway", tree("e3-old"), new, RENDERED))
+
+
+def test_braces_inside_literals_and_comments_do_not_cut_the_test_module_wrong() -> None:
+    required, reads = pb.env_keys(tree("e3-braces"))
+    assert required == {"AFTER_TEST_MODULE", "AFTER_CONST_KEY"}
+    assert reads == {"AFTER_TEST_MODULE", "AFTER_CONST_KEY", "LOOKUP_KEY"}
 
 
 # ── E4: the migration diff ──────────────────────────────────────────────────

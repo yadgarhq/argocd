@@ -43,10 +43,12 @@ with a reason per failure:
   digest equals the top-level manifest digest of
   `ghcr.io/yadgarhq/<module>:<new version>` (a bare tag, no `v`);
 - `platform` did not move, and no dependency was added or removed;
-- E3, the boot audit, is green for every moved module: no `env_required*` key
-  new at the new source tag that the render does not set, and no upper-snake
-  string literal new at the new tag that is neither rendered nor a known
-  optional name;
+- E3, the boot audit, is green for every moved module: no required key
+  (`env_required*`, `env_parsed`, `parse_bucket_env`) new at the new source tag
+  that the render does not set, and no env name read at an env-read call site
+  (`std::env::var`, `env::var_os`, a lookup closure) new at the new tag that is
+  neither rendered nor a known optional name. An upper-snake literal anywhere
+  else, such as an error code, is not an env name and does not count;
 - E4, the migration diff, finds no added, removed or changed migration in any
   moved `-db` module (`src/schema.rs` and `src/schema/**`).
 
@@ -380,24 +382,87 @@ def judge_image(key, path, old_image, new_image, old_modules, new_modules, diges
 # ── reading Rust source ─────────────────────────────────────────────────────
 
 TEST_MODULE = re.compile(r"#\[cfg\(test\)\]\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{")
+CHAR_LITERAL = re.compile(r"'(?:\\u\{[0-9a-fA-F]{1,6}\}|\\.|[^\\'\n])'")
+RAW_STRING = re.compile(r'b?r(#*)"')
 
 
-def matching_brace(text: str, opening: int) -> int:
-    """Index just past the `}` closing the `{` at `opening`. Naive: braces inside literals are counted."""
+def code_mask(text: str) -> str:
+    """`text` with the inside of every comment, string and char literal blanked to spaces, same length.
+
+    What a brace counter or a call-site search reads, so a `{` in `"{"`, `'{'`,
+    `r#"{"#`, `// {` or `/* { */` is never code. Newlines are kept. A lifetime
+    (`'a`) is not a char literal and stays code.
+    """
+    out = list(text)
+    length = len(text)
+
+    def blank(start: int, stop: int) -> None:
+        for k in range(start, stop):
+            if out[k] != "\n":
+                out[k] = " "
+
+    i = 0
+    while i < length:
+        if text.startswith("//", i):
+            stop = text.find("\n", i)
+            stop = length if stop < 0 else stop
+            blank(i, stop)
+            i = stop
+            continue
+        if text.startswith("/*", i):
+            depth, j = 0, i
+            while j < length:
+                if text.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif text.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                    if depth == 0:
+                        break
+                else:
+                    j += 1
+            blank(i, j)
+            i = j
+            continue
+        boundary = i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+        raw = RAW_STRING.match(text, i) if boundary and text[i] in "rb" else None
+        if raw:
+            close = '"' + raw.group(1)
+            stop = text.find(close, raw.end())
+            stop = length if stop < 0 else stop
+            blank(raw.end(), stop)
+            i = min(length, stop + len(close))
+            continue
+        if text[i] == '"':
+            j = i + 1
+            while j < length and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            blank(i + 1, min(j, length))
+            i = j + 1
+            continue
+        if text[i] == "'" and (char := CHAR_LITERAL.match(text, i)):
+            blank(i + 1, char.end() - 1)
+            i = char.end()
+            continue
+        i += 1
+    return "".join(out)
+
+
+def matching_brace(mask: str, opening: int) -> int:
+    """Index just past the `}` closing the `{` at `opening`, counted on a `code_mask`."""
     depth = 0
-    for index in range(opening, len(text)):
-        if text[index] == "{":
+    for index in range(opening, len(mask)):
+        if mask[index] == "{":
             depth += 1
-        elif text[index] == "}":
+        elif mask[index] == "}":
             depth -= 1
             if depth == 0:
                 return index + 1
-    return len(text)
+    return len(mask)
 
 
 def without_test_modules(text: str) -> str:
-    while match := TEST_MODULE.search(text):
-        text = text[: match.start()] + text[matching_brace(text, match.end() - 1) :]
+    while match := TEST_MODULE.search(mask := code_mask(text)):
+        text = text[: match.start()] + text[matching_brace(mask, match.end() - 1) :]
     return text
 
 
@@ -418,21 +483,60 @@ def production_sources(source: dict[str, str]) -> dict[str, str]:
 
 # ── E3: the boot audit ──────────────────────────────────────────────────────
 
-STRING = re.compile(r'"((?:[^"\\\n]|\\.)*)"')
-UPPER_SNAKE = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+")
-# The key is the first or second argument: `env_required("K")`,
-# `env_required(&env, "K", "chart.key")`, `env_required_chart(env, "K", …)`.
-REQUIRED_CALL = re.compile(r'\benv_required\w*\s*\(\s*(?:[^()";]*?,\s*)?"([A-Z][A-Z0-9_]*)"')
+# AN UPPER-SNAKE LITERAL COUNTS ONLY AS AN ENV NAME AT AN ENV-READ CALL SITE
+# (coordinator ruling, ledger 1632): error codes such as `NOT_FOUND` and
+# `PROJECT_ARCHIVED` are not env names. The call sites are every pattern the
+# seven module repos use, grepped 2026-10-18 at their latest tags:
+#
+#   required  `env_required*(…)` (`env_required`, `_allow_empty`, `_chart`,
+#             `_named`), `env_parsed(…)` (task-db) and `parse_bucket_env(…)`
+#             (gateway): each refuses to boot on an absent key;
+#   read      `std::env::var(…)`, `env::var_os(…)`, and a call to a lookup
+#             closure parameter typed `impl Fn(&str) -> Option<String>` —
+#             gateway's `from_lookup(lookup: …)` reads `lookup(KEY)`, the -db
+#             modules' `boot(env: …)` read `env(KEY)`.
+#
+# The key is the first or second argument, a string literal or a `const` of
+# type `&str` defined in the module's own source. A key built at run time
+# (`lookup(&format!("{prefix}_{suffix}"))`) is not visible here; the image-only
+# E1 rule covers it.
+CONST_STR = re.compile(r'\bconst\s+([A-Z][A-Z0-9_]*)\s*:\s*&(?:\'static\s+)?str\s*=\s*"([^"\\]*)"\s*;')
+LOOKUP_PARAMETER = re.compile(
+    r"\b([a-z_][a-z0-9_]*)\s*:\s*&?\s*(?:impl|dyn)\s+Fn\s*\(\s*&str\s*\)\s*->\s*Option\s*<\s*String\s*>"
+)
+REQUIRED_READERS = r"env_required\w*|env_parsed|parse_bucket_env"
+KEY_ARGUMENT = r'\s*\(\s*(?:[^()";,]*,\s*)?(?:"([A-Z][A-Z0-9_]*)"|([A-Z][A-Z0-9_]*)\b)'
 
 
 def env_keys(source: dict[str, str]) -> tuple[set[str], set[str]]:
-    """`(env_required* keys, upper-snake string literals)` of the non-test source."""
+    """`(required keys, every key read)` at the env-read call sites of the non-test source."""
+    files = production_sources(source)
+    masks = {path: code_mask(text) for path, text in files.items()}
+    consts: dict[str, set[str]] = {}
+    closures = set()
+    for path, text in files.items():
+        for match in CONST_STR.finditer(text):
+            if masks[path][match.start()] == text[match.start()]:
+                consts.setdefault(match.group(1), set()).add(match.group(2))
+        closures.update(LOOKUP_PARAMETER.findall(masks[path]))
+    readers = r"\benv::var(?:_os)?"
+    if closures:
+        readers += r"|(?<![\w.])(?:" + "|".join(sorted(map(re.escape, closures))) + ")"
+    call = re.compile(rf"(?P<required>(?<![\w.])(?:{REQUIRED_READERS}))|(?P<read>{readers})")
     required: set[str] = set()
-    literals: set[str] = set()
-    for text in production_sources(source).values():
-        required.update(REQUIRED_CALL.findall(text))
-        literals.update(value for value in STRING.findall(text) if UPPER_SNAKE.fullmatch(value))
-    return required, literals
+    reads: set[str] = set()
+    for path, text in files.items():
+        mask = masks[path]
+        for match in call.finditer(mask):
+            argument = re.compile(KEY_ARGUMENT).match(text, match.end())
+            if not argument:
+                continue
+            literal, constant = argument.groups()
+            keys = {literal} if literal else consts.get(constant, set())
+            reads.update(keys)
+            if match.group("required"):
+                required.update(keys)
+    return required, reads
 
 
 def optional(name: str) -> bool:
@@ -440,21 +544,21 @@ def optional(name: str) -> bool:
 
 
 def boot_audit(module: str, old_source: dict, new_source: dict, rendered: set[str] | None) -> list[str]:
-    """E3 for one moved module: the names its new source reads that the render does not set."""
+    """E3 for one moved module: the env names its new source reads that the render does not set."""
     if rendered is None:
         return [f"{module}: a container takes `envFrom`, so the keys it sets cannot be read from the render"]
-    old_required, old_literals = env_keys(old_source)
-    new_required, new_literals = env_keys(new_source)
-    if not new_required and not new_literals:
+    if not production_sources(new_source):
         return [f"{module}: no Rust source under src/ at the new tag, so nothing could be audited"]
+    old_required, old_reads = env_keys(old_source)
+    new_required, new_reads = env_keys(new_source)
     reasons = [
         f"{module}: required key {key} is new at the new tag and the render does not set it"
         for key in sorted(new_required - old_required)
         if key not in rendered
     ]
     reasons += [
-        f"{module}: literal {name} is new at the new tag, not rendered and not a known optional name"
-        for name in sorted(new_literals - old_literals - new_required)
+        f"{module}: env read {name} is new at the new tag, not rendered and not a known optional name"
+        for name in sorted(new_reads - old_reads - new_required)
         if name not in rendered and not optional(name)
     ]
     return reasons
@@ -491,12 +595,13 @@ def migration_blocks(source: dict[str, str]) -> dict[int, str]:
     """`{version: the struct literal that declares it}` across `src/schema.rs` and `src/schema/**`."""
     blocks: dict[int, str] = {}
     for path, text in schema_sources(source).items():
-        for match in MIGRATION_VERSION.finditer(text):
-            opening = text.rfind("{", 0, match.start())
+        mask = code_mask(text)
+        for match in MIGRATION_VERSION.finditer(mask):
+            opening = mask.rfind("{", 0, match.start())
             version = int(match.group(1))
             if version in blocks:
                 raise Refused(f"migration {version} declared twice ({path})")
-            blocks[version] = " ".join(text[opening : matching_brace(text, opening)].split())
+            blocks[version] = " ".join(text[opening : matching_brace(mask, opening)].split())
     return blocks
 
 
