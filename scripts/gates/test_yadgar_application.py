@@ -183,6 +183,13 @@ CI job, never in the offline pre-commit hook.
       new digest equals its module's own GHCR tag digest), and
       `NetworkPolicy/project-ingress`, which admits `app: seeder` beside
       `app: gateway` on 50052.
+      Re-measured 2026-10-18 at 0.25.9, carrying project-db 0.7.1 (every
+      other module and platform 0.2.6 unchanged): 94 objects, none added or
+      removed, 1 changed (the `project-db` Deployment, `image` only; the new
+      digest equals `project-db:0.7.1`'s GHCR tag digest). 0.7.1 adds
+      append-only migration 6, `project_class_columns`, which a store
+      migrated by v0.1.x never received (the 2026-10-18 seeder failure,
+      `1054 Unknown column 'source_repo'`).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
