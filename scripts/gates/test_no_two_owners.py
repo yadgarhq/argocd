@@ -1341,6 +1341,9 @@ HOOK_DELETE_POLICY = "before-hook-creation"
 # the wrong-key refusal the parent's default `iamKeys.create: true` relies on
 # is not armed here. `iam-keys` stays with `make secrets` and 1Password.
 #
+# THE SEEDER'S JOB (parent 0.25.8, plans/the-d35-seeder.md) MINTS NOTHING
+# EITHER: it reads `seeder-client-tls` and `project-tls` and creates no Secret.
+#
 # THE TWO PROBE JOBS MINT NOTHING, AND B9 STATES THAT RATHER THAN FILTERING
 # THEM OUT. `preflight` and `envoy-gateway-probe` are Jobs too, so this map
 # names every Job the render carries, and a probe that started creating a
@@ -1350,6 +1353,7 @@ EXPECTED_MINTED = {
     "admin-bootstrap-token": ("admin-bootstrap-token",),
     "preflight": (),
     "envoy-gateway-probe": (),
+    "seeder": (),
 }
 NEVER_MINTED = "iam-keys"
 IAM_KEYS_KEY = "platform.bootstrap.iamKeys.create"
@@ -1984,6 +1988,14 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # mounted from two new secret volumes. The new pin is still diffed against
 # 0.19.1, not 0.24.9 (task 1507).
 #
+# RE-MEASURED AT 0.25.8 (gateway 0.12.9, iam 0.11.8, iam-db 0.10.6, project
+# 0.3.5, project-db 0.7.0, platform 0.2.6, and the new seeder 0.1.0), against
+# the same 0.19.1: 82 -> 86 objects, the four added exactly `PIN_ADDED` (the
+# seeder's leaf, Job, ConfigMap and ServiceAccount), none removed, 30 changes —
+# the 26 fields as at 0.24.17 plus the four added objects. Every module whose
+# field moves was already in PIN_CHANGES. The previous pin's side renders the
+# values without `seeder`, which 0.19.1's schema refuses (see `PIN_ADDED`).
+#
 # BOTH SIDES RENDER EVERY SERVER AT `clientAuth: "off"`, FROM B-U8a ON. The
 # 0.13.13 module charts predate the B-U5 contracts, and their render checks
 # refuse `optional` and `required` by name ("not enforced yet"). Once a hop
@@ -2057,7 +2069,20 @@ PIN_ALONE_OVERRIDES: tuple[str, ...] = (
     *("--set", "platform.valkey.tls.plaintext=true"),
     *("--set-string", "platform.valkey.tls.clientAuth=off"),
 )
-PIN_ADDED: set[tuple[str, str]] = set()
+# THE SEEDER ARRIVES WITH THIS PIN (parent 0.25.8, plans/the-d35-seeder.md
+# stages 6 and 7). `platform` 0.2.6 issues its client leaf, and the seeder
+# chart renders its Job, ConfigMap and ServiceAccount from this organisation's
+# `seeder.registry`. 0.19.1's parent schema has no `seeder` section and
+# refuses the key, so the previous pin's side renders the values WITHOUT the
+# `seeder` block (`test_the_pin_alone_changes_only_the_named_fields`); the
+# current side renders them whole. `project`'s ingress list carries `seeder`
+# on both sides, so `NetworkPolicy/project-ingress` does not move here.
+PIN_ADDED: set[tuple[str, str]] = {
+    ("Certificate", "seeder-client-tls"),
+    ("Job", "seeder"),
+    ("ConfigMap", "seeder-registry"),
+    ("ServiceAccount", "seeder"),
+}
 PIN_CHANGES = {
     *(
         ("Deployment", module, "spec.template.spec.containers[0].image")
@@ -2178,6 +2203,10 @@ def test_the_pin_alone_changes_only_the_named_fields(tmp_path: Path) -> None:
     pinned = re.findall(r"^\s*targetRevision: (\d+\.\d+\.\d+)\s*$", text, re.MULTILINE)
     assert len(pinned) == 1, pinned
     application.write_text(text.replace(f"targetRevision: {pinned[0]}", f"targetRevision: {PREVIOUS_PIN}"))
+    # The previous pin has no `seeder` section and refuses the key (see PIN_ADDED).
+    document = yaml.safe_load(application.read_text())
+    document["spec"]["source"]["helm"]["valuesObject"].pop("seeder", None)
+    application.write_text(yaml.safe_dump(document, sort_keys=False))
     before = parent_render(tree, PIN_ALONE_OVERRIDES)
     after = parent_render(REPOSITORY, PIN_ALONE_OVERRIDES)
     changes = field_changes(before, after)

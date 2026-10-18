@@ -170,6 +170,19 @@ CI job, never in the offline pre-commit hook.
       leave `env` as `secretKeyRef`s; the liveness probe is an `exec` that
       runs `sha256sum -c` before `/healthz`; two secret volumes and their
       read-only mounts are added.
+      Re-measured 2026-10-18 at 0.25.8, carrying gateway 0.12.9, iam
+      0.11.8, iam-db 0.10.6, project 0.3.5, project-db 0.7.0, platform 0.2.6
+      and the new seeder 0.1.0 (config 0.2.1, task 0.7.5 and task-db 0.9.4
+      unchanged), with this organisation's `seeder.registry` declared and
+      `seeder` added to `project.networkPolicy.clients` (plans/the-d35-
+      seeder.md stage 7): 94 objects, 4 added, none removed, 6 changed. Added:
+      `Certificate/seeder-client-tls` (platform 0.2.6, common name
+      `seeder-caller`), and the seeder's `Job/seeder`, `ConfigMap/seeder-
+      registry` and `ServiceAccount/seeder`. Changed: the `gateway`, `iam`,
+      `iam-db`, `project` and `project-db` Deployments, `image` only (each
+      new digest equals its module's own GHCR tag digest), and
+      `NetworkPolicy/project-ingress`, which admits `app: seeder` beside
+      `app: gateway` on 50052.
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. Re-measure in the same pull request, read the named objects,
@@ -209,7 +222,7 @@ from test_no_two_owners import REPOSITORY, parent_render, tuples_of  # noqa: F40
 APPLICATION = REPOSITORY / "applications" / "yadgar.yaml"
 TABLE = Path(__file__).resolve().parent / "yadgar_render.sha256"
 EXAMPLE_URL = "https://raw.githubusercontent.com/yadgarhq/chart/v{revision}/example/application.yaml"
-EXPECTED_OBJECTS = 90
+EXPECTED_OBJECTS = 94
 
 # The two paths E3 excepts, and nothing else.
 EXCEPTED = (("spec", "syncPolicy"), ("spec", "source", "helm", "valuesObject"))
@@ -427,14 +440,18 @@ def test_every_issued_client_leaf_is_mounted_by_its_caller() -> None:
         if d["kind"] == "Certificate" and d["spec"]["secretName"].endswith("-client-tls")
     }
     mounted = {
-        d["metadata"]["name"]: {
+        (d["kind"], d["metadata"]["name"]): {
             v["secret"]["secretName"] for v in d["spec"]["template"]["spec"].get("volumes", []) if "secret" in v
         }
         for d in documents
-        if d["kind"] == "Deployment"
+        if d["kind"] in ("Deployment", "Job")
     }
-    assert issued == set(CLIENT_LEAVES.values())
-    assert {name: leaf for name, leaf in CLIENT_LEAVES.items() if leaf not in mounted.get(name, set())} == {}
+    # The seeder's leaf is mounted by a Job, not a Deployment (JOB_CLIENT_LEAVES).
+    expected = {("Deployment", name): leaf for name, leaf in CLIENT_LEAVES.items()} | {
+        ("Job", name): leaf for name, leaf in JOB_CLIENT_LEAVES.items()
+    }
+    assert issued == set(expected.values())
+    assert {caller: leaf for caller, leaf in expected.items() if leaf not in mounted.get(caller, set())} == {}
 
 
 # ── THE SIX SERVERS' CLIENT AUTH MODE AND CLIENT CA (PB-2, B-U8, B-U9) ─────
@@ -578,17 +595,34 @@ def test_every_server_states_its_client_auth_and_stages_its_own_ca() -> None:
 # env, and that is what this pins.
 #
 # THE MAP IS COMPLETE, AND THE RENDER SAYS SO. `rendered_client_hops` reads
-# every non-`LISTEN_` `*_TLS_ENABLED` env NAME in every container, init
-# container and ephemeral container of every object in the render, hooks
-# included. That set must equal this map, so a caller or hop added by a chart
-# bump reddens here instead of going unpinned. No container in the render
-# uses `envFrom`; one that did could carry a hop this scan cannot see.
+# every non-`LISTEN_` `*_TLS_ENABLED` and `*_TLS_CLIENT_CERT_FILE` env NAME in
+# every container, init container and ephemeral container of every object in
+# the render, hooks included. That set must equal this map plus
+# `JOB_CLIENT_HOPS`, so a caller or hop added by a chart bump reddens here
+# instead of going unpinned. No container in the render uses `envFrom`; one
+# that did could carry a hop this scan cannot see.
 CLIENT_HOPS = {
     "gateway": ("TASK", "IAM", "PROJECT", "NATS", "VALKEY"),
     "iam": ("IAM_DB", "NATS"),
     "task": ("TASK_DB",),
     "project": ("PROJECT_DB",),
 }
+# THE ONE CALLER THAT IS A JOB, NOT A DEPLOYMENT (plans/the-d35-seeder.md stage
+# 7). The seeder dials `project` once per Argo sync and presents
+# `seeder-client-tls`, common name `seeder-caller`: the one leaf `project`
+# admits to `SyncProjects` (ADR-0936). Its chart has NO `PROJECT_TLS_ENABLED`
+# switch, because TLS is not optional for it, so a scan of `_TLS_ENABLED` names
+# alone never saw this hop. That is why the scan also reads
+# `_TLS_CLIENT_CERT_FILE` names, and why `client_identity_failures` checks the
+# leaf's common name for this caller: `project`'s authorisation reads it.
+JOB_CLIENT_HOPS = {
+    "seeder": ("PROJECT",),
+}
+JOB_CLIENT_LEAVES = {
+    "seeder": "seeder-client-tls",
+}
+# The env-name suffixes that mark a client hop, by NAME whatever the value.
+HOP_ENV_SUFFIXES = ("_TLS_ENABLED", "_TLS_CLIENT_CERT_FILE")
 # A CALLER DIALED EVERY HOP ABOVE IN CLEARTEXT UNTIL ITS HOP STEP (PB-3, ledger
 # 925): `CLEARTEXT_HOPS` and its check (`cleartext_failures`) held that interim
 # posture, and `GATEWAY_VALKEY_CLEARTEXT` was its last entry (gateway/VALKEY,
@@ -625,9 +659,11 @@ CONTAINER_LISTS = ("containers", "initContainers", "ephemeralContainers")
 
 
 def rendered_client_hops(documents: list) -> set[tuple[str, str, str]]:
-    """Every `(kind, name, PREFIX)` whose render carries a non-`LISTEN_` `<PREFIX>_TLS_ENABLED` env.
+    """Every `(kind, name, PREFIX)` whose render carries a non-`LISTEN_` hop env (`HOP_ENV_SUFFIXES`).
 
-    By NAME, whatever its value: a hop rendered `"0"` is still a hop.
+    By NAME, whatever its value: a hop rendered `"0"` is still a hop. A hop
+    with no `_TLS_ENABLED` switch (the seeder's) is seen by its client
+    certificate env instead.
     """
     hops: set[tuple[str, str, str]] = set()
 
@@ -637,8 +673,11 @@ def rendered_client_hops(documents: list) -> set[tuple[str, str, str]]:
                 for container in node.get(key) or []:
                     for env in container.get("env") or []:
                         variable = env.get("name", "")
-                        if variable.endswith("_TLS_ENABLED") and not variable.startswith("LISTEN_"):
-                            hops.add((kind, name, variable.removesuffix("_TLS_ENABLED")))
+                        if variable.startswith("LISTEN_"):
+                            continue
+                        for suffix in HOP_ENV_SUFFIXES:
+                            if variable.endswith(suffix):
+                                hops.add((kind, name, variable.removesuffix(suffix)))
             for value in node.values():
                 walk(value, kind, name)
         elif isinstance(node, list):
@@ -671,10 +710,11 @@ def env_value(documents: list, kind: str, name: str, variable: str) -> object:
 
 
 def pinned_hops() -> set[tuple[str, str, str]]:
-    """Every hop this file names (`CLIENT_HOPS`)."""
+    """Every hop this file names (`CLIENT_HOPS` on Deployments, `JOB_CLIENT_HOPS` on Jobs)."""
     return {
-        ("Deployment", caller, prefix)
-        for caller, prefixes in CLIENT_HOPS.items()
+        (kind, caller, prefix)
+        for kind, hops in (("Deployment", CLIENT_HOPS), ("Job", JOB_CLIENT_HOPS))
+        for caller, prefixes in hops.items()
         for prefix in prefixes
     }
 
@@ -685,35 +725,42 @@ def client_identity_failures(documents: list) -> dict[str, object]:
     THE PATHS ARE READ OFF THE RENDER, never written here: each env names a
     file, the mount at that file's directory names a volume, and that volume
     must project the caller's leaf with `tls.crt`/`tls.key` at the file's name.
-    A rendered hop that `CLIENT_HOPS` does not name is keyed
-    `<kind>/<name>/<PREFIX>: not in CLIENT_HOPS`.
+    A rendered hop that neither `CLIENT_HOPS` nor `JOB_CLIENT_HOPS` names is
+    keyed `<kind>/<name>/<PREFIX>: not in CLIENT_HOPS`.
+
+    A Deployment caller's hop must also render `<PREFIX>_TLS_ENABLED` "1". A
+    Job caller (the seeder) has no such switch, so instead its leaf's common
+    name must be `<caller>-caller`: the identity `project` admits.
     """
     certificates = {d["spec"]["secretName"]: d["spec"] for d in documents if d["kind"] == "Certificate"}
-    deployments = {d["metadata"]["name"]: d for d in documents if d["kind"] == "Deployment"}
+    workloads = {(d["kind"], d["metadata"]["name"]): d for d in documents if d["kind"] in ("Deployment", "Job")}
     failures: dict[str, object] = {}
     for kind, name, prefix in sorted(rendered_client_hops(documents) - pinned_hops()):
         failures[f"{kind}/{name}/{prefix}: not in CLIENT_HOPS"] = env_value(
             documents, kind, name, f"{prefix}_TLS_ENABLED"
         )
-    for caller, prefixes in CLIENT_HOPS.items():
-        leaf = CLIENT_LEAVES[caller]
+    callers = [("Deployment", caller, prefixes, CLIENT_LEAVES[caller]) for caller, prefixes in CLIENT_HOPS.items()]
+    callers += [("Job", caller, prefixes, JOB_CLIENT_LEAVES[caller]) for caller, prefixes in JOB_CLIENT_HOPS.items()]
+    for kind, caller, prefixes, leaf in callers:
         certificate = certificates.get(leaf) or {}
         if certificate.get("issuerRef") != LEAF_ISSUER:
             failures[f"{caller}: {leaf} issuerRef"] = certificate.get("issuerRef")
         if "client auth" not in (certificate.get("usages") or []):
             failures[f"{caller}: {leaf} usages"] = certificate.get("usages")
-        deployment = deployments.get(caller)
-        if deployment is None:
-            failures[f"{caller}: Deployment"] = None
+        if kind == "Job" and certificate.get("commonName") != f"{caller}-caller":
+            failures[f"{caller}: {leaf} commonName"] = certificate.get("commonName")
+        workload = workloads.get((kind, caller))
+        if workload is None:
+            failures[f"{caller}: {kind}"] = None
             continue
-        pod = deployment["spec"]["template"]["spec"]
+        pod = workload["spec"]["template"]["spec"]
         container = pod["containers"][0]
         env = {e["name"]: e.get("value") for e in container.get("env", [])}
         mounts = {m["mountPath"]: m for m in container.get("volumeMounts", [])}
         volumes = {v["name"]: v for v in pod.get("volumes", [])}
         for prefix in prefixes:
             hop = f"{caller}/{prefix}"
-            if env.get(f"{prefix}_TLS_ENABLED") != "1":
+            if kind == "Deployment" and env.get(f"{prefix}_TLS_ENABLED") != "1":
                 failures[f"{hop}: {prefix}_TLS_ENABLED"] = env.get(f"{prefix}_TLS_ENABLED")
             for half, key in LEAF_KEYS.items():
                 name = f"{prefix}_TLS_CLIENT_{half}_FILE"
@@ -931,7 +978,9 @@ def test_every_client_hop_prefix_has_a_pinned_ca_secret() -> None:
     key; this holds the two maps to the same prefix set so that shows up
     here, by name, instead.
     """
-    assert set(HOP_CA_SECRET) == {prefix for prefixes in CLIENT_HOPS.values() for prefix in prefixes}
+    assert set(HOP_CA_SECRET) == {
+        prefix for hops in (CLIENT_HOPS, JOB_CLIENT_HOPS) for prefixes in hops.values() for prefix in prefixes
+    }
 
 
 def test_a_dropped_ca_env_names_its_hop(rendered: list) -> None:
@@ -953,6 +1002,207 @@ def test_a_ca_pointed_at_another_servers_secret_names_its_hop(rendered: list) ->
     assert client_identity_failures(mutated(rendered, "Deployment", "gateway", change)) == {
         "gateway/TASK: TASK_TLS_CA_FILE": "/var/run/config/task-ca/ca.pem"
     }
+
+
+# ── THE SEEDER'S HOP TO project (plans/the-d35-seeder.md stage 7) ──────────
+
+
+def test_the_seeder_job_is_a_pinned_hop(rendered: list) -> None:
+    """The seeder Job renders, and its hop is seen by its client-certificate env, not by a switch."""
+    assert ("Job", "seeder", "PROJECT") in rendered_client_hops(rendered)
+
+
+def test_a_seeder_leaf_with_another_common_name_names_it(rendered: list) -> None:
+    """`project` admits `SyncProjects` from `seeder-caller` only (ADR-0936); another name is refused live."""
+
+    def rename(certificate: dict) -> None:
+        certificate["spec"]["commonName"] = "project-caller"
+
+    assert client_identity_failures(mutated(rendered, "Certificate", "seeder-client-tls", rename)) == {
+        "seeder: seeder-client-tls commonName": "project-caller"
+    }
+
+
+def test_the_seeder_mounting_another_leaf_names_both_halves(rendered: list) -> None:
+    def other_leaf(job: dict) -> None:
+        volume = next(v for v in job["spec"]["template"]["spec"]["volumes"] if v["name"] == "client-cert")
+        volume["secret"]["secretName"] = "project-client-tls"
+
+    assert client_identity_failures(mutated(rendered, "Job", "seeder", other_leaf)) == {
+        "seeder/PROJECT: PROJECT_TLS_CLIENT_CERT_FILE": "/var/run/secrets/client-cert/client.crt",
+        "seeder/PROJECT: PROJECT_TLS_CLIENT_KEY_FILE": "/var/run/secrets/client-cert/client.key",
+    }
+
+
+def test_the_seeder_trusting_another_servers_ca_names_its_hop(rendered: list) -> None:
+    def other_ca(job: dict) -> None:
+        volume = next(v for v in job["spec"]["template"]["spec"]["volumes"] if v["name"] == "project-ca")
+        volume["secret"]["secretName"] = "project-db-tls"
+
+    assert client_identity_failures(mutated(rendered, "Job", "seeder", other_ca)) == {
+        "seeder/PROJECT: PROJECT_TLS_CA_FILE": "/var/run/config/project-ca/ca.pem"
+    }
+
+
+def test_a_missing_seeder_job_names_it(rendered: list) -> None:
+    documents = [d for d in rendered if not (d["kind"] == "Job" and d["metadata"]["name"] == "seeder")]
+    assert client_identity_failures(documents) == {"seeder: Job": None}
+
+
+def test_an_unpinned_hop_with_no_switch_names_it(rendered: list) -> None:
+    """A hop carried by a client-certificate env alone is still a hop (the seeder's shape)."""
+    change = add_env("containers", "TASK_TLS_CLIENT_CERT_FILE", "/x/client.crt")
+    assert client_identity_failures(mutated(rendered, "Job", "preflight", change)) == {
+        "Job/preflight/TASK: not in CLIENT_HOPS": None
+    }
+
+
+# Each gRPC server's ingress allow-list on its gRPC port, by the `app` label of
+# the pods it admits. `project` admits the gateway and the seeder; `project-db`
+# admits `project` alone, because no module but its twin reaches a `-db`
+# (ADR-0936, ADR-0938). K3 alone cannot hold this: `--write` blesses whatever
+# renders, so a seeder added to `project-db`'s list would pass K3.
+INGRESS_PEERS = {
+    "project-ingress": (50052, {"gateway", "seeder"}),
+    "project-db-ingress": (50051, {"project"}),
+}
+
+
+def ingress_peer_failures(documents: list) -> dict[str, object]:
+    """Every policy in `INGRESS_PEERS` whose gRPC-port peers differ, and every admitted label no pod carries."""
+    policies = {d["metadata"]["name"]: d for d in documents if d["kind"] == "NetworkPolicy"}
+    pod_apps = {
+        ((d["spec"]["template"].get("metadata") or {}).get("labels") or {}).get("app")
+        for d in documents
+        if d["kind"] in ("Deployment", "Job", "StatefulSet")
+    }
+    failures: dict[str, object] = {}
+    for name, (port, expected) in INGRESS_PEERS.items():
+        policy = policies.get(name)
+        if policy is None:
+            failures[f"{name}: NetworkPolicy"] = None
+            continue
+        peers = {
+            peer["podSelector"]["matchLabels"].get("app")
+            for rule in policy["spec"].get("ingress") or []
+            if any(p.get("port") == port for p in rule.get("ports") or [])
+            for peer in rule.get("from") or []
+            if "podSelector" in peer
+        }
+        if peers != expected:
+            failures[f"{name}: peers on {port}"] = sorted(peers)
+        if peers - pod_apps:
+            failures[f"{name}: peers no pod carries"] = sorted(peers - pod_apps)
+    return failures
+
+
+def test_project_admits_the_gateway_and_the_seeder_and_project_db_admits_project_only(rendered: list) -> None:
+    assert ingress_peer_failures(rendered) == {}
+
+
+def test_the_seeder_admitted_to_project_db_names_it() -> None:
+    """End to end through the chart: the twin-only rule (ADR-0938) broken in values."""
+    documents = [
+        d
+        for d in parent_render(REPOSITORY, ("--set", "project-db.networkPolicy.clients={project,seeder}"))
+        if isinstance(d, dict) and d.get("kind")
+    ]
+    assert ingress_peer_failures(documents) == {"project-db-ingress: peers on 50051": ["project", "seeder"]}
+
+
+def test_a_seeder_pod_without_its_label_names_the_peer(rendered: list) -> None:
+    def relabel(job: dict) -> None:
+        job["spec"]["template"]["metadata"]["labels"]["app"] = "seeder-job"
+
+    assert ingress_peer_failures(mutated(rendered, "Job", "seeder", relabel)) == {
+        "project-ingress: peers no pod carries": ["seeder"]
+    }
+
+
+# ── THE ESTATE'S REGISTRY DECLARATION (plans/the-d35-seeder.md stage 7) ──────
+
+# Max's ruling (2026-10-18): "Declare every yadgarhq repo that holds tasks, plus
+# the estate roots." Every non-archived repository of the yadgarhq organisation,
+# read with `gh repo list yadgarhq --json name,isArchived` on 2026-10-18; the
+# one archived repository, `deploy`, is left out. A repository created or
+# archived later is a values change, and this list moves with it.
+DECLARED_REPOSITORIES = (
+    "actions",
+    "argocd",
+    "argocd-verify",
+    "chart",
+    "config",
+    "dial",
+    "docs",
+    "estate",
+    "gateway",
+    "iam",
+    "iam-db",
+    "lifecycle",
+    "platform",
+    "project",
+    "project-db",
+    "proto",
+    "seeder",
+    "store",
+    "task",
+    "task-db",
+    "telemetry",
+    "yadgar",
+)
+# The namespace anchors (ADR-0673) and the estate's one landing path, ledger
+# 1244 option B: smoke runs claim `estate/smoke`, a project under the root
+# `estate`, because the store refuses a root that contains `/`.
+DECLARED_ROOTS = {"yadgarhq": "yadgarhq/argocd", "estate": "yadgarhq/estate"}
+DECLARED_EXTRA_PROJECTS = {"estate/smoke": "yadgarhq/estate"}
+
+
+def registry_failures(registry: object) -> dict[str, object]:
+    """Every way `seeder.registry` differs from the ruling above."""
+    if not isinstance(registry, dict):
+        return {"seeder.registry": registry}
+    failures: dict[str, object] = {}
+    if registry.get("allowMassArchive") is not False:
+        failures["allowMassArchive"] = registry.get("allowMassArchive")
+    roots = {r.get("path"): r.get("sourceRepo") for r in registry.get("roots") or []}
+    if roots != DECLARED_ROOTS:
+        failures["roots"] = roots
+    projects = {p.get("path"): p.get("sourceRepo") for p in registry.get("projects") or []}
+    expected = {f"yadgarhq/{name}": f"yadgarhq/{name}" for name in DECLARED_REPOSITORIES} | DECLARED_EXTRA_PROJECTS
+    if projects != expected:
+        failures["projects"] = {
+            "missing": sorted(expected.keys() - projects.keys()),
+            "extra": sorted(projects.keys() - expected.keys()),
+            "sourceRepo": sorted(k for k in expected.keys() & projects.keys() if expected[k] != projects[k]),
+        }
+    return failures
+
+
+def declared_registry() -> object:
+    values = committed()["spec"]["source"]["helm"]["valuesObject"]
+    return (values.get("seeder") or {}).get("registry")
+
+
+def test_the_registry_declares_every_repository_and_the_estate_roots() -> None:
+    assert registry_failures(declared_registry()) == {}
+
+
+def test_the_rendered_registry_is_the_declaration(rendered: list) -> None:
+    """The ConfigMap the Job reads carries exactly the declared rows and the guard."""
+    configmap = next(d for d in rendered if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "seeder-registry")
+    assert registry_failures(json.loads(configmap["data"]["registry.json"])) == {}
+
+
+def test_a_mass_archive_flag_names_it() -> None:
+    registry = json.loads(json.dumps(declared_registry()))
+    registry["allowMassArchive"] = True
+    assert registry_failures(registry) == {"allowMassArchive": True}
+
+
+def test_a_dropped_repository_names_it() -> None:
+    registry = json.loads(json.dumps(declared_registry()))
+    registry["projects"] = [p for p in registry["projects"] if p["path"] != "yadgarhq/docs"]
+    assert registry_failures(registry) == {"projects": {"missing": ["yadgarhq/docs"], "extra": [], "sourceRepo": []}}
 
 
 # ── THE BROKER'S TLS LISTENER (B-N4.1, B-N5, ledger 925, ADR-0852) ───────────
