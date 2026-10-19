@@ -19,6 +19,11 @@ car C8). This file never asks for them.
 
 WHAT `run` DOES, in order. Every refusal comes before any cluster read.
 
+  0. The checker is main's: every file in CHECKER_FILES that this process runs
+     is byte-identical to the same file at `--main-sha`, or the run is an
+     infrastructure failure. The result names that checker (`checker.main_sha`
+     and a sha256 per file), so `find` can refuse a green from an older one.
+
   1. Refuse unless main and the sha have exactly one merge base (a
      criss-cross history makes `main...sha` ambiguous), and `main...sha`
      (`--no-renames`, so a rename shows its old path) changes only the three
@@ -31,6 +36,15 @@ WHAT `run` DOES, in order. Every refusal comes before any cluster read.
      and its `chart_pin.json` is main's with only `chart_tag` moved. So no PR
      value reaches the credential: the head render is main's values at the
      target version. A values change beside the pin is refused, not ignored.
+     ONE PARSE ONLY. PyYAML, Go's YAML (Argo CD, Helm, kubectl) and a JSON
+     reader can disagree on the same bytes, so `yadgar.yaml` at main and at the
+     sha is refused when it holds any construct two readers may read apart: a
+     duplicate key (PyYAML keeps the last, a first-key reader the first), an
+     anchor, alias or merge key, an explicit tag, more than one document, a
+     byte order mark, a tab, or a plain scalar YAML 1.1 and 1.2 read
+     differently (`on`, `no`, `y`, `0755`, `1:30`). `chart_pin.json` is refused
+     on a duplicate key. With those gone, the line-anchored `targetRevision`
+     edit and the parsed `spec.source.targetRevision` name the same value.
   3. Render main's `yadgar.yaml` (the base) and the rewritten one (the head)
      through the gates' own `parent_render` (helm v3.18.4 in the workflow).
      Refuse when the sha's K3 table disagrees with the head render, when a
@@ -114,7 +128,12 @@ THE RESULT holds object keys and field paths, never a value: `sha`,
              the caller passes (`--main-sha`, `--pin`: argocd main now), or
              its `read_at` is missing, older than FRESH_SECONDS, or in the
              future past FUTURE_SKEW_SECONDS;
-    green    otherwise. Only green exits 0.
+    stale    also: its result names no checker or another checker than
+             main's, or its run's head_sha is an older default-branch commit
+             (an older `pin-dryrun.yaml` ran: the trust is main's current
+             workflow file, never the run's own version);
+    green    otherwise. Only green exits 0. A `result.json` with a duplicate
+             key is an infrastructure failure (exit 3), never a verdict.
 
   WHY THE BINDING. The token `auto-pin.yaml` reads with
   (`yadgarhq-settled-dispatch`, `actions: write` on argocd-verify) can also
@@ -138,6 +157,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import io
 import json
 import os
@@ -178,6 +198,21 @@ MAX_CANDIDATES = 50
 FRESH_SECONDS = 3600
 # A `read_at` this far in the future is a clock skew; any further is refused.
 FUTURE_SKEW_SECONDS = 300
+# THE CHECKER: every file `run` executes, relative to the argocd checkout.
+CHECKER_FILES = (
+    "scripts/pin_dryrun.py",
+    "scripts/pin_bump.py",
+    "scripts/settled_gate.py",
+    "scripts/verify_handover.py",
+    "scripts/gates/test_no_two_owners.py",
+    "scripts/gates/test_yadgar_application.py",
+)
+# Plain scalars YAML 1.1 reads as a bool, an octal or a sexagesimal number and
+# YAML 1.2 reads otherwise (or the reverse).
+AMBIGUOUS_SCALAR = re.compile(
+    r"(?:y|Y|yes|Yes|YES|n|N|no|No|NO|on|On|ON|off|Off|OFF)"
+    r"|[-+]?0[0-7]+|[-+]?0o[0-7]+|[-+]?0b[01_]+|[-+]?\d[\d_]*(?::[0-5]?\d)+(?:\.\d*)?"
+)
 
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
 RELEASE = re.compile(r"\d+\.\d+\.\d+")
@@ -279,6 +314,87 @@ def read_at(repo: Path, sha: str, path: str, runner: Callable) -> bytes | None:
         raise InfrastructureError(str(error)) from error
 
 
+# ── one parse only ──────────────────────────────────────────────────────────
+
+
+class DuplicateKey(ValueError):
+    pass
+
+
+def _strict_pairs(pairs: list) -> dict:
+    seen: dict = {}
+    for key, value in pairs:
+        if key in seen:
+            raise DuplicateKey(f"duplicate key {key!r}")
+        seen[key] = value
+    return seen
+
+
+def strict_json(text: str | bytes):
+    """`json.loads` that refuses a duplicate key instead of keeping the last."""
+    return json.loads(text, object_pairs_hook=_strict_pairs)
+
+
+def yaml_ambiguities(text: str) -> list[str]:
+    """Every construct in `text` two YAML readers may read apart, or [] when it parses one way only."""
+    yaml = _load("yaml")
+    problems: list[str] = []
+    if text.startswith("\ufeff"):
+        problems.append("a byte order mark")
+    if "\t" in text:
+        problems.append("a tab")
+    try:
+        tokens = list(yaml.scan(text))
+        documents = list(yaml.compose_all(text))
+    except yaml.YAMLError as error:
+        return [*problems, f"does not parse: {type(error).__name__}"]
+    names = {
+        yaml.AnchorToken: "an anchor", yaml.AliasToken: "an alias", yaml.TagToken: "an explicit tag",
+        yaml.DirectiveToken: "a directive", yaml.DocumentStartToken: "an explicit document marker",
+        yaml.DocumentEndToken: "an explicit document marker",
+    }  # fmt: skip
+    for token in tokens:
+        for kind, name in names.items():
+            if isinstance(token, kind) and name not in problems:
+                problems.append(name)
+    if len(documents) != 1:
+        problems.append(f"{len(documents)} documents, not 1")
+
+    def walk(node, where: str) -> None:
+        if isinstance(node, yaml.MappingNode):
+            keys: set = set()
+            for key, value in node.value:
+                if isinstance(key, yaml.ScalarNode):
+                    if key.value == "<<" and key.style is None:
+                        problems.append(f"a merge key at {where or '<root>'}")
+                    if key.value in keys:
+                        problems.append(f"duplicate key {key.value!r} at {where or '<root>'}")
+                    keys.add(key.value)
+                walk(key, where)
+                walk(value, f"{where}.{getattr(key, 'value', '?')}".lstrip("."))
+        elif isinstance(node, yaml.SequenceNode):
+            for i, item in enumerate(node.value):
+                walk(item, f"{where}[{i}]")
+        elif isinstance(node, yaml.ScalarNode) and node.style is None and AMBIGUOUS_SCALAR.fullmatch(node.value):
+            problems.append(f"plain scalar {node.value!r} at {where or '<root>'} reads differently in YAML 1.1 and 1.2")
+
+    for document in documents:
+        walk(document, "")
+    return problems
+
+
+def checker_identity(repo: Path, base: str, runner: Callable) -> dict:
+    """`{main_sha, files: {path: sha256}}` of the code running, refused unless it is main's byte for byte."""
+    files: dict[str, str] = {}
+    for relative in CHECKER_FILES:
+        running = (HERE.parent / relative).read_bytes()
+        at_main = read_at(repo, base, relative, runner)
+        if at_main != running:
+            raise InfrastructureError(f"the checker running is not main's: {relative} differs from {base[:12]}")
+        files[relative] = hashlib.sha256(running).hexdigest()
+    return {"main_sha": base, "files": files}
+
+
 # ── step 1-3: refusals, before any cluster read ─────────────────────────────
 
 
@@ -297,6 +413,19 @@ def pin_refusals(repo: Path, base: str, sha: str, runner: Callable) -> tuple[str
     head_application = read_at(repo, sha, APPLICATION, runner)
     if main_application is None or head_application is None:
         raise InfrastructureError(f"{APPLICATION} is absent at main or at the sha")
+    for side, text in (("main", main_application), ("the sha", head_application)):
+        problems += [f"{APPLICATION} at {side}: {p}; refused, two readers may read it apart" for p in yaml_ambiguities(text.decode())]
+    for side, commit in (("main", base), ("the sha", sha)):
+        raw = read_at(repo, commit, CHART_PIN, runner)
+        try:
+            if raw is not None:
+                strict_json(raw)
+        except DuplicateKey as error:
+            problems.append(f"{CHART_PIN} at {side}: {error}; refused, two readers may read it apart")
+        except ValueError:
+            problems.append(f"{CHART_PIN} at {side}: not JSON")
+    if problems and any("two readers" in p for p in problems):
+        return None, None, None, problems
     try:
         pin = pin_bump.current_pin(main_application.decode())
         target = pin_bump.current_pin(head_application.decode())
@@ -574,6 +703,7 @@ def dry_run(repo: Path, base: str, sha: str, cluster, *, render: Callable[[bytes
         "hooks_left_out": [],
         "compared": 0,
         "admission": {},
+        "checker": checker_identity(repo, base, runner),
     }
     pin, target, head_application, problems = pin_refusals(repo, base, sha, runner)
     result.update(pin=pin, target=target)
@@ -703,7 +833,7 @@ def on_default_branch(github, repository: str, sha: object, branch_sha: str) -> 
 def _result_of(archive: bytes) -> dict:
     try:
         with zipfile.ZipFile(io.BytesIO(archive)) as opened:
-            return json.loads(opened.read(RESULT_FILE))
+            return strict_json(opened.read(RESULT_FILE))
     except (zipfile.BadZipFile, KeyError, ValueError) as error:
         raise InfrastructureError(f"a {ARTIFACT} artifact holds no readable {RESULT_FILE}: {error}") from error
 
@@ -718,7 +848,7 @@ def _parse_time(value) -> dt.datetime | None:
     return moment if moment.tzinfo is not None else None
 
 
-def verdict_of(run: dict, result: dict, *, main_sha: str, pin: str, now: dt.datetime) -> tuple[str, str]:
+def verdict_of(run: dict, result: dict, *, main_sha: str, pin: str, now: dt.datetime, workflow_head: str | None = None) -> tuple[str, str]:
     """`(pending | red | stale | green, reason)` of the newest trusted result. Values here are shas, pins and times only."""
     if run.get("status") != "completed":
         return "pending", f"run {run.get('id')} is {run.get('status')}"
@@ -731,6 +861,10 @@ def verdict_of(run: dict, result: dict, *, main_sha: str, pin: str, now: dt.date
         return "stale", f"judged against main {result.get('main_sha')}, main is {main_sha}"
     if result.get("pin") != pin:
         return "stale", f"judged against pin {result.get('pin')}, main pins {pin}"
+    if not isinstance(result.get("checker"), dict) or result["checker"].get("main_sha") != main_sha:
+        return "stale", f"checker {(result.get('checker') or {}).get('main_sha') if isinstance(result.get('checker'), dict) else None}, not main's {main_sha}"
+    if workflow_head is not None and run.get("head_sha") != workflow_head:
+        return "stale", f"run {run.get('id')} ran the workflow at {run.get('head_sha')}, the default branch is now at {workflow_head}"
     read = _parse_time(result.get("read_at"))
     if read is None:
         return "stale", "no read_at"
@@ -785,7 +919,7 @@ def find(github, repository: str, workflow_path: str, sha: str, *, main_sha: str
         result = _result_of(github.download(candidate["archive_download_url"]))
         if result.get("sha") != sha:
             continue
-        verdict, reason = verdict_of(run, result, main_sha=main_sha, pin=pin, now=now)
+        verdict, reason = verdict_of(run, result, main_sha=main_sha, pin=pin, now=now, workflow_head=default_head)
         return {
             "found": True,
             "verdict": verdict,

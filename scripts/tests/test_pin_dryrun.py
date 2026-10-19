@@ -162,6 +162,12 @@ def repo(tmp_path: Path) -> Path:
     write(root, "scripts/gates/yadgar_render.sha256", table_for(base_documents(), PIN))
     write(root, ".github/workflows/ci.yaml", "name: ci\n")
     write(root, "README.md", "argocd\n")
+    # THE CHECKER AT MAIN: the very files this test imports, so `dry_run`
+    # finds the code it runs is main's (it refuses otherwise).
+    for path in pin_dryrun.CHECKER_FILES:
+        target = root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((SCRIPTS.parent / path).read_bytes())
     commit(root, "main")
     return root
 
@@ -659,6 +665,71 @@ def test_the_summary_prints_paths_with_repr_so_a_newline_cannot_forge_a_line(cap
     assert "\n## pin-dryrun: green" not in capsys.readouterr().out
 
 
+# ── 4c. the checker is main's, and the inputs parse one way only ────────────
+# Second review: "stale-checker trust" and "parser differential".
+
+
+def test_the_result_names_the_checker_it_ran(repo: Path) -> None:
+    result = run(repo, pin_branch(repo))
+    assert result["checker"]["main_sha"] == main_sha(repo)
+    assert set(result["checker"]["files"]) == set(pin_dryrun.CHECKER_FILES)
+
+
+def test_a_checker_that_is_not_mains_is_infrastructure(repo: Path) -> None:
+    # The code running differs from the code at --main-sha: the result would
+    # name a checker that did not run.
+    write(repo, "scripts/pin_dryrun.py", "# an older, weaker checker\n")
+    commit(repo, "main moves its checker")
+    with pytest.raises(pin_dryrun.InfrastructureError, match="checker"):
+        run(repo, pin_branch(repo))
+
+
+@pytest.mark.parametrize(
+    ("text", "why"),
+    [
+        ("a: 1\na: 2\n", "duplicate key"),
+        ("spec:\n  source:\n    chart: x\n  source:\n    chart: y\n", "duplicate key"),
+        ("base: &b {x: 1}\nother: *b\n", "anchor"),
+        ("base: {x: 1}\nother:\n  <<: {x: 2}\n", "merge key"),
+        ("a: !!str 1\n", "tag"),
+        ("a: 1\n---\nb: 2\n", "document"),
+        ("\ufeffa: 1\n", "byte order mark"),
+        ("a:\n\t- 1\n", "tab"),
+        ("enabled: on\n", "YAML 1.1"),
+        ("enabled: No\n", "YAML 1.1"),
+        ("mode: 0755\n", "YAML 1.1"),
+        ("window: 1:30\n", "YAML 1.1"),
+    ],
+)
+def test_an_ambiguous_yaml_construct_is_named(text: str, why: str) -> None:
+    assert any(why in p for p in pin_dryrun.yaml_ambiguities(text)), pin_dryrun.yaml_ambiguities(text)
+
+
+def test_the_fixture_application_and_the_real_one_are_unambiguous() -> None:
+    assert pin_dryrun.yaml_ambiguities(APPLICATION.format(pin=PIN)) == []
+    assert pin_dryrun.yaml_ambiguities((SCRIPTS.parent / "applications" / "yadgar.yaml").read_text()) == []
+
+
+def test_a_duplicate_key_in_yadgar_yaml_is_refused_before_any_cluster_read(repo: Path) -> None:
+    # PyYAML keeps the LAST `targetRevision`; a first-key-wins reader keeps the first.
+    def duplicate(r: Path) -> None:
+        text = (r / "applications/yadgar.yaml").read_text()
+        write(r, "applications/yadgar.yaml", text.replace("    chart: yadgar\n", "    chart: yadgar\n    chart: other\n"))
+
+    result = run(repo, pin_branch(repo, extra=duplicate), kubectl=NoCluster())
+    assert result["result"] == "refused"
+    assert any("applications/yadgar.yaml" in p and "duplicate key" in p for p in result["problems"]), result["problems"]
+
+
+def test_a_duplicate_key_in_chart_pin_json_is_refused(repo: Path) -> None:
+    def duplicate(r: Path) -> None:
+        write(r, "scripts/chart_pin.json", CHART_PIN.format(pin=TARGET).replace('"platform_version"', '"chart_tag": "v0.0.1",\n  "platform_version"'))
+
+    result = run(repo, pin_branch(repo, extra=duplicate), kubectl=NoCluster())
+    assert result["result"] == "refused"
+    assert any("scripts/chart_pin.json" in p and "duplicate key" in p for p in result["problems"]), result["problems"]
+
+
 # ── 5. output, kubectl and failures ─────────────────────────────────────────
 
 
@@ -754,7 +825,7 @@ class FakeGitHub:
         }
         self.downloads: dict[str, bytes] = {}
         self.artifacts: list[dict] = []
-        self.reachable: set[str] = {HEAD}
+        self.reachable: set[str] = {HEAD, BRANCH_HEAD}
         self.seen: list[str] = []
 
     def add(self, run_id: int, *, created: str, result: str = "green", sha: str = WANTED, record=None, **run_overrides) -> None:
@@ -764,7 +835,7 @@ class FakeGitHub:
             "conclusion": "success" if result == "green" else "failure",
             "event": "workflow_dispatch",
             "head_branch": "main",
-            "head_sha": HEAD,
+            "head_sha": BRANCH_HEAD,
             "path": PATH,
             "repository": {"id": OWN_ID},
             "head_repository": {"id": OWN_ID},
@@ -772,7 +843,7 @@ class FakeGitHub:
         run.update(run_overrides)
         self.paths[f"/repos/{REPO}/actions/runs/{run_id}"] = run
         url = f"https://api.github.com/artifacts/{run_id}/zip"
-        body = {"sha": sha, "result": result, "main_sha": MAIN_SHA, "pin": PIN, "read_at": FRESH, "objects": []}
+        body = {"sha": sha, "result": result, "main_sha": MAIN_SHA, "checker": {"main_sha": MAIN_SHA}, "pin": PIN, "read_at": FRESH, "objects": []}
         body.update(record or {})
         self.downloads[url] = archive({k: v for k, v in body.items() if v is not None})
         self.artifacts.append(
@@ -782,7 +853,7 @@ class FakeGitHub:
                 "expired": False,
                 "created_at": created,
                 "archive_download_url": url,
-                "workflow_run": {"id": run_id, "repository_id": OWN_ID, "head_repository_id": OWN_ID, "head_branch": "main", "head_sha": HEAD},
+                "workflow_run": {"id": run_id, "repository_id": OWN_ID, "head_repository_id": OWN_ID, "head_branch": "main", "head_sha": BRANCH_HEAD},
             }
         )
 
@@ -936,6 +1007,42 @@ def test_the_find_cli_exits_0_only_on_a_fresh_green_bound_to_main(tmp_path: Path
 
 def test_the_find_cli_requires_main_sha_and_pin(tmp_path: Path) -> None:
     assert pin_dryrun.main(["find", "--sha", WANTED, "--out", str(tmp_path / "x")], github=FakeGitHub(), now=NOW) == 2
+
+
+# Second review ("stale-checker trust"): the result must name the checker it ran,
+# and the workflow file that ran must be the default branch's current one.
+
+
+@pytest.mark.parametrize("checker", [None, {}, {"main_sha": "b" * 40}])
+def test_find_calls_a_result_from_another_checker_stale(checker) -> None:
+    github = FakeGitHub()
+    github.add(1, created="2026-10-19T09:00:00Z", result="green", record={"checker": checker})
+    found = find(github)
+    assert found["verdict"] == "stale" and "checker" in found["reason"]
+
+
+def test_find_calls_a_run_of_an_older_workflow_version_stale() -> None:
+    # The run's head_sha is ON the default branch (an ancestor), but the branch
+    # has moved since: an older pin-dryrun.yaml produced it.
+    github = FakeGitHub()
+    github.add(1, created="2026-10-19T09:00:00Z", result="green", head_sha=HEAD)
+    found = find(github)
+    assert found["verdict"] == "stale" and "workflow" in found["reason"]
+
+
+def test_find_refuses_a_result_json_with_duplicate_keys(tmp_path: Path) -> None:
+    # Second review ("parser differential"): `{"result": "red", "result": "green"}`
+    # reads green in Python and red in a first-key-wins parser.
+    github = FakeGitHub()
+    github.add(1, created="2026-10-19T09:00:00Z", result="green")
+    url = github.artifacts[0]["archive_download_url"]
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as opened:
+        opened.writestr("result.json", '{"sha": "%s", "result": "red", "result": "green"}' % WANTED)
+    github.downloads[url] = buffer.getvalue()
+    out = tmp_path / "found.json"
+    argv = ["find", "--sha", WANTED, "--main-sha", MAIN_SHA, "--pin", PIN, "--out", str(out)]
+    assert pin_dryrun.main(argv, github=github, now=NOW) == 3
 
 
 # ── 7. the reader imports without PyYAML ────────────────────────────────────
