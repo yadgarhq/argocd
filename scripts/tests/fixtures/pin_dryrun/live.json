@@ -1,0 +1,589 @@
+{
+  "applications.argoproj.io yadgar -n argocd": {
+    "apiVersion": "argoproj.io/v1alpha1",
+    "kind": "Application",
+    "metadata": {
+      "name": "yadgar",
+      "namespace": "argocd"
+    },
+    "spec": {
+      "source": {
+        "chart": "yadgar",
+        "repoURL": "ghcr.io/yadgarhq/charts",
+        "targetRevision": "0.25.27"
+      }
+    },
+    "status": {
+      "health": {
+        "status": "Healthy"
+      },
+      "operationState": {
+        "finishedAt": "2026-10-18T19:41:00Z",
+        "phase": "Succeeded",
+        "startedAt": "2026-10-18T19:40:00Z"
+      },
+      "sync": {
+        "revision": "0.25.27",
+        "status": "Synced"
+      }
+    }
+  },
+  "configmaps -n yadgar": {
+    "apiVersion": "v1",
+    "items": [
+      {
+        "apiVersion": "v1",
+        "data": {
+          "CPU_HINT": "1000m",
+          "LOG_LEVEL": "info"
+        },
+        "kind": "ConfigMap",
+        "metadata": {
+          "annotations": {
+            "argocd.argoproj.io/tracking-id": "yadgar:/ConfigMap:yadgar/shared",
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"kind\":\"...\"}"
+          },
+          "creationTimestamp": "2026-10-18T19:40:00Z",
+          "generation": 1,
+          "managedFields": [
+            {
+              "manager": "argocd-controller",
+              "operation": "Update"
+            }
+          ],
+          "name": "shared",
+          "namespace": "yadgar",
+          "resourceVersion": "4242",
+          "uid": "uid-configmap-shared"
+        }
+      }
+    ],
+    "kind": "List"
+  },
+  "deployments.apps -n yadgar": {
+    "apiVersion": "v1",
+    "items": [
+      {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+          "annotations": {
+            "argocd.argoproj.io/tracking-id": "yadgar:apps/Deployment:yadgar/gateway",
+            "deployment.kubernetes.io/revision": "7"
+          },
+          "creationTimestamp": "2026-10-18T19:40:00Z",
+          "generation": 7,
+          "labels": {
+            "app.kubernetes.io/name": "gateway"
+          },
+          "managedFields": [
+            {
+              "manager": "argocd-controller",
+              "operation": "Update"
+            }
+          ],
+          "name": "gateway",
+          "namespace": "yadgar",
+          "resourceVersion": "4242",
+          "uid": "uid-deployment-gateway"
+        },
+        "spec": {
+          "progressDeadlineSeconds": 600,
+          "replicas": 2,
+          "revisionHistoryLimit": 10,
+          "selector": {
+            "matchLabels": {
+              "app.kubernetes.io/name": "gateway"
+            }
+          },
+          "strategy": {
+            "rollingUpdate": {
+              "maxSurge": "25%",
+              "maxUnavailable": "25%"
+            },
+            "type": "RollingUpdate"
+          },
+          "template": {
+            "metadata": {
+              "annotations": {
+                "kubectl.kubernetes.io/restartedAt": "2026-10-18T19:00:00Z"
+              },
+              "labels": {
+                "app.kubernetes.io/name": "gateway"
+              }
+            },
+            "spec": {
+              "containers": [
+                {
+                  "env": [
+                    {
+                      "name": "GATEWAY_PORT",
+                      "value": "8080"
+                    }
+                  ],
+                  "image": "ghcr.io/yadgarhq/gateway:0.12.13@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "imagePullPolicy": "IfNotPresent",
+                  "name": "gateway",
+                  "ports": [
+                    {
+                      "containerPort": 8080,
+                      "name": "http",
+                      "protocol": "TCP"
+                    }
+                  ],
+                  "resources": {
+                    "limits": {
+                      "memory": "1Gi"
+                    },
+                    "requests": {
+                      "cpu": "1",
+                      "memory": "1Gi"
+                    }
+                  },
+                  "securityContext": {
+                    "readOnlyRootFilesystem": true
+                  },
+                  "terminationMessagePath": "/dev/termination-log",
+                  "terminationMessagePolicy": "File"
+                }
+              ],
+              "dnsPolicy": "ClusterFirst",
+              "initContainers": [
+                {
+                  "image": "ghcr.io/yadgarhq/wait:0.1.0@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                  "imagePullPolicy": "IfNotPresent",
+                  "name": "wait-for-nats",
+                  "resources": {},
+                  "securityContext": {
+                    "readOnlyRootFilesystem": true
+                  },
+                  "terminationMessagePath": "/dev/termination-log",
+                  "terminationMessagePolicy": "File"
+                }
+              ],
+              "restartPolicy": "Always",
+              "schedulerName": "default-scheduler",
+              "securityContext": {
+                "runAsNonRoot": true
+              },
+              "serviceAccount": "gateway",
+              "serviceAccountName": "gateway",
+              "terminationGracePeriodSeconds": 30
+            }
+          }
+        },
+        "status": {
+          "observedGeneration": 7,
+          "readyReplicas": 2,
+          "replicas": 2
+        }
+      },
+      {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+          "annotations": {
+            "argocd.argoproj.io/tracking-id": "someone-else:apps/Deployment:yadgar/not-ours"
+          },
+          "name": "not-ours",
+          "namespace": "yadgar"
+        },
+        "spec": {
+          "template": {
+            "spec": {
+              "containers": [
+                {
+                  "image": "example.org/x:1",
+                  "name": "x"
+                }
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "kind": "List"
+  },
+  "gatewayclasses.gateway.networking.k8s.io": {
+    "apiVersion": "v1",
+    "items": [
+      {
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "kind": "GatewayClass",
+        "metadata": {
+          "annotations": {
+            "argocd.argoproj.io/tracking-id": "yadgar:gateway.networking.k8s.io/GatewayClass:/yadgar",
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"kind\":\"...\"}"
+          },
+          "creationTimestamp": "2026-10-18T19:40:00Z",
+          "generation": 1,
+          "managedFields": [
+            {
+              "manager": "argocd-controller",
+              "operation": "Update"
+            }
+          ],
+          "name": "yadgar",
+          "resourceVersion": "4242",
+          "uid": "uid-gatewayclass-yadgar"
+        },
+        "spec": {
+          "controllerName": "gateway.envoyproxy.io/gatewayclass-controller"
+        },
+        "status": {
+          "conditions": [
+            {
+              "status": "True",
+              "type": "Accepted"
+            }
+          ]
+        }
+      }
+    ],
+    "kind": "List"
+  },
+  "jobs.batch -n yadgar": {
+    "apiVersion": "v1",
+    "items": [
+      {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+          "annotations": {
+            "argocd.argoproj.io/sync-options": "Replace=true,Force=true",
+            "argocd.argoproj.io/tracking-id": "yadgar:batch/Job:yadgar/seeder",
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"kind\":\"...\"}"
+          },
+          "creationTimestamp": "2026-10-18T19:40:00Z",
+          "generation": 1,
+          "labels": {
+            "batch.kubernetes.io/controller-uid": "uid-job-seeder",
+            "batch.kubernetes.io/job-name": "seeder",
+            "controller-uid": "uid-job-seeder",
+            "job-name": "seeder"
+          },
+          "managedFields": [
+            {
+              "manager": "argocd-controller",
+              "operation": "Update"
+            }
+          ],
+          "name": "seeder",
+          "namespace": "yadgar",
+          "resourceVersion": "4242",
+          "uid": "uid-job-seeder"
+        },
+        "spec": {
+          "backoffLimit": 6,
+          "completionMode": "NonIndexed",
+          "completions": 1,
+          "manualSelector": false,
+          "parallelism": 1,
+          "podReplacementPolicy": "TerminatingOrFailed",
+          "selector": {
+            "matchLabels": {
+              "batch.kubernetes.io/controller-uid": "uid-job-seeder"
+            }
+          },
+          "suspend": false,
+          "template": {
+            "metadata": {
+              "labels": {
+                "batch.kubernetes.io/controller-uid": "uid-job-seeder",
+                "batch.kubernetes.io/job-name": "seeder",
+                "controller-uid": "uid-job-seeder",
+                "job-name": "seeder"
+              }
+            },
+            "spec": {
+              "containers": [
+                {
+                  "image": "ghcr.io/yadgarhq/seeder:0.1.1@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                  "imagePullPolicy": "IfNotPresent",
+                  "name": "seeder",
+                  "resources": {},
+                  "securityContext": {
+                    "readOnlyRootFilesystem": true
+                  }
+                }
+              ],
+              "dnsPolicy": "ClusterFirst",
+              "restartPolicy": "OnFailure",
+              "securityContext": {
+                "runAsNonRoot": true
+              }
+            }
+          }
+        },
+        "status": {
+          "conditions": [
+            {
+              "status": "True",
+              "type": "Complete"
+            }
+          ],
+          "succeeded": 1
+        }
+      }
+    ],
+    "kind": "List"
+  },
+  "mutatingwebhookconfigurations.admissionregistration.k8s.io": {
+    "apiVersion": "v1",
+    "items": [
+      {
+        "metadata": {
+          "name": "sidecar-injector"
+        },
+        "webhooks": [
+          {
+            "name": "inject.example.org",
+            "rules": [
+              {
+                "apiGroups": ["apps"],
+                "apiVersions": ["v1"],
+                "operations": ["CREATE", "UPDATE"],
+                "resources": ["deployments"]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "metadata": {
+          "name": "pods-only"
+        },
+        "webhooks": [
+          {
+            "name": "pods.example.org",
+            "rules": [
+              {
+                "apiGroups": [""],
+                "apiVersions": ["v1"],
+                "operations": ["CREATE"],
+                "resources": ["pods"]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "kind": "List"
+  },
+  "serviceaccounts -n yadgar": {
+    "apiVersion": "v1",
+    "items": [
+      {
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "metadata": {
+          "annotations": {
+            "argocd.argoproj.io/tracking-id": "yadgar:/ServiceAccount:yadgar/gateway",
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"kind\":\"...\"}"
+          },
+          "creationTimestamp": "2026-10-18T19:40:00Z",
+          "generation": 1,
+          "managedFields": [
+            {
+              "manager": "argocd-controller",
+              "operation": "Update"
+            }
+          ],
+          "name": "gateway",
+          "namespace": "yadgar",
+          "resourceVersion": "4242",
+          "uid": "uid-serviceaccount-gateway"
+        }
+      }
+    ],
+    "kind": "List"
+  },
+  "services -n yadgar": {
+    "apiVersion": "v1",
+    "items": [
+      {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+          "annotations": {
+            "argocd.argoproj.io/tracking-id": "yadgar:/Service:yadgar/gateway",
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"kind\":\"...\"}"
+          },
+          "creationTimestamp": "2026-10-18T19:40:00Z",
+          "generation": 1,
+          "managedFields": [
+            {
+              "manager": "argocd-controller",
+              "operation": "Update"
+            }
+          ],
+          "name": "gateway",
+          "namespace": "yadgar",
+          "resourceVersion": "4242",
+          "uid": "uid-service-gateway"
+        },
+        "spec": {
+          "clusterIP": "10.96.0.42",
+          "clusterIPs": ["10.96.0.42"],
+          "internalTrafficPolicy": "Cluster",
+          "ipFamilies": ["IPv4"],
+          "ipFamilyPolicy": "SingleStack",
+          "ports": [
+            {
+              "name": "http",
+              "port": 80,
+              "protocol": "TCP",
+              "targetPort": "http"
+            }
+          ],
+          "selector": {
+            "app.kubernetes.io/name": "gateway"
+          },
+          "sessionAffinity": "None",
+          "type": "ClusterIP"
+        },
+        "status": {
+          "loadBalancer": {}
+        }
+      }
+    ],
+    "kind": "List"
+  },
+  "statefulsets.apps -n yadgar": {
+    "apiVersion": "v1",
+    "items": [
+      {
+        "apiVersion": "apps/v1",
+        "kind": "StatefulSet",
+        "metadata": {
+          "annotations": {
+            "argocd.argoproj.io/tracking-id": "yadgar:apps/StatefulSet:yadgar/nats",
+            "kubectl.kubernetes.io/last-applied-configuration": "{\"kind\":\"...\"}"
+          },
+          "creationTimestamp": "2026-10-18T19:40:00Z",
+          "generation": 3,
+          "managedFields": [
+            {
+              "manager": "argocd-controller",
+              "operation": "Update"
+            }
+          ],
+          "name": "nats",
+          "namespace": "yadgar",
+          "resourceVersion": "4242",
+          "uid": "uid-statefulset-nats"
+        },
+        "spec": {
+          "podManagementPolicy": "OrderedReady",
+          "replicas": 1,
+          "selector": {
+            "matchLabels": {
+              "app.kubernetes.io/name": "nats"
+            }
+          },
+          "serviceName": "nats-headless",
+          "template": {
+            "metadata": {
+              "labels": {
+                "app.kubernetes.io/name": "nats"
+              }
+            },
+            "spec": {
+              "containers": [
+                {
+                  "image": "docker.io/library/nats:2.12.1@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                  "imagePullPolicy": "IfNotPresent",
+                  "name": "nats",
+                  "resources": {},
+                  "securityContext": {
+                    "readOnlyRootFilesystem": true
+                  }
+                }
+              ],
+              "restartPolicy": "Always",
+              "securityContext": {
+                "runAsNonRoot": true
+              }
+            }
+          },
+          "updateStrategy": {
+            "rollingUpdate": {
+              "partition": 0
+            },
+            "type": "RollingUpdate"
+          }
+        },
+        "status": {
+          "readyReplicas": 1,
+          "replicas": 1
+        }
+      }
+    ],
+    "kind": "List"
+  },
+  "validatingadmissionpolicies.admissionregistration.k8s.io": {
+    "apiVersion": "v1",
+    "items": [
+      {
+        "metadata": {
+          "name": "replica-limit"
+        },
+        "spec": {
+          "matchConstraints": {
+            "resourceRules": [
+              {
+                "apiGroups": ["apps"],
+                "apiVersions": ["v1"],
+                "operations": ["CREATE", "UPDATE"],
+                "resources": ["deployments"]
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "kind": "List"
+  },
+  "validatingwebhookconfigurations.admissionregistration.k8s.io": {
+    "apiVersion": "v1",
+    "items": [
+      {
+        "metadata": {
+          "name": "cert-manager-webhook"
+        },
+        "webhooks": [
+          {
+            "name": "webhook.cert-manager.io",
+            "rules": [
+              {
+                "apiGroups": ["cert-manager.io", "acme.cert-manager.io"],
+                "apiVersions": ["v1"],
+                "operations": ["CREATE", "UPDATE"],
+                "resources": ["*/*"]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "metadata": {
+          "name": "catch-all"
+        },
+        "webhooks": [
+          {
+            "name": "everything.example.org",
+            "rules": [
+              {
+                "apiGroups": ["*"],
+                "apiVersions": ["*"],
+                "operations": ["*"],
+                "resources": ["*"]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "kind": "List"
+  }
+}
