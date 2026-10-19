@@ -380,7 +380,7 @@ def test_the_trial_sends_the_personal_claim_and_reddens_as_designed(capsys) -> N
     # ADR-0959: the claim is under the caller's OWN segment, read from whoami.
     assert fake.gets == [("/auth/whoami", {"authorization": "Bearer tok-SECRET"})]
     assert fake.posts[1][1]["x-yadgar-project"] == OWN_CLAIM
-    assert "trial: VALID" in out
+    assert "trial: VALID" in out and f"neither {U} nor {N} did" in out
 
 
 def test_the_trial_claim_follows_whatever_segment_whoami_answers() -> None:
@@ -417,6 +417,8 @@ BAD_WHOAMI = {
     "not v7": (200, {"account_segment": OWN.replace("-7000-", "-4000-"), "user_id": "yadgar:user:" + OWN.replace("-7000-", "-4000-")}),
     "bad variant": (200, {"account_segment": OWN.replace("-8000-", "-c000-"), "user_id": "yadgar:user:" + OWN.replace("-8000-", "-c000-")}),
     "segment with a slash": (200, {"account_segment": OWN + "/x", "user_id": f"yadgar:user:{OWN}/x"}),
+    "misplaced dash": (200, {"account_segment": OWN[:8] + OWN[9] + "-" + OWN[10:], "user_id": "yadgar:user:" + OWN[:8] + OWN[9] + "-" + OWN[10:]}),
+    "no dashes": (200, {"account_segment": OWN.replace("-", "a"), "user_id": "yadgar:user:" + OWN.replace("-", "a")}),
     "user_id disagrees": (200, {"account_segment": OWN, "user_id": "yadgar:user:0192f0a0-0000-7000-8000-0000000000b0"}),
     "not an object": (200, [OWN]),
 }
@@ -711,11 +713,18 @@ def test_the_not_member_claim_is_a_well_formed_foreign_private_claim() -> None:
     assert segment != OWN
 
 
-@pytest.mark.parametrize("own", [pp.FOREIGN_SEGMENT, pp.FOREIGN_SEGMENT.upper()])
-def test_a_not_member_claim_equal_to_the_own_segment_is_refused(own) -> None:
-    # The gateway compares segments ASCII-case-insensitively, so must the probe.
+def test_a_not_member_claim_equal_to_the_own_segment_is_refused() -> None:
     with pytest.raises(pp.ProbeError, match="NOT_MEMBER"):
-        pp.leg_c_arms(own)
+        pp.leg_c_arms(pp.FOREIGN_SEGMENT)
+
+
+def test_segments_compare_ascii_case_insensitively_as_the_gateway_does() -> None:
+    # gateway `member::is_foreign_private` uses `eq_ignore_ascii_case`. The
+    # fixed FOREIGN_SEGMENT has no letters, so the case rule is tested here on
+    # one that does.
+    assert pp.same_segment(OWN, OWN.upper())
+    assert pp.same_segment(OWN.upper(), OWN)
+    assert not pp.same_segment(OWN, OWN.replace("a11c", "a11d"))
 
 
 def test_leg_c_refuses_to_run_when_its_own_segment_is_the_foreign_one(capsys) -> None:
@@ -731,7 +740,26 @@ def test_leg_c_names_a_registered_private_ancestor_when_personal_did_not_rise(ca
     # and PERSONAL would not count: leg (c) is red, and says why it might be.
     assert run(Arms([BEFORE, rose(U, O, I, A, N)]), "--leg-c") == pp.EXIT_FAIL
     out = capsys.readouterr().out
-    assert f"local/{OWN}" in out and "registered" in out
+    # Text only the hint prints: the `call PERSONAL ... claim=` line also
+    # carries `local/<own>`, so that alone would pass with the hint deleted.
+    assert f"registered private row at local/{OWN} or {OWN_CLAIM} would resolve the claim" in out
+
+
+def test_leg_c_prints_no_ancestor_hint_when_personal_rose(capsys) -> None:
+    assert run(Arms([BEFORE, rose(*ALL)]), "--leg-c") == pp.EXIT_PASS
+    assert "would resolve the claim" not in capsys.readouterr().out
+
+
+def test_the_trial_names_a_registered_private_ancestor_when_personal_did_not_rise(capsys) -> None:
+    assert run(Fake([BEFORE]), "--trial", "unregistered-personal") == pp.EXIT_TRIAL_INVALID
+    out = capsys.readouterr().out
+    assert f"a registered row at local/<own> or {OWN_CLAIM} would resolve the claim" in out
+
+
+def test_the_trial_prints_no_ancestor_hint_when_personal_rose_with_another(capsys) -> None:
+    both = vector({"a": 1, "b": 1}, {("a", N): 1, ("b", P): 1})
+    assert run(Fake([BEFORE, both]), "--trial", "unregistered-personal") == pp.EXIT_TRIAL_INVALID
+    assert "would resolve the claim" not in capsys.readouterr().out
 
 
 def test_leg_c_claims_reach_the_classes_the_gateway_assigns() -> None:

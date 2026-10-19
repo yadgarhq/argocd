@@ -215,9 +215,14 @@ def personal_claim(own_segment: str) -> str:
     return f"local/{own_segment}/{PERSONAL_SUFFIX}"
 
 
+def same_segment(a: str, b: str) -> bool:
+    """Whether two `local/` segments name one account: ASCII-case-insensitive, as the gateway compares."""
+    return a.lower() == b.lower()
+
+
 def leg_c_arms(own_segment: str) -> tuple[Arm, ...]:
     """Leg (c)'s arms, one per probed reason. The PERSONAL claim is the caller's own."""
-    if FOREIGN_SEGMENT.lower() == own_segment.lower():
+    if same_segment(FOREIGN_SEGMENT, own_segment):
         raise ProbeError(
             f"the NOT_MEMBER arm's segment {FOREIGN_SEGMENT} is this account's own; "
             "that claim would not count PROJECT_NOT_MEMBER"
@@ -619,7 +624,10 @@ def run(
         print(f"::warning::project-probe {verdict.message}", flush=True)
     if args.trial == "unregistered-personal":
         if trial_valid(deltas):
-            say(f"trial: VALID — the assertion is red as designed; {PERSONAL} moved and {UNRESOLVABLE} did not")
+            say(
+                f"trial: VALID — the assertion is red as designed; {PERSONAL} moved and neither "
+                f"{UNRESOLVABLE} nor {NOT_MEMBER} did"
+            )
             return EXIT_TRIAL_RED
         say(
             f"trial: INVALID — needs {PERSONAL} to rise and neither {UNRESOLVABLE} nor {NOT_MEMBER}; "

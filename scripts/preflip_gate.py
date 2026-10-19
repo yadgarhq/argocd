@@ -21,9 +21,9 @@ class (`PROJECT_UNRESOLVABLE`, `PROJECT_UNREGISTERED_PERSONAL`,
 `PROJECT_NOT_MEMBER`) and exits 0 only when every one of their counters rose
 per pod; it is red when inconclusive. Its PERSONAL claim is under the probe
 account's own segment, read from the gateway's `GET /auth/whoami` (ADR-0959),
-so leg (c) cannot pass on a gateway without that route. argocd-verify's `project-probe.yaml` names such a run
-`project-probe leg-c` (`run-name`; the runs listing carries no dispatch
-inputs). Only a `workflow_dispatch` of that workflow's path on this
+so leg (c) cannot pass on a gateway without that route. argocd-verify's
+`project-probe.yaml` names such a run `project-probe leg-c` (`run-name`; the
+runs listing carries no dispatch inputs). Only a `workflow_dispatch` of that workflow's path on this
 repository's default branch, with this repository as head and a `head_sha`
 the default branch contains, counts: a branch's or a tag's copy of the
 workflow could set the same name and exit 0. Only the probe job's own
