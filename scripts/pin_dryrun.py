@@ -19,10 +19,15 @@ car C8). This file never asks for them.
 
 WHAT `run` DOES, in order. Every refusal comes before any cluster read.
 
-  0. The checker is main's: every file in CHECKER_FILES that this process runs
-     is byte-identical to the same file at `--main-sha`, or the run is an
-     infrastructure failure. The result names that checker (`checker.main_sha`
-     and a sha256 per file), so `find` can refuse a green from an older one.
+  0. A self-check, not a control: every file in CHECKER_FILES that this
+     process runs is compared with the same file at `--main-sha`, and a
+     mismatch is an infrastructure failure. That catches an honest mix-up (a
+     checkout at the wrong sha). It cannot stop a modified checker, which can
+     skip the check and write main's hashes. The result's `checker` block
+     (`main_sha`, a sha256 per file) is therefore a RECORD only. The guard
+     against a stale or weaker checker is `find`'s run binding: the run must
+     be main's own workflow file at the default branch's current head, and
+     the result must name argocd main's current sha.
 
   1. Refuse unless main and the sha have exactly one merge base (a
      criss-cross history makes `main...sha` ambiguous), and `main...sha`
@@ -128,10 +133,14 @@ THE RESULT holds object keys and field paths, never a value: `sha`,
              the caller passes (`--main-sha`, `--pin`: argocd main now), or
              its `read_at` is missing, older than FRESH_SECONDS, or in the
              future past FUTURE_SKEW_SECONDS;
-    stale    also: its result names no checker or another checker than
-             main's, or its run's head_sha is an older default-branch commit
+    stale    also: its run's head_sha is an older default-branch commit
              (an older `pin-dryrun.yaml` ran: the trust is main's current
-             workflow file, never the run's own version);
+             workflow file, never the run's own version). THIS run binding is
+             the guard against a stale checker: that workflow checks out
+             argocd main at a full sha and runs its code. A result whose
+             `checker.main_sha` is absent or differs is stale too, but that
+             field is self-attested, a consistency record, not a control;
+             `find` never reads `checker.files`;
     green    otherwise. Only green exits 0. A `result.json` with a duplicate
              key is an infrastructure failure (exit 3), never a verdict.
 
@@ -384,7 +393,13 @@ def yaml_ambiguities(text: str) -> list[str]:
 
 
 def checker_identity(repo: Path, base: str, runner: Callable) -> dict:
-    """`{main_sha, files: {path: sha256}}` of the code running, refused unless it is main's byte for byte."""
+    """`{main_sha, files: {path: sha256}}` of the code running, refused unless it is main's byte for byte.
+
+    A SELF-CHECK AND A RECORD, NOT A CONTROL. It catches an honest mix-up (a
+    checkout at the wrong sha). A modified checker can skip it and write
+    main's hashes. The guard is `find`'s run binding: main's workflow file at
+    the default branch's head, which checks out argocd main and runs its code.
+    """
     files: dict[str, str] = {}
     for relative in CHECKER_FILES:
         running = (HERE.parent / relative).read_bytes()
@@ -457,6 +472,17 @@ def pin_refusals(repo: Path, base: str, sha: str, runner: Callable) -> tuple[str
 
 def objects_of(documents: list) -> dict[str, dict]:
     return {object_key(d): d for d in documents if isinstance(d, dict) and d.get("kind")}
+
+
+def rendered_twice(documents: list) -> list[str]:
+    """Every object key a render holds more than once. A dict of objects would silently keep one."""
+    seen: set[str] = set()
+    twice: set[str] = set()
+    for document in documents:
+        if isinstance(document, dict) and document.get("kind"):
+            key = object_key(document)
+            (twice if key in seen else seen).add(key)
+    return sorted(twice)
 
 
 def is_hook(document: dict) -> bool:
@@ -596,7 +622,9 @@ def render_problems(base: dict[str, dict], head: dict[str, dict]) -> list[str]:
         if is_hook(old) != is_hook(new):
             problems.append(f"render diff: {key} hook status changed ({HOOK} {'added' if is_hook(new) else 'removed'} at head)")
         for path in render_paths(old, new):
-            if new.get("kind") not in WORKLOAD_KINDS or old.get("kind") != new.get("kind") or not IMAGE_PATH.fullmatch(path):
+            # The key carries the kind, so `old` and `new` share it. This clause is
+            # the only guard on a hook of a non-workload kind (hooks skip READS).
+            if new.get("kind") not in WORKLOAD_KINDS or not IMAGE_PATH.fullmatch(path):
                 problems.append(f"render diff outside the image rule: {key} {path}")
                 continue
             before, after = _at(old, path), _at(new, path)
@@ -718,8 +746,14 @@ def dry_run(repo: Path, base: str, sha: str, cluster, *, render: Callable[[bytes
         head_documents = render(head_application)
     except settled_gate.InfrastructureError as error:
         raise InfrastructureError(str(error)) from error
+    problems = [f"{key}: rendered twice at {side}; refused" for side, docs in (("main", base_documents), ("the head", head_documents)) for key in rendered_twice(docs)]
+    if problems:
+        return {**result, "problems": problems}
     base_objects, head_objects = objects_of(base_documents), objects_of(head_documents)
-    problems = render_refusals(base_objects, head_objects, head_documents, read_at(repo, sha, TABLE, runner), target)
+    try:
+        problems = render_refusals(base_objects, head_objects, head_documents, read_at(repo, sha, TABLE, runner), target)
+    except AssertionError as error:  # a gate helper's assert; never an exit-1 traceback
+        raise InfrastructureError(f"a gate helper failed: {error}") from error
     if problems:
         return {**result, "problems": problems}
 

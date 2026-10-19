@@ -344,6 +344,29 @@ def test_an_object_added_at_head_is_red(repo: Path) -> None:
     assert any("/ConfigMap//new-one" in p and "added" in p for p in result["problems"]), result["problems"]
 
 
+def test_a_steady_object_removed_at_head_is_red(repo: Path) -> None:
+    # Re-review F1: a chart that drops a steady object (the ConfigMap here, a
+    # NetworkPolicy in life) leaves it live, so only the object-set rule sees it.
+    head = [d for d in head_documents() if not (d["kind"] == "ConfigMap" and d["metadata"]["name"] == "shared")]
+    sha = pin_branch(repo, table_docs=head)
+    result = run(repo, sha, render=Render({PIN: base_documents(), TARGET: head}))
+    assert result["result"] == "red"
+    assert any("/ConfigMap//shared" in p and "removed at head" in p for p in result["problems"]), result["problems"]
+
+
+def test_a_key_rendered_twice_is_refused_not_a_traceback(repo: Path, tmp_path: Path) -> None:
+    # Re-review F9: `digests` asserts on a key rendered twice; that must not escape as exit 1.
+    twice = head_documents() + [by_kind_name(head_documents(), "ConfigMap", "shared")]
+    sha = pin_branch(repo, table_docs=head_documents())
+    result = run(repo, sha, kubectl=NoCluster(), render=Render({PIN: base_documents(), TARGET: twice}))
+    assert result["result"] == "refused"
+    assert any("/ConfigMap//shared" in p and "rendered twice" in p for p in result["problems"]), result["problems"]
+    out = tmp_path / "out" / "result.json"
+    argv = ["run", "--repo", str(repo), "--main-sha", main_sha(repo), "--sha", sha, "--context", CONTEXT, "--out", str(out)]
+    assert pin_dryrun.main(argv, render=Render({PIN: base_documents(), TARGET: twice}), kube_runner=NoCluster()) == 1
+    assert json.loads(out.read_text())["result"] == "refused"
+
+
 # ── 2. settledness ──────────────────────────────────────────────────────────
 
 
@@ -576,6 +599,25 @@ def test_a_field_removed_at_head_is_red(repo: Path) -> None:
     assert result["result"] == "red"
     assert any("render diff" in p and "apps/Deployment//gateway spec.template.spec.securityContext" in p for p in result["problems"])
     assert any("spec.template.spec.containers[0].securityContext" in p for p in result["problems"]), result["problems"]
+
+
+def test_a_hook_daemonset_image_change_is_red(repo: Path) -> None:
+    # Re-review F2: a hook skips READS, so the WORKLOAD_KINDS clause is the only
+    # guard on a hook of a non-workload kind. A DaemonSet is not one.
+    def daemonset(image: str) -> dict:
+        return {
+            "apiVersion": "apps/v1",
+            "kind": "DaemonSet",
+            "metadata": {"name": "h", "annotations": {"helm.sh/hook": "pre-upgrade"}},
+            "spec": {"template": {"spec": {"containers": [{"name": "c", "image": image}]}}},
+        }
+
+    base = base_documents() + [daemonset("ghcr.io/yadgarhq/x:1")]
+    head = head_documents() + [daemonset("ghcr.io/yadgarhq/x:2")]
+    sha = pin_branch(repo, table_docs=head)
+    result = run(repo, sha, render=Render({PIN: base, TARGET: head}))
+    assert result["result"] == "red"
+    assert any("apps/DaemonSet//h" in p and "containers[0].image" in p for p in result["problems"]), result["problems"]
 
 
 def test_a_mutated_hook_is_red(repo: Path) -> None:
