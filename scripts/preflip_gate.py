@@ -65,6 +65,23 @@ THE LEGS, all read, all reported, any one failing fails the gate:
      `--min-resolutions` (default 1): zero traffic yields zero refusals for
      free, so a silent window proves nothing.
   7. Leg (c), as above.
+  8. AT GATE TIME, `registry_loaded` reads 1 on EVERY gateway replica (ledger
+     1674, ADR-0674's gauge). Argo calls the gateway Healthy once its pods are
+     Ready, which can precede the registry load; a flip then refuses every
+     call such a replica serves. Read at `now`, not over the window:
+     - the expected count is the live Deployment `yadgar/gateway`'s
+       `spec.replicas` (an integer >= 1), never a constant;
+     - the live pods are those its own `matchLabels` selector lists, minus
+       the terminal phases (Failed, Succeeded); a selector with
+       `matchExpressions`, or none, is refused rather than approximated;
+     - the live pod count must equal `spec.replicas`, every live pod must
+       have the gauge in the instant read (`LOADED{namespace="yadgar"}`, no
+       pod or instance filter) and every one of its series must read 1, and
+       no series may name a pod that is not live. A missing series is a FAIL
+       (unscraped, or a boot that never published), never a pass.
+     The Kubernetes reads are two GETs with the runner pod's own
+     ServiceAccount token (`post-merge-verifier`, get/list on pods and
+     deployments), straight to the API server.
 
 PER SERIES, FROM RAW SAMPLES, NEVER A BARE `increase()` (ADR-0620). The gateway
 registers its counters lazily, so a pod's first refusal makes the series appear
@@ -102,7 +119,7 @@ as input. Prometheus on kind-yadgar keeps 1d (measured 2026-10-18), so a
 longer window refuses at leg 3 until retention changes or the window is read
 in slices.
 
-Exit 0 PASS, 1 FAIL. Any read that fails is a FAIL. Never printed: the token.
+Exit 0 PASS, 1 FAIL. Any read that fails is a FAIL. Never printed: either token.
 
 Standard library only: the pre-commit hook that runs the tests installs pytest
 and PyYAML and nothing else.
@@ -118,6 +135,7 @@ import json
 import math
 import os
 import re
+import ssl
 import sys
 import time
 import urllib.error
@@ -133,6 +151,12 @@ LOWEST_QUERY = 'min(prometheus_tsdb_lowest_timestamp_seconds{job="prometheus"})'
 # a relabelled pod still counts. `up` carries no gateway-specific name and does.
 SELECTOR = f'{{__name__=~"{REFUSALS}|{RESOLUTIONS}|{LOADED}",namespace="yadgar"}}'
 UP_SELECTOR = 'up{namespace="yadgar",app="gateway"}'
+# Leg 8's instant read: every pod's gauge, with no pod, instance or app filter.
+LOADED_NOW_QUERY = f'{LOADED}{{namespace="yadgar"}}'
+GATEWAY_NAMESPACE = "yadgar"
+GATEWAY_DEPLOYMENT = "gateway"
+TERMINAL_POD_PHASES = frozenset({"Failed", "Succeeded"})
+SERVICE_ACCOUNT_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
 
 PROBE_REPO = "yadgarhq/argocd-verify"
 PROBE_WORKFLOW = "project-probe.yaml"
@@ -315,6 +339,60 @@ def up_failures(ups: list[Series], start: float, end: float) -> list[str]:
     return out
 
 
+def parse_vector(body: dict) -> dict[str, list[float]]:
+    """An instant read of the gauge, as {pod: [value per series]}."""
+    if body.get("status") != "success" or body.get("data", {}).get("resultType") != "vector":
+        raise GateError(f"prometheus answered {body.get('status')!r} to the gate-time read: {body.get('error', 'not a vector')}")
+    out: dict[str, list[float]] = {}
+    for row in body["data"]["result"]:
+        pod = row["metric"].get("pod")
+        if not pod:
+            raise GateError(f"a gate-time {LOADED} series without a pod: {row['metric']}")
+        value = float(row["value"][1])
+        if math.isnan(value):
+            raise GateError(f"{LOADED} {pod}: NaN at gate time")
+        out.setdefault(pod, []).append(value)
+    return out
+
+
+def registry_loaded_now(transport: "Transport", now: float) -> tuple[list[str], str]:
+    """Leg 8: `(failures, summary)`. Every live gateway replica reads 1 now, and
+    the live replicas are exactly as many as the Deployment wants."""
+    where = f"Deployment {GATEWAY_NAMESPACE}/{GATEWAY_DEPLOYMENT}"
+    deployment = transport.kube_get(f"/apis/apps/v1/namespaces/{GATEWAY_NAMESPACE}/deployments/{GATEWAY_DEPLOYMENT}")
+    spec = deployment.get("spec") or {}
+    replicas = spec.get("replicas")
+    if not isinstance(replicas, int) or isinstance(replicas, bool) or replicas < 1:
+        raise GateError(f"{where} spec.replicas is {replicas!r}: the gate needs an integer >= 1 to compare against")
+    selector = spec.get("selector") or {}
+    labels = selector.get("matchLabels") or {}
+    if not labels or selector.get("matchExpressions"):
+        raise GateError(f"{where} selector {selector!r}: only a non-empty matchLabels selector is read exactly")
+    query = urllib.parse.urlencode({"labelSelector": ",".join(f"{k}={v}" for k, v in sorted(labels.items()))})
+    pods = transport.kube_get(f"/api/v1/namespaces/{GATEWAY_NAMESPACE}/pods?{query}").get("items")
+    if not isinstance(pods, list):
+        raise GateError(f"kubernetes: the pod list for {where} carries no items")
+    live = sorted(
+        p["metadata"]["name"] for p in pods if (p.get("status") or {}).get("phase") not in TERMINAL_POD_PHASES
+    )
+    loaded = parse_vector(transport.prom_query({"query": LOADED_NOW_QUERY, "time": f"{now:.3f}"}))
+    failures = []
+    if len(live) != replicas:
+        failures.append(f"{where} wants {replicas} replica(s), {len(live)} gateway pod(s) are live: {live}")
+    for pod in live:
+        values = loaded.get(pod)
+        if not values:
+            failures.append(
+                f"pod {pod} has no {LOADED} series at gate time: unscraped or never published, so not loaded"
+            )
+        elif any(v != 1 for v in values):
+            failures.append(f"pod {pod}: {LOADED} is {min(values):g}, not 1: its project registry has not loaded")
+    for pod in sorted(loaded.keys() - set(live)):
+        failures.append(f"pod {pod} reports {LOADED} but is not a live gateway pod of {where}")
+    ok = sum(1 for pod in live if loaded.get(pod) and all(v == 1 for v in loaded[pod]))
+    return failures, f"registry loaded on {ok}/{replicas} gateway replica(s) at {iso(now)}"
+
+
 # --- the probe's runs -------------------------------------------------------------
 
 
@@ -442,12 +520,37 @@ def leg_c(transport: "Transport", start: float, slack: float, max_age: float) ->
 class Transport(Protocol):
     def prom_query(self, params: dict) -> dict: ...
     def github_get(self, path: str) -> dict: ...
+    def kube_get(self, path: str) -> dict: ...
 
 
 class Network:
-    def __init__(self, prometheus_url: str, github_token: str):
+    def __init__(self, prometheus_url: str, github_token: str, kube_url: str = "https://kubernetes.default.svc"):
         self.prometheus_url = prometheus_url
         self.github_token = github_token
+        self.kube_url = kube_url
+
+    def kube_get(self, path: str) -> dict:
+        """One GET to the API server with the runner pod's own ServiceAccount token."""
+        try:
+            with open(f"{SERVICE_ACCOUNT_DIR}/token") as f:
+                token = f.read().strip()
+            context = ssl.create_default_context(cafile=f"{SERVICE_ACCOUNT_DIR}/ca.crt")
+        except (OSError, ssl.SSLError) as e:
+            raise GateError(
+                f"no in-cluster ServiceAccount token or CA under {SERVICE_ACCOUNT_DIR} ({type(e).__name__}): "
+                "is the runner pod's serviceAccountName post-merge-verifier?"
+            ) from None
+        if not token:
+            raise GateError(f"the ServiceAccount token under {SERVICE_ACCOUNT_DIR} is empty")
+        request = urllib.request.Request(f"{self.kube_url}{path}", headers={"Accept": "application/json"})
+        request.add_header("Authorization", f"Bearer {token}")
+        try:
+            with urllib.request.urlopen(request, timeout=30, context=context) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as e:
+            raise GateError(f"kubernetes {path.split('?')[0]}: HTTP {e.code}") from e
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise GateError(f"kubernetes {path.split('?')[0]}: {e}") from e
 
     def prom_query(self, params: dict) -> dict:
         url = f"{self.prometheus_url}/api/v1/query?{urllib.parse.urlencode(params)}"
@@ -509,6 +612,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="the leg-c run must end within this many seconds before start: finite, > 0, at most 7 days",
     )
     p.add_argument("--prometheus-url", default="http://prometheus-server.observability.svc:80")
+    p.add_argument("--kube-url", default="https://kubernetes.default.svc", help="the API server, read with the pod's own token")
     return p.parse_args(argv)
 
 
@@ -625,13 +729,24 @@ def run(
     except (KeyError, IndexError, TypeError, ValueError) as e:
         failures.append(f"prometheus answer not understood: {e!r}")
 
+    # Leg 8: the registry loaded on every replica, at gate time.
+    loaded_line = "registry loaded: not read"
+    try:
+        loaded_failures, loaded_line = registry_loaded_now(transport, now())
+        say(loaded_line)
+        failures.extend(loaded_failures)
+    except GateError as e:
+        failures.append(str(e))
+    except (KeyError, IndexError, TypeError, ValueError) as e:
+        failures.append(f"gate-time registry read not understood: {e!r}")
+
     for f in failures:
         say(f"FAIL: {f}")
     tally = f"refusals {refusals.total:g}, resolutions {resolutions.total:g}, window {iso(start)} .. {iso(end)}"
     if failures:
         say(f"FAIL: {tally}")
     else:
-        say(f"PASS: legs (a)+(b)+(c) passed ({tally}); {leg_c_line}")
+        say(f"PASS: legs (a)+(b)+(c) passed ({tally}); {leg_c_line}; {loaded_line}")
     return EXIT_PASS if not failures else EXIT_FAIL
 
 
@@ -644,7 +759,7 @@ def main(argv: list[str] | None = None) -> int:
         print(line, flush=True)
         lines.append(line)
 
-    code = run(args, env, Network(args.prometheus_url, env.get("GITHUB_TOKEN", "")), out=out)
+    code = run(args, env, Network(args.prometheus_url, env.get("GITHUB_TOKEN", ""), args.kube_url), out=out)
     summary = env.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a") as f:
