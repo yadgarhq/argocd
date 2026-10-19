@@ -23,8 +23,8 @@ CI job, never in the offline pre-commit hook.
       `infra/yadgar/values.yaml` at 05b160b with the same flags — "this
       organisation's render, before and after the move of its values:
       byte-identical, 0 differing objects". A difference is named by object.
-      Each later pin's measurement is in the pull request body that moved the
-      pin, not in a log here (ledger 1632, car C2).
+      Each later pin bump's or values change's measurement is in the pull
+      request body that made it, not in a log here (ledger 1632, car C2).
 
       A PIN BUMP OR A VALUES CHANGE IS A RENDER CHANGE, AND THIS REDDENS ON IT
       ON PURPOSE. `scripts/pin_bump.py --write` rewrites the table in the same

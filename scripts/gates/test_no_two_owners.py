@@ -1920,16 +1920,26 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # constant rather than read out of git, for the depth-1 reason the valkey
 # constants above give.
 #
-# Each later pin's measurement is in the pull request body that moved the pin,
-# not in a log here (ledger 1632, car C2). `PIN_BEFORE_B9` stays 0.3.7:
-# `test_the_old_pin_names_both_probe_defects` needs a pin whose probes are
-# defective.
+# `PREVIOUS_PIN` stays 0.19.1; every later pin is still diffed against it, not
+# against the pin before (task 1507). `PIN_CHANGES` therefore holds, per field
+# group, the bump that first moved it:
+#   - every module `image`: each bump;
+#   - valkey args, probes, mounts and volumes: 0.23.1 (B-V2);
+#   - valkey env: 0.23.10 (platform 0.2.3);
+#   - gateway, iam, project and task env: 0.24.17 (ADR-0925 Q-C1);
+#   - nats command, args, env, liveness probe, mounts and volumes: 0.24.17
+#     (ADR-0924);
+#   - nats `checksum/config` annotation: 0.23.1 (B-N2);
+#   - seeder, in `PIN_ADDED`: 0.25.8.
+# The per-bump measurements that used to be logged here are gone (ledger 1632,
+# car C2). `PIN_BEFORE_B9` stays 0.3.7: `test_the_old_pin_names_both_probe_defects`
+# needs a pin whose probes are defective.
 #
 # BOTH SIDES RENDER EVERY SERVER AT `clientAuth: "off"`, FROM B-U8a ON. The
 # 0.13.13 module charts predate the B-U5 contracts, and their render checks
 # refuse `optional` and `required` by name ("not enforced yet"). Once a hop
 # moves past `off`, the previous pin cannot render the current values at all.
-# PB-2 measured with all six at `off`, so pinning `off` on
+# PB-2 (0.13.13 → 0.19.1) measured with all six at `off`, so pinning `off` on
 # both sides keeps this a measurement of the pin alone. The modes themselves
 # are gated by `test_yadgar_application.py`'s `EXPECTED_CLIENT_AUTH` and by K3.
 #
