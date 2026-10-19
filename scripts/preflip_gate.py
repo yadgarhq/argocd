@@ -30,7 +30,7 @@ passes when the NEWEST such run whose job completed at or
 before `start - probe_slack`, and no earlier than `start - leg_c_max_age`,
 concluded `success`. A newer red run is not masked by an older green one.
 Re-reading the counter here instead would need the run, the slack and the
-window inside Prometheus' 1d retention together, which caps the window.
+window inside Prometheus' 3d retention together, which caps the window.
 `PROJECT_REGISTRY_UNAVAILABLE` has no probe (it needs the registry down); legs
 (a) and 4 cover it inside the window.
 
@@ -115,7 +115,7 @@ Prometheus' discovery:
     covered at all.
 
 THE WINDOW LENGTH IS THE OPERATOR'S (plan open question 3). This gate takes it
-as input. Prometheus on kind-yadgar keeps 1d (measured 2026-10-18), so a
+as input. Prometheus on kind-yadgar keeps 3d (set by ledger 1678), so a
 longer window refuses at leg 3 until retention changes or the window is read
 in slices.
 
