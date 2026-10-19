@@ -2,7 +2,7 @@
 """E2-interim of the automatic pin: judge a pin sha against kind-yadgar, read-only (ledger 1632 C4, ADR-0946, ADR-0948 R2).
 
     pin_dryrun.py run  --repo DIR --main-sha SHA --sha SHA --context CTX --out FILE
-    pin_dryrun.py find --sha SHA --out FILE [--repository R] [--workflow-path P]
+    pin_dryrun.py find --sha SHA --main-sha SHA --pin X.Y.Z --out FILE [--repository R] [--workflow-path P]
 
 THE PLAN IS `yadgarhq/docs` `plans/auto-deploy-parent-chart.md`, section 3,
 "Check E2". `yadgarhq/argocd-verify`'s `pin-dryrun.yaml` runs `run` on the
@@ -19,11 +19,14 @@ car C8). This file never asks for them.
 
 WHAT `run` DOES, in order. Every refusal comes before any cluster read.
 
-  1. Refuse unless `main...sha` (`--no-renames`, so a rename shows its old
-     path) changes only the three pin files: `applications/yadgar.yaml`,
-     `scripts/chart_pin.json`, `scripts/gates/yadgar_render.sha256`.
+  1. Refuse unless main and the sha have exactly one merge base (a
+     criss-cross history makes `main...sha` ambiguous), and `main...sha`
+     (`--no-renames`, so a rename shows its old path) changes only the three
+     pin files: `applications/yadgar.yaml`, `scripts/chart_pin.json`,
+     `scripts/gates/yadgar_render.sha256`.
   2. Read ONE value from the sha's data: `spec.source.targetRevision`, a bare
-     release `X.Y.Z`. Refuse unless the sha's `yadgar.yaml` is main's with that
+     release `X.Y.Z` not lower than main's pin (a downgrade is a human revert).
+     Refuse unless the sha's `yadgar.yaml` is main's with that
      one line rewritten (`pin_bump.rewrite_target_revision`), byte for byte,
      and its `chart_pin.json` is main's with only `chart_tag` moved. So no PR
      value reaches the credential: the head render is main's values at the
@@ -32,9 +35,9 @@ WHAT `run` DOES, in order. Every refusal comes before any cluster read.
      through the gates' own `parent_render` (helm v3.18.4 in the workflow).
      Refuse when the sha's K3 table disagrees with the head render, when a
      render holds a Secret (never read), or a kind the read table below does
-     not name. `helm.sh/hook` objects are left out of every comparison, as in
-     the hand method of argocd#103 to #112 (Argo runs hooks; they are not
-     steady-state objects).
+     not name. `helm.sh/hook` objects are not read from the cluster, as in the
+     hand method of argocd#103 to #112 (Argo runs hooks; they are not
+     steady-state objects), but they ARE judged in step 7's render diff.
   4. Read, once: the `yadgar` Application, each rendered kind in namespace
      `yadgar` (cluster-scoped kinds without a namespace), and the mutating and
      validating webhook configurations and admission policies.
@@ -46,10 +49,15 @@ WHAT `run` DOES, in order. Every refusal comes before any cluster read.
      the annotation the hand method added before `kubectl diff`), and its
      rendered fields are a subset of live. Any mismatch is drift: red,
      "baseline not empty".
-  7. The head diff: the fields where the head render differs from live. Green
-     only when every one is `spec.template.spec.containers[N].image` of a
-     Deployment, StatefulSet or Job (an initContainer image is red, as in
-     `pin_bump.py`'s classifier), and the object set is the same at both pins.
+  7. The render diff: the base render against the head render, EVERY object,
+     hooks included, in both directions (a field removed at head counts). Green
+     only when the object set is the same at both pins, every object keeps its
+     hook status (`helm.sh/hook` neither added nor removed), and every changed
+     path is exactly `spec.template.spec.containers[N].image` (anchored) of a
+     Deployment, StatefulSet or Job whose image repository does not move. An
+     initContainer image is red, as in `pin_bump.py`'s classifier.
+  8. The live head diff: the fields where the head render differs from live,
+     steady objects only, held to the same image rule.
 
 THE COMPARATOR. Rendered fields only, so `managedFields`, `resourceVersion`,
 `generation`, `status`, uids, server defaults and extra live annotations never
@@ -69,9 +77,10 @@ admission it did not run. ADR-0948 R2 lets a pin auto-merge on this evidence.
 No client-side dry run either: it is not a `get`, and kubectl skips its own
 schema check when the server supports field validation, so a client dry run
 would add a write-shaped verb and validate nothing (reasoned from kubectl's
-validator code, NOT measured on kind-yadgar). A head diff limited to the
-image of objects that already passed admission at the current pin needs no
-schema check.
+validator code, NOT measured on kind-yadgar). That omission stands only
+together with step 7: the head render may differ from the base render, which
+live already admitted, in an image string of the same repository alone, and
+an image string needs no schema check.
 
 `Job/seeder` carries `Replace=true,Force=true`; its pod template is immutable,
 so even E2-full would judge it by the render alone. Here it is compared like
@@ -83,22 +92,46 @@ THE RESULT holds object keys and field paths, never a value: `sha`,
 `compared`, `admission`. `pin-dryrun.yaml` uploads it as artifact `pin-dryrun`
 (`result.json`).
 
-`find` is the reader, and the evidence is only as good as its filters. It takes
-the newest `pin-dryrun` artifact whose run is a completed `workflow_dispatch`
-of exactly the workflow's path, with this repository as repository and head,
-on the default branch, AND with a `head_sha` reachable from the default branch
-through `compare/{branch}...{sha}`: a tag named `main` reports
-`head_branch=main` while running the tag's copy of the workflow (argocd#111
-S1). The artifact's own `sha` must be the one asked for. A newer red beats an
-older green. Never `commits/{sha}`: GitHub serves the whole fork network there.
+`find` is the reader, and the evidence is only as good as its filters.
+
+  TRUST. It considers a `pin-dryrun` artifact only when its run is a
+  `workflow_dispatch` of exactly the workflow's path, with this repository as
+  repository and head, on the default branch, AND with a `head_sha` reachable
+  from the default branch's head COMMIT: `compare/{branch head sha}...{sha}`.
+  Never the bare branch name, because git resolves `refs/tags/main` before
+  the branch; and `head_branch` alone is not enough either, because a run on a
+  tag named `main` reports `head_branch=main` (argocd#111 S1). The artifact's
+  own `sha` must be the one asked for. Never `commits/{sha}`: GitHub serves
+  the whole fork network there.
+
+  BINDING. The NEWEST trusted artifact for the sha decides, and nothing older
+  is consulted behind it. Its verdict is:
+    pending  its run has not completed (an artifact is uploaded before the
+             job's last step, so a red run is visible before it ends);
+    red      its result is red or refused, or its run concluded anything but
+             `success`;
+    stale    its result names another main sha or another pin than the ones
+             the caller passes (`--main-sha`, `--pin`: argocd main now), or
+             its `read_at` is missing, older than FRESH_SECONDS, or in the
+             future past FUTURE_SKEW_SECONDS;
+    green    otherwise. Only green exits 0.
+
+  WHY THE BINDING. The token `auto-pin.yaml` reads with
+  (`yadgarhq-settled-dispatch`, `actions: write` on argocd-verify) can also
+  DELETE artifacts and CANCEL runs. Without the binding, whoever holds it
+  could cancel or delete a newer red and let an older green, judged against an
+  older main, authorise a merge. Bound to argocd main's current sha and pin
+  and to a fresh `read_at`, an older green is stale, and a cancelled run is
+  red.
 
 STANDARD LIBRARY AT IMPORT. `find` runs in a job that may install nothing, so
 PyYAML, `settled_gate` (which imports PyYAML at module level), `pin_bump` and
 the gate modules load only inside `run`, which `pin-dryrun.yaml` runs after
 installing its hash-pinned requirements.
 
-Exit codes: 0 green (or found green); 1 red, refused, or not found green;
-2 usage; 3 infrastructure (nothing written for `run`).
+Exit codes: 0 green (for `find`: a green verdict); 1 red, refused, or for
+`find` pending, stale or nothing found; 2 usage; 3 infrastructure (nothing
+written for `run`).
 """
 
 from __future__ import annotations
@@ -138,6 +171,13 @@ REPOSITORY = "yadgarhq/argocd-verify"
 WORKFLOW_PATH = ".github/workflows/pin-dryrun.yaml"
 GITHUB_API = "https://api.github.com"
 MAX_CANDIDATES = 50
+# THE FRESHNESS WINDOW of a result `find` may call green: `auto-pin.yaml`
+# dispatches, waits behind the shared `maxRunners: 1` runner, then reads. An
+# hour bounds that wait; an older result was judged against a cluster that may
+# have moved since.
+FRESH_SECONDS = 3600
+# A `read_at` this far in the future is a clock skew; any further is refused.
+FUTURE_SKEW_SECONDS = 300
 
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
 RELEASE = re.compile(r"\d+\.\d+\.\d+")
@@ -226,6 +266,11 @@ def changed_paths(repo: Path, base: str, sha: str, runner: Callable) -> list[str
     return sorted(path for path in out.decode().split("\0") if path)
 
 
+def merge_bases(repo: Path, base: str, sha: str, runner: Callable) -> list[str]:
+    out = _git(repo, ["merge-base", "--all", base, sha], runner)
+    return [line for line in out.decode().split() if line]
+
+
 def read_at(repo: Path, sha: str, path: str, runner: Callable) -> bytes | None:
     settled_gate = _load("settled_gate")
     try:
@@ -245,6 +290,9 @@ def pin_refusals(repo: Path, base: str, sha: str, runner: Callable) -> tuple[str
         for path in changed_paths(repo, base, sha, runner)
         if path not in PIN_FILES
     ]
+    bases = merge_bases(repo, base, sha, runner)
+    if len(bases) != 1:
+        problems.append(f"main and the sha have {len(bases)} merge bases, not 1: main...sha is ambiguous")
     main_application = read_at(repo, base, APPLICATION, runner)
     head_application = read_at(repo, sha, APPLICATION, runner)
     if main_application is None or head_application is None:
@@ -257,6 +305,8 @@ def pin_refusals(repo: Path, base: str, sha: str, runner: Callable) -> tuple[str
     if not RELEASE.fullmatch(target):
         problems.append(f"{APPLICATION}: targetRevision {target!r} at the sha is not a release X.Y.Z")
         return pin, target, None, problems
+    if RELEASE.fullmatch(pin) and _version(target) < _version(pin):
+        problems.append(f"{APPLICATION}: targetRevision {target} is lower than main's pin {pin}; a downgrade is a human revert")
     try:
         expected = pin_bump.rewrite_target_revision(main_application.decode(), target)[0].encode()
     except pin_bump.Refused as refused:
@@ -380,6 +430,52 @@ def differences(rendered, live, path: str = "") -> list[str]:
     return [path]
 
 
+def _version(text: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in text.split("."))
+
+
+def render_paths(old, new, path: str = "") -> list[str]:
+    """Every path where two renders differ, both directions: a field on one side only counts."""
+    if isinstance(old, dict) and isinstance(new, dict):
+        return [found for key in sorted(set(old) | set(new), key=str) for found in render_paths(old.get(key), new.get(key), _join(path, str(key)))]
+    if isinstance(old, list) and isinstance(new, list) and len(old) == len(new):
+        return [found for i, (a, b) in enumerate(zip(old, new, strict=True)) for found in render_paths(a, b, f"{path}[{i}]")]
+    if isinstance(old, bool) != isinstance(new, bool) or old != new:
+        return [path or "<root>"]
+    return []
+
+
+def _at(document, path: str):
+    node = document
+    for part in SEGMENT.findall(path):
+        node = node[int(part[1:-1])] if part.startswith("[") else node[part]
+    return node
+
+
+def image_repository(reference: str) -> str:
+    """The repository of `repo[:tag][@digest]`."""
+    named = reference.partition("@")[0]
+    last = named.rsplit("/", 1)[-1]
+    return named.rsplit(":", 1)[0] if ":" in last else named
+
+
+def render_problems(base: dict[str, dict], head: dict[str, dict]) -> list[str]:
+    """Step 7: base render against head render, every object, hooks included."""
+    problems: list[str] = []
+    for key in sorted(base.keys() & head.keys()):
+        old, new = base[key], head[key]
+        if is_hook(old) != is_hook(new):
+            problems.append(f"render diff: {key} hook status changed ({HOOK} {'added' if is_hook(new) else 'removed'} at head)")
+        for path in render_paths(old, new):
+            if new.get("kind") not in WORKLOAD_KINDS or old.get("kind") != new.get("kind") or not IMAGE_PATH.fullmatch(path):
+                problems.append(f"render diff outside the image rule: {key} {path}")
+                continue
+            before, after = _at(old, path), _at(new, path)
+            if not isinstance(before, str) or not isinstance(after, str) or image_repository(before) != image_repository(after):
+                problems.append(f"render diff: {key} {path} image repository moved")
+    return problems
+
+
 def tracking_problem(key: str, document: dict, live: dict) -> str | None:
     group, kind = group_kind(document)
     name = (document.get("metadata") or {}).get("name")
@@ -499,6 +595,7 @@ def dry_run(repo: Path, base: str, sha: str, cluster, *, render: Callable[[bytes
 
     problems = [f"{key}: added at head (the object set moved)" for key in sorted(head_objects.keys() - base_objects.keys())]
     problems += [f"{key}: removed at head (the object set moved)" for key in sorted(base_objects.keys() - head_objects.keys())]
+    problems += render_problems(base_objects, head_objects)
     hooks = sorted(k for k, d in {**base_objects, **head_objects}.items() if is_hook(d))
     base_steady = {k: d for k, d in base_objects.items() if not is_hook(d)}
     head_steady = {k: d for k, d in head_objects.items() if not is_hook(d)}
@@ -579,12 +676,25 @@ class GitHub:
         return self._read(url)
 
 
-def on_default_branch(github, repository: str, sha: object, branch: str) -> bool:
-    """`sha` is the default branch's head or an ancestor of it. Never `commits/{sha}`."""
+def branch_head(github, repository: str, branch: str) -> str:
+    """The commit sha a branch points at, read from the branches API (never resolved by name)."""
+    head = ((github.get(f"/repos/{repository}/branches/{urllib.parse.quote(branch, safe='')}") or {}).get("commit") or {}).get("sha")
+    if not isinstance(head, str) or not FULL_SHA.fullmatch(head):
+        raise InfrastructureError(f"/repos/{repository}/branches/{branch} carries no commit sha")
+    return head
+
+
+def on_default_branch(github, repository: str, sha: object, branch_sha: str) -> bool:
+    """`sha` is the default branch's head commit or an ancestor of it.
+
+    Compared against the head COMMIT, never the branch name: `compare/main...X`
+    resolves `refs/tags/main` first when a tag of that name exists. Never
+    `commits/{sha}`.
+    """
     if not isinstance(sha, str) or not FULL_SHA.fullmatch(sha):
         return False
     try:
-        status = github.get(f"/repos/{repository}/compare/{urllib.parse.quote(branch, safe='/')}...{sha}").get("status")
+        status = github.get(f"/repos/{repository}/compare/{branch_sha}...{sha}").get("status")
     except NotFound:
         return False
     return status in {"behind", "identical"}
@@ -598,11 +708,47 @@ def _result_of(archive: bytes) -> dict:
         raise InfrastructureError(f"a {ARTIFACT} artifact holds no readable {RESULT_FILE}: {error}") from error
 
 
-def find(github, repository: str, workflow_path: str, sha: str) -> dict | None:
-    """The newest trusted `pin-dryrun` result for `sha`, or None."""
+def _parse_time(value) -> dt.datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo is not None else None
+
+
+def verdict_of(run: dict, result: dict, *, main_sha: str, pin: str, now: dt.datetime) -> tuple[str, str]:
+    """`(pending | red | stale | green, reason)` of the newest trusted result. Values here are shas, pins and times only."""
+    if run.get("status") != "completed":
+        return "pending", f"run {run.get('id')} is {run.get('status')}"
+    outcome = result.get("result")
+    if outcome != "green":
+        return "red", f"result {outcome}"
+    if run.get("conclusion") != "success":
+        return "red", f"run {run.get('id')} conclusion {run.get('conclusion')}, not success"
+    if result.get("main_sha") != main_sha:
+        return "stale", f"judged against main {result.get('main_sha')}, main is {main_sha}"
+    if result.get("pin") != pin:
+        return "stale", f"judged against pin {result.get('pin')}, main pins {pin}"
+    read = _parse_time(result.get("read_at"))
+    if read is None:
+        return "stale", "no read_at"
+    age = (now - read).total_seconds()
+    if age > FRESH_SECONDS:
+        return "stale", f"read {int(age)} s ago, past FRESH_SECONDS {FRESH_SECONDS}"
+    if age < -FUTURE_SKEW_SECONDS:
+        return "stale", f"read_at {int(-age)} s in the future"
+    return "green", f"run {run.get('id')} green, read {int(age)} s ago"
+
+
+def find(github, repository: str, workflow_path: str, sha: str, *, main_sha: str, pin: str, now: dt.datetime | None = None) -> dict | None:
+    """The newest trusted `pin-dryrun` result for `sha` with its verdict, or None."""
+    now = now or dt.datetime.now(dt.timezone.utc)
     own = github.get(f"/repos/{repository}")
     if "id" not in own or not own.get("default_branch"):
         raise InfrastructureError(f"/repos/{repository} carries no id or default_branch")
+    default_head = branch_head(github, repository, own["default_branch"])
     artifacts: list[dict] = []
     for page in range(1, 101):
         batch = github.get(f"/repos/{repository}/actions/artifacts?name={ARTIFACT}&per_page=100&page={page}").get("artifacts")
@@ -628,19 +774,27 @@ def find(github, repository: str, workflow_path: str, sha: str) -> dict | None:
     for candidate in candidates[:MAX_CANDIDATES]:
         run = github.get(f"/repos/{repository}/actions/runs/{candidate['workflow_run']['id']}")
         if (
-            run.get("status") != "completed"
-            or run.get("event") != "workflow_dispatch"
+            run.get("event") != "workflow_dispatch"
             or run.get("path") != workflow_path
             or run.get("head_branch") != own["default_branch"]
             or (run.get("repository") or {}).get("id") != own["id"]
             or (run.get("head_repository") or {}).get("id") != own["id"]
-            or not on_default_branch(github, repository, run.get("head_sha"), own["default_branch"])
+            or not on_default_branch(github, repository, run.get("head_sha"), default_head)
         ):
             continue
         result = _result_of(github.download(candidate["archive_download_url"]))
         if result.get("sha") != sha:
             continue
-        return {"found": True, "run_id": run["id"], "artifact_id": candidate["id"], "created_at": candidate.get("created_at"), "result": result}
+        verdict, reason = verdict_of(run, result, main_sha=main_sha, pin=pin, now=now)
+        return {
+            "found": True,
+            "verdict": verdict,
+            "reason": reason,
+            "run_id": run["id"],
+            "artifact_id": candidate["id"],
+            "created_at": candidate.get("created_at"),
+            "result": result,
+        }
     return None
 
 
@@ -650,6 +804,12 @@ def find(github, repository: str, workflow_path: str, sha: str) -> dict | None:
 def _full_sha(value: str) -> str:
     if not FULL_SHA.fullmatch(value):
         raise argparse.ArgumentTypeError(f"{value!r} is not a full 40-hex commit sha")
+    return value
+
+
+def _release(value: str) -> str:
+    if not RELEASE.fullmatch(value):
+        raise argparse.ArgumentTypeError(f"{value!r} is not a release X.Y.Z")
     return value
 
 
@@ -666,18 +826,21 @@ def _parser() -> argparse.ArgumentParser:
     found.add_argument("--repository", default=REPOSITORY)
     found.add_argument("--workflow-path", default=WORKFLOW_PATH)
     found.add_argument("--sha", type=_full_sha, required=True)
+    found.add_argument("--main-sha", type=_full_sha, required=True, help="argocd main's sha now; a result judged against another is stale")
+    found.add_argument("--pin", type=_release, required=True, help="argocd main's pin now; a result judged against another is stale")
     found.add_argument("--out", type=Path, required=True)
     return parser
 
 
 def _summary(result: dict) -> None:
     print(f"pin-dryrun {result['result']} (interim): sha {result['sha']} pin {result['pin']} -> {result['target']}, {result['compared']} objects compared")
+    # repr(): a key, path or name holding a newline must not forge a line of the step summary.
     for item in result["objects"]:
-        print(f"head diff: {item['key']} {', '.join(item['paths'])}")
+        print(f"head diff: {item['key']!r} {', '.join(repr(p) for p in item['paths'])}")
     for problem in result["problems"]:
-        print(f"{result['result'].upper()}: {problem}")
+        print(f"{result['result'].upper()}: {problem!r}")
     for which, names in result["admission"].items():
-        print(f"not run, {which}: {', '.join(names) or 'none'}")
+        print(f"not run, {which}: {', '.join(repr(n) for n in names) or 'none'}")
 
 
 def main(
@@ -687,6 +850,7 @@ def main(
     runner: Callable = subprocess.run,
     kube_runner: Callable = subprocess.run,
     github=None,
+    now: dt.datetime | None = None,
 ) -> int:
     try:
         args = _parser().parse_args(argv)
@@ -694,13 +858,13 @@ def main(
         return 2 if exit_.code else 0
     if args.command == "find":
         try:
-            found = find(github or GitHub(), args.repository, args.workflow_path, args.sha)
+            found = find(github or GitHub(), args.repository, args.workflow_path, args.sha, main_sha=args.main_sha, pin=args.pin, now=now)
         except InfrastructureError as error:
             print(f"INFRASTRUCTURE FAILURE: {error}", file=sys.stderr)
             return 3
         args.out.write_text(json.dumps(found or {"found": False}, indent=2, sort_keys=True) + "\n")
-        verdict = (found or {}).get("result", {}).get("result")
-        print(f"pin-dryrun for {args.sha}: " + (f"{verdict}, run {found['run_id']}" if found else "none"))
+        verdict = (found or {}).get("verdict")
+        print(f"pin-dryrun for {args.sha}: " + (f"{verdict} ({found['reason']}), run {found['run_id']}" if found else "none"))
         return 0 if verdict == "green" else 1
     try:
         cluster = _load("verify_handover").Cluster(args.context, runner=kube_runner)
