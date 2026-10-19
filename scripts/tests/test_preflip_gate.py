@@ -83,6 +83,15 @@ def resolution(pod: str, steps, last: float = END) -> dict:
     return counter(pg.RESOLUTIONS, pod, ("outcome", "exact"), steps, last)
 
 
+def vector(*rows: tuple[str, str]) -> dict:
+    """The gate-time instant read of the gauge: one (pod, value) row per series."""
+    result = [
+        {"metric": {"__name__": pg.LOADED, "app": "gateway", "namespace": "yadgar", "pod": pod}, "value": [NOW, value]}
+        for pod, value in rows
+    ]
+    return {"status": "success", "data": {"resultType": "vector", "result": result}}
+
+
 def matrix(*series: dict) -> dict:
     return {"status": "success", "data": {"resultType": "matrix", "result": list(series)}}
 
@@ -146,8 +155,27 @@ class FakeTransport:
         runs: list[tuple[dict, dict]] = (),
         up: dict | None = None,
         leg_c: tuple[tuple[dict, dict], ...] | None = None,
+        live_pods: list[str] | None = None,
+        replicas: int | None = None,
+        loaded_now: dict | None = None,
     ):
         self.body = body
+        # Leg 8, read at gate time. By default the live gateway pods are the
+        # ones whose gauge is still scraped at the window's end, the
+        # Deployment wants exactly that many, and each reads 1 now.
+        if live_pods is None:
+            live_pods = sorted(
+                {r["metric"]["pod"] for r in (body or {}).get("data", {}).get("result", [])
+                 if r["metric"].get("__name__") == pg.LOADED and r["values"] and r["values"][-1][0] >= END}
+            )
+        self.live_pods = live_pods
+        self.deployment = {
+            "metadata": {"name": "gateway", "namespace": "yadgar"},
+            "spec": {"replicas": len(live_pods) if replicas is None else replicas, "selector": {"matchLabels": {"app": "gateway"}}},
+        }
+        self.loaded_now = loaded_now if loaded_now is not None else vector(*[(pod, "1") for pod in live_pods])
+        self.kube_paths: list[str] = []
+        self.kube_down = False
         self.up = up if up is not None else derived_up(body)
         self.lowest = lowest
         # Every case carries a green leg (c) sweep an hour before the window,
@@ -171,7 +199,19 @@ class FakeTransport:
             }
         if params["query"].startswith("up{"):
             return self.up
+        if params["query"] == pg.LOADED_NOW_QUERY:
+            return self.loaded_now
         return self.body
+
+    def kube_get(self, path: str) -> dict:
+        self.kube_paths.append(path)
+        if self.kube_down:
+            raise pg.GateError("kubernetes: HTTP 403")
+        if path == "/apis/apps/v1/namespaces/yadgar/deployments/gateway":
+            return self.deployment
+        if path.startswith("/api/v1/namespaces/yadgar/pods?"):
+            return {"items": [{"metadata": {"name": pod}, "status": {"phase": "Running"}} for pod in self.live_pods]}
+        raise pg.GateError(f"kubernetes {path}: HTTP 404")
 
     def github_get(self, path: str) -> dict:
         if self.github_down:
@@ -773,3 +813,135 @@ def test_the_pass_line_names_the_max_age_used() -> None:
     assert code == pg.EXIT_PASS, out
     pass_line = next(line for line in out.splitlines() if "PASS" in line)
     assert "max age 86400s" in pass_line
+
+
+# --- ledger 1674: leg 8, the registry loaded on every replica, at gate time ------
+#
+# A counting -> enforcing flip refuses every call a replica serves before its
+# registry loaded (ADR-0674). Argo reports the Deployment Healthy as soon as the
+# pods are Ready, which can precede the load. So the gate reads, at gate time,
+# `registry_loaded` on every gateway pod and compares the pods it found with
+# the replica count the live Deployment wants. Never hardcoded.
+
+TWO = matrix(gauge("a"), gauge("b"), TRAFFIC)
+
+
+def test_all_replicas_at_one_pass() -> None:
+    t = FakeTransport(TWO)
+    code, out = gate(t)
+    assert code == pg.EXIT_PASS, out
+    assert "registry loaded on 2/2 gateway replica(s)" in out
+
+
+def test_a_replica_with_no_series_at_gate_time_fails_closed() -> None:
+    t = FakeTransport(TWO, loaded_now=vector(("a", "1")))
+    code, out = gate(t)
+    assert code == pg.EXIT_FAIL, out
+    assert "pod b has no yadgar_gateway_project_registry_loaded series at gate time" in out
+
+
+def test_no_series_at_all_at_gate_time_fails_closed() -> None:
+    t = FakeTransport(TWO, loaded_now=vector())
+    code, out = gate(t)
+    assert code == pg.EXIT_FAIL, out
+    assert "pod a has no" in out and "pod b has no" in out
+
+
+def test_one_replica_at_zero_fails() -> None:
+    t = FakeTransport(TWO, loaded_now=vector(("a", "1"), ("b", "0")))
+    code, out = gate(t)
+    assert code == pg.EXIT_FAIL, out
+    assert "pod b: yadgar_gateway_project_registry_loaded is 0, not 1" in out
+
+
+def test_a_replica_count_that_does_not_match_the_deployment_fails() -> None:
+    # The Deployment wants 3; only 2 pods are live, both loaded.
+    t = FakeTransport(TWO, replicas=3)
+    code, out = gate(t)
+    assert code == pg.EXIT_FAIL, out
+    assert "Deployment yadgar/gateway wants 3 replica(s), 2 gateway pod(s) are live" in out
+
+
+def test_a_loaded_series_on_a_pod_that_is_not_live_fails() -> None:
+    # A stale series (a pod gone, or one outside the Deployment's selector)
+    # must not stand in for a live replica.
+    t = FakeTransport(TWO, loaded_now=vector(("a", "1"), ("b", "1"), ("c", "1")))
+    code, out = gate(t)
+    assert code == pg.EXIT_FAIL, out
+    assert "pod c reports yadgar_gateway_project_registry_loaded but is not a live gateway pod" in out
+
+
+def test_the_expected_count_is_the_live_deployments_not_a_constant() -> None:
+    body = matrix(gauge("a"), gauge("b"), gauge("c"), TRAFFIC)
+    code, out = gate(FakeTransport(body))
+    assert code == pg.EXIT_PASS, out
+    assert "registry loaded on 3/3 gateway replica(s)" in out
+
+
+def test_the_pods_are_listed_by_the_deployments_own_selector() -> None:
+    t = FakeTransport(TWO)
+    t.deployment["spec"]["selector"] = {"matchLabels": {"app": "gateway", "tier": "edge"}}
+    gate(t)
+    assert "/api/v1/namespaces/yadgar/pods?labelSelector=app%3Dgateway%2Ctier%3Dedge" in t.kube_paths
+
+
+@pytest.mark.parametrize("replicas", [0, None, "2", True, -1])
+def test_an_unusable_replica_count_fails_closed(replicas) -> None:
+    t = FakeTransport(TWO)
+    t.deployment["spec"]["replicas"] = replicas
+    code, out = gate(t)
+    assert code == pg.EXIT_FAIL, out
+    assert "spec.replicas" in out
+
+
+@pytest.mark.parametrize(
+    "selector",
+    [{}, {"matchLabels": {}}, {"matchLabels": {"app": "gateway"}, "matchExpressions": [{"key": "x", "operator": "Exists"}]}],
+)
+def test_a_selector_the_gate_cannot_read_exactly_fails_closed(selector) -> None:
+    t = FakeTransport(TWO)
+    t.deployment["spec"]["selector"] = selector
+    code, out = gate(t)
+    assert code == pg.EXIT_FAIL, out
+    assert "selector" in out
+
+
+def test_the_deployment_unreadable_fails_closed() -> None:
+    t = FakeTransport(TWO)
+    t.kube_down = True
+    code, out = gate(t)
+    assert code == pg.EXIT_FAIL, out
+    assert "kubernetes: HTTP 403" in out
+
+
+def test_a_terminal_pod_is_not_a_live_replica() -> None:
+    t = FakeTransport(TWO)
+    pods = t.kube_get("/api/v1/namespaces/yadgar/pods?x")
+    pods["items"].append({"metadata": {"name": "old"}, "status": {"phase": "Failed"}})
+    t.kube_get = lambda path: pods if path.startswith("/api/v1/") else t.deployment
+    code, out = gate(t)
+    assert code == pg.EXIT_PASS, out
+
+
+def test_a_gate_time_vector_row_without_a_pod_fails_closed() -> None:
+    body = vector(("a", "1"), ("b", "1"))
+    del body["data"]["result"][1]["metric"]["pod"]
+    code, out = gate(FakeTransport(TWO, loaded_now=body))
+    assert code == pg.EXIT_FAIL, out
+    assert "without a pod" in out
+
+
+def test_the_gate_time_read_is_at_now() -> None:
+    t = FakeTransport(TWO)
+    gate(t)
+    q = next(p for p in t.queries if p["query"] == pg.LOADED_NOW_QUERY)
+    assert q["time"] == f"{NOW:.3f}"
+    assert 'namespace="yadgar"' in q["query"]
+    # Every gateway pod: no pod, instance or app filter narrows the read.
+    assert "pod" not in q["query"] and "instance" not in q["query"] and "app=" not in q["query"]
+
+
+def test_the_in_cluster_read_without_a_token_fails_closed(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(pg, "SERVICE_ACCOUNT_DIR", str(tmp_path))
+    with pytest.raises(pg.GateError, match="ServiceAccount token"):
+        pg.Network("http://prom", "x").kube_get("/apis/apps/v1/namespaces/yadgar/deployments/gateway")
