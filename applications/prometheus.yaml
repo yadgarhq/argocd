@@ -51,7 +51,8 @@
 # system. PROJECTED 2026-10-01 at today's series count, the upper bound of the
 # TSDB at 15s is about 1.5 to 1.6 GB: blocks about 1.0 GB plus WAL about
 # 0.55 GB. That is a projection: the TSDB had not yet held 24h at 15s (650 MB
-# on disk, WAL peak 460 MB). `--storage.tsdb.retention.time=24h` binds;
+# on disk, WAL peak 460 MB). `--storage.tsdb.retention.time=24h` bound (3d
+# since ledger 1678);
 # since ledger 1210 `retention.size` is a second bound, set so that it should
 # never bind (below).
 #
@@ -109,8 +110,31 @@
 #   carries none.
 # - `server.resources` and `server.retentionSize`. Not deploy's: ledger 1210,
 #   above. They replace `platform`'s 100m/256Mi and add a size bound.
-# `retention: 24h` and the four disabled components are `platform`'s own
-# defaults, so they are not repeated here.
+# - `server.retention: 3d`. Ledger 1678, below. It replaces `platform`'s 24h.
+# The four disabled components are `platform`'s own defaults, so they are not
+# repeated here.
+#
+# LEDGER 1678 RAISES TIME RETENTION FROM 24h TO 3d, AND THE SIZE BOUND FROM
+# 4 GiB TO 8 GiB. `/api/v1/status/runtimeinfo` read `storageRetention: "1d or
+# 4GiB"` (2026-10-19). The pre-flip gate (scripts/preflip_gate.py) reads a 24h
+# refusal window plus a 300s lookback, and its leg 3 refuses a window that
+# starts before the oldest sample. A 24h store holds a 24h window only if the
+# gate runs the moment the window closes, so the window had no margin. 3d
+# holds the window and two more days in which to run the gate or re-run it.
+# Measured read-only 2026-10-19 on kind-yadgar: blocks 0.64 GB for about 22h
+# of data (`prometheus_tsdb_storage_blocks_bytes`), WAL peak 0.49 GB over 1d,
+# head chunks 0.06 GB, head series 97.9k now and 109k peak over 1d. Time
+# retention deletes whole blocks, and a block spans up to 10% of the
+# retention, so the store can hold about 3.3d. That projects to about 2.8 GB:
+# 3.3d at 0.68 GB/day of blocks, plus the WAL and the head chunks. 4 GiB
+# (4.29 GB) would leave about 1.5 times that, so a modest series growth would
+# let SIZE bind first, which this file forbids (`retentionSize`, above). 8 GiB
+# (8.59 GB) keeps about 3 times, close to ledger 1210's margin. The disk:
+# the yadgar-worker node file system had 56.5 GB free of 1978 GB (kubelet
+# stats summary, 2026-10-19), and 8 GiB is a bound, not an allocation. The
+# rules' `[24h]` ranges are unchanged: a 3d store holds a 24h range whole.
+# The `retention.time` and `retention.size` arguments change, so the pod
+# rolls once (Recreate, as for ledger 1210).
 #
 # `syncPolicy` is S0 of the operators handover (ADR-0824): `automated.prune` is
 # omitted, and `retry` is copied from `yadgarhq/chart@v0.3.15`'s
@@ -191,9 +215,13 @@ spec:
                 memory: 1Gi
               limits:
                 memory: 2Gi
-            # Powers of 2 (4 GiB). About 2.7 times the projected 24h upper
-            # bound, so `retention: 24h` binds and this is only a backstop.
-            retentionSize: 4GB
+            # Ledger 1678: 3d, not `platform`'s 24h. The pre-flip gate reads a
+            # 24h refusal window plus its lookback and slack, which 24h of
+            # store cannot hold. The header has the arithmetic.
+            retention: 3d
+            # Powers of 2 (8 GiB). About 3 times the projected 3d upper
+            # bound, so `retention: 3d` binds and this is only a backstop.
+            retentionSize: 8GB
           # `null`, not `{}`: it deletes `platform`'s 10m/32Mi requests, so the
           # pod template stays as deploy rendered it and nothing rolls.
           configmapReload:
@@ -544,9 +572,10 @@ spec:
                     #     existence and the event are the same fact: the series
                     #     cannot be present below 1.
                     #
-                    # THE RANGE IS 24h BECAUSE THE STORE'S RETENTION IS, and this
-                    # is the honest limit of what was bought. `retention: 24h` is
-                    # set at the top of this file, so a bare `> 0` would stop
+                    # THE RANGE IS 24h BECAUSE THE STORE'S RETENTION WAS, and this
+                    # is the honest limit of what was bought. `retention: 24h` was
+                    # `platform`'s default (3d since ledger 1678, which leaves this
+                    # range unchanged), so a bare `> 0` would stop
                     # matching roughly five minutes after the emitting pod died —
                     # reproducing the very failure this rule exists to correct, a
                     # record that does not outlive the pod. `max_over_time` over

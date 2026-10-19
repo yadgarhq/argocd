@@ -298,16 +298,22 @@ PLATFORM_SOURCED: dict[str, dict] = {
         # 1210 set them after D4, and the pod rolls once for them. Measured
         # 2026-10-01 at the 15s scrape interval: RSS peak >=790 MB and still
         # rising, so the request covers it and the limit leaves room for WAL
-        # replay. The TSDB's 24h upper bound is PROJECTED at 1.5 to 1.6 GB, so
-        # 4GB (4 GiB: Prometheus counts in powers of 2) keeps `retention: 24h`
-        # the bound that binds, with room for about 2.5 times the series.
-        # local-path does not enforce the nominal 2Gi. A drop or a change of
-        # any of them reddens `carried`.
+        # replay. local-path does not enforce the nominal 2Gi.
+        #
+        # `server.retention` and `server.retentionSize` are ledger 1678's. 3d
+        # replaces `platform`'s 24h so that the pre-flip gate's 24h refusal
+        # window, its lookback and its slack fit inside the store with margin.
+        # Measured 2026-10-19: blocks 0.64 GB for about 22h, WAL peak 0.49 GB,
+        # so the 3d upper bound projects to about 2.8 GB; 8GB (8 GiB:
+        # Prometheus counts in powers of 2) keeps time the bound that binds,
+        # with room for about 3 times the series. A drop or a change of any of
+        # them reddens `carried`.
         "carried": {
             "server": {
                 "persistentVolume": {"enabled": True, "size": "2Gi"},
                 "resources": {"requests": {"cpu": "100m", "memory": "1Gi"}, "limits": {"memory": "2Gi"}},
-                "retentionSize": "4GB",
+                "retention": "3d",
+                "retentionSize": "8GB",
             },
             "configmapReload": {"prometheus": {"resources": None}},
         },
