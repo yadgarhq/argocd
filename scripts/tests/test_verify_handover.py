@@ -31,6 +31,10 @@ WHAT IS ASSERTED, and each has a red case below:
   6. `diff` passes, with a warning, on a syncPolicy change, a restart-count
      increase, and a generation change outside Deployments and CRDs. A
      skipped edge probe prints SKIPPED and is never counted as a pass.
+  6b. A tracked object annotated `Replace=true,Force=true` (Argo re-creates
+     it on every sync) warns on a new uid, the mark read from either
+     snapshot; without both options a new uid still fails, and such an
+     object that is gone or terminating still fails.
   7. The wait states: a doc-only merge (no operation) counts as done once
      root's revision is the sha; a Running operation is pending; a Failed one
      fails; `--since` needs an operation that started after T; `--settled`
@@ -689,6 +693,86 @@ def test_secrets_absent_from_both_is_not_compared(snap) -> None:
     report = vh.diff(before, after)
     assert report.exit_code == 0
     assert "Secrets not compared" in report.render()
+
+
+# --- 6b. objects Argo deletes and re-creates on every sync --------------------
+# kind-yadgar's `yadgar/seeder` Job carries `Replace=true,Force=true`, so every
+# sync of `yadgar` deletes it and creates a new one. Its uid changing is the
+# sync working (verify-argocd run 39207462499: the seeder uid was its only FAIL).
+
+FORCE_REPLACE = "Replace=true,Force=true"
+SEEDER = "batch/Job/keda/seeder"
+
+
+def with_seeder(responses: dict, sync_options: str | None) -> dict:
+    """The fixture plus a Job `keda` tracks, annotated with `sync_options` (None: no annotation)."""
+    responses = copy_module.deepcopy(responses)
+    for item in responses["get applications.argoproj.io -n argocd -o json"]["items"]:
+        if item["metadata"]["name"] == "keda":
+            item["status"]["resources"].append({"group": "batch", "kind": "Job", "namespace": "keda", "name": "seeder"})
+    metadata = {"name": "seeder", "namespace": "keda", "uid": "job-1", "generation": 1}
+    if sync_options is not None:
+        metadata["annotations"] = {"argocd.argoproj.io/sync-options": sync_options}
+    responses["get Job.batch -A -o json"] = {"kind": "List", "items": [{"metadata": metadata}]}
+    return responses
+
+
+def test_collect_marks_an_object_argo_force_replaces(responses) -> None:
+    snap = vh.collect(cluster(with_seeder(responses, FORCE_REPLACE)))
+    assert snap["objects"][SEEDER] == {"uid": "job-1", "generation": 1, "deletionTimestamp": None, "replacedBySync": True}
+
+
+@pytest.mark.parametrize("sync_options", [None, "Replace=true", "Force=true", "Replace=false,Force=true", "Prune=false"])
+def test_collect_does_not_mark_an_object_argo_does_not_force_replace(responses, sync_options) -> None:
+    snap = vh.collect(cluster(with_seeder(responses, sync_options)))
+    assert "replacedBySync" not in snap["objects"][SEEDER]
+
+
+def test_collect_reads_force_replace_with_spaces_and_any_order(responses) -> None:
+    snap = vh.collect(cluster(with_seeder(responses, " Force=true , ServerSideApply=false,Replace=true ")))
+    assert snap["objects"][SEEDER]["replacedBySync"] is True
+
+
+def test_a_force_replaced_objects_new_uid_warns_and_passes(responses) -> None:
+    before = vh.collect(cluster(with_seeder(responses, FORCE_REPLACE)))
+    report = mutated(before, lambda s: s["objects"][SEEDER].update(uid="job-2"))
+    assert report.exit_code == 0, report.render()
+    assert f"object/{SEEDER}" in levels(report)["WARN"], report.render()
+    assert "re-created by sync" in report.render()
+
+
+def test_a_baseline_from_before_the_mark_still_softens(responses) -> None:
+    after = vh.collect(cluster(with_seeder(responses, FORCE_REPLACE)))
+    before = copy_module.deepcopy(after)
+    del before["objects"][SEEDER]["replacedBySync"]
+    after["objects"][SEEDER]["uid"] = "job-2"
+    report = vh.diff(before, after)
+    assert report.exit_code == 0, report.render()
+    assert f"object/{SEEDER}" in levels(report)["WARN"], report.render()
+
+
+@pytest.mark.parametrize("sync_options", [None, "Replace=true", "Force=true"])
+def test_an_unmarked_objects_new_uid_still_fails(responses, sync_options) -> None:
+    before = vh.collect(cluster(with_seeder(responses, sync_options)))
+    report = mutated(before, lambda s: s["objects"][SEEDER].update(uid="job-2"))
+    assert report.exit_code == 1, report.render()
+    assert f"object/{SEEDER}" in levels(report)["FAIL"], report.render()
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda s: s["objects"].pop(SEEDER),
+        lambda s: s["objects"].update({SEEDER: {"missing": True}}),
+        lambda s: s["objects"][SEEDER].update(deletionTimestamp="2026-10-19T12:00:00Z"),
+    ],
+    ids=["gone", "missing", "terminating"],
+)
+def test_a_force_replaced_object_that_is_gone_or_terminating_still_fails(responses, mutate) -> None:
+    before = vh.collect(cluster(with_seeder(responses, FORCE_REPLACE)))
+    report = mutated(before, mutate)
+    assert report.exit_code == 1, report.render()
+    assert f"object/{SEEDER}" in levels(report)["FAIL"], report.render()
 
 
 # --- 7. wait states -----------------------------------------------------------
