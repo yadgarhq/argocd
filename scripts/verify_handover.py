@@ -38,8 +38,13 @@ deletionTimestamp fails whoever owns it. An object root owns in EITHER snapshot
 is root's. Hook resources are never compared.
 
 WHAT IT ONLY WARNS ON (exit 0): a syncPolicy change, a restart-count increase, a
-generation change outside Deployments and CRDs, and root pruning something on a
-new revision. Additions are INFO.
+generation change outside Deployments and CRDs, root pruning something on a
+new revision, and a new uid on a tracked object annotated
+`argocd.argoproj.io/sync-options` with both `Replace=true` and `Force=true`
+(Argo deletes and re-creates such an object on every sync, as with yadgar's
+seeder Job; the mark is read from the head snapshot only). Such an object
+that is gone, has a deletionTimestamp, or (as a Deployment) has a new
+generation still fails. Additions are INFO.
 
 `diff` REFUSES (exit 2) two snapshots from different clusters (the kube-system
 namespace uid differs), an unknown schema, and a snapshot with no Applications
@@ -80,6 +85,10 @@ SECRET_COLUMNS = "custom-columns=NAME:.metadata.name,UID:.metadata.uid,RV:.metad
 # Applications are compared in their own section, where an operation's
 # generation bump is not a finding.
 TRACKING_ID = "argocd.argoproj.io/tracking-id"
+SYNC_OPTIONS = "argocd.argoproj.io/sync-options"
+# Both together make Argo delete and re-create the object on every sync
+# (`kubectl replace --force`), so its uid changing is the sync working.
+FORCE_REPLACE_OPTIONS = frozenset({"Replace=true", "Force=true"})
 UNLISTED_INSTANCE_CRDS = frozenset(
     {
         "certificaterequests.cert-manager.io",
@@ -217,6 +226,11 @@ def _meta(obj: dict) -> dict:
 def _identity(obj: dict) -> dict:
     meta = _meta(obj)
     return {"uid": meta.get("uid"), "generation": meta.get("generation"), "deletionTimestamp": meta.get("deletionTimestamp")}
+
+
+def _replaced_by_sync(obj: dict) -> bool:
+    options = str((_meta(obj).get("annotations") or {}).get(SYNC_OPTIONS) or "")
+    return FORCE_REPLACE_OPTIONS <= {option.strip() for option in options.split(",")}
 
 
 def _ownership(obj: dict, kind: str | None = None) -> dict:
@@ -357,7 +371,11 @@ def _tracked_objects(cluster: Cluster, records: dict) -> dict:
         live = {}
         for item in cluster.json("get", resource, "-A").get("items") or []:
             meta = _meta(item)
-            live[f"{group}/{kind}/{meta.get('namespace') or ''}/{meta.get('name')}"] = _identity(item)
+            identity = _identity(item)
+            if _replaced_by_sync(item):
+                # Only when set, so a snapshot without such objects keeps the schema-2 shape.
+                identity["replacedBySync"] = True
+            live[f"{group}/{kind}/{meta.get('namespace') or ''}/{meta.get('name')}"] = identity
         for key in sorted(keys):
             objects[key] = live.get(key, {"missing": True})
     return objects
@@ -587,7 +605,10 @@ def _compare_identities(
             report.add("INFO", label, f"appeared (uid {a.get('uid')})")
         else:
             if a.get("uid") != b.get("uid"):
-                report.add(fail, label, f"uid {b.get('uid')} -> {a.get('uid')}{suffix}")
+                if a.get("replacedBySync"):
+                    report.add("WARN", label, f"uid {b.get('uid')} -> {a.get('uid')} (re-created by sync: Replace=true,Force=true){suffix}")
+                else:
+                    report.add(fail, label, f"uid {b.get('uid')} -> {a.get('uid')}{suffix}")
             if a.get("generation") != b.get("generation") and "generation" in a and "generation" in b:
                 level = fail if generation_fails(key) else "WARN"
                 report.add(level, label, f"generation {b.get('generation')} -> {a.get('generation')}{suffix}")
