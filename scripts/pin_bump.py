@@ -509,7 +509,12 @@ def production_sources(source: dict[str, str]) -> dict[str, str]:
 #             gateway's `from_lookup(lookup: …)` reads `lookup(KEY)`, the -db
 #             modules' `boot(env: …)` read `env(KEY)`;
 #   wrapped   a local closure whose body calls one of the above — seeder's
-#             `let required = |var| match lookup(var) …` — and a `fn` or
+#             `let required = |var| match lookup(var) …` — read only inside
+#             the block that binds it (a `let` cannot be named outside it, so
+#             gateway's tls.rs `let get = |suffix| …` never makes axum's
+#             `get(whoami)` in another fn a read; a closure whose name
+#             appears in that block other than as a call — passed, returned,
+#             stored — escapes, and stays a reader crate-wide), and a `fn` or
 #             `macro_rules!` whose body calls one keyed on its own parameter
 #             (`fn get(k) { std::env::var(k) }`, `req!($k)`) are readers too,
 #             required ones when the name says `required` or the body calls a
@@ -602,41 +607,78 @@ def reader_call(required: set[str], read: set[str]) -> re.Pattern:
     return re.compile(rf"(?:{pattern})(?=\s*\()")
 
 
-def wrappers(mask: str) -> list[tuple[str, str, set[str], int, int]]:
-    """`(kind, name, parameters, body start, body stop)` of every local closure, fn and macro_rules! in `mask`."""
+def enclosing_block_end(mask: str, position: int) -> int:
+    """Index just past the `}` closing the innermost `{` that encloses `position`, counted on a `code_mask`."""
+    depth = 0
+    for index in range(position - 1, -1, -1):
+        if mask[index] == "}":
+            depth += 1
+        elif mask[index] == "{":
+            if depth == 0:
+                return matching_brace(mask, index)
+            depth -= 1
+    return len(mask)
+
+
+def wrappers(mask: str) -> list[tuple[str, str, set[str], int, int, tuple[int, int] | None]]:
+    """`(kind, name, parameters, body start, body stop, scope)` of every local closure, fn and macro_rules! in
+    `mask`. `scope` is a closure's `(binding, end of its enclosing block)`, the only span that can name it;
+    None for a fn or macro, which the crate can name anywhere, and for a closure whose value escapes that span."""
     found = []
     for closure in LOCAL_CLOSURE.finditer(mask):
         parameters = set(re.findall(r"([a-z_]\w*)\s*(?::|$|,)", closure.group(2)))
         brace, semicolon = mask.find("{", closure.end()), mask.find(";", closure.end())
         stop = matching_brace(mask, brace) if 0 <= brace < semicolon or semicolon < 0 <= brace else semicolon
-        found.append(("closure", re.escape(closure.group(1)), parameters, closure.end(), stop if stop > 0 else len(mask)))
+        scope: tuple[int, int] | None = (closure.start(), enclosing_block_end(mask, closure.start()))
+        uses = re.finditer(rf"(?<![\w.]){re.escape(closure.group(1))}\b(?!\s*\()", mask[closure.end() : scope[1]])
+        if next(uses, None) is not None:
+            scope = None  # the closure value escapes (passed, returned, stored, aliased): crate-wide, as before
+        found.append(("closure", re.escape(closure.group(1)), parameters, closure.end(), stop if stop > 0 else len(mask), scope))
     for function in FN_DEFINITION.finditer(mask):
         close = matching_paren(mask, function.end() - 1)
         parameters = set(re.findall(r"(?:^|[,(])\s*(?:mut\s+)?([a-z_]\w*)\s*:", mask[function.end() - 1 : close]))
         brace = mask.find("{", close)
         if brace >= 0 and ";" not in mask[close:brace]:
-            found.append(("fn", re.escape(function.group(1)), parameters, brace, matching_brace(mask, brace)))
+            found.append(("fn", re.escape(function.group(1)), parameters, brace, matching_brace(mask, brace), None))
     for macro in MACRO_DEFINITION.finditer(mask):
         stop = matching_brace(mask, macro.end() - 1)
         parameters = {f"${name}" for name in re.findall(r"\$([a-z_]\w*)\s*:", mask[macro.end() : stop])}
-        found.append(("macro", re.escape(macro.group(1)) + "!", parameters, macro.end(), stop))
+        found.append(("macro", re.escape(macro.group(1)) + "!", parameters, macro.end(), stop, None))
     return found
 
 
-def readers_of(files: dict[str, str], masks: dict[str, str]) -> tuple[set[str], set[str]]:
-    """`(required reader names, plain reader names)`: the fixed ones, lookup parameters, and every closure,
-    fn or macro_rules! whose body calls a reader keyed on one of its own parameters (or, for a closure, at all)."""
+Scopes = dict[str, list[tuple[str, int, int]]]
+
+
+def visible(scopes: Scopes, matched: str, path: str, position: int) -> bool:
+    """Whether the reader call `matched` at `position` in `path` names a reader: always for a crate-wide one,
+    and for a closure-only name only inside a block that binds it."""
+    spans = scopes.get(re.escape(matched))
+    return spans is None or any(p == path and start <= position < stop for p, start, stop in spans)
+
+
+def readers_of(files: dict[str, str], masks: dict[str, str]) -> tuple[set[str], set[str], Scopes]:
+    """`(required reader names, plain reader names, scopes)`: the fixed ones, lookup parameters, and every
+    closure, fn or macro_rules! whose body calls a reader keyed on one of its own parameters (or, for a
+    closure, at all). `scopes` maps a name read only by closures to the `(path, start, stop)` spans that
+    can name it; a name absent from `scopes` is a reader anywhere in the crate."""
     required = set(REQUIRED_READERS)
     read = {re.escape(name) for mask in masks.values() for name in LOOKUP_PARAMETER.findall(mask)}
-    every = [(w, mask) for mask in masks.values() for w in wrappers(mask)]
+    crate_wide = required | read
+    scopes: Scopes = {}
+    every = [(path, w) for path, mask in masks.items() for w in wrappers(mask)]
+    done: set[int] = set()
     while True:
         call = reader_call(required, read)
         found = False
-        for (kind, name, parameters, start, stop), mask in every:
-            if name in required or name in read:
+        for index, (path, (kind, name, parameters, start, stop, scope)) in enumerate(every):
+            if index in done or name in crate_wide:
                 continue
+            mask = masks[path]
             inner = []
             for match in call.finditer(mask, start, stop):
+                if not visible(scopes, match.group(0), path, match.start()):
+                    continue
                 opening = mask.find("(", match.end())
                 keyed = {bare(a) for a in arguments(mask, opening)[:2]} & parameters
                 if keyed or kind == "closure":
@@ -646,9 +688,15 @@ def readers_of(files: dict[str, str], masks: dict[str, str]) -> tuple[set[str], 
             plain = name.rstrip("!").replace("\\", "")
             is_required = "required" in plain or any(m.group("required") for m in inner)
             (required if is_required else read).add(name)
+            if scope is None:
+                crate_wide.add(name)
+                scopes.pop(name, None)
+            else:
+                scopes.setdefault(name, []).append((path, *scope))
+            done.add(index)
             found = True
         if not found:
-            return required, read
+            return required, read, scopes
 
 
 def enclosing_fn(mask: str, position: int) -> str:
@@ -669,7 +717,8 @@ def env_sites(source: dict[str, str]) -> tuple[set[str], set[str], Counter]:
         for match in CONST_STR.finditer(text):
             if masks[path][match.start()] == text[match.start()]:
                 consts.setdefault(match.group(1), set()).add(match.group(2))
-    call = reader_call(*readers_of(files, masks))
+    required_names, read_names, scopes = readers_of(files, masks)
+    call = reader_call(required_names, read_names)
     required: set[str] = set()
     reads: set[str] = set()
     unresolved: Counter = Counter()
@@ -678,6 +727,8 @@ def env_sites(source: dict[str, str]) -> tuple[set[str], set[str], Counter]:
         for match in call.finditer(mask):
             if re.search(r"\b(?:fn|macro_rules!)\s*$", mask[max(0, match.start() - 16) : match.start()]):
                 continue  # the reader's own definition, not a call
+            if not visible(scopes, match.group(0), path, match.start()):
+                continue  # a closure reader's name outside the block that binds it
             argument = KEY_ARGUMENT.match(text, match.end())
             prefix, literal, constant = argument.groups() if argument else (None, None, None)
             keys = {literal} if literal else consts.get(constant or "", set())
@@ -704,7 +755,7 @@ def entry_points(source: dict[str, str]) -> Counter:
     """Calls whose env read happens elsewhere: `*from_env*` / `*from_lookup*`, and any call handed a reader."""
     files = production_sources(source)
     masks = {path: code_mask(text) for path, text in files.items()}
-    _, read = readers_of(files, masks)
+    _, read, _ = readers_of(files, masks)
     passed = {name.replace("\\", "") for name in read if not name.endswith("!")} | {"std::env::var", "env::var"}
     counts: Counter = Counter()
     for mask in masks.values():
