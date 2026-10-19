@@ -512,7 +512,9 @@ def production_sources(source: dict[str, str]) -> dict[str, str]:
 #             `let required = |var| match lookup(var) …` — read only inside
 #             the block that binds it (a `let` cannot be named outside it, so
 #             gateway's tls.rs `let get = |suffix| …` never makes axum's
-#             `get(whoami)` in another fn a read), and a `fn` or
+#             `get(whoami)` in another fn a read; a closure whose name
+#             appears in that block other than as a call — passed, returned,
+#             stored — escapes, and stays a reader crate-wide), and a `fn` or
 #             `macro_rules!` whose body calls one keyed on its own parameter
 #             (`fn get(k) { std::env::var(k) }`, `req!($k)`) are readers too,
 #             required ones when the name says `required` or the body calls a
@@ -621,13 +623,16 @@ def enclosing_block_end(mask: str, position: int) -> int:
 def wrappers(mask: str) -> list[tuple[str, str, set[str], int, int, tuple[int, int] | None]]:
     """`(kind, name, parameters, body start, body stop, scope)` of every local closure, fn and macro_rules! in
     `mask`. `scope` is a closure's `(binding, end of its enclosing block)`, the only span that can name it;
-    None for a fn or macro, which the crate can name anywhere."""
+    None for a fn or macro, which the crate can name anywhere, and for a closure whose value escapes that span."""
     found = []
     for closure in LOCAL_CLOSURE.finditer(mask):
         parameters = set(re.findall(r"([a-z_]\w*)\s*(?::|$|,)", closure.group(2)))
         brace, semicolon = mask.find("{", closure.end()), mask.find(";", closure.end())
         stop = matching_brace(mask, brace) if 0 <= brace < semicolon or semicolon < 0 <= brace else semicolon
-        scope = (closure.start(), enclosing_block_end(mask, closure.start()))
+        scope: tuple[int, int] | None = (closure.start(), enclosing_block_end(mask, closure.start()))
+        uses = re.finditer(rf"(?<![\w.]){re.escape(closure.group(1))}\b(?!\s*\()", mask[closure.end() : scope[1]])
+        if next(uses, None) is not None:
+            scope = None  # the closure value escapes (passed, returned, stored, aliased): crate-wide, as before
         found.append(("closure", re.escape(closure.group(1)), parameters, closure.end(), stop if stop > 0 else len(mask), scope))
     for function in FN_DEFINITION.finditer(mask):
         close = matching_paren(mask, function.end() - 1)

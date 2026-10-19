@@ -34,9 +34,12 @@ One constructed case per arm:
 - E3 closure scope (pin 0.27.7, gateway v0.12.17): a local closure reader
   (`let get = |suffix| lookup(…)`) is a reader only in the block that binds
   it, so axum's `get(handler)` / `post(handler)` / `.route(.., get(x))` in
-  another fn is green; a new literal or unresolvable read through the closure
-  in its own block, and a real `std::env::var` / `env::var` read beside it,
-  stay NEEDS-HUMAN;
+  another fn is green, in another file or the same one (also at an offset
+  inside the closure's block), after the inner block that binds it, and before
+  the `let`; a new literal or unresolvable read through the closure in its own
+  block, a real `std::env::var` / `env::var` read beside it, and a new key
+  through a closure value that escapes (passed to a fn, returned) stay
+  NEEDS-HUMAN;
 - E4: a moved `yadgar-store` pin on a -db module, a schema change outside the
   blocks and an `include_str!` are NEEDS-HUMAN;
 - E4: an added migration version is NEEDS-HUMAN; an unchanged schema is green;
@@ -583,6 +586,75 @@ def test_an_axum_method_router_named_like_a_closure_reader_elsewhere_is_not_an_e
     old = {"src/upstream/tls.rs": closure_tls(name)}
     new = {**old, "src/http/whoami.rs": AXUM_ROUTES[shape].replace("NAME", name)}
     assert pb.boot_audit("gateway", old, new, set()) == []
+
+
+def test_an_axum_get_in_another_fn_of_the_same_file_is_not_an_env_read() -> None:
+    old = {"src/upstream/tls.rs": closure_tls("get")}
+    new = {"src/upstream/tls.rs": closure_tls("get") + "pub fn routes() -> Router {\n    Router::new().route(\"/\", get(handler))\n}\n"}
+    assert pb.boot_audit("gateway", old, new, set()) == []
+
+
+def test_an_axum_get_in_another_file_at_an_offset_inside_the_closure_block_is_not_an_env_read() -> None:
+    """The span is per file: a call whose offset falls inside the closure's block in tls.rs is still outside it."""
+    tls = closure_tls("get")
+    offset = tls.index('get("TLS_ENABLED")')
+    routes = "fn routes() { let _r = get(handler); }\n"
+    padding = offset - routes.index("get(handler)")
+    old = {"src/upstream/tls.rs": tls}
+    new = {**old, "src/http/whoami.rs": " " * padding + routes}
+    assert pb.boot_audit("gateway", old, new, set()) == []
+
+
+INNER_BLOCK = (
+    "pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {\n"
+    "    {\n"
+    "        let get = |k: &str| lookup(k);\n"
+    '        let _ = get("TLS_ENABLED");\n'
+    "    }\n"
+    "    None\n"
+    "}\n"
+)
+
+
+def test_a_bare_get_after_the_inner_block_that_binds_the_closure_is_not_an_env_read() -> None:
+    new = {"src/upstream/tls.rs": INNER_BLOCK.replace("    None\n", "    let _r = get(handler);\n    None\n")}
+    assert pb.boot_audit("gateway", {"src/upstream/tls.rs": INNER_BLOCK}, new, set()) == []
+
+
+def test_a_bare_get_before_the_closure_binding_is_not_an_env_read() -> None:
+    new = {"src/upstream/tls.rs": closure_tls("get").replace("    let get =", "    let _r = get(handler);\n    let get =")}
+    assert pb.boot_audit("gateway", {"src/upstream/tls.rs": closure_tls("get")}, new, set()) == []
+
+
+ESCAPE_PASSED = (
+    "pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) {\n"
+    "    let get = |k: &str| lookup(k);\n"
+    "    helper(get);\n"
+    "}\n"
+    "fn helper<F: Fn(&str) -> Option<String>>(get: F) -> Option<String> {\n"
+    "    get(OLD_K)\n"
+    "}\n"
+)
+ESCAPE_RETURNED = (
+    "fn mk(lookup: impl Fn(&str) -> Option<String>) -> impl Fn(&str) -> Option<String> {\n"
+    "    let get = move |k: &str| lookup(k);\n"
+    "    get\n"
+    "}\n"
+    "pub fn boot(l: impl Fn(&str) -> Option<String>) {\n"
+    "    let get = mk(l);\n"
+    "    let _ = get(OLD_K);\n"
+    "}\n"
+)
+
+
+@pytest.mark.parametrize("source", [ESCAPE_PASSED, ESCAPE_RETURNED], ids=["passed-to-a-fn", "returned-from-a-fn"])
+def test_a_new_key_through_an_escaping_closure_value_is_needs_human(source: str) -> None:
+    """A closure value that leaves its block (passed, returned) can be called by the same name anywhere."""
+    consts = 'const OLD_K: &str = "OLD_K";\nconst NEW_K: &str = "NEW_ESCAPED_KEY";\n'
+    old = {"src/upstream/tls.rs": consts + source}
+    new = {"src/upstream/tls.rs": consts + source.replace("get(OLD_K)", "get(OLD_K);\n    get(NEW_K)")}
+    reasons = pb.boot_audit("gateway", old, new, set())
+    assert any("NEW_ESCAPED_KEY" in r for r in reasons), reasons
 
 
 def with_closure_line(line: str) -> dict[str, str]:
