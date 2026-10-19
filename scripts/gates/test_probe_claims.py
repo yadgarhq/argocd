@@ -54,6 +54,25 @@ def test_the_unresolvable_claim_has_no_declared_ancestor() -> None:
     assert nearest(pp.CLAIM) is None
 
 
-def test_the_personal_claim_is_under_the_reserved_root_and_undeclared() -> None:
-    assert pp.TRIAL_CLAIM.split("/")[0] == "local"
-    assert nearest(pp.TRIAL_CLAIM) is None
+# A canonical v7 segment standing in for whatever `GET /auth/whoami` answers
+# at run time (ADR-0959). The personal claim is built from it, so the check
+# below holds for every account the probe could log in as.
+SOME_SEGMENT = "0192f0a0-0000-7000-8000-00000000a11c"
+
+
+def test_the_personal_claim_is_under_the_callers_own_segment_and_undeclared() -> None:
+    claim = pp.personal_claim(SOME_SEGMENT)
+    assert claim.split("/")[:2] == ["local", SOME_SEGMENT]
+    assert nearest(claim) is None
+
+
+def test_the_seeder_declares_nothing_under_the_reserved_local_root() -> None:
+    # The personal arm counts PROJECT_UNREGISTERED_PERSONAL only while no
+    # ancestor of `local/<own>/probe-never-registered` is registered. The
+    # declared registry is checked here; private rows made at run time cannot be
+    # read by the probe, whose leg (c) goes red and names the cause instead.
+    assert not [p for p in declared() if p == "local" or p.startswith("local/")]
+
+
+def test_the_not_member_claim_is_undeclared() -> None:
+    assert nearest(pp.NOT_MEMBER_CLAIM) is None

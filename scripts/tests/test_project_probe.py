@@ -29,6 +29,13 @@ _spec.loader.exec_module(pp)
 
 U = pp.UNRESOLVABLE
 P = pp.PERSONAL
+N = pp.NOT_MEMBER
+
+# The probe account's own segment, as `GET /auth/whoami` answers it (gateway#124,
+# ADR-0959): a canonical v7 uuid, `account_segment(user_id)`.
+OWN = "0192f0a0-0000-7000-8000-00000000a11c"
+WHOAMI = (200, {"account_segment": OWN, "user_id": f"yadgar:user:{OWN}"})
+OWN_CLAIM = f"local/{OWN}/probe-never-registered"
 
 
 def vector(loaded: dict[str, float], refusals: dict[tuple[str, str], float]) -> dict:
@@ -124,8 +131,8 @@ def test_one_query_reads_both_series_so_liveness_is_the_same_read() -> None:
 # --- the verdict --------------------------------------------------------------
 
 
-def deltas(u_rise=0, p_rise=0, **kw) -> dict[str, pp.Delta]:
-    return {U: pp.Delta(rise=u_rise, **kw), P: pp.Delta(rise=p_rise)}
+def deltas(u_rise=0, p_rise=0, n_rise=0, **kw) -> dict[str, pp.Delta]:
+    return {U: pp.Delta(rise=u_rise, **kw), P: pp.Delta(rise=p_rise), N: pp.Delta(rise=n_rise)}
 
 
 def test_only_project_unresolvable_passes() -> None:
@@ -156,6 +163,9 @@ def test_the_trial_passes_only_when_personal_rose_and_unresolvable_did_not() -> 
     assert pp.trial_valid(deltas()) is False
     assert pp.trial_valid(deltas(u_rise=1)) is False
     assert pp.trial_valid(deltas(p_rise=1, resets=["a"])) is False
+    # Run 39267418592's failure: the claim counted NOT_MEMBER. A trial that saw
+    # NOT_MEMBER move sent a claim outside its own segment and proved nothing.
+    assert pp.trial_valid(deltas(p_rise=1, n_rise=1)) is False
 
 
 # --- attribution under estate's own traffic -----------------------------------
@@ -191,9 +201,11 @@ def test_only_a_smoke_job_running_inside_the_window_overlaps(j, overlaps) -> Non
 class Fake:
     """Scripted network. `readings` is consumed one per Prometheus query."""
 
-    def __init__(self, readings, *, login=(200, {"token": "tok-SECRET"}), call=None, runs=None, jobs=None, prom_down=False):
+    def __init__(self, readings, *, login=(200, {"token": "tok-SECRET"}), whoami=WHOAMI, call=None, runs=None, jobs=None, prom_down=False):
         self.readings = list(readings)
         self.login = login
+        self.whoami = whoami
+        self.gets: list[tuple[str, dict]] = []
         self.call = call or (200, {"jsonrpc": "2.0", "id": 1, "result": {"resultType": "complete", "structuredContent": {}}})
         self.runs = runs if runs is not None else {"workflow_runs": []}
         self.jobs = jobs or {}
@@ -218,6 +230,11 @@ class Fake:
         self.posts.append((path, headers, json.loads(body)))
         status, payload = self.login if path == "/auth/login" else self.call
         return status, json.dumps(payload).encode()
+
+    def edge_get(self, path, headers):
+        self.gets.append((path, headers))
+        status, payload = self.whoami
+        return status, payload if isinstance(payload, bytes) else json.dumps(payload).encode()
 
 
 class Clock:
@@ -360,8 +377,79 @@ def test_the_trial_sends_the_personal_claim_and_reddens_as_designed(capsys) -> N
     fake = Fake([BEFORE, ROSE_P])
     assert run(fake, "--trial", "unregistered-personal") == pp.EXIT_TRIAL_RED
     out = capsys.readouterr().out
-    assert fake.posts[1][1]["x-yadgar-project"] == pp.TRIAL_CLAIM
-    assert "trial: VALID" in out
+    # ADR-0959: the claim is under the caller's OWN segment, read from whoami.
+    assert fake.gets == [("/auth/whoami", {"authorization": "Bearer tok-SECRET"})]
+    assert fake.posts[1][1]["x-yadgar-project"] == OWN_CLAIM
+    assert "trial: VALID" in out and f"neither {U} nor {N} did" in out
+
+
+def test_the_trial_claim_follows_whatever_segment_whoami_answers() -> None:
+    # A mutant that hardcodes a segment (or the old `local/probe-never-registered`)
+    # sends the same claim for every account; this pins derivation, not a value.
+    other = "0192f0a0-ffff-7abc-b000-0000000000b0"
+    fake = Fake([BEFORE, ROSE_P], whoami=(200, {"account_segment": other, "user_id": f"yadgar:user:{other}"}))
+    assert run(fake, "--trial", "unregistered-personal") == pp.EXIT_TRIAL_RED
+    assert fake.posts[1][1]["x-yadgar-project"] == f"local/{other}/probe-never-registered"
+
+
+def test_the_old_shared_personal_claim_is_gone() -> None:
+    # gateway v0.12.16 `member.rs`: `local/probe-never-registered` names the
+    # segment `probe-never-registered`, which is nobody's own, so it counts
+    # PROJECT_NOT_MEMBER. That made leg (c) run 39267418592 red.
+    assert not hasattr(pp, "TRIAL_CLAIM")
+    assert pp.personal_claim(OWN) == OWN_CLAIM
+
+
+# --- whoami fails closed (ADR-0959) -------------------------------------------
+#
+# A run that cannot learn its own segment must never guess one: every refusal
+# below ends the run before ANY MCP call is sent, so no claim is built.
+
+BAD_WHOAMI = {
+    "401": (401, {"error": "unauthenticated"}),
+    "500": (500, {"error": "x"}),
+    "not json": (200, b"<html>"),
+    "missing key": (200, {"user_id": f"yadgar:user:{OWN}"}),
+    "null segment": (200, {"account_segment": None, "user_id": "dev-user"}),
+    "empty segment": (200, {"account_segment": "", "user_id": "yadgar:user:"}),
+    "not a uuid": (200, {"account_segment": "probe", "user_id": "yadgar:user:probe"}),
+    "upper case": (200, {"account_segment": OWN.upper(), "user_id": f"yadgar:user:{OWN.upper()}"}),
+    "not v7": (200, {"account_segment": OWN.replace("-7000-", "-4000-"), "user_id": "yadgar:user:" + OWN.replace("-7000-", "-4000-")}),
+    "bad variant": (200, {"account_segment": OWN.replace("-8000-", "-c000-"), "user_id": "yadgar:user:" + OWN.replace("-8000-", "-c000-")}),
+    "segment with a slash": (200, {"account_segment": OWN + "/x", "user_id": f"yadgar:user:{OWN}/x"}),
+    "misplaced dash": (200, {"account_segment": OWN[:8] + OWN[9] + "-" + OWN[10:], "user_id": "yadgar:user:" + OWN[:8] + OWN[9] + "-" + OWN[10:]}),
+    "no dashes": (200, {"account_segment": OWN.replace("-", "a"), "user_id": "yadgar:user:" + OWN.replace("-", "a")}),
+    "user_id disagrees": (200, {"account_segment": OWN, "user_id": "yadgar:user:0192f0a0-0000-7000-8000-0000000000b0"}),
+    "not an object": (200, [OWN]),
+}
+
+
+@pytest.mark.parametrize("mode", [("--trial", "unregistered-personal"), ("--leg-c",)])
+@pytest.mark.parametrize("case", sorted(BAD_WHOAMI))
+def test_whoami_refused_or_malformed_fails_closed_and_sends_no_call(case, mode, capsys) -> None:
+    fake = Arms([BEFORE, rose(*ALL)], whoami=BAD_WHOAMI[case])
+    assert run(fake, *mode) == pp.EXIT_FAIL
+    assert [p[0] for p in fake.posts] == ["/auth/login"], "no MCP call may follow a failed whoami"
+    out = capsys.readouterr().out
+    assert "whoami" in out and "FAIL" in out
+    assert "SECRET" not in out
+
+
+def test_leg_c_reads_whoami_once_with_the_login_token() -> None:
+    # The segment comes from the credential the run just obtained, never from config.
+    fake = Arms([BEFORE, rose(*ALL)])
+    assert run(fake, "--leg-c") == pp.EXIT_PASS
+    assert fake.gets == [("/auth/whoami", {"authorization": "Bearer tok-SECRET"})]
+
+
+def test_the_routine_probe_and_the_no_token_trial_never_call_whoami() -> None:
+    # The routine probe runs on a cron; it must not depend on gateway#124.
+    fake = Fake([BEFORE, ROSE_U], whoami=(404, {"error": "x"}))
+    assert run(fake) == 0
+    assert fake.gets == []
+    fake = Fake([BEFORE], call=UNAUTHENTICATED, whoami=(404, {"error": "x"}))
+    assert run(fake, "--trial", "no-token") == pp.EXIT_TRIAL_RED
+    assert fake.gets == []
 
 
 def test_a_trial_where_nothing_moved_is_itself_a_failure(capsys) -> None:
@@ -371,6 +459,11 @@ def test_a_trial_where_nothing_moved_is_itself_a_failure(capsys) -> None:
 
 def test_a_trial_where_unresolvable_rose_is_invalid() -> None:
     both = vector({"a": 1, "b": 1}, {("a", U): 1, ("b", P): 1})
+    assert run(Fake([BEFORE, both]), "--trial", "unregistered-personal") == pp.EXIT_TRIAL_INVALID
+
+
+def test_a_trial_where_not_member_rose_is_invalid() -> None:
+    both = vector({"a": 1, "b": 1}, {("a", N): 1, ("b", P): 1})
     assert run(Fake([BEFORE, both]), "--trial", "unregistered-personal") == pp.EXIT_TRIAL_INVALID
 
 
@@ -550,7 +643,7 @@ def test_the_internet_rule_is_443_only_and_excepts_every_cluster_range() -> None
 O = pp.UNREGISTERED_ORG
 I = pp.INVALID
 A = pp.ARCHIVED
-ALL = (U, P, O, I, A)
+ALL = (U, P, O, I, A, N)
 
 
 class Arms(Fake):
@@ -588,16 +681,85 @@ def test_leg_c_sends_one_call_per_reason_class_with_matching_mirror_headers(caps
     assert run(fake, "--leg-c") == pp.EXIT_PASS, capsys.readouterr().out
     calls = fake.posts[1:]
     by_claim = {h["x-yadgar-project"]: (h, b) for _, h, b in calls}
-    assert set(by_claim) == {pp.CLAIM, pp.TRIAL_CLAIM, pp.ORG_CLAIM, pp.INVALID_CLAIM, pp.ARCHIVED_CLAIM}
-    assert len(calls) == 5
+    assert set(by_claim) == {pp.CLAIM, OWN_CLAIM, pp.ORG_CLAIM, pp.INVALID_CLAIM, pp.ARCHIVED_CLAIM, pp.NOT_MEMBER_CLAIM}
+    assert len(calls) == 6
     for headers, body in by_claim.values():
         # The gateway cross-checks Mcp-Name against the body's tool name.
         assert headers["mcp-name"] == body["params"]["name"]
     assert by_claim[pp.ARCHIVED_CLAIM][1]["params"]["name"] == "create_task"
     # No title: the tool refuses before `task` is dialled, so nothing is written.
     assert "title" not in by_claim[pp.ARCHIVED_CLAIM][1]["params"]["arguments"]
-    for claim in (pp.CLAIM, pp.TRIAL_CLAIM, pp.ORG_CLAIM, pp.INVALID_CLAIM):
+    for claim in (pp.CLAIM, OWN_CLAIM, pp.ORG_CLAIM, pp.INVALID_CLAIM, pp.NOT_MEMBER_CLAIM):
         assert by_claim[claim][1]["params"]["name"] == "find_tasks"
+    # Reads only, bar the ARCHIVED arm's title-less create_task.
+    assert sorted(b["params"]["name"] for _, _, b in calls).count("create_task") == 1
+
+
+def test_leg_c_has_one_arm_per_probed_reason_and_every_reason_is_watched() -> None:
+    arms = pp.leg_c_arms(OWN)
+    assert sorted(a.reason for a in arms) == sorted(pp.REASONS)
+    assert pp.NOT_MEMBER == "PROJECT_NOT_MEMBER"  # gateway `src/project.rs` Reason::NotMember
+    (personal,) = [a for a in arms if a.reason == P]
+    assert personal.claim == OWN_CLAIM
+
+
+def test_the_not_member_claim_is_a_well_formed_foreign_private_claim() -> None:
+    # gateway `member::is_foreign_private`: well-formed, under `local`, and a
+    # segment that is not the caller's. The fixed segment is canonical-shaped so
+    # a future gateway that also checks the segment's shape still counts it.
+    root, segment, rest = pp.NOT_MEMBER_CLAIM.split("/")
+    assert root == "local" and rest == "probe"
+    assert pp.is_canonical_segment(segment)
+    assert segment != OWN
+
+
+def test_a_not_member_claim_equal_to_the_own_segment_is_refused() -> None:
+    with pytest.raises(pp.ProbeError, match="NOT_MEMBER"):
+        pp.leg_c_arms(pp.FOREIGN_SEGMENT)
+
+
+def test_segments_compare_ascii_case_insensitively_as_the_gateway_does() -> None:
+    # gateway `member::is_foreign_private` uses `eq_ignore_ascii_case`. The
+    # fixed FOREIGN_SEGMENT has no letters, so the case rule is tested here on
+    # one that does.
+    assert pp.same_segment(OWN, OWN.upper())
+    assert pp.same_segment(OWN.upper(), OWN)
+    assert not pp.same_segment(OWN, OWN.replace("a11c", "a11d"))
+
+
+def test_leg_c_refuses_to_run_when_its_own_segment_is_the_foreign_one(capsys) -> None:
+    whoami = (200, {"account_segment": pp.FOREIGN_SEGMENT, "user_id": f"yadgar:user:{pp.FOREIGN_SEGMENT}"})
+    fake = Arms([BEFORE, rose(*ALL)], whoami=whoami)
+    assert run(fake, "--leg-c") == pp.EXIT_FAIL
+    assert [p[0] for p in fake.posts] == ["/auth/login"]
+
+
+def test_leg_c_names_a_registered_private_ancestor_when_personal_did_not_rise(capsys) -> None:
+    # The probe cannot read the private registry (no egress into `yadgar`). If a
+    # row at `local/<own>` or the claim itself existed, the claim would resolve
+    # and PERSONAL would not count: leg (c) is red, and says why it might be.
+    assert run(Arms([BEFORE, rose(U, O, I, A, N)]), "--leg-c") == pp.EXIT_FAIL
+    out = capsys.readouterr().out
+    # Text only the hint prints: the `call PERSONAL ... claim=` line also
+    # carries `local/<own>`, so that alone would pass with the hint deleted.
+    assert f"registered private row at local/{OWN} or {OWN_CLAIM} would resolve the claim" in out
+
+
+def test_leg_c_prints_no_ancestor_hint_when_personal_rose(capsys) -> None:
+    assert run(Arms([BEFORE, rose(*ALL)]), "--leg-c") == pp.EXIT_PASS
+    assert "would resolve the claim" not in capsys.readouterr().out
+
+
+def test_the_trial_names_a_registered_private_ancestor_when_personal_did_not_rise(capsys) -> None:
+    assert run(Fake([BEFORE]), "--trial", "unregistered-personal") == pp.EXIT_TRIAL_INVALID
+    out = capsys.readouterr().out
+    assert f"a registered row at local/<own> or {OWN_CLAIM} would resolve the claim" in out
+
+
+def test_the_trial_prints_no_ancestor_hint_when_personal_rose_with_another(capsys) -> None:
+    both = vector({"a": 1, "b": 1}, {("a", N): 1, ("b", P): 1})
+    assert run(Fake([BEFORE, both]), "--trial", "unregistered-personal") == pp.EXIT_TRIAL_INVALID
+    assert "would resolve the claim" not in capsys.readouterr().out
 
 
 def test_leg_c_claims_reach_the_classes_the_gateway_assigns() -> None:
@@ -634,6 +796,8 @@ def test_leg_c_fails_when_the_archived_write_failed_for_another_reason() -> None
 def test_leg_c_accepts_an_enforcing_refusal_with_the_expected_reason() -> None:
     refused = (400, {"jsonrpc": "2.0", "id": 1, "error": {"code": -32602, "message": "x", "data": {"reason": A}}})
     assert run(Arms([BEFORE, rose(*ALL)], answers={pp.ARCHIVED_CLAIM: refused}), "--leg-c") == pp.EXIT_PASS
+    not_member = (403, {"jsonrpc": "2.0", "id": 1, "error": {"code": -32602, "message": "x", "data": {"reason": N}}})
+    assert run(Arms([BEFORE, rose(*ALL)], answers={pp.NOT_MEMBER_CLAIM: not_member}), "--leg-c") == pp.EXIT_PASS
 
 
 def test_leg_c_fails_on_a_refusal_with_another_reason() -> None:

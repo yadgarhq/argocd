@@ -21,7 +21,8 @@ THE STEPS, in order:
      must not gain it (plan M10).
   3. Log in at the edge (`/auth/login`, user `estate-probe`, password from
      `ESTATE_PROBE_PASSWORD`) and send `tools/call find_tasks` with
-     `X-Yadgar-Project: probe-unregistered/never-registered`.
+     `X-Yadgar-Project: probe-unregistered/never-registered`. (The personal
+     trial and leg (c) first read the account's own segment; see OWN SEGMENT.)
   4. Poll Prometheus every 15 s for up to 120 s until the per-pod sum rises.
   5. Read estate's runs again; a `smoke` job that ran inside the window makes
      the run INCONCLUSIVE.
@@ -52,12 +53,14 @@ THE VERDICT:
                 `registry_loaded == 1`; a pod whose value is unknown. exit 1
 
 THE TRIALS (stage 6 acceptance 2 and 3):
-  --trial unregistered-personal sends `local/probe-never-registered`, which
-      classifies as `PROJECT_UNREGISTERED_PERSONAL`. The probe's assertion on
-      `PROJECT_UNRESOLVABLE` must then fail. The trial is VALID only when
-      `PROJECT_UNREGISTERED_PERSONAL` rose and `PROJECT_UNRESOLVABLE` did not:
-      exit 3 (red, as designed). Anything else is exit 2 (the trial proved
-      nothing). A trial where neither series moved proves nothing.
+  --trial unregistered-personal sends `local/<own>/probe-never-registered`,
+      where `<own>` is the probe account's own segment (see OWN SEGMENT below).
+      It classifies as `PROJECT_UNREGISTERED_PERSONAL`. The probe's assertion
+      on `PROJECT_UNRESOLVABLE` must then fail. The trial is VALID only when
+      `PROJECT_UNREGISTERED_PERSONAL` rose and neither `PROJECT_UNRESOLVABLE`
+      nor `PROJECT_NOT_MEMBER` did: exit 3 (red, as designed). Anything else
+      is exit 2 (the trial proved nothing). A trial where neither series moved
+      proves nothing. A whoami that fails is exit 1 and sends no call.
   --trial no-token sends the call with no bearer token. The trial is VALID
       only when the call answered 401 AND every reason's rise is 0 with no
       reset, unknown or vanished pod: exit 3 (red, as designed). Any other
@@ -69,11 +72,23 @@ to count, before its window opens. This mode sends one call per class that a
 probe can reach, in one login, then polls until every class's counter rose:
 
   PROJECT_UNRESOLVABLE           find_tasks   probe-unregistered/never-registered
-  PROJECT_UNREGISTERED_PERSONAL  find_tasks   local/probe-never-registered
+  PROJECT_UNREGISTERED_PERSONAL  find_tasks   local/<own>/probe-never-registered
   PROJECT_UNREGISTERED_ORG       find_tasks   yadgarhq/probe-never-registered
   PROJECT_INVALID                find_tasks   probe-invalid/
   PROJECT_ARCHIVED               create_task  yadgarhq/probe-archived
+  PROJECT_NOT_MEMBER             find_tasks   local/<FOREIGN_SEGMENT>/probe
 
+  - PERSONAL needs the caller's OWN segment: gateway v0.12.16 counts any
+    well-formed `local/<seg>/...` claim whose `<seg>` is not the caller's as
+    `PROJECT_NOT_MEMBER`, before the registry is read (`project.rs`,
+    `member::is_foreign_private`, ADR-0954). It also needs no registered
+    ancestor (`local/<own>` or the claim itself). The probe cannot read
+    private rows (its egress never reaches namespace `yadgar`), so a row
+    there shows as PERSONAL not rising, and the failure says so.
+  - NOT_MEMBER uses a fixed, canonical-shaped segment no account is minted
+    with (a v7 uuid with a zero timestamp). The run refuses before sending
+    anything if it equals the own segment, compared ASCII-case-insensitively
+    as the gateway compares it.
   - ORG needs the root `yadgarhq` declared and the claim itself undeclared:
     the walk then lands on the anchor (`classify.rs`, ADR-0673).
   - INVALID: a trailing `/` fails the grammar before any resolution.
@@ -97,6 +112,15 @@ expected AND every class's counter rose per pod. Anything else is exit 1,
 INCONCLUSIVE included (a smoke overlap, a reset or a vanished pod): leg (c)
 needs a clean proof, so dispatch again. `project-probe.yaml` names these runs
 `project-probe leg-c`, and `preflip_gate.py` reads the newest one.
+
+OWN SEGMENT (ADR-0959). `--leg-c` and `--trial unregistered-personal` read
+`GET /auth/whoami` with the login's bearer token right after login. The answer
+is `{"account_segment": "<uuid>", "user_id": "yadgar:user:<uuid>"}` (gateway
+#124). The run fails closed (exit 1, no MCP call sent) on any answer but 200, a
+missing or null `account_segment`, a segment that is not a canonical v7 uuid as
+gateway `project/account.rs` spells one, or a `user_id` that is not
+`yadgar:user:` + that segment. It never falls back to a guessed claim. The
+routine probe and `--trial no-token` do not call whoami.
 
 NEVER PRINTED: the password and the bearer token.
 
@@ -129,13 +153,23 @@ PERSONAL = "PROJECT_UNREGISTERED_PERSONAL"
 UNREGISTERED_ORG = "PROJECT_UNREGISTERED_ORG"
 INVALID = "PROJECT_INVALID"
 ARCHIVED = "PROJECT_ARCHIVED"
-REASONS = (UNRESOLVABLE, PERSONAL, UNREGISTERED_ORG, INVALID, ARCHIVED)
+NOT_MEMBER = "PROJECT_NOT_MEMBER"  # gateway `src/project.rs` Reason::NotMember
+REASONS = (UNRESOLVABLE, PERSONAL, UNREGISTERED_ORG, INVALID, ARCHIVED, NOT_MEMBER)
 
-# No ancestor of either claim is registered. `classify` (gateway
-# `src/project/classify.rs`) returns `Unresolvable` for the first and
-# `UnregisteredPersonal` for the second, whose root is the reserved `local`.
+# No ancestor of this claim is registered: `classify` (gateway
+# `src/project/classify.rs`) returns `Unresolvable`.
 CLAIM = "probe-unregistered/never-registered"
-TRIAL_CLAIM = "local/probe-never-registered"
+# The personal claim is `local/<own segment>/<PERSONAL_SUFFIX>`, built at run
+# time from `GET /auth/whoami` (ADR-0959); see `personal_claim`. Under the
+# caller's own segment with no registered ancestor it is `UnregisteredPersonal`.
+PERSONAL_SUFFIX = "probe-never-registered"
+# A canonical-shaped v7 segment with a zero timestamp, which no real account is
+# minted with. Never the caller's own, so the claim counts NOT_MEMBER before the
+# registry is read (gateway `member::is_foreign_private`). Asserted at run time.
+FOREIGN_SEGMENT = "00000000-0000-7000-8000-000000000000"
+NOT_MEMBER_CLAIM = f"local/{FOREIGN_SEGMENT}/probe"
+USER_ID_PREFIX = "yadgar:user:"  # gateway `src/project/account.rs`
+WHOAMI = "/auth/whoami"
 # Leg (c)'s three further claims; see the docstring for why each reaches its
 # class. `scripts/gates/test_probe_claims.py` binds the first to the declared
 # registry. The last is bound by argocd#113 (the step that archives the row):
@@ -164,14 +198,44 @@ class Arm:
     arguments: dict
 
 
-LEG_C_ARMS = (
-    Arm(UNRESOLVABLE, CLAIM, TOOL, {"page_size": 1}),
-    Arm(PERSONAL, TRIAL_CLAIM, TOOL, {"page_size": 1}),
-    Arm(UNREGISTERED_ORG, ORG_CLAIM, TOOL, {"page_size": 1}),
-    Arm(INVALID, INVALID_CLAIM, TOOL, {"page_size": 1}),
-    # NO `title`: the one argument whose absence makes the write a no-op.
-    Arm(ARCHIVED, ARCHIVED_CLAIM, WRITE_TOOL, {}),
-)
+def is_canonical_segment(segment: object) -> bool:
+    """Gateway `account.rs` `is_canonical_user_id`, less the prefix: a lower-case v7 uuid."""
+    if not isinstance(segment, str) or len(segment) != 36:
+        return False
+    for i, c in enumerate(segment):
+        if i in (8, 13, 18, 23):
+            if c != "-":
+                return False
+        elif c not in "0123456789abcdef":
+            return False
+    return segment[14] == "7" and segment[19] in "89ab"
+
+
+def personal_claim(own_segment: str) -> str:
+    return f"local/{own_segment}/{PERSONAL_SUFFIX}"
+
+
+def same_segment(a: str, b: str) -> bool:
+    """Whether two `local/` segments name one account: ASCII-case-insensitive, as the gateway compares."""
+    return a.lower() == b.lower()
+
+
+def leg_c_arms(own_segment: str) -> tuple[Arm, ...]:
+    """Leg (c)'s arms, one per probed reason. The PERSONAL claim is the caller's own."""
+    if same_segment(FOREIGN_SEGMENT, own_segment):
+        raise ProbeError(
+            f"the NOT_MEMBER arm's segment {FOREIGN_SEGMENT} is this account's own; "
+            "that claim would not count PROJECT_NOT_MEMBER"
+        )
+    return (
+        Arm(UNRESOLVABLE, CLAIM, TOOL, {"page_size": 1}),
+        Arm(PERSONAL, personal_claim(own_segment), TOOL, {"page_size": 1}),
+        Arm(UNREGISTERED_ORG, ORG_CLAIM, TOOL, {"page_size": 1}),
+        Arm(INVALID, INVALID_CLAIM, TOOL, {"page_size": 1}),
+        # NO `title`: the one argument whose absence makes the write a no-op.
+        Arm(ARCHIVED, ARCHIVED_CLAIM, WRITE_TOOL, {}),
+        Arm(NOT_MEMBER, NOT_MEMBER_CLAIM, TOOL, {"page_size": 1}),
+    )
 
 PASS, FAIL, INCONCLUSIVE = "PASS", "FAIL", "INCONCLUSIVE"
 EXIT_PASS, EXIT_FAIL, EXIT_TRIAL_INVALID, EXIT_TRIAL_RED = 0, 1, 2, 3
@@ -284,8 +348,8 @@ def evaluate(expected: str, deltas: dict[str, Delta]) -> Verdict:
 
 
 def trial_valid(deltas: dict[str, Delta]) -> bool:
-    u, p = deltas[UNRESOLVABLE], deltas[PERSONAL]
-    return p.rise >= 1 and u.rise == 0 and not (u.resets or u.unknown or u.missing)
+    u, p, n = deltas[UNRESOLVABLE], deltas[PERSONAL], deltas[NOT_MEMBER]
+    return p.rise >= 1 and u.rise == 0 and n.rise == 0 and not (u.resets or u.unknown or u.missing)
 
 
 # --- estate's smoke runs ------------------------------------------------------
@@ -332,6 +396,7 @@ class Transport(Protocol):
     def prom_query(self, query: str) -> dict: ...
     def github_get(self, path: str) -> dict: ...
     def edge_post(self, path: str, headers: dict[str, str], body: bytes) -> tuple[int, bytes]: ...
+    def edge_get(self, path: str, headers: dict[str, str]) -> tuple[int, bytes]: ...
 
 
 class _PinnedHTTPS(http.client.HTTPSConnection):
@@ -375,16 +440,48 @@ class Network:
             raise ProbeError(f"github {path}: {e}") from e
 
     def edge_post(self, path: str, headers: dict[str, str], body: bytes) -> tuple[int, bytes]:
+        return self._edge("POST", path, {"content-type": "application/json", **headers}, body)
+
+    def edge_get(self, path: str, headers: dict[str, str]) -> tuple[int, bytes]:
+        return self._edge("GET", path, headers, None)
+
+    def _edge(self, method: str, path: str, headers: dict[str, str], body: bytes | None) -> tuple[int, bytes]:
         context = ssl.create_default_context(cafile=self.args.edge_ca)
         conn = _PinnedHTTPS(self.args.edge_address, self.args.edge_host, self.args.edge_port, context, 30)
         try:
-            conn.request("POST", path, body=body, headers={"content-type": "application/json", **headers})
+            conn.request(method, path, body=body, headers=headers)
             response = conn.getresponse()
             return response.status, response.read()
         except (OSError, http.client.HTTPException) as e:
             raise ProbeError(f"edge {self.args.edge_address}:{self.args.edge_port} {path}: {e}") from e
         finally:
             conn.close()
+
+
+def own_segment(transport: Transport, token: str) -> str:
+    """The caller's own `local/` segment from `GET /auth/whoami` (ADR-0959). Fails closed.
+
+    Raises `ProbeError` on anything but a 200 whose `account_segment` is a
+    canonical v7 uuid and whose `user_id` is exactly `yadgar:user:` + it. The
+    caller then sends nothing: a guessed segment would make the PERSONAL arm
+    count NOT_MEMBER and prove nothing.
+    """
+    status, raw = transport.edge_get(WHOAMI, {"authorization": f"Bearer {token}"})
+    say(f"whoami: HTTP {status}")
+    if status != 200:
+        raise ProbeError(f"whoami answered HTTP {status}; the own segment is unknown, so no personal claim is built")
+    answer = _json(raw)
+    if "account_segment" not in answer:
+        raise ProbeError("whoami answered 200 without `account_segment`; no personal claim is built")
+    segment = answer["account_segment"]
+    if segment is None:
+        raise ProbeError("whoami answered a null `account_segment` (a non-canonical user_id); no personal claim is built")
+    if not is_canonical_segment(segment):
+        raise ProbeError(f"whoami answered a malformed `account_segment` {str(segment)[:64]!r}; no personal claim is built")
+    if answer.get("user_id") != USER_ID_PREFIX + segment:
+        raise ProbeError("whoami's `user_id` is not `yadgar:user:` + its `account_segment`; no personal claim is built")
+    say(f"whoami: own segment {segment}")
+    return segment
 
 
 def mcp_call(token: str | None, claim: str, tool: str = TOOL, arguments: dict | None = None) -> tuple[dict[str, str], bytes]:
@@ -450,7 +547,7 @@ def run(
 ) -> int:
     if args.leg_c:
         return run_leg_c(args, transport, env, now, sleep)
-    claim = TRIAL_CLAIM if args.trial == "unregistered-personal" else CLAIM
+    claim = CLAIM
     send_token = args.trial != "no-token"
     password = env.get("ESTATE_PROBE_PASSWORD", "")
     if send_token and not password:
@@ -475,6 +572,8 @@ def run(
             if not token:
                 say(f"FAIL: login as {args.username} answered HTTP {status} with no token")
                 return EXIT_FAIL
+            if args.trial == "unregistered-personal":
+                claim = personal_claim(own_segment(transport, token))
 
         headers, body = mcp_call(token, claim)
         status, raw = transport.edge_post("/", headers, body)
@@ -525,9 +624,17 @@ def run(
         print(f"::warning::project-probe {verdict.message}", flush=True)
     if args.trial == "unregistered-personal":
         if trial_valid(deltas):
-            say(f"trial: VALID — the assertion is red as designed; {PERSONAL} moved and {UNRESOLVABLE} did not")
+            say(
+                f"trial: VALID — the assertion is red as designed; {PERSONAL} moved and neither "
+                f"{UNRESOLVABLE} nor {NOT_MEMBER} did"
+            )
             return EXIT_TRIAL_RED
-        say(f"trial: INVALID — needs {PERSONAL} to rise and {UNRESOLVABLE} not to; moved: {moved(deltas)}")
+        say(
+            f"trial: INVALID — needs {PERSONAL} to rise and neither {UNRESOLVABLE} nor {NOT_MEMBER}; "
+            f"moved: {moved(deltas)}"
+        )
+        if deltas[PERSONAL].rise < 1:
+            say(f"trial: a registered row at local/<own> or {claim} would resolve the claim and count nothing")
         return EXIT_TRIAL_INVALID
     return EXIT_FAIL if verdict.kind == FAIL else EXIT_PASS
 
@@ -590,8 +697,10 @@ def run_leg_c(
         if not token:
             say(f"FAIL: login as {args.username} answered HTTP {status} with no token")
             return EXIT_FAIL
+        own = own_segment(transport, token)
+        arms = leg_c_arms(own)
 
-        for arm in LEG_C_ARMS:
+        for arm in arms:
             headers, body = mcp_call(token, arm.claim, arm.tool, arm.arguments)
             status, raw = transport.edge_post("/", headers, body)
             ok, detail = answer_ok(arm, status, _json(raw))
@@ -624,6 +733,11 @@ def run_leg_c(
             failures.append(f"{verdict.message}; leg (c) needs a clean proof, dispatch again")
         else:
             failures.append(f"{reason} did not rise: {verdict.message}")
+            if reason == PERSONAL:
+                failures.append(
+                    f"{PERSONAL} did not rise: a registered private row at local/{own} or "
+                    f"{personal_claim(own)} would resolve the claim; the probe cannot read private rows"
+                )
 
     for f in failures:
         say(f"FAIL: {f}")
