@@ -31,6 +31,12 @@ One constructed case per arm:
   or macro wrapper, a duplicate unresolved site in a new fn, an unpinnable or
   overridden shared crate, a moved Cargo.lock commit, a missing Cargo.lock: each
   NEEDS-HUMAN; a key rendered on one container of two is not rendered;
+- E3 closure scope (pin 0.27.7, gateway v0.12.17): a local closure reader
+  (`let get = |suffix| lookup(…)`) is a reader only in the block that binds
+  it, so axum's `get(handler)` / `post(handler)` / `.route(.., get(x))` in
+  another fn is green; a new literal or unresolvable read through the closure
+  in its own block, and a real `std::env::var` / `env::var` read beside it,
+  stay NEEDS-HUMAN;
 - E4: a moved `yadgar-store` pin on a -db module, a schema change outside the
   blocks and an `include_str!` are NEEDS-HUMAN;
 - E4: an added migration version is NEEDS-HUMAN; an unchanged schema is green;
@@ -545,6 +551,70 @@ def test_a_second_argument_const_after_an_upper_snake_first_argument_is_unresolv
     source = {"src/boot.rs": 'const K9: &str = "REAL_KEY_FROM_A_VARIABLE";\nconst D: &str = "NOT_THE_KEY";\nfn f() { let _ = env_parsed(K9, D); }\n'}
     required, reads = pb.env_keys(source)
     assert "NOT_THE_KEY" not in reads and "NOT_THE_KEY" not in required
+
+
+# ── E3: a local closure reader is a reader in its own block only ────────────
+# gateway v0.12.17 (pin 0.27.7): `upstream/tls.rs` `from_lookup` binds
+# `let get = |suffix| lookup(&format!(…))`, and the new `http/whoami.rs` calls
+# axum's `get(whoami)`. A `let` binding cannot be named outside its block, so
+# the axum call is not an env read; before the fix it was judged one.
+
+
+def closure_tls(name: str) -> str:
+    """gateway's `upstream/tls.rs` shape: a closure `name` over a lookup parameter, read by literal suffix."""
+    return (
+        "pub fn from_lookup(prefix: &'static str, lookup: impl Fn(&str) -> Option<String>) -> Option<String> {\n"
+        f'    let {name} = |suffix: &str| lookup(&format!("{{prefix}}_{{suffix}}"));\n'
+        f'    {name}("TLS_ENABLED")\n'
+        "}\n"
+    )
+
+
+AXUM_ROUTES = {
+    "route-fallback": 'pub fn routes() -> Router {\n    Router::new().route("/auth/whoami", NAME(whoami).fallback(method_not_allowed))\n}\n',
+    "bare-handler": "pub fn routes() -> Router {\n    let _r = NAME(handler);\n    Router::new()\n}\n",
+    "inside-another-closure": 'pub fn routes() -> Router {\n    let mk = || Router::new().route("/", NAME(handler));\n    mk()\n}\n',
+}
+
+
+@pytest.mark.parametrize("name", ["get", "post"])
+@pytest.mark.parametrize("shape", sorted(AXUM_ROUTES))
+def test_an_axum_method_router_named_like_a_closure_reader_elsewhere_is_not_an_env_read(name: str, shape: str) -> None:
+    old = {"src/upstream/tls.rs": closure_tls(name)}
+    new = {**old, "src/http/whoami.rs": AXUM_ROUTES[shape].replace("NAME", name)}
+    assert pb.boot_audit("gateway", old, new, set()) == []
+
+
+def with_closure_line(line: str) -> dict[str, str]:
+    """`closure_tls("get")` with `line` added inside `from_lookup`, after the closure."""
+    text = closure_tls("get").replace('    get("TLS_ENABLED")', f'    {line}\n    get("TLS_ENABLED")')
+    return {"src/upstream/tls.rs": text}
+
+
+def test_a_new_unresolvable_read_through_the_closure_in_its_own_block_is_needs_human() -> None:
+    reasons = pb.boot_audit("gateway", {"src/upstream/tls.rs": closure_tls("get")}, with_closure_line("let _ = get(&dynamic);"), set())
+    assert any("cannot resolve" in r and "get(&dynamic)" in r for r in reasons), reasons
+
+
+def test_a_new_literal_read_through_the_closure_in_its_own_block_is_needs_human() -> None:
+    reasons = pb.boot_audit("gateway", {"src/upstream/tls.rs": closure_tls("get")}, with_closure_line('let _ = get("NEW_CLOSURE_KEY");'), set())
+    assert any("NEW_CLOSURE_KEY" in r for r in reasons), reasons
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ('let _r = std::env::var("NEW_STD_KEY").ok();', "NEW_STD_KEY"),
+        ('let _r = env::var(&format!("{p}_NEW")).ok();', "cannot resolve"),
+    ],
+    ids=["std-env-var", "env-var-unresolvable"],
+)
+def test_a_real_env_read_beside_the_closure_reader_is_still_needs_human(line: str, expected: str) -> None:
+    old = {"src/upstream/tls.rs": closure_tls("get")}
+    new = {**old, "src/http/whoami.rs": f"pub fn routes(p: &str) {{\n    {line}\n    let _ = get(handler);\n}}\n"}
+    reasons = pb.boot_audit("gateway", old, new, set())
+    assert any(expected in r for r in reasons), reasons
+    assert not any("get(handler)" in r for r in reasons), reasons
 
 
 CARGO_LIFECYCLE = 'yadgar-lifecycle = { git = "https://github.com/yadgarhq/lifecycle.git", tag = "v0.2.17" }'
