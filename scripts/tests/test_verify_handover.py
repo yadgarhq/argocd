@@ -32,9 +32,10 @@ WHAT IS ASSERTED, and each has a red case below:
      increase, and a generation change outside Deployments and CRDs. A
      skipped edge probe prints SKIPPED and is never counted as a pass.
   6b. A tracked object annotated `Replace=true,Force=true` (Argo re-creates
-     it on every sync) warns on a new uid, the mark read from either
-     snapshot; without both options a new uid still fails, and such an
-     object that is gone or terminating still fails.
+     it on every sync) warns on a new uid, the mark read from the head
+     snapshot only; without both options, or when the head drops them, a new
+     uid still fails, and such an object that is gone, terminating, or (as a
+     Deployment) has a new generation still fails.
   7. The wait states: a doc-only merge (no operation) counts as done once
      root's revision is the sha; a Running operation is pending; a Failed one
      fails; `--since` needs an operation that started after T; `--settled`
@@ -749,6 +750,31 @@ def test_a_baseline_from_before_the_mark_still_softens(responses) -> None:
     report = vh.diff(before, after)
     assert report.exit_code == 0, report.render()
     assert f"object/{SEEDER}" in levels(report)["WARN"], report.render()
+
+
+def test_a_head_that_drops_the_mark_fails_on_a_new_uid(responses) -> None:
+    before = vh.collect(cluster(with_seeder(responses, FORCE_REPLACE)))
+    after = copy_module.deepcopy(before)
+    del after["objects"][SEEDER]["replacedBySync"]
+    after["objects"][SEEDER]["uid"] = "job-2"
+    report = vh.diff(before, after)
+    assert report.exit_code == 1, report.render()
+    assert f"object/{SEEDER}" in levels(report)["FAIL"], report.render()
+
+
+def test_a_force_replaced_deployments_generation_change_still_fails(responses) -> None:
+    # The mark softens only the uid line. A generation change keeps its own
+    # rule: FAIL on a Deployment (a Job's generation change already warns).
+    responses = copy_module.deepcopy(responses)
+    for item in responses["get Deployment.apps -A -o json"]["items"]:
+        if item["metadata"]["name"] == "keda-operator":
+            item["metadata"].setdefault("annotations", {})["argocd.argoproj.io/sync-options"] = FORCE_REPLACE
+    before = vh.collect(cluster(responses))
+    key = "apps/Deployment/keda/keda-operator"
+    assert before["objects"][key]["replacedBySync"] is True
+    report = mutated(before, lambda s: s["objects"][key].update(generation=s["objects"][key]["generation"] + 1))
+    assert report.exit_code == 1, report.render()
+    assert f"object/{key}" in levels(report)["FAIL"], report.render()
 
 
 @pytest.mark.parametrize("sync_options", [None, "Replace=true", "Force=true"])

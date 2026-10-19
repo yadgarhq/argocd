@@ -42,8 +42,9 @@ generation change outside Deployments and CRDs, root pruning something on a
 new revision, and a new uid on a tracked object annotated
 `argocd.argoproj.io/sync-options` with both `Replace=true` and `Force=true`
 (Argo deletes and re-creates such an object on every sync, as with yadgar's
-seeder Job; the mark in either snapshot counts). Such an object that is gone
-or has a deletionTimestamp still fails. Additions are INFO.
+seeder Job; the mark is read from the head snapshot only). Such an object
+that is gone, has a deletionTimestamp, or (as a Deployment) has a new
+generation still fails. Additions are INFO.
 
 `diff` REFUSES (exit 2) two snapshots from different clusters (the kube-system
 namespace uid differs), an unknown schema, and a snapshot with no Applications
@@ -604,7 +605,7 @@ def _compare_identities(
             report.add("INFO", label, f"appeared (uid {a.get('uid')})")
         else:
             if a.get("uid") != b.get("uid"):
-                if a.get("replacedBySync") or b.get("replacedBySync"):
+                if a.get("replacedBySync"):
                     report.add("WARN", label, f"uid {b.get('uid')} -> {a.get('uid')} (re-created by sync: Replace=true,Force=true){suffix}")
                 else:
                     report.add(fail, label, f"uid {b.get('uid')} -> {a.get('uid')}{suffix}")
