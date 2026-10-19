@@ -1190,13 +1190,20 @@ DECLARED_EXTRA_PROJECTS = {"estate/smoke": "yadgarhq/estate"}
 # `project_probe.py --leg-c` writes to it to count `PROJECT_ARCHIVED`.
 # Declaring it again REACTIVATES the row and silently turns that arm into a
 # resolution. IMPORTED from the probe, never retyped: the guard must name the
-# path the probe actually writes to.
-_probe_spec = importlib.util.spec_from_file_location("project_probe", REPOSITORY / "scripts" / "project_probe.py")
-project_probe = sys.modules.get("project_probe") or importlib.util.module_from_spec(_probe_spec)
-if "project_probe" not in sys.modules:
-    sys.modules["project_probe"] = project_probe
-    _probe_spec.loader.exec_module(project_probe)
-ARCHIVED_ON_PURPOSE = (project_probe.ARCHIVED_CLAIM.lower(),)
+# path the probe actually writes to. Imported LAZILY, inside the two tests that
+# read it: `pin_bump.write_files` runs this file with `--write` in a tree that
+# holds only the mechanical files and the two writers, and a module-level load
+# of `scripts/project_probe.py` would die there with FileNotFoundError.
+def archived_on_purpose():
+    """`(project_probe.ARCHIVED_CLAIM, lower-cased)`, loading the probe on first call."""
+    if "project_probe" not in sys.modules:
+        spec = importlib.util.spec_from_file_location("project_probe", REPOSITORY / "scripts" / "project_probe.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["project_probe"] = module
+        spec.loader.exec_module(module)
+    project_probe = sys.modules["project_probe"]
+    ARCHIVED_ON_PURPOSE = (project_probe.ARCHIVED_CLAIM.lower(),)
+    return ARCHIVED_ON_PURPOSE
 
 
 def registry_failures(registry: object) -> dict[str, object]:
@@ -1238,14 +1245,14 @@ def test_the_rendered_registry_is_the_declaration(rendered: list) -> None:
 def test_the_probe_row_archived_on_purpose_is_not_declared() -> None:
     registry = declared_registry()
     declared = {p["path"].lower() for p in registry["projects"]} | {r["path"].lower() for r in registry["roots"]}
-    assert declared.isdisjoint(ARCHIVED_ON_PURPOSE)
+    assert declared.isdisjoint(archived_on_purpose())
 
 
 def test_the_row_archived_on_purpose_is_the_probes_own_claim_not_a_copy() -> None:
     # Imported, never retyped: a rename of the probe's claim must move this
     # guard with it, or the guard protects a path nothing writes to.
-    assert ARCHIVED_ON_PURPOSE == (project_probe.ARCHIVED_CLAIM.lower(),)
-    (assignment,) = [line for line in Path(__file__).read_text().splitlines() if line.startswith("ARCHIVED_ON_PURPOSE =")]
+    assert archived_on_purpose() == (sys.modules["project_probe"].ARCHIVED_CLAIM.lower(),)
+    (assignment,) = [line.strip() for line in Path(__file__).read_text().splitlines() if line.strip().startswith("ARCHIVED_ON_PURPOSE =")]
     assert "project_probe.ARCHIVED_CLAIM" in assignment and '"' not in assignment, assignment
 
 
