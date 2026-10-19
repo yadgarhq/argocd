@@ -43,6 +43,8 @@ from __future__ import annotations
 import copy
 import importlib.util
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -712,3 +714,18 @@ def test_the_body_carries_the_commit_table_the_digest_and_the_rollback() -> None
 def test_a_needs_human_body_names_every_reason() -> None:
     body = pb.pr_body(evidence(False, ["platform moved 0.2.4 -> 0.2.5"]))
     assert "NEEDS-HUMAN" in body and "platform moved 0.2.4 -> 0.2.5" in body
+
+
+def test_the_writer_loads_without_the_probe_in_its_tree(tmp_path: Path) -> None:
+    """`write_files` runs the writer inside a tree that holds the mechanical files and the two writers, nothing
+    else (the replay tests build exactly that). A writer that loads `scripts/project_probe.py` at module level dies
+    there with FileNotFoundError; the probe is a test's input, never the `--write` path's."""
+    gates = tmp_path / "scripts" / "gates"
+    gates.mkdir(parents=True)
+    for name in ("test_yadgar_application.py", "test_no_two_owners.py"):
+        shutil.copyfile(REPOSITORY / "scripts" / "gates" / name, gates / name)
+    writer = gates / "test_yadgar_application.py"
+    finished = subprocess.run(
+        [sys.executable, str(writer), "--write"], capture_output=True, text=True, check=False, cwd=tmp_path
+    )
+    assert "project_probe" not in finished.stderr, finished.stderr

@@ -7712,3 +7712,43 @@ was not re-created. NEEDS-MAX: `argocd app sync yadgar`.
 Revert. The next sync then omits the path, and the seeder ARCHIVES the row,
 which is step 2's outcome anyway. An archived row is never deleted
 (ADR-0934).
+
+## The seeder archives `yadgarhq/probe-archived`, step 2 of 2 of the leg (c) ARCHIVED probe row (ledger 1624)
+
+**Merge only after step 1 (argocd#112) has synced** and `Job/seeder` logged
+`inserted 1`. This merge removes the declaration, so the seeder ARCHIVES the
+row (ADR-0934): `archived 1`, `unchanged 25`. 1 of 26 active org rows is under
+ADR-0939's half-way guard. The rendered registry then equals the one before
+step 1 byte for byte (K3 table identical to `e7403b0`'s), but the store now
+holds one archived row the declaration does not name, by design.
+
+**ADR-0881 dry run.** The meaningful baseline is the cluster at step 1's
+state, so the server-side diff is taken after step 1 syncs: expected exactly
+`ConfigMap/seeder-registry`, losing the one project.
+
+### After this merge, read-only
+
+```bash
+# 1. yadgar Synced/Healthy.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+
+# 2. The seeder archived the row. Expect archived 1, unchanged 25.
+kubectl --context kind-yadgar -n yadgar logs job/seeder | tail -1
+
+# 3. The gateways still load 26 paths: an archived row stays in the loaded set
+#    with its status (ListProjects is not filtered by status).
+for p in $(kubectl --context kind-yadgar -n yadgar get pods -l app=gateway -o name); do
+  kubectl --context kind-yadgar -n yadgar logs "$p" | grep 'registry is loaded' | tail -1
+done
+```
+
+Then dispatch argocd-verify `project-probe.yaml` with `leg_c: true` (needs
+`PROJECT_PROBE_ENABLED=true`). Expect `PROJECT_ARCHIVED` among the risen
+reasons and the ARCHIVED arm answering "tool refused the missing title;
+nothing written".
+
+### Rollback
+
+Revert: the next sync declares the path again and the seeder REACTIVATES the
+row (`reactivated 1`). The leg (c) ARCHIVED arm then cannot pass.
