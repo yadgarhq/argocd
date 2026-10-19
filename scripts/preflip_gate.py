@@ -17,9 +17,11 @@ guards 1-4 that make them readable; leg 7 is (c).
 LEG (C) IS READ FROM THE PROBE'S OWN VERDICT, NOT FROM PROMETHEUS AGAIN
 (ledger 1624). `project_probe.py --leg-c` sends one call per probeable reason
 class (`PROJECT_UNRESOLVABLE`, `PROJECT_UNREGISTERED_PERSONAL`,
-`PROJECT_UNREGISTERED_ORG`, `PROJECT_INVALID`, `PROJECT_ARCHIVED`) and exits 0
-only when every one of their counters rose per pod; it is red when
-inconclusive. argocd-verify's `project-probe.yaml` names such a run
+`PROJECT_UNREGISTERED_ORG`, `PROJECT_INVALID`, `PROJECT_ARCHIVED`,
+`PROJECT_NOT_MEMBER`) and exits 0 only when every one of their counters rose
+per pod; it is red when inconclusive. Its PERSONAL claim is under the probe
+account's own segment, read from the gateway's `GET /auth/whoami` (ADR-0959),
+so leg (c) cannot pass on a gateway without that route. argocd-verify's `project-probe.yaml` names such a run
 `project-probe leg-c` (`run-name`; the runs listing carries no dispatch
 inputs). Only a `workflow_dispatch` of that workflow's path on this
 repository's default branch, with this repository as head and a `head_sha`
