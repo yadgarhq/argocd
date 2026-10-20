@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """The 785 refusal-counter probe: front-door coverage of gateway -> project -> project-db.
 
-ADR-0841 keeps `gateway.projectValidation.mode` at `counting` and covers the
-project path with this probe instead. The routine run sends one authenticated,
+kind-yadgar runs `gateway.projectValidation.mode: enforcing` (ADR-0967, which
+superseded ADR-0841's `counting` hold; argocd#129), and this probe keeps
+covering the project path end to end. The routine run sends one authenticated,
 read-only MCP call carrying a project claim nobody registered, then checks that
 the matching `yadgar_gateway_project_refusal_total{reason}` rose in Prometheus
 (`--leg-c` sends one call per reason class; see below). The plan is
@@ -45,22 +46,35 @@ PER POD, NEVER A BARE `increase()` (ADR-0620). A pod present in both reads must
 not decrease; a decrease is a reset, contributes nothing and is reported. A pod
 new since the first read counts from 0. A pod gone by the last read is reported.
 
-THE ANSWER, in every mode that sends a token (`answer_ok`). Under `counting`
-the call is SERVED (2xx, no JSON-RPC error). Under `enforcing` (argocd#129) the
-gateway refuses the claim instead: a 4xx JSON-RPC error whose `data.reason` is
-the class the claim earns (`PROJECT_UNRESOLVABLE` here, the trial's
-`PROJECT_UNREGISTERED_PERSONAL`, each leg (c) arm's own). Either passes, and
-either still needs the counter to rise. A refusal with any other reason, or
-none, and any 5xx are FAIL.
+THE ANSWER (`answer_ok`). Under `counting` the call is SERVED (2xx, no
+JSON-RPC error). Under `enforcing` (argocd#129) the gateway refuses the claim
+instead: a 4xx JSON-RPC error whose `data.reason` is the class the claim earns
+(`PROJECT_UNRESOLVABLE` here, the trial's `PROJECT_UNREGISTERED_PERSONAL`, each
+leg (c) arm's own). Either way the counter must still rise. A refusal with any
+other reason, or none, and any refusal outside 4xx are FAIL.
+
+THE DECLARED MODE (`declared_mode`, `answer_for_mode`). The gateway counts a
+claim BEFORE it branches on the mode (`project.rs` `decide`), so the counter
+cannot tell the modes apart. The routine probe and `--trial
+unregistered-personal` therefore first read the mode argocd declares, from
+`applications/yadgar.yaml` in this script's own checkout (`--application`): an
+exact match on `projectValidation: { mode: enforcing }` (the line the render
+gate pins) or `... counting }`, and no line at all means the chart default,
+`counting`. Any other form fails the run closed (exit 1) before anything is
+sent. They then accept ONLY that mode's answer; the other mode's answer is
+mode drift and FAILs. Leg (c) and `--trial no-token` do not read the mode, and
+leg (c) accepts either mode's answer.
 
 THE VERDICT:
-  PASS          the answer is as expected and `PROJECT_UNRESOLVABLE`
-                rose by at least 1.                                   exit 0
+  PASS          the answer is the declared mode's and
+                `PROJECT_UNRESOLVABLE` rose by at least 1.            exit 0
   INCONCLUSIVE  an estate `smoke` job overlapped, or no rise and a
                 reset or vanished pod could have hidden it.           exit 0
-  FAIL          no rise; a 401, a 5xx or any other non-2xx that is not
-                the expected refusal; a JSON-RPC error that is not the
-                expected refusal; Prometheus or the GitHub API
+  FAIL          no rise; the other mode's answer (mode drift); a mode
+                line that cannot be read; a 401, a 5xx or any other
+                non-2xx that is not the expected refusal; a JSON-RPC
+                error that is not the expected refusal; Prometheus or
+                the GitHub API
                 unreachable; no pod with `registry_loaded == 1`; a pod
                 whose value is unknown.                               exit 1
 
@@ -73,7 +87,8 @@ THE TRIALS (stage 6 acceptance 2 and 3):
       nor `PROJECT_NOT_MEMBER` did: exit 3 (red, as designed). Anything else
       is exit 2 (the trial proved nothing). A trial where neither series moved
       proves nothing. A whoami that fails is exit 1 and sends no call. An
-      answer that is neither served nor the PERSONAL refusal is exit 1.
+      answer that is not the declared mode's (served, or the PERSONAL
+      refusal) is exit 1.
   --trial no-token sends the call with no bearer token. The trial is VALID
       only when the call answered 401 AND every reason's rise is 0 with no
       reset, unknown or vanished pod: exit 3 (red, as designed). Any other
@@ -157,6 +172,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Callable, Protocol
 
 REFUSALS = "yadgar_gateway_project_refusal_total"
@@ -191,6 +207,18 @@ WHOAMI = "/auth/whoami"
 ORG_CLAIM = "yadgarhq/probe-never-registered"
 INVALID_CLAIM = "probe-invalid/"
 ARCHIVED_CLAIM = "yadgarhq/probe-archived"
+
+# argocd's own Application, beside this script in the same checkout (the
+# argocd-verify workflow checks argocd out at one sha and runs this file there).
+APPLICATION = Path(__file__).resolve().parents[1] / "applications" / "yadgar.yaml"
+
+COUNTING, ENFORCING = "counting", "enforcing"
+# The ONLY forms of the mode line this probe reads, matched whole after
+# stripping indentation. `scripts/gates/test_project_validation_render.py`
+# pins the enforcing one (`PROJECT_VALIDATION_LINE`). No line at all is the
+# gateway chart's default, `counting`. Anything else mentioning
+# `projectValidation` outside a comment fails the run closed.
+MODE_LINES = {f"projectValidation: {{ mode: {m} }}": m for m in (COUNTING, ENFORCING)}
 
 QUERY = f'{{__name__=~"{REFUSALS}|{LOADED}",namespace="yadgar",app="gateway"}}'
 
@@ -471,6 +499,52 @@ class Network:
             conn.close()
 
 
+def declared_mode(application: Path) -> str:
+    """The `projectValidation` mode argocd declares for the gateway. Fails closed.
+
+    Standard library only, so an exact text match on the one line the render
+    gate pins rather than a YAML parse. Raises `ProbeError` when the file cannot
+    be read, or when any non-comment line mentions `projectValidation` in a form
+    `MODE_LINES` does not name, or when more than one does.
+    """
+    try:
+        text = application.read_text()
+    except OSError as e:
+        raise ProbeError(f"cannot read the declared mode from {application}: {e}") from e
+    found = [
+        line.strip()
+        for line in text.splitlines()
+        if "projectValidation" in line and not line.lstrip().startswith("#")
+    ]
+    if not found:
+        return COUNTING
+    if len(found) > 1 or found[0] not in MODE_LINES:
+        raise ProbeError(
+            f"{application}: cannot read the declared projectValidation mode from {found!r}; "
+            f"expected exactly one of {sorted(MODE_LINES)!r} or none"
+        )
+    return MODE_LINES[found[0]]
+
+
+def answer_for_mode(arm: Arm, status: int, answer: dict, mode: str) -> tuple[bool, str]:
+    """`answer_ok`, narrowed to the one answer the declared mode allows.
+
+    The gateway counts a claim BEFORE it branches on the mode (`project.rs`
+    `decide`), so a counter rise cannot tell the modes apart; only the answer
+    can. Under `enforcing` a served call means the gateway drifted to
+    `counting`; under `counting` a refusal means it drifted to `enforcing`.
+    """
+    ok, detail = answer_ok(arm, status, answer)
+    if not ok:
+        return ok, detail
+    refused = isinstance(answer.get("error"), dict)
+    if mode == ENFORCING and not refused:
+        return False, f"{detail}, but argocd declares enforcing: mode drift, the gateway served a claim it must refuse"
+    if mode == COUNTING and refused:
+        return False, f"{detail}, but argocd declares counting: mode drift, the gateway refused a claim it must serve"
+    return True, detail
+
+
 def own_segment(transport: Transport, token: str) -> str:
     """The caller's own `local/` segment from `GET /auth/whoami` (ADR-0959). Fails closed.
 
@@ -537,6 +611,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--username", default="estate-probe")
     p.add_argument("--estate-repo", default="yadgarhq/estate")
     p.add_argument("--smoke-workflow", default="smoke.yaml")
+    p.add_argument(
+        "--application",
+        default=str(APPLICATION),
+        help="argocd's applications/yadgar.yaml, read for the declared projectValidation mode",
+    )
     p.add_argument("--poll-interval", type=float, default=15.0)
     p.add_argument("--poll-timeout", type=float, default=120.0)
     mode = p.add_mutually_exclusive_group()
@@ -560,8 +639,9 @@ def run(
 ) -> int:
     if args.leg_c:
         return run_leg_c(args, transport, env, now, sleep)
-    # The routine probe and the trials judge their one answer as leg (c) judges
-    # an arm (`answer_ok`): served under `counting`, or under `enforcing` a 4xx
+    # The routine probe and the personal trial judge their one answer as leg (c)
+    # judges an arm (`answer_ok`), narrowed to the mode argocd declares
+    # (`answer_for_mode`): served under `counting`, or under `enforcing` a 4xx
     # refusal naming this claim's class. The counter must rise either way.
     arm = Arm(UNRESOLVABLE, CLAIM, TOOL, {"page_size": 1})
     send_token = args.trial != "no-token"
@@ -571,6 +651,10 @@ def run(
         return EXIT_FAIL
 
     try:
+        mode = None
+        if send_token:
+            mode = declared_mode(Path(args.application))
+            say(f"declared mode: {mode} ({args.application})")
         start = now()
         overlap = smoke_overlaps(transport, args.estate_repo, args.smoke_workflow, start, start)
         if overlap:
@@ -593,7 +677,9 @@ def run(
 
         headers, body = mcp_call(token, arm.claim, arm.tool, arm.arguments)
         status, raw = transport.edge_post("/", headers, body)
-        call_ok, detail = answer_ok(arm, status, _json(raw))
+        # No token (the no-token trial): judged on its 401 below, never on a mode.
+        answer = _json(raw)
+        call_ok, detail = answer_for_mode(arm, status, answer, mode) if mode else answer_ok(arm, status, answer)
         say(f"call: tools/call {arm.tool} claim={arm.claim} -> {detail}")
 
         after, deltas = before, {r: Delta() for r in REASONS}
