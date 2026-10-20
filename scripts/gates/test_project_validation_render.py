@@ -1,4 +1,4 @@
-"""The gateway renders `YADGAR_PROJECT_VALIDATION_MODE=enforcing` (ADR-0841's flip).
+"""The gateway renders `YADGAR_PROJECT_VALIDATION_MODE=enforcing` (ADR-0967).
 
 K3 (`yadgar_render.sha256`) alone cannot hold this: `--write` blesses whatever
 renders, and the gateway chart's default is `counting`, so a dropped or

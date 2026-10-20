@@ -1,4 +1,4 @@
-"""The gateway's project validation is `enforcing` (ADR-0841's flip).
+"""The gateway's project validation is `enforcing` (ADR-0967, superseding ADR-0841's `counting` hold).
 
 The gateway chart ships `projectValidation.mode: counting`, so removing the one
 line in `applications/yadgar.yaml` silently turns enforcement off: the render
@@ -9,8 +9,8 @@ pre-commit hook reddens on it;
 `scripts/gates/test_project_validation_render.py` pins the env var it renders
 to.
 
-A deliberate rollback to `counting` changes the expected value here in the
-same pull request, which makes the rollback a visible, reviewed edit.
+The rollback is a revert of the flip's merge, which deletes this file with the
+line it pins; removing only the line leaves this test red, on purpose.
 """
 
 from __future__ import annotations
