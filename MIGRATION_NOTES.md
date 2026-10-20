@@ -7752,3 +7752,87 @@ nothing written".
 
 Revert: the next sync declares the path again and the seeder REACTIVATES the
 row (`reactivated 1`). The leg (c) ARCHIVED arm then cannot pass.
+
+## The gateway's project validation flips from `counting` to `enforcing` (ADR-0967, superseding ADR-0841's hold)
+
+**Preconditions, and where each was met.** The observation window
+2026-10-19T18:17:23Z..2026-10-20T12:11:31Z (17.90 h, shortened by Max) closed
+clean, and the pre-flip gate (argocd-verify `preflip.yaml`, legs (a), (b) and
+(c)) PASSED in argocd-verify run 39420337082: refusal increase 0, resolution
+increase 44. Leg (c) ran in run 39300427293. The pin to parent chart 0.27.8
+(argocd#128, gateway 0.12.18) merged at `fd98165`, and this branch is rebased
+on it with `scripts/gates/yadgar_render.sha256` regenerated at 0.27.8. Flip
+ADR: ADR-0967. argocd-verify's `PROJECT_PROBE_ENABLED` stays `false`, and stays
+`false` after this flip too (see the caveat below).
+
+**What the merge does.** It adds one value to `applications/yadgar.yaml`:
+`valuesObject.gateway.projectValidation.mode: enforcing`. The gateway chart
+ships `counting`, which renders `YADGAR_PROJECT_VALIDATION_MODE=counting`; this
+renders `enforcing`. `registryPollSeconds` keeps the chart's 60. The pin does
+not move.
+
+Measured 2026-10-20 at 0.27.8 (`fd98165`) with helm 3.18.4:
+
+- `yadgar`: 94 → 94 objects. One changed: `Deployment/gateway`, and in it one
+  field: the env `YADGAR_PROJECT_VALIDATION_MODE`, `counting` → `enforcing`.
+- Live `Deployment/gateway` on kind-yadgar (read-only `get`) runs the image
+  the render at `origin/main` names and `YADGAR_PROJECT_VALIDATION_MODE=counting`.
+- Settled-gate K moves (`spec.source` changed), so the merge dispatches a
+  settled run.
+
+**What runs.** Argo syncs `Deployment/gateway`; the env change rolls its pods.
+Each new pod refuses what the old ones only counted: 400 with the reason token
+for the caller classes, 403 for `PROJECT_NOT_MEMBER`, 503 with
+`PROJECT_REGISTRY_UNAVAILABLE` until its registry first loads (ADR-0674). A
+write to an archived project is refused (ADR-0944). The resolved-path stamping
+becomes active: a claim that resolves to a different canonical path gets
+`_meta["io.yadgarhq/projectResolution"]` and a content note (ADR-0961). A pod
+started with `trustUnauthenticatedHeaders` refuses to boot under `enforcing`;
+this organisation leaves it at the chart default, `false`.
+
+### After this merge, read-only
+
+```bash
+# 1. yadgar Synced/Healthy and the gateway rolled.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+kubectl --context kind-yadgar -n yadgar rollout status deploy/gateway --timeout=300s
+
+# 2. Every gateway pod BOOTED enforcing. Expect one line per pod carrying
+#    "mode":"Enforcing" (the boot line, not the Deployment spec: a pod that has
+#    not rolled still runs Counting).
+for p in $(kubectl --context kind-yadgar -n yadgar get pods -l app=gateway -o name); do
+  echo "$p"
+  kubectl --context kind-yadgar -n yadgar logs "$p" | grep 'project validation is configured' | grep -o '"mode":"[A-Za-z]*"' | tail -1
+done
+
+# 3. No gateway pod restarting after the roll.
+kubectl --context kind-yadgar -n yadgar get pods -l app=gateway
+```
+
+Then the stage 5 proof (plans/project-validation.md): one probe per reason
+class now REFUSED with its reason token, an exact-path call unaffected, and a
+marker-file subpath call landing at its ancestor with `exact: false`.
+
+### Rollback
+
+If `yadgar`'s operation is Running or retrying, NEEDS-MAX `argocd app
+terminate-op yadgar` first. Then revert this merge, never the mode line
+alone: the revert removes the line (the chart default `counting` renders
+again), restores `yadgar_render.sha256`, and DELETES both new test files,
+`scripts/tests/test_project_validation_mode.py` and
+`scripts/gates/test_project_validation_render.py`, which would stay red
+against a line-only rollback. Nothing is migrated, so the revert is clean; a
+write refused while enforcing stays refused (it never landed). After the
+revert syncs (mode back on `counting`), NEEDS-MAX may set argocd-verify's
+`PROJECT_PROBE_ENABLED` back to `true` and read it back.
+
+### Caveat: `PROJECT_PROBE_ENABLED` STAYS `false` after this flip
+
+In `scripts/project_probe.py`, the routine `run()` path and
+`--trial unregistered-personal` treat any JSON-RPC error as FAIL. Under
+`enforcing` the probe's deliberately unregistered claim is refused with a
+JSON-RPC error, so the */30 cron would go red on every run. Re-enable the
+variable only after the probe accepts an enforcing refusal carrying the
+expected reason plus a rise of `yadgar_gateway_project_refusal_total{reason}`
+(a separate fix).
