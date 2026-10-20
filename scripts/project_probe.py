@@ -23,6 +23,7 @@ THE STEPS, in order:
      `ESTATE_PROBE_PASSWORD`) and send `tools/call find_tasks` with
      `X-Yadgar-Project: probe-unregistered/never-registered`. (The personal
      trial and leg (c) first read the account's own segment; see OWN SEGMENT.)
+     The answer must be the expected one for either mode (THE ANSWER below).
   4. Poll Prometheus every 15 s for up to 120 s until the per-pod sum rises.
   5. Read estate's runs again; a `smoke` job that ran inside the window makes
      the run INCONCLUSIVE.
@@ -44,13 +45,24 @@ PER POD, NEVER A BARE `increase()` (ADR-0620). A pod present in both reads must
 not decrease; a decrease is a reset, contributes nothing and is reported. A pod
 new since the first read counts from 0. A pod gone by the last read is reported.
 
+THE ANSWER, in every mode that sends a token (`answer_ok`). Under `counting`
+the call is SERVED (2xx, no JSON-RPC error). Under `enforcing` (argocd#129) the
+gateway refuses the claim instead: a 4xx JSON-RPC error whose `data.reason` is
+the class the claim earns (`PROJECT_UNRESOLVABLE` here, the trial's
+`PROJECT_UNREGISTERED_PERSONAL`, each leg (c) arm's own). Either passes, and
+either still needs the counter to rise. A refusal with any other reason, or
+none, and any 5xx are FAIL.
+
 THE VERDICT:
-  PASS          `PROJECT_UNRESOLVABLE` rose by at least 1.            exit 0
+  PASS          the answer is as expected and `PROJECT_UNRESOLVABLE`
+                rose by at least 1.                                   exit 0
   INCONCLUSIVE  an estate `smoke` job overlapped, or no rise and a
                 reset or vanished pod could have hidden it.           exit 0
-  FAIL          no rise; a 401 or any non-2xx; a JSON-RPC error;
-                Prometheus or the GitHub API unreachable; no pod with
-                `registry_loaded == 1`; a pod whose value is unknown. exit 1
+  FAIL          no rise; a 401, a 5xx or any other non-2xx that is not
+                the expected refusal; a JSON-RPC error that is not the
+                expected refusal; Prometheus or the GitHub API
+                unreachable; no pod with `registry_loaded == 1`; a pod
+                whose value is unknown.                               exit 1
 
 THE TRIALS (stage 6 acceptance 2 and 3):
   --trial unregistered-personal sends `local/<own>/probe-never-registered`,
@@ -60,7 +72,8 @@ THE TRIALS (stage 6 acceptance 2 and 3):
       `PROJECT_UNREGISTERED_PERSONAL` rose and neither `PROJECT_UNRESOLVABLE`
       nor `PROJECT_NOT_MEMBER` did: exit 3 (red, as designed). Anything else
       is exit 2 (the trial proved nothing). A trial where neither series moved
-      proves nothing. A whoami that fails is exit 1 and sends no call.
+      proves nothing. A whoami that fails is exit 1 and sends no call. An
+      answer that is neither served nor the PERSONAL refusal is exit 1.
   --trial no-token sends the call with no bearer token. The trial is VALID
       only when the call answered 401 AND every reason's rise is 0 with no
       reset, unknown or vanished pod: exit 3 (red, as designed). Any other
@@ -106,8 +119,8 @@ probe can reach, in one login, then polls until every class's counter rose:
   - `PROJECT_REGISTRY_UNAVAILABLE` is not probed: it needs the registry down.
 
 An arm's answer passes when it is the expected one for `counting` (served, or
-for ARCHIVED the title refusal) or, under `enforcing`, a JSON-RPC error whose
-`data.reason` is that arm's class. Exit 0 only when every arm answered as
+for ARCHIVED the title refusal) or, under `enforcing`, a 4xx JSON-RPC error
+whose `data.reason` is that arm's class (THE ANSWER above). Exit 0 only when every arm answered as
 expected AND every class's counter rose per pod. Anything else is exit 1,
 INCONCLUSIVE included (a smoke overlap, a reset or a vanished pod): leg (c)
 needs a clean proof, so dispatch again. `project-probe.yaml` names these runs
@@ -547,7 +560,10 @@ def run(
 ) -> int:
     if args.leg_c:
         return run_leg_c(args, transport, env, now, sleep)
-    claim = CLAIM
+    # The routine probe and the trials judge their one answer as leg (c) judges
+    # an arm (`answer_ok`): served under `counting`, or under `enforcing` a 4xx
+    # refusal naming this claim's class. The counter must rise either way.
+    arm = Arm(UNRESOLVABLE, CLAIM, TOOL, {"page_size": 1})
     send_token = args.trial != "no-token"
     password = env.get("ESTATE_PROBE_PASSWORD", "")
     if send_token and not password:
@@ -573,16 +589,12 @@ def run(
                 say(f"FAIL: login as {args.username} answered HTTP {status} with no token")
                 return EXIT_FAIL
             if args.trial == "unregistered-personal":
-                claim = personal_claim(own_segment(transport, token))
+                arm = Arm(PERSONAL, personal_claim(own_segment(transport, token)), TOOL, {"page_size": 1})
 
-        headers, body = mcp_call(token, claim)
+        headers, body = mcp_call(token, arm.claim, arm.tool, arm.arguments)
         status, raw = transport.edge_post("/", headers, body)
-        answer = _json(raw)
-        call_ok = 200 <= status < 300 and "error" not in answer
-        detail = f"error {answer['error'].get('code')}" if isinstance(answer.get("error"), dict) else (
-            "isError" if answer.get("result", {}).get("isError") else "served"
-        )
-        say(f"call: tools/call {TOOL} claim={claim} -> HTTP {status} ({detail})")
+        call_ok, detail = answer_ok(arm, status, _json(raw))
+        say(f"call: tools/call {arm.tool} claim={arm.claim} -> {detail}")
 
         after, deltas = before, {r: Delta() for r in REASONS}
         for attempt in range(1, math.ceil(args.poll_timeout / args.poll_interval) + 1):
@@ -606,7 +618,7 @@ def run(
             return EXIT_TRIAL_INVALID
 
         if not call_ok:
-            say(f"FAIL: the call answered HTTP {status} ({detail}); moved: {moved(deltas)}")
+            say(f"FAIL: the call answered {detail}; moved: {moved(deltas)}")
             return EXIT_FAIL
 
         overlap = smoke_overlaps(transport, args.estate_repo, args.smoke_workflow, start, end)
@@ -634,13 +646,20 @@ def run(
             f"moved: {moved(deltas)}"
         )
         if deltas[PERSONAL].rise < 1:
-            say(f"trial: a registered row at local/<own> or {claim} would resolve the claim and count nothing")
+            say(f"trial: a registered row at local/<own> or {arm.claim} would resolve the claim and count nothing")
         return EXIT_TRIAL_INVALID
     return EXIT_FAIL if verdict.kind == FAIL else EXIT_PASS
 
 
 def answer_ok(arm: Arm, status: int, answer: dict) -> tuple[bool, str]:
-    """Whether one leg (c) call answered as its arm expects, and what it said.
+    """Whether one probe call answered as its arm expects, and what it said.
+
+    Expected: served under `counting` (for ARCHIVED, the title refusal), or
+    under `enforcing` a JSON-RPC error whose `data.reason` is the arm's class
+    on a 4xx. The gateway refuses a caller's claim with 400, or 403 for
+    NOT_MEMBER (`http/answer.rs` `project_answer`); its one 5xx refusal is
+    PROJECT_REGISTRY_UNAVAILABLE, which no arm probes. A 5xx is never the
+    expected answer, whatever reason it carries.
 
     Never echoes a served payload except the ARCHIVED arm's written task id,
     which is what someone needs to find and remove the row.
@@ -648,9 +667,12 @@ def answer_ok(arm: Arm, status: int, answer: dict) -> tuple[bool, str]:
     error = answer.get("error")
     if isinstance(error, dict):
         reason = (error.get("data") or {}).get("reason") if isinstance(error.get("data"), dict) else None
-        if reason == arm.reason:
+        if reason == arm.reason and 400 <= status < 500:
             return True, f"HTTP {status} refused {reason} (enforcing)"
-        return False, f"HTTP {status} error {error.get('code')} reason {reason!r}, expected {arm.reason} or a served call"
+        return False, (
+            f"HTTP {status} error {error.get('code')} reason {reason!r}, "
+            f"expected a 4xx refusing {arm.reason} or a served call"
+        )
     if not 200 <= status < 300:
         return False, f"HTTP {status}"
     result = answer.get("result") if isinstance(answer.get("result"), dict) else {}

@@ -851,3 +851,72 @@ def test_leg_c_archived_arm_needs_the_gateways_exact_title_refusal() -> None:
     near = (200, {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "title service unavailable"}], "isError": True}})
     assert run(Arms([BEFORE, rose(*ALL)], answers={pp.ARCHIVED_CLAIM: near}), "--leg-c") == pp.EXIT_FAIL
     assert pp.TITLE_REQUIRED == "`title` is required"
+
+
+# --- the routine probe and the trial under `enforcing` (ledger 1718) ----------
+#
+# Under `enforcing` (argocd#129) the gateway answers a refused claim with a
+# JSON-RPC error whose `data.reason` is the class (gateway `http/answer.rs`
+# `project_answer`: 400, or 403 for NOT_MEMBER). The routine probe and the
+# personal trial must accept that refusal exactly as leg (c) does, and still
+# need the counter to rise. Any other refusal, or any 5xx, stays red.
+
+
+def refusal(status: int, reason: str | None) -> tuple[int, dict]:
+    error = {"code": -32600, "message": "refused"}
+    if reason is not None:
+        error["data"] = {"reason": reason}
+    return status, {"jsonrpc": "2.0", "id": 1, "error": error}
+
+
+def test_the_routine_probe_passes_on_an_enforcing_refusal_with_its_reason_and_a_rise(capsys) -> None:
+    assert run(Fake([BEFORE, ROSE_U], call=refusal(400, U))) == pp.EXIT_PASS
+    out = capsys.readouterr().out
+    assert f"refused {U} (enforcing)" in out and "PASS" in out
+
+
+@pytest.mark.parametrize("reason", [P, N, pp.UNREGISTERED_ORG, pp.INVALID, pp.ARCHIVED, "PROJECT_REGISTRY_UNAVAILABLE", None])
+def test_the_routine_probe_fails_on_a_refusal_with_another_reason(reason) -> None:
+    # The counter rose, but the answer is not the refusal this claim earns.
+    assert run(Fake([BEFORE, ROSE_U], call=refusal(400, reason))) == pp.EXIT_FAIL
+
+
+def test_the_routine_probe_fails_on_an_enforcing_refusal_with_no_rise(capsys) -> None:
+    assert run(Fake([BEFORE], call=refusal(400, U))) == pp.EXIT_FAIL
+    assert f"expected {U} to rise" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("status", [500, 502, 503])
+def test_the_routine_probe_fails_on_a_5xx_even_carrying_its_reason(status) -> None:
+    # The gateway refuses a caller's claim with a 4xx only; a 5xx is not that refusal.
+    assert run(Fake([BEFORE, ROSE_U], call=refusal(status, U))) == pp.EXIT_FAIL
+
+
+def test_the_trial_reddens_as_designed_on_an_enforcing_personal_refusal(capsys) -> None:
+    fake = Fake([BEFORE, ROSE_P], call=refusal(400, P))
+    assert run(fake, "--trial", "unregistered-personal") == pp.EXIT_TRIAL_RED
+    out = capsys.readouterr().out
+    assert fake.posts[1][1]["x-yadgar-project"] == OWN_CLAIM
+    assert f"refused {P} (enforcing)" in out and "trial: VALID" in out
+
+
+@pytest.mark.parametrize("call", [refusal(403, N), refusal(400, U), refusal(400, None)])
+def test_the_trial_fails_on_a_refusal_with_another_reason(call) -> None:
+    assert run(Fake([BEFORE, ROSE_P], call=call), "--trial", "unregistered-personal") == pp.EXIT_FAIL
+
+
+def test_the_trial_on_an_enforcing_refusal_with_no_rise_proves_nothing(capsys) -> None:
+    # Never red-as-designed: with nothing counted the trial proved nothing.
+    assert run(Fake([BEFORE], call=refusal(400, P)), "--trial", "unregistered-personal") == pp.EXIT_TRIAL_INVALID
+    assert "trial: INVALID" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("status", [500, 503])
+def test_the_trial_fails_on_a_5xx_even_carrying_its_reason(status) -> None:
+    assert run(Fake([BEFORE, ROSE_P], call=refusal(status, P)), "--trial", "unregistered-personal") == pp.EXIT_FAIL
+
+
+@pytest.mark.parametrize("status", [500, 503])
+def test_leg_c_fails_on_a_5xx_even_carrying_the_arms_reason(status) -> None:
+    answers = {pp.ORG_CLAIM: refusal(status, pp.UNREGISTERED_ORG)}
+    assert run(Arms([BEFORE, rose(*ALL)], answers=answers), "--leg-c") == pp.EXIT_FAIL
