@@ -15,6 +15,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -248,10 +249,26 @@ class Clock:
         self.t += seconds
 
 
-def run(fake, *argv, env=None):
+# The routine probe and the personal trial read the EXPECTED mode from argocd's
+# `applications/yadgar.yaml` (the run's own checkout). Tests hand them a copy
+# that holds only the line under test; `mode=None` writes no line at all.
+_APPLICATIONS = Path(tempfile.mkdtemp(prefix="project-probe-"))
+
+
+def application(mode: str | None = "counting", text: str | None = None) -> str:
+    if text is None:
+        text = "        gateway:\n          autoscaling: { enabled: true }\n"
+        if mode is not None:
+            text += f"          projectValidation: {{ mode: {mode} }}\n"
+    path = _APPLICATIONS / f"yadgar-{abs(hash(text))}.yaml"
+    path.write_text(text)
+    return str(path)
+
+
+def run(fake, *argv, env=None, mode="counting", app=None):
     clock = Clock()
     return pp.run(
-        pp.parse_args(["--edge-ca", "/dev/null", *argv]),
+        pp.parse_args(["--edge-ca", "/dev/null", "--application", app or application(mode), *argv]),
         fake,
         env={"ESTATE_PROBE_PASSWORD": "pw-SECRET"} if env is None else env,
         now=clock.now,
@@ -851,3 +868,159 @@ def test_leg_c_archived_arm_needs_the_gateways_exact_title_refusal() -> None:
     near = (200, {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": "title service unavailable"}], "isError": True}})
     assert run(Arms([BEFORE, rose(*ALL)], answers={pp.ARCHIVED_CLAIM: near}), "--leg-c") == pp.EXIT_FAIL
     assert pp.TITLE_REQUIRED == "`title` is required"
+
+
+
+# --- the routine probe and the trial know the mode argocd declares (ledger 1718)
+#
+# Under `enforcing` (argocd#129) the gateway answers a refused claim with a
+# JSON-RPC error whose `data.reason` is the class (gateway `http/answer.rs`
+# `project_answer`: 400, or 403 for NOT_MEMBER). The gateway counts the claim
+# BEFORE it branches on the mode (`project.rs` `decide`), so the counter alone
+# cannot tell the modes apart. The routine probe and the personal trial
+# therefore read the mode argocd declares and accept ONLY that mode's answer:
+# `enforcing` the expected-reason 4xx refusal, `counting` a served call. A
+# mismatch is mode drift and FAILs. Leg (c) keeps accepting either mode.
+
+
+def refusal(status: int, reason: str | None) -> tuple[int, dict]:
+    error = {"code": -32600, "message": "refused"}
+    if reason is not None:
+        error["data"] = {"reason": reason}
+    return status, {"jsonrpc": "2.0", "id": 1, "error": error}
+
+
+def test_the_mode_is_read_from_the_line_the_render_gate_pins() -> None:
+    # The default path is this checkout's own Application, and today it declares
+    # enforcing in exactly the form `test_project_validation_render.py` pins.
+    assert Path(pp.parse_args(["--edge-ca", "/dev/null"]).application) == REPOSITORY / "applications" / "yadgar.yaml"
+    assert pp.declared_mode(REPOSITORY / "applications" / "yadgar.yaml") == pp.ENFORCING
+    assert pp.declared_mode(Path(application("counting"))) == pp.COUNTING
+    # Absent is the gateway chart's default.
+    assert pp.declared_mode(Path(application(None))) == pp.COUNTING
+
+
+def test_the_routine_probe_passes_on_an_enforcing_refusal_with_its_reason_and_a_rise(capsys) -> None:
+    assert run(Fake([BEFORE, ROSE_U], call=refusal(400, U)), mode="enforcing") == pp.EXIT_PASS
+    out = capsys.readouterr().out
+    assert "declared mode: enforcing" in out
+    assert f"refused {U} (enforcing)" in out and "PASS" in out
+
+
+def test_the_routine_probe_passes_on_a_served_call_when_the_mode_line_is_absent() -> None:
+    assert run(Fake([BEFORE, ROSE_U]), mode=None) == pp.EXIT_PASS
+
+
+def test_the_routine_probe_fails_on_a_served_call_when_enforcing_is_declared(capsys) -> None:
+    # The counter rose, but the gateway SERVED the claim: it is counting again.
+    assert run(Fake([BEFORE, ROSE_U]), mode="enforcing") == pp.EXIT_FAIL
+    out = capsys.readouterr().out
+    assert "mode drift" in out and "declares enforcing" in out
+
+
+@pytest.mark.parametrize("mode", ["counting", None])
+def test_the_routine_probe_fails_on_a_refusal_when_counting_is_declared(mode, capsys) -> None:
+    assert run(Fake([BEFORE, ROSE_U], call=refusal(400, U)), mode=mode) == pp.EXIT_FAIL
+    out = capsys.readouterr().out
+    assert "mode drift" in out and "declares counting" in out
+
+
+BAD_MODE_LINES = {
+    "unknown mode": "          projectValidation: { mode: off }\n",
+    "quoted": '          projectValidation: { mode: "enforcing" }\n',
+    "another key beside it": "          projectValidation: { mode: enforcing, registryPollSeconds: 60 }\n",
+    "block style": "          projectValidation:\n            mode: enforcing\n",
+    "two lines": "          projectValidation: { mode: enforcing }\n          projectValidation: { mode: counting }\n",
+    "trailing comment": "          projectValidation: { mode: enforcing } # x\n",
+}
+
+
+@pytest.mark.parametrize("mode", [(), ("--trial", "unregistered-personal")])
+@pytest.mark.parametrize("case", sorted(BAD_MODE_LINES))
+def test_an_unparseable_or_unknown_mode_line_fails_closed_before_any_call(case, mode, capsys) -> None:
+    fake = Fake([BEFORE, ROSE_U, ROSE_P], call=refusal(400, U))
+    assert run(fake, *mode, app=application(text="        gateway:\n" + BAD_MODE_LINES[case])) == pp.EXIT_FAIL
+    assert fake.posts == [], "nothing may be sent when the expected mode is unknown"
+    assert "FAIL" in capsys.readouterr().out
+
+
+def test_a_missing_application_file_fails_closed(capsys) -> None:
+    fake = Fake([BEFORE, ROSE_U])
+    assert run(fake, app=str(_APPLICATIONS / "absent.yaml")) == pp.EXIT_FAIL
+    assert fake.posts == []
+
+
+@pytest.mark.parametrize("reason", [P, N, pp.UNREGISTERED_ORG, pp.INVALID, pp.ARCHIVED, "PROJECT_REGISTRY_UNAVAILABLE", None])
+def test_the_routine_probe_fails_on_a_refusal_with_another_reason(reason) -> None:
+    # The counter rose, but the answer is not the refusal this claim earns.
+    assert run(Fake([BEFORE, ROSE_U], call=refusal(400, reason)), mode="enforcing") == pp.EXIT_FAIL
+
+
+def test_the_routine_probe_fails_on_an_enforcing_refusal_with_no_rise(capsys) -> None:
+    assert run(Fake([BEFORE], call=refusal(400, U)), mode="enforcing") == pp.EXIT_FAIL
+    assert f"expected {U} to rise" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("status", [500, 502, 503])
+def test_the_routine_probe_fails_on_a_5xx_even_carrying_its_reason(status) -> None:
+    # The gateway refuses a caller's claim with a 4xx only; a 5xx is not that refusal.
+    assert run(Fake([BEFORE, ROSE_U], call=refusal(status, U)), mode="enforcing") == pp.EXIT_FAIL
+
+
+def test_the_routine_probe_fails_on_a_2xx_carrying_its_reason() -> None:
+    # The lower bound of the 4xx window: a 200 with an error is not the refusal.
+    assert run(Fake([BEFORE, ROSE_U], call=refusal(200, U)), mode="enforcing") == pp.EXIT_FAIL
+
+
+def test_the_trial_reddens_as_designed_on_an_enforcing_personal_refusal(capsys) -> None:
+    fake = Fake([BEFORE, ROSE_P], call=refusal(400, P))
+    assert run(fake, "--trial", "unregistered-personal", mode="enforcing") == pp.EXIT_TRIAL_RED
+    out = capsys.readouterr().out
+    assert fake.posts[1][1]["x-yadgar-project"] == OWN_CLAIM
+    assert f"refused {P} (enforcing)" in out and "trial: VALID" in out
+
+
+def test_the_trial_fails_on_a_served_call_when_enforcing_is_declared(capsys) -> None:
+    assert run(Fake([BEFORE, ROSE_P]), "--trial", "unregistered-personal", mode="enforcing") == pp.EXIT_FAIL
+    assert "mode drift" in capsys.readouterr().out
+
+
+def test_the_trial_fails_on_a_refusal_when_counting_is_declared(capsys) -> None:
+    assert run(Fake([BEFORE, ROSE_P], call=refusal(400, P)), "--trial", "unregistered-personal") == pp.EXIT_FAIL
+    assert "mode drift" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("call", [refusal(403, N), refusal(400, U), refusal(400, None)])
+def test_the_trial_fails_on_a_refusal_with_another_reason(call) -> None:
+    assert run(Fake([BEFORE, ROSE_P], call=call), "--trial", "unregistered-personal", mode="enforcing") == pp.EXIT_FAIL
+
+
+def test_the_trial_on_an_enforcing_refusal_with_no_rise_proves_nothing(capsys) -> None:
+    # Never red-as-designed: with nothing counted the trial proved nothing.
+    fake = Fake([BEFORE], call=refusal(400, P))
+    assert run(fake, "--trial", "unregistered-personal", mode="enforcing") == pp.EXIT_TRIAL_INVALID
+    assert "trial: INVALID" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("status", [500, 503])
+def test_the_trial_fails_on_a_5xx_even_carrying_its_reason(status) -> None:
+    fake = Fake([BEFORE, ROSE_P], call=refusal(status, P))
+    assert run(fake, "--trial", "unregistered-personal", mode="enforcing") == pp.EXIT_FAIL
+
+
+def test_the_no_token_trial_does_not_read_the_mode() -> None:
+    garbage = application(text="projectValidation: nonsense\n")
+    assert run(Fake([BEFORE], call=UNAUTHENTICATED), "--trial", "no-token", app=garbage) == pp.EXIT_TRIAL_RED
+
+
+@pytest.mark.parametrize("status", [500, 503, 200])
+def test_leg_c_fails_on_a_refusal_outside_4xx_even_carrying_the_arms_reason(status) -> None:
+    answers = {pp.ORG_CLAIM: refusal(status, pp.UNREGISTERED_ORG)}
+    assert run(Arms([BEFORE, rose(*ALL)], answers=answers), "--leg-c") == pp.EXIT_FAIL
+
+
+def test_leg_c_accepts_either_mode_and_never_reads_the_declared_one() -> None:
+    garbage = application(text="projectValidation: nonsense\n")
+    assert run(Arms([BEFORE, rose(*ALL)]), "--leg-c", app=garbage) == pp.EXIT_PASS
+    answers = {pp.ORG_CLAIM: refusal(400, pp.UNREGISTERED_ORG), pp.NOT_MEMBER_CLAIM: refusal(403, N)}
+    assert run(Arms([BEFORE, rose(*ALL)], answers=answers), "--leg-c", app=application("counting")) == pp.EXIT_PASS
