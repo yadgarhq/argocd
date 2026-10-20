@@ -162,6 +162,17 @@ spec:
           autoscaling: { enabled: true }
           sourceAddress: { trustedProxyHops: "" }
           adminBootstrap: { tokenSecret: admin-bootstrap-token }
+          # PROJECT VALIDATION IS ENFORCING (ADR-0841's flip, after the clean
+          # observation window and the pre-flip gate). The gateway chart ships
+          # `counting`, which counts would-be refusals and serves the call;
+          # `enforcing` answers them (400 with the reason token, 403 for
+          # PROJECT_NOT_MEMBER, 503 before the registry first loads) and makes the
+          # resolved-path stamping of ADR-0961 active. Rollback is this one line
+          # removed (the chart default is `counting`) plus the regenerated render
+          # table. `registryPollSeconds` keeps the chart's 60. Pinned offline by
+          # `scripts/tests/test_project_validation_mode.py` and on the render by
+          # `scripts/gates/test_project_validation_render.py`.
+          projectValidation: { mode: enforcing }
           gateway: { enabled: true } # the HTTPRoute
           iam: { tls: { enabled: true } } # DIAL to iam
           task: { tls: { enabled: true } } # DIAL to task
