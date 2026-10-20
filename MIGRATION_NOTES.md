@@ -7836,3 +7836,173 @@ JSON-RPC error, so the */30 cron would go red on every run. Re-enable the
 variable only after the probe accepts an enforcing refusal carrying the
 expected reason plus a rise of `yadgar_gateway_project_refusal_total{reason}`
 (a separate fix).
+
+## A0: the yadgar pin moves to parent chart 0.30.0: iam and iam-db admit only their one caller (ADR-0972, ledger 1629)
+
+Step A0 of `plans/admin-and-client-gaps.md` (yadgarhq/docs, §1 and §7). It is
+mandatory and reversible: no migration and no new env, so a pin revert rolls it
+back. The riskiest change of the train goes alone, before A1's one-way
+migration.
+
+**What the merge does.** It moves `applications/yadgar.yaml`'s
+`targetRevision` from 0.27.8 to 0.30.0 and `scripts/chart_pin.json`'s
+`chart_tag` from `v0.27.8` to `v0.30.0`. `platform_version` stays 0.2.6, so
+the operator Applications do not move. It also splits
+`scripts/gates/test_no_two_owners.py`'s `PIN_ALONE_OVERRIDES` into a before
+and an after tuple (ledger 1732): from K1, iam and iam-db refuse
+`clientAuth: "off"` while their TLS is on, so the after side renders them at
+the values' `"required"`.
+
+| Module     | From    | To         | Carries                                                                                                                                                     |
+| ---------- | ------- | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| iam        | 0.11.10 | **0.13.0** | iam#109 (0.12.0): every `IamService` verb admits only `gateway-caller`. iam#108 (0.13.0): the chart refuses `clientAuth: "off"` with TLS on (K1, ADR-0975). |
+| iam-db     | 0.10.8  | **0.11.0** | iam-db#97 (0.10.10): every `IamDbService` verb admits only `iam-caller`. iam-db#95 (0.11.0): K1. iam-db#96 (0.10.9): rustls-webpki, webpki-roots (RUSTSEC). |
+| gateway    | 0.12.18 | 0.12.19    | gateway#126: rustls-webpki, webpki-roots past RUSTSEC-2026-0382/0381.                                                                                       |
+| project    | 0.4.1   | 0.4.2      | project#41: rustls-webpki past RUSTSEC-2026-0382.                                                                                                           |
+| project-db | 0.8.2   | 0.8.3      | project-db#70: rustls-webpki, webpki-roots (RUSTSEC).                                                                                                       |
+| task       | 0.7.6   | 0.7.7      | task#81: rustls-webpki (RUSTSEC).                                                                                                                           |
+| task-db    | 0.9.5   | 0.9.6      | task-db#93: rustls-webpki, webpki-roots (RUSTSEC).                                                                                                          |
+| seeder     | 0.1.1   | 0.1.3      | seeder#4: rustls-webpki (RUSTSEC). seeder#3: docs.                                                                                                          |
+
+iam and iam-db move `yadgar-lifecycle` to v0.2.24 (from v0.2.21 and v0.2.20).
+lifecycle v0.2.20..v0.2.24 adds `caller_common_name` (ADR-0936), rustls
+0.23.46, tokio 1.53.2 and "rotate keeps every leaf of a Presented kind". It
+adds no env read.
+
+**Measured 2026-10-20 (helm 3.18.4; ADR-0881 dry run).** `yadgar`: 94 → 94
+objects, 8 changed, `image` only: the seven module Deployments and
+`Job/seeder`. Each digest equals its module's GHCR tag digest. Server-side
+`kubectl diff` against kind-yadgar, tracking annotation added, the 13 hook
+objects left out: at 0.27.8, all 81 objects, empty diff. At 0.30.0, the seven
+Deployments differ in `image` and `generation` only. `Job/seeder` alone is
+refused, `spec.template: field is immutable`; its `Replace=true,Force=true`
+is why Argo deletes and re-creates it. No env moves in the live render: the
+values already run iam and iam-db at `required`.
+
+**What runs.** Seven Deployments roll (`maxUnavailable: 0`). The seeder Job is
+re-created on 0.1.3; the run before this merge logged `inserted 0, updated 0,
+archived 0, reactivated 0, unchanged 25` (read 2026-10-20). From the roll, iam
+refuses every verb from any leaf but `gateway-caller`, and iam-db refuses every
+verb from any leaf but `iam-caller`.
+
+### Before this merge: the two leaf-name hard gates (NEEDS-MAX, read-only)
+
+A wrong name is an authentication outage, not an admin outage. A wrong
+`gateway-caller` stops `ResolveCredential`: every agent request and every
+login fails once the gateway's credential cache expires. A wrong
+`iam-caller` does the same one hop down; iam stays up (its key-identity check
+stays `NotYet` and logs an ERROR naming the caller gate) but answers nothing.
+Both reads print the certificate subject only.
+
+```bash
+# 1. Expect exactly: subject=CN=gateway-caller (openssl may print `CN = gateway-caller`).
+kubectl --context kind-yadgar -n yadgar get secret gateway-client-tls \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -subject
+
+# 2. Expect exactly: subject=CN=iam-caller.
+kubectl --context kind-yadgar -n yadgar get secret iam-client-tls \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -subject
+```
+
+Any other CN: STOP. Do not merge.
+
+### After this merge, read-only
+
+```bash
+# 1. yadgar Synced/Healthy at 0.30.0, and every module ready.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+kubectl --context kind-yadgar -n yadgar get deploy
+
+# 2. The gate refused nobody real. Expect no series, or only caller="none" /
+#    other probe names you sent yourself. A gateway-caller or iam-caller
+#    series means the gate refuses the real caller: roll back.
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(pod%2Ccaller)(yadgar_iam_caller_refused_total)'
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(pod%2Ccaller)(yadgar_iamdb_caller_refused_total)'
+
+# 3. Real traffic still passes: ResolveCredential OK grows on the NEW iam pods,
+#    and GetKeyIdentity OK on the new iam-db pods (called by the new iam pods).
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(service%2Cpod%2Ctool%2Coutcome)(yadgar_calls_total%7Bservice%3D~%22iam%7Ciam-db%22%7D)'
+
+# 4. The seeder re-ran on 0.1.3 and changed nothing (unchanged 25 as before).
+kubectl --context kind-yadgar -n yadgar get job seeder \
+  -o 'custom-columns=SUCCEEDED:.status.succeeded,DONE:.status.completionTime'
+kubectl --context kind-yadgar -n yadgar logs job/seeder --tail=20 | grep 'sync applied'
+```
+
+### After the roll: the wrong-name probe (NEEDS-MAX, operator-run)
+
+`task-client-tls` (CN `task-caller`) is issued by the same internal CA, so it
+passes the handshake and reaches the gate. **The ledger-1400 rule in the B-U9
+section ("do NOT add `-cert` to grpcurl") does not apply here.** That rule is
+about proving a wrong ANCHOR. This probe uses a leaf of the RIGHT anchor with
+the wrong NAME, and Go sends the leaf because the server's CertificateRequest
+names the CA that issued it.
+
+Counters are per pod (ADR-0620), so pin one pod per server and read the counter
+on that pod. Run from a clone of yadgarhq/proto (for `-import-path .`):
+
+```bash
+# Terminal 1: pin one NEW iam pod and one NEW iam-db pod, and tunnel to each.
+IAM_POD=$(kubectl --context kind-yadgar -n yadgar get pod -l app=iam -o name | head -1)
+IAMDB_POD=$(kubectl --context kind-yadgar -n yadgar get pod -l app=iam-db -o name | head -1)
+echo "$IAM_POD $IAMDB_POD"
+kubectl --context kind-yadgar -n yadgar port-forward "$IAM_POD" 15052:50052 &
+kubectl --context kind-yadgar -n yadgar port-forward "$IAMDB_POD" 15051:50051 &
+
+# Terminal 2: read the counters BEFORE (a missing series counts as 0).
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(pod%2Ccaller)(yadgar_iam_caller_refused_total)'
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(pod%2Ccaller)(yadgar_iamdb_caller_refused_total)'
+
+# The task leaf, into a private temp dir. Nothing is printed.
+umask 077
+PROBE_DIR=$(mktemp -d)
+kubectl --context kind-yadgar -n yadgar get secret task-client-tls -o jsonpath='{.data.tls\.crt}' | base64 -d > "$PROBE_DIR/task.crt"
+kubectl --context kind-yadgar -n yadgar get secret task-client-tls -o jsonpath='{.data.tls\.key}' | base64 -d > "$PROBE_DIR/task.key"
+
+# Expect `Code: PermissionDenied` from both.
+grpcurl -insecure -cert "$PROBE_DIR/task.crt" -key "$PROBE_DIR/task.key" -authority iam.yadgar.svc -import-path . \
+  -proto yadgar/iam/v1/iam.proto -d '{}' 127.0.0.1:15052 yadgar.iam.v1.IamService/ResolveCredential
+grpcurl -insecure -cert "$PROBE_DIR/task.crt" -key "$PROBE_DIR/task.key" -authority iam-db.yadgar.svc -import-path . \
+  -proto yadgar/iamdb/v1/iamdb.proto -d '{}' 127.0.0.1:15051 yadgar.iamdb.v1.IamDbService/GetKeyIdentity
+
+# Delete the key material.
+rm -rf "$PROBE_DIR"
+
+# Wait at least one scrape interval (about 60 s), then read AFTER (same two
+# queries as BEFORE). Expect caller="task-caller" up by exactly 1 on $IAM_POD
+# for yadgar_iam_caller_refused_total, and by exactly 1 on $IAMDB_POD for
+# yadgar_iamdb_caller_refused_total.
+
+# Close the tunnels.
+kill %1 %2
+```
+
+Any other answer (OK, `Unauthenticated`, a TLS error, or no counter rise)
+means the gate is not live: STOP and roll back. Run the same probe again after
+A1.
+
+The `:4425` (B-U8b) and `:5608` (B-U9) no-certificate probes stay as they are
+for A0. They still fail at the handshake, before any verb. Their rewrite to the
+gateway `/auth/login` + `/auth/whoami` positive control (ADR-0972, ADR-0959) is
+train step AR, which lands after G1 and before A1, not in A0.
+
+### Rollback: a revert of the pin
+
+A0 adds no migration and no env, so the 0.27.8 images run unchanged.
+
+1. If `yadgar`'s operation is Running or retrying, first run (NEEDS-MAX)
+   `argocd app terminate-op yadgar`. Argo CD v3.1.8 has no `retry.refresh`, so
+   a retrying operation keeps applying the bad revision (ADR-0881).
+2. Revert this PR's whole merge commit by PR. The pin, the K3 tuples and this
+   section move together; a pin-only revert reddens K3.
+
+`LISTEN_TLS_CLIENT_AUTH=off` is no longer a break-glass value for iam or
+iam-db from 0.30.0: with no client-certificate name the gate refuses every
+verb (ADR-0972 Q3), and the chart refuses to render it. The break-glass is the
+pin revert above.

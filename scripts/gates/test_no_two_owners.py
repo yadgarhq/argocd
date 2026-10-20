@@ -1930,17 +1930,25 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 #   - nats command, args, env, liveness probe, mounts and volumes: 0.24.17
 #     (ADR-0924);
 #   - nats `checksum/config` annotation: 0.23.1 (B-N2);
-#   - seeder, in `PIN_ADDED`: 0.25.8.
+#   - seeder, in `PIN_ADDED`: 0.25.8;
+#   - iam-db's client-auth env value: 0.30.0 (A0, ledger 1732; see below).
 # The per-bump measurements that used to be logged here are gone (ledger 1632,
 # car C2). `PIN_BEFORE_B9` stays 0.3.7: `test_the_old_pin_names_both_probe_defects`
 # needs a pin whose probes are defective.
 #
-# BOTH SIDES RENDER EVERY SERVER AT `clientAuth: "off"`, FROM B-U8a ON. The
+# THE PREVIOUS PIN RENDERS EVERY SERVER AT `clientAuth: "off"`, FROM B-U8a ON;
+# THE CURRENT PIN RENDERS FOUR OF THEM THERE, FROM A0 ON (ledger 1732). The
 # 0.13.13 module charts predate the B-U5 contracts, and their render checks
 # refuse `optional` and `required` by name ("not enforced yet"). Once a hop
 # moves past `off`, the previous pin cannot render the current values at all.
-# PB-2 (0.13.13 → 0.19.1) measured with all six at `off`, so pinning `off` on
-# both sides keeps this a measurement of the pin alone. The modes themselves
+# PB-2 (0.13.13 → 0.19.1) measured with all six at `off`, so the BEFORE side
+# (`PIN_ALONE_OVERRIDES_BEFORE`) keeps all six at `off`. The AFTER side
+# (`PIN_ALONE_OVERRIDES_AFTER`) cannot: from iam 0.13.0 and iam-db 0.11.0 (K1,
+# ADR-0972, ADR-0975, parent 0.30.0) both charts refuse `"off"` while their own
+# TLS is on, so the after side renders `iam` and `iam-db` at the values'
+# `"required"` and their client CA. `task`, `task-db`, `project` and
+# `project-db` stay at `off` on both sides. So `iam`'s and `iam-db`'s env moves
+# with this pin as well as their image (`PIN_CHANGES`). The modes themselves
 # are gated by `test_yadgar_application.py`'s `EXPECTED_CLIENT_AUTH` and by K3.
 #
 # THE BROKER IS RENDERED AT ITS PB-3 POSTURE ON BOTH SIDES, FROM B-N4.1 ON, for
@@ -1988,13 +1996,8 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 # asked-for leaf is gated by `cache_failures` and by K3.
 PIN_BEFORE_B9 = "0.3.7"
 PREVIOUS_PIN = "0.19.1"
-PIN_ALONE_OVERRIDES: tuple[str, ...] = (
+PIN_ALONE_SHARED_OVERRIDES: tuple[str, ...] = (
     *PREFLIGHT_OFF,
-    *(
-        argument
-        for server in ("iam", "iam-db", "task", "task-db", "project", "project-db")
-        for argument in ("--set-string", f"{server}.tls.clientAuth=off")
-    ),
     *("--set", "platform.nats.tls.enabled=false"),
     *("--set", "platform.nats.config.nats.tls.enabled=false"),
     *("--set", "platform.nats.config.nats.tls.secretName=null"),
@@ -2007,6 +2010,21 @@ PIN_ALONE_OVERRIDES: tuple[str, ...] = (
     *("--set", "gateway.valkey.tls.enabled=false"),
     *("--set", "platform.valkey.tls.plaintext=true"),
     *("--set-string", "platform.valkey.tls.clientAuth=off"),
+)
+
+
+def client_auth_off(servers: tuple[str, ...]) -> tuple[str, ...]:
+    """`--set-string <server>.tls.clientAuth=off` for each of `servers` (a bare `off` is YAML false). PURE."""
+    return tuple(argument for server in servers for argument in ("--set-string", f"{server}.tls.clientAuth=off"))
+
+
+PIN_ALONE_OVERRIDES_BEFORE: tuple[str, ...] = (
+    *PIN_ALONE_SHARED_OVERRIDES,
+    *client_auth_off(("iam", "iam-db", "task", "task-db", "project", "project-db")),
+)
+PIN_ALONE_OVERRIDES_AFTER: tuple[str, ...] = (
+    *PIN_ALONE_SHARED_OVERRIDES,
+    *client_auth_off(("task", "task-db", "project", "project-db")),
 )
 # THE SEEDER ARRIVES WITH THIS PIN (parent 0.25.8, plans/the-d35-seeder.md
 # stages 6 and 7). `platform` 0.2.6 issues its client leaf, and the seeder
@@ -2043,6 +2061,10 @@ PIN_CHANGES = {
         ("Deployment", module, "spec.template.spec.containers[0].env")
         for module in ("gateway", "iam", "project", "task")
     ),
+    # A0 (ledger 1732, parent 0.30.0): `iam-db` renders at `"required"` on the
+    # after side only (`PIN_ALONE_OVERRIDES_AFTER`), so its client-auth env value
+    # moves. `iam`'s env is already listed above, from 0.24.17.
+    ("Deployment", "iam-db", "spec.template.spec.containers[0].env[6].value"),
     ("StatefulSet", "nats", "spec.template.metadata.annotations"),
     *(
         ("StatefulSet", "nats", f"spec.template.spec.{field}")
@@ -2135,7 +2157,8 @@ def probe_violations(documents: list) -> list[str]:
 
 
 def test_the_pin_alone_changes_only_the_named_fields(tmp_path: Path) -> None:
-    """K3 of the last pin bump: previous pin against current, preflight and client auth off on both sides."""
+    """K3 of the last pin bump: previous pin against current, preflight off on both sides, client auth
+    off for all six servers before and for all but `iam` and `iam-db` after (`PIN_ALONE_OVERRIDES_*`)."""
     tree = a_copy_of_the_tree(tmp_path)
     application = tree / "applications" / "yadgar.yaml"
     text = application.read_text()
@@ -2146,8 +2169,8 @@ def test_the_pin_alone_changes_only_the_named_fields(tmp_path: Path) -> None:
     document = yaml.safe_load(application.read_text())
     document["spec"]["source"]["helm"]["valuesObject"].pop("seeder", None)
     application.write_text(yaml.safe_dump(document, sort_keys=False))
-    before = parent_render(tree, PIN_ALONE_OVERRIDES)
-    after = parent_render(REPOSITORY, PIN_ALONE_OVERRIDES)
+    before = parent_render(tree, PIN_ALONE_OVERRIDES_BEFORE)
+    after = parent_render(REPOSITORY, PIN_ALONE_OVERRIDES_AFTER)
     changes = field_changes(before, after)
     print(f"[K3 pin] {PREVIOUS_PIN} -> {pinned[0]}: {len(before)} -> {len(after)} object(s), {len(changes)} change(s)")
     # NOT `len(before) == len(after)` any more: this bump adds two objects. The
