@@ -8085,3 +8085,234 @@ A0 adds no migration and no env, so the 0.27.8 images run unchanged.
 iam-db from 0.30.0: with no client-certificate name the gate refuses every
 verb (ADR-0972 Q3), and the chart refuses to render it. The break-glass is the
 pin revert above.
+
+## A1: the yadgar pin moves to parent chart 0.33.2: credential lifetime, list and revoke one credential, the credential epoch and the enrolment void (ADR-0972, ONE-WAY)
+
+Step A1 of `plans/admin-and-client-gaps.md` (yadgarhq/docs, §2, §3, §5 and
+§7). It ships ledgers 1627, 1628, 1578 and 1630 on the server side. **A1 is
+one-way.** iam-db 0.12.0 runs migrations 16, 17 and 18 at its first boot. From
+then on, an older iam-db binary refuses to boot against the database
+(`DatabaseAhead`). So the rollback is an image-only revert of iam and gateway,
+never a revert of the pin (see "Rollback" below).
+
+**What the merge does.** It moves `applications/yadgar.yaml`'s
+`targetRevision` from 0.30.0 to 0.33.2 and `scripts/chart_pin.json`'s
+`chart_tag` from `v0.30.0` to `v0.33.2`. `platform_version` stays 0.2.6, so the
+operator Applications do not move. `valuesObject` does not change: iam's
+`credential.lifetimeSeconds` takes the chart default, 7776000 (90 days).
+
+| Module  | From    | To          | Carries                                                                                                                                                                                                                                                                                                                        |
+| ------- | ------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| iam     | 0.13.0  | **0.15.0**  | iam#110 (`2c90739`, 0.13.1): `ListCredentials` relays to iam-db, `RevokeCredential` relays the actor. iam#111 (`34164fb`, 0.14.0): revoke ownership, epoch-checked mints, void-count relay. iam#112 (`84f6107`, 0.15.0): `CREDENTIAL_LIFETIME_SECONDS` required; Login and Redeem credentials expire. proto v1.19.0 → v1.21.0. |
+| iam-db  | 0.11.0  | **0.12.0**  | iam-db#98 (`95ffa53`): migrations 16-18, the credential epoch, the enrolment void, revoke ownership, `ResolveCredential` returns `expires_at`. proto v1.19.0 → v1.21.0.                                                                                                                                                        |
+| gateway | 0.12.19 | **0.12.21** | gateway#127 (`7e4c79c`, 0.12.20): `POST /admin/list-credentials`, `POST /admin/revoke-credential`, void-count echo. gateway#128 (`c74d24c`, 0.12.21): `/auth/login` and `/auth/enrol` echo `expires_at`; enrol answers 409 on a lost epoch race. proto v1.20.0 → v1.21.0.                                                      |
+
+Unchanged: `config` 0.2.1, `platform` 0.2.6, `project` 0.4.2, `project-db`
+0.8.3, `task` 0.7.7, `task-db` 0.9.6, `seeder` 0.1.3. No module moves a
+`yadgar-*` crate in `Cargo.toml`. iam-db keeps `yadgar-store` v0.2.13.
+
+**The migrations (iam-db `src/schema.rs` at v0.12.0).** Each is one `ALTER`
+on one table. MariaDB auto-commits each `ALTER`, so a boot can stop only
+between whole migrations.
+
+- 16 `user_credential_epoch`: `ALTER TABLE iam_user ADD COLUMN credential_epoch BIGINT UNSIGNED NOT NULL DEFAULT 0`
+- 17 `enrolment_voided_at`: `ALTER TABLE iam_enrolment ADD COLUMN voided_at TIMESTAMP NULL DEFAULT NULL`
+- 18 `redemption_credential_epoch`: `ALTER TABLE iam_enrolment_redemption ADD COLUMN credential_epoch BIGINT UNSIGNED NOT NULL DEFAULT 0`
+
+**Measured 2026-10-21 (helm 3.18.4 and 4.3.0; ADR-0881 dry run).** `yadgar`:
+94 → 94 objects, 3 changed. Server-side `kubectl diff` against kind-yadgar,
+tracking annotation added, the 13 hook objects left out: at 0.30.0, all 81
+objects, empty diff. At 0.33.2, 78 objects empty, and:
+
+- `Deployment/gateway`: `image` (`ee8016a9…` → `651a370a…`), `generation`.
+- `Deployment/iam-db`: `image` (`cb3205e3…` → `194e62dc…`), `generation`.
+- `Deployment/iam`: `image` (`63dad504…` → `996e418e…`), `generation`, and
+  one env entry added: `CREDENTIAL_LIFETIME_SECONDS` = `"7776000"`.
+
+`Job/seeder` does not move: seeder stays 0.1.3, so its diff is empty and Argo
+does not re-create it.
+
+**The boot audit.** iam 0.15.0 reads `CREDENTIAL_LIFETIME_SECONDS` with
+`env_required` (`src/service/lifetime.rs`). An iam pod without it refuses to
+boot. The render above sets it, and `scripts/pin_bump.py`'s E3 boot audit is
+green for gateway, iam and iam-db.
+
+### Before this merge (NEEDS-MAX, read-only)
+
+```bash
+# 1. yadgar Synced/Healthy at 0.30.0, no operation running.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+
+# 2. The two leaf-name hard gates again (plan §7, C1). Expect exactly
+#    subject=CN=gateway-caller and subject=CN=iam-caller. Any other CN: STOP.
+kubectl --context kind-yadgar -n yadgar get secret gateway-client-tls \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -subject
+kubectl --context kind-yadgar -n yadgar get secret iam-client-tls \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -subject
+
+# 3. The schema before the roll. Expect "schema at migration 15" on each
+#    iam-db pod (read 2026-10-21: 15).
+for p in $(kubectl --context kind-yadgar -n yadgar get pod -l app=iam-db -o name); do
+  echo "$p"; kubectl --context kind-yadgar -n yadgar logs "$p" | grep 'schema at migration' | tail -1
+done
+```
+
+4. **Freeze revoke-all for the length of the roll.** Do not call
+   `/admin/revoke-credentials` (or `yaadgaar admin revoke-credentials`) and do
+   not issue a revoking re-enrolment until every iam-db pod runs 0.12.0. An old
+   iam-db replica neither voids the person's enrolments nor bumps the epoch.
+
+### After this merge, read-only
+
+```bash
+# 1. yadgar Synced/Healthy at 0.33.2; every module ready; the old ReplicaSets
+#    at 0; no pod restarting or in CrashLoopBackOff.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=NAME:.metadata.name,REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+kubectl --context kind-yadgar -n yadgar get deploy gateway iam iam-db
+kubectl --context kind-yadgar -n yadgar get rs -l 'app in (gateway,iam,iam-db)'
+kubectl --context kind-yadgar -n yadgar get pods -l 'app in (gateway,iam,iam-db)'
+
+# 2. iam-db applied migration 18. Expect "schema at migration 18" on EACH new
+#    iam-db pod. SQL is not allowed here; the boot log is the record.
+for p in $(kubectl --context kind-yadgar -n yadgar get pod -l app=iam-db -o name); do
+  echo "$p"; kubectl --context kind-yadgar -n yadgar logs "$p" | grep 'schema at migration' | tail -1
+done
+
+# 3. iam booted with the lifetime. Expect lifetime_seconds 7776000 on EACH new
+#    iam pod, and the env in the live Deployment.
+for p in $(kubectl --context kind-yadgar -n yadgar get pod -l app=iam -o name); do
+  echo "$p"; kubectl --context kind-yadgar -n yadgar logs "$p" | grep 'CREDENTIAL_LIFETIME_SECONDS' | tail -1
+done
+kubectl --context kind-yadgar -n yadgar get deploy iam \
+  -o jsonpath='{range .spec.template.spec.containers[0].env[?(@.name=="CREDENTIAL_LIFETIME_SECONDS")]}{.name}={.value}{"\n"}{end}'
+
+# 4. The gate still refuses nobody real (as in A0's after-check 2).
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(pod%2Ccaller)(yadgar_iam_caller_refused_total)'
+kubectl --context kind-yadgar get --raw \
+  '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(pod%2Ccaller)(yadgar_iamdb_caller_refused_total)'
+```
+
+**5. A fresh login answers `expires_at` about 90 days out, and
+`/admin/list-credentials` works for an administrator (NEEDS-MAX,
+operator-run).** The route admits an attested administrator only. The
+bootstrap token is refused before its secret is compared
+(`Verb::accepts_bootstrap`), and there is no owner self-service. Log in as an
+administrator account. The body is strict: a key other than `user_id` and
+`page_token` answers 400.
+
+```bash
+# Needs the live kind-yadgar gateway edge only (no kubectl). The password is
+# read without echo. The token stays in a shell variable, goes to each call in
+# a curl config, and is unset at the end.
+G='https://gateway.yadgar.internal:18443'
+read -r -p 'administrator username: ' ADMIN
+read -rs -p "$ADMIN password: " PW; echo
+raw="$(curl -sS --max-time 20 -w '\n%{http_code}' -H 'content-type: application/json' \
+  --data-binary @<(U="$ADMIN" P="$PW" jq -nc '{username:env.U,password:env.P,label:"a1-check"}') \
+  "$G/auth/login")"; unset PW
+echo "login HTTP ${raw##*$'\n'}"                                  # expect 200
+printf '%s' "${raw%$'\n'*}" | jq -r '.expires_at'                 # expect now + 90 d
+TOKEN="$(printf '%s' "${raw%$'\n'*}" | jq -er .token)"; raw=''
+date -u -d '+90 days' +%FT%TZ                                     # compare
+USER_ID="$(curl -sS --max-time 20 \
+  --config <(printf 'header = "authorization: Bearer %s"\n' "$TOKEN") \
+  "$G/auth/whoami" | jq -er .user_id)"
+curl -sS --max-time 20 -w '%{stderr}list HTTP %{http_code}\n' -H 'content-type: application/json' \
+  --config <(printf 'header = "authorization: Bearer %s"\n' "$TOKEN") \
+  --data-binary "$(jq -nc --arg u "$USER_ID" '{user_id:$u}')" \
+  "$G/admin/list-credentials" | jq -c '.credentials[] | {id, label, created_at, expires_at}'
+unset TOKEN
+```
+
+Expect login HTTP 200 and an `expires_at` within a minute of the `date`
+line. Expect list HTTP 200, the new `a1-check` row with that `expires_at`, and
+every row minted before the roll WITHOUT an `expires_at` key (no backfill,
+ADR-0972 (3)). The list omits revoked rows. A 403 means the account is not an
+administrator. An opaque 5xx ("the administrative service is unavailable")
+can mean an iam 0.13.0 pod still serves, which answers `UNIMPLEMENTED`: wait
+for the roll to finish and run it again. Revoke the `a1-check`
+credential afterwards if you want, with `POST /admin/revoke-credential`
+`{"user_id": ..., "credential_id": ...}`.
+
+**6. The wrong-name probe again (NEEDS-MAX).** Run A0's
+"After the roll: the wrong-name probe" block unchanged, against one NEW iam pod
+and one NEW iam-db pod. Expect `PermissionDenied` from both, and
+`caller="task-caller"` up by exactly 1 on each counter. Any other answer: the
+gate is not live. STOP, and use the image-only rollback below for iam.
+
+### During the roll: the overlap windows (ledger 1734)
+
+All three Deployments roll at once (`maxSurge: 1`, `maxUnavailable: 0`, two
+replicas each). For a few minutes old and new pods serve together, on one
+database. The first new iam-db pod applies migrations 16-18 before it is
+ready. The old iam-db pods keep serving: the new columns are additive, and
+`check_not_ahead` runs only at boot.
+
+- **list-credentials and revoke-credential can answer an error.** A new
+  gateway that reaches an old iam 0.13.0 gets `UNIMPLEMENTED` on
+  list-credentials, which the edge answers as an opaque refusal. An old iam reaching a
+  new iam-db on `RevokeCredential` sends no `user_id`, and iam-db 0.12.0
+  answers `INVALID_ARGUMENT` ("a revoke must name the credential's user").
+  Retry after the roll.
+- **Some mints are unchecked, as today.** An old iam sends no expected epoch,
+  and an old iam-db ignores one. Either way the mint is unchecked, which is
+  the behaviour before A1.
+- **A spurious refused login, fail-closed.** An old iam-db answers
+  `GetPasswordHash` with epoch 0. If a new iam-db already bumped that person's
+  epoch, the mint is refused. `/auth/login` answers it as ADR-0927's opaque
+  503, and `/auth/enrol` as 409 (ADR-0977). The person logs in again after
+  the roll.
+- **No revoke-all during the roll** (pre-merge step 4). An old iam-db replica
+  neither voids enrolments nor bumps the epoch.
+- **An old iam-db pod that restarts after migration 16 CrashLoops on
+  `DatabaseAhead`.** The same holds for a pod that KEDA scales onto the old
+  ReplicaSet mid-roll (iam-db's ScaledObject is active). It is noise, not an
+  outage: the new pods serve, and the old ReplicaSet goes to 0 when the roll
+  completes. `yadgar` can show Degraded or Progressing until then.
+- **Credentials minted before the roll have no expiry.** There is no
+  backfill (ADR-0972 (3)). Only credentials minted by the new iam expire.
+
+### Rollback: image-only, never a revert of the pin
+
+**Never `git revert` the A1 merge, and never move `targetRevision` below
+0.33.2.** That takes iam-db back to 0.11.0. Its first boot reads the database
+at migration 18, `check_not_ahead` (`yadgar-store` v0.2.13
+`src/migrate.rs:78`, called from `apply` at `:281`, which iam-db calls at boot
+in `src/main.rs:401`) answers `DatabaseAhead`, and iam-db CrashLoops. That is
+an authentication outage. A defect in iam-db 0.12.0 itself is a forward fix:
+a new iam-db release and a new pin.
+
+1. If `yadgar`'s operation is Running or retrying, first run (NEEDS-MAX)
+   `argocd app terminate-op yadgar`. Argo CD v3.1.8 has no `retry.refresh`, so
+   a retrying operation keeps applying the bad revision (ADR-0881).
+2. Open a PR that keeps `targetRevision: 0.33.2` and pins the two images back
+   by digest in `valuesObject`. iam-db stays on 0.12.0.
+
+   ```yaml
+   # applications/yadgar.yaml, spec.source.helm.valuesObject
+   gateway:
+     image:
+       digest: sha256:ee8016a9613691801ec17350d83ed5924403112234e79990c0a7de9c1baaff56 # gateway 0.12.19
+   iam:
+     image:
+       digest: sha256:63dad5041f5544557a12be96011a6ddf6f3faa65a9fd9d886912a359c6a4c815 # iam 0.13.0
+   ```
+
+   Merge each key into the existing `gateway:` and `iam:` blocks. Do not add a
+   second block. Measured 2026-10-21: against the 0.33.2 render, these two
+   values change exactly `Deployment/gateway` and `Deployment/iam`
+   `containers[0].image`, nothing else. Regenerate `yadgar_render.sha256`
+   (`python3 scripts/gates/test_yadgar_application.py --write`, helm 3.18.4).
+   The PR changes values beside the pin, so the classifier and `pin-dryrun`
+   call it NEEDS-HUMAN: run the ADR-0881 dry run by hand. The rendered
+   `CREDENTIAL_LIFETIME_SECONDS` stays in the iam env; iam 0.13.0 does not read
+   it.
+
+The old iam works against iam-db 0.12.0. Every new proto field is additive. An
+absent epoch leaves the mint unchecked, as today. The old iam ignores
+`voided_enrolments` and `expires_at`. The void and the epoch bumps keep running
+inside iam-db, which is the safe direction. Credentials minted with an expiry
+keep it.
