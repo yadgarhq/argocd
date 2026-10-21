@@ -4429,9 +4429,40 @@ grpcurl -insecure -authority project-db.yadgar.svc -import-path . -proto yadgar/
 
 Expect both to fail with a TLS error that names `certificate required`, and
 NO gRPC status from the server. A gRPC status such as `INVALID_ARGUMENT` means
-the handshake was ACCEPTED: STOP and revert. The positive control is the
-callers' own OK traffic in the after-check. Stop both tunnels and delete the
+the handshake was ACCEPTED: STOP and revert. Stop both tunnels and delete the
 temp directory afterwards.
+
+**Positive control: through the gateway, not direct.** Since A0 (argocd#131),
+iam-db admits only `iam-caller` on every RPC. A direct grpcurl call with any
+other module leaf answers `PermissionDenied`, so it is not a positive control
+(ADR-0972 (1)). The positive control is a login and a `whoami` through the
+gateway (ADR-0959):
+
+```bash
+# NEEDS-MAX, operator-run. Needs the live kind-yadgar gateway edge only (no
+# kubectl). The password is read without echo. The token stays in a shell
+# variable, goes to the next call in a curl config, and is unset at the end.
+G='https://gateway.yadgar.internal:18443'
+read -rs -p 'claude-probe password: ' PW; echo
+raw="$(curl -sS --max-time 20 -w '\n%{http_code}' -H 'content-type: application/json' \
+  --data-binary @<(P="$PW" jq -nc '{username:"claude-probe",password:env.P,label:"host-curl"}') \
+  "$G/auth/login")"; unset PW
+echo "login HTTP ${raw##*$'\n'}"                       # expect 200
+TOKEN="$(printf '%s' "${raw%$'\n'*}" | jq -er .token)"; raw=''
+curl -sS --max-time 20 -w '%{stderr}whoami HTTP %{http_code}\n' \
+  --config <(printf 'header = "authorization: Bearer %s"\n' "$TOKEN") \
+  "$G/auth/whoami" | jq -c '{user_id, account_segment}'    # expect 200 and the user
+unset TOKEN
+```
+
+Expect login HTTP 200, then whoami HTTP 200 with the probe user's `user_id`
+and `account_segment`. The login is fresh, so its token is new to the gateway's cache and
+`whoami` calls `ResolveCredential`. The pair runs iam → iam-db
+`GetPasswordHash`, `CreateCredential` and `ResolveCredential` through
+`iam-caller`. A green login also proves iam's key-identity check passed,
+because iam serves only after that check. Any other answer means a hop from
+`iam` or `gateway` is refused: STOP and read the refusal counters in the
+after-check.
 
 **grpcurl CANNOT probe the wrong anchor (ledger 1400).** An earlier version
 of this section also ran both calls with `-cert leaf.crt -key leaf.key` and
@@ -5609,7 +5640,37 @@ grpcurl -insecure -authority iam.yadgar.svc -import-path . -proto yadgar/iam/v1/
 ```
 
 Do NOT add `-cert` to grpcurl to prove the wrong anchor (ledger 1400). P2
-proves it. The positive control is the gateway's OK traffic in step 5.
+proves it.
+
+**Positive control: through the gateway, not direct.** Since A0 (argocd#131),
+iam admits only `gateway-caller` on every RPC. A direct grpcurl call with any
+other module leaf answers `PermissionDenied`, so it is not a positive control
+(ADR-0972 (1)). The positive control is a login and a `whoami` through the
+gateway (ADR-0959), next to the gateway's OK traffic in step 5:
+
+```bash
+# NEEDS-MAX, operator-run. Needs the live kind-yadgar gateway edge only (no
+# kubectl). The password is read without echo. The token stays in a shell
+# variable, goes to the next call in a curl config, and is unset at the end.
+G='https://gateway.yadgar.internal:18443'
+read -rs -p 'claude-probe password: ' PW; echo
+raw="$(curl -sS --max-time 20 -w '\n%{http_code}' -H 'content-type: application/json' \
+  --data-binary @<(P="$PW" jq -nc '{username:"claude-probe",password:env.P,label:"host-curl"}') \
+  "$G/auth/login")"; unset PW
+echo "login HTTP ${raw##*$'\n'}"                       # expect 200
+TOKEN="$(printf '%s' "${raw%$'\n'*}" | jq -er .token)"; raw=''
+curl -sS --max-time 20 -w '%{stderr}whoami HTTP %{http_code}\n' \
+  --config <(printf 'header = "authorization: Bearer %s"\n' "$TOKEN") \
+  "$G/auth/whoami" | jq -c '{user_id, account_segment}'    # expect 200 and the user
+unset TOKEN
+```
+
+Expect login HTTP 200, then whoami HTTP 200 with the probe user's `user_id`
+and `account_segment`. The login is fresh, so its token is new to the gateway's cache and
+`whoami` calls `ResolveCredential`. The pair runs `Login` and
+`ResolveCredential` on iam through `gateway-caller`. Any other answer means
+the gateway hop is refused: STOP and read the refusal counters in the
+after-check.
 
 ### Rollback — a revert
 
@@ -7946,24 +8007,34 @@ Counters are per pod (ADR-0620), so pin one pod per server and read the counter
 on that pod. Run from a clone of yadgarhq/proto (for `-import-path .`):
 
 ```bash
-# Terminal 1: pin one NEW iam pod and one NEW iam-db pod, and tunnel to each.
+# Run ALL of this block in ONE shell. The tunnels are background jobs of that
+# shell, and the end of the block stops them by PID. Every command here needs
+# the live cluster (kubectl --context kind-yadgar).
+
+# Pin one NEW iam pod and one NEW iam-db pod, and tunnel to each.
 IAM_POD=$(kubectl --context kind-yadgar -n yadgar get pod -l app=iam -o name | head -1)
 IAMDB_POD=$(kubectl --context kind-yadgar -n yadgar get pod -l app=iam-db -o name | head -1)
 echo "$IAM_POD $IAMDB_POD"
 kubectl --context kind-yadgar -n yadgar port-forward "$IAM_POD" 15052:50052 &
+PF_IAM=$!
 kubectl --context kind-yadgar -n yadgar port-forward "$IAMDB_POD" 15051:50051 &
+PF_IAMDB=$!
+sleep 3
 
-# Terminal 2: read the counters BEFORE (a missing series counts as 0).
+# Read the counters BEFORE (a missing series counts as 0).
 kubectl --context kind-yadgar get --raw \
   '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(pod%2Ccaller)(yadgar_iam_caller_refused_total)'
 kubectl --context kind-yadgar get --raw \
   '/api/v1/namespaces/observability/services/prometheus-server:80/proxy/api/v1/query?query=sum%20by%20(pod%2Ccaller)(yadgar_iamdb_caller_refused_total)'
 
-# The task leaf, into a private temp dir. Nothing is printed.
-umask 077
-PROBE_DIR=$(mktemp -d)
-kubectl --context kind-yadgar -n yadgar get secret task-client-tls -o jsonpath='{.data.tls\.crt}' | base64 -d > "$PROBE_DIR/task.crt"
-kubectl --context kind-yadgar -n yadgar get secret task-client-tls -o jsonpath='{.data.tls\.key}' | base64 -d > "$PROBE_DIR/task.key"
+# The task leaf, into a private temp dir. Nothing is printed. `umask 077` is
+# set inside subshells, so it does not stay on in your shell.
+PROBE_DIR=$(umask 077; mktemp -d)
+(
+  umask 077
+  kubectl --context kind-yadgar -n yadgar get secret task-client-tls -o jsonpath='{.data.tls\.crt}' | base64 -d > "$PROBE_DIR/task.crt"
+  kubectl --context kind-yadgar -n yadgar get secret task-client-tls -o jsonpath='{.data.tls\.key}' | base64 -d > "$PROBE_DIR/task.key"
+)
 
 # Expect `Code: PermissionDenied` from both.
 grpcurl -insecure -cert "$PROBE_DIR/task.crt" -key "$PROBE_DIR/task.key" -authority iam.yadgar.svc -import-path . \
@@ -7979,18 +8050,21 @@ rm -rf "$PROBE_DIR"
 # for yadgar_iam_caller_refused_total, and by exactly 1 on $IAMDB_POD for
 # yadgar_iamdb_caller_refused_total.
 
-# Close the tunnels.
-kill %1 %2
+# Close the tunnels, by PID, in the same shell that started them.
+kill "$PF_IAM" "$PF_IAMDB"
 ```
 
 Any other answer (OK, `Unauthenticated`, a TLS error, or no counter rise)
 means the gate is not live: STOP and roll back. Run the same probe again after
 A1.
 
-The `:4425` (B-U8b) and `:5608` (B-U9) no-certificate probes stay as they are
-for A0. They still fail at the handshake, before any verb. Their rewrite to the
-gateway `/auth/login` + `/auth/whoami` positive control (ADR-0972, ADR-0959) is
-train step AR, which lands after G1 and before A1, not in A0.
+The B-U8b and B-U9 no-certificate probes stay as they are for A0. They still
+fail at the handshake, before any verb. Their positive control is now the
+gateway `/auth/login` + `/auth/whoami` pair (ADR-0972 (1), ADR-0959), written
+into both sections by train step AR. A direct call to iam or iam-db with a
+module leaf is no longer a positive control: since A0 it answers
+`PermissionDenied`, unless the leaf is `gateway-caller` (iam) or `iam-caller`
+(iam-db).
 
 ### Rollback: a revert of the pin
 
