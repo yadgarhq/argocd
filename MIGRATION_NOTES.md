@@ -8109,7 +8109,7 @@ operator Applications do not move. `valuesObject` does not change: iam's
 
 Unchanged: `config` 0.2.1, `platform` 0.2.6, `project` 0.4.2, `project-db`
 0.8.3, `task` 0.7.7, `task-db` 0.9.6, `seeder` 0.1.3. No module moves a
-`yadgar-*` crate in `Cargo.toml`. iam-db keeps `yadgar-store` v0.2.13.
+`yadgar-*` crate in `Cargo.toml`. iam-db keeps `yadgar-store` v0.4.0.
 
 **The migrations (iam-db `src/schema.rs` at v0.12.0).** Each is one `ALTER`
 on one table. MariaDB auto-commits each `ALTER`, so a boot can stop only
@@ -8262,9 +8262,16 @@ ready. The old iam-db pods keep serving: the new columns are additive, and
   the behaviour before A1.
 - **A spurious refused login, fail-closed.** An old iam-db answers
   `GetPasswordHash` with epoch 0. If a new iam-db already bumped that person's
-  epoch, the mint is refused. `/auth/login` answers it as ADR-0927's opaque
-  503, and `/auth/enrol` as 409 (ADR-0977). The person logs in again after
-  the roll.
+  epoch, the mint is refused. On `/auth/login`, iam 0.15.0 answers
+  `UNAUTHENTICATED` (`src/service/login.rs:143`, `refused()`), and the gateway
+  answers 401 `{"error":"invalid username or password"}`. That is the same
+  answer as a wrong password. The person logs in again after the roll.
+- **A redemption that loses the epoch race.** The password IS set and the
+  enrolment is spent, but no credential is minted. Through gateway 0.12.21,
+  `/auth/enrol` answers 409 with the fixed "run `yaadgaar login`" sentence
+  (ADR-0977). Through an old gateway 0.12.19, it answers 503
+  `{"error":"enrolment is unavailable"}`, and a retried enrol gets 401. In
+  both cases, run `yaadgaar login`.
 - **No revoke-all during the roll** (pre-merge step 4). An old iam-db replica
   neither voids enrolments nor bumps the epoch.
 - **An old iam-db pod that restarts after migration 16 CrashLoops on
@@ -8279,9 +8286,9 @@ ready. The old iam-db pods keep serving: the new columns are additive, and
 
 **Never `git revert` the A1 merge, and never move `targetRevision` below
 0.33.2.** That takes iam-db back to 0.11.0. Its first boot reads the database
-at migration 18, `check_not_ahead` (`yadgar-store` v0.2.13
-`src/migrate.rs:78`, called from `apply` at `:281`, which iam-db calls at boot
-in `src/main.rs:401`) answers `DatabaseAhead`, and iam-db CrashLoops. That is
+at migration 18, `check_not_ahead` (`yadgar-store` v0.4.0
+`src/migrate.rs:78`, called from `apply` at `:326`, which iam-db calls at boot
+in `src/main.rs:403`) answers `DatabaseAhead`, and iam-db CrashLoops. That is
 an authentication outage. A defect in iam-db 0.12.0 itself is a forward fix:
 a new iam-db release and a new pin.
 
@@ -8315,4 +8322,9 @@ The old iam works against iam-db 0.12.0. Every new proto field is additive. An
 absent epoch leaves the mint unchecked, as today. The old iam ignores
 `voided_enrolments` and `expires_at`. The void and the epoch bumps keep running
 inside iam-db, which is the safe direction. Credentials minted with an expiry
-keep it.
+keep it: iam-db enforces `expires_at` in its `ResolveCredential` SQL.
+
+**While rolled back, new credentials do not expire.** iam 0.13.0 mints every
+Login and Redeem credential with no expiry (`src/service/login.rs:122`,
+`src/service/enrolment.rs:205`). Those credentials join the legacy
+non-expiring set, and there is no backfill.
