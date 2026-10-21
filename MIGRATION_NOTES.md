@@ -4459,10 +4459,15 @@ Expect login HTTP 200, then whoami HTTP 200 with the probe user's `user_id`
 and `account_segment`. The login is fresh, so its token is new to the gateway's cache and
 `whoami` calls `ResolveCredential`. The pair runs iam → iam-db
 `GetPasswordHash`, `CreateCredential` and `ResolveCredential` through
-`iam-caller`. A green login also proves iam's key-identity check passed,
-because iam serves only after that check. Any other answer means a hop from
-`iam` or `gateway` is refused: STOP and read the refusal counters in the
-after-check.
+`iam-caller`. A green login does not prove iam's key-identity check passed:
+iam serves before that check answers (ADR-0764). Read `GetKeyIdentity` OK on
+iam-db in the after-check. Any other answer (401 mistyped password, 429 rate
+limit, 503 outage, or a refused hop): STOP and read the refusal counters
+before concluding.
+
+This pair covers iam-db only. project-db (15053) has no caller gate, so the
+gateway pair does not reach it. Its positive control is the callers' own OK
+traffic in the after-check.
 
 **grpcurl CANNOT probe the wrong anchor (ledger 1400).** An earlier version
 of this section also ran both calls with `-cert leaf.crt -key leaf.key` and
@@ -5668,9 +5673,9 @@ unset TOKEN
 Expect login HTTP 200, then whoami HTTP 200 with the probe user's `user_id`
 and `account_segment`. The login is fresh, so its token is new to the gateway's cache and
 `whoami` calls `ResolveCredential`. The pair runs `Login` and
-`ResolveCredential` on iam through `gateway-caller`. Any other answer means
-the gateway hop is refused: STOP and read the refusal counters in the
-after-check.
+`ResolveCredential` on iam through `gateway-caller`. Any other answer (401
+mistyped password, 429 rate limit, 503 outage, or a refused hop): STOP and
+read the refusal counters before concluding.
 
 ### Rollback — a revert
 
