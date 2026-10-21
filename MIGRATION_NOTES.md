@@ -8328,3 +8328,49 @@ keep it: iam-db enforces `expires_at` in its `ResolveCredential` SQL.
 Login and Redeem credential with no expiry (`src/service/login.rs:122`,
 `src/service/enrolment.rs:205`). Those credentials join the legacy
 non-expiring set, and there is no backfill.
+
+## A2: the yadgar pin moves to parent chart 0.33.4: gateway 0.12.23, the mode-specific project-validation boot line
+
+Step A2 of `plans/admin-and-client-gaps.md` (yadgarhq/docs). A pure pin bump:
+it moves `applications/yadgar.yaml`'s `targetRevision` from 0.33.2 to 0.33.4,
+`scripts/chart_pin.json`'s `chart_tag` from `v0.33.2` to `v0.33.4`, and
+regenerates `scripts/gates/yadgar_render.sha256`. `platform_version` stays
+0.2.6. `valuesObject` does not change.
+
+| Module  | From    | To          | Carries                                                                                                                                                                                                                                                                                           |
+| ------- | ------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| gateway | 0.12.21 | **0.12.23** | gateway#129 (`e793f13`, 0.12.22): the project-validation boot line states the configured mode's behaviour (ledger 1747); a comment-only note on the revoke-credential receipt (1741). gateway#130 (`f6931e7`, 0.12.23): the exact enforcing line (ledger 1755); a deflaked retry log test (1752). |
+
+No other dependency moves (`git diff v0.33.2 v0.33.4 -- chart/Chart.yaml` in
+yadgarhq/chart: only `gateway`). No migration, no env change, no new object.
+The gateway change is a log string only, so no behaviour changes.
+
+**Measured 2026-10-21 (ADR-0881 dry run).** `pin_bump.py --target 0.33.4
+--check`: ACCEPT, 1 image change. `kubectl --context kind-yadgar -n yadgar
+diff -f`, per object, tracking annotation added, hook objects left out: at
+0.33.2, all 81 objects, empty diff; at 0.33.4, 80 objects empty, and
+`Deployment/gateway`: `image` (`651a370a…` → `93e591f4…`), `generation`.
+
+### After the roll — read-only
+
+```bash
+# 1. Every gateway pod runs the 0.12.23 digest.
+kubectl --context kind-yadgar -n yadgar get pods -l app=gateway \
+  -o 'custom-columns=NAME:.metadata.name,IMAGEID:.status.containerStatuses[0].imageID'
+
+# 2. Every gateway pod logs the enforcing boot line. Expect, per pod, one line
+#    with "mode":"Enforcing" whose message contains BOTH
+#    "has not yet loaded (RegistryUnavailable)" and
+#    "refuses writes to an archived project but still serves its reads".
+#    Before A2 the pod printed the `counting` text under "mode":"Enforcing".
+for p in $(kubectl --context kind-yadgar -n yadgar get pods -l app=gateway -o name); do
+  echo "$p"
+  kubectl --context kind-yadgar -n yadgar logs "$p" | grep 'project validation is configured'
+done
+
+# 3. The settled gate ran green on this merge's epoch.
+gh-personal api 'repos/yadgarhq/argocd-verify/actions/workflows/settled.yaml/runs?event=workflow_dispatch&per_page=5' \
+  --jq '.workflow_runs[] | [.id, .event, .triggering_actor.login, .created_at, .conclusion] | @tsv'
+```
+
+**Rollback.** Two-way: revert the A2 merge. No schema or state moves.
