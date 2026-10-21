@@ -8374,3 +8374,78 @@ gh-personal api 'repos/yadgarhq/argocd-verify/actions/workflows/settled.yaml/run
 ```
 
 **Rollback.** Two-way: revert the A2 merge. No schema or state moves.
+
+## The yadgar pin moves to parent chart 0.34.0: seeder 0.2.0 makes `seeder.registry` required (ADR-0857 contract step), and the operators move to platform 0.2.7
+
+A pin bump with a platform move. It moves `applications/yadgar.yaml`'s
+`targetRevision` from 0.33.4 to 0.34.0, `scripts/chart_pin.json` to
+`v0.34.0` and `platform_version` 0.2.7, the five operator Applications'
+`targetRevision` from 0.2.6 to 0.2.7, and regenerates
+`scripts/gates/yadgar_render.sha256`. `valuesObject` does not change.
+
+| Module     | From    | To          | Carries                                                                                                                                                    |
+| ---------- | ------- | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| seeder     | 0.1.3   | **0.2.0**   | seeder#6 (`cb4fcb0`): `registry` is required with no default (ADR-0857 contract step). Chart, schema, tests and README only; no `src/` change since 0.1.3. |
+| platform   | 0.2.6   | **0.2.7**   | platform#46: actions-hooks bump only. The five operator renders are byte-identical.                                                                        |
+| config     | 0.2.1   | **0.2.2**   | actions-hooks bump only (`.pre-commit-config.yaml`).                                                                                                       |
+| gateway    | 0.12.23 | **0.12.24** | actions-hooks bump only.                                                                                                                                   |
+| iam        | 0.15.0  | **0.15.1**  | actions-hooks bump only.                                                                                                                                   |
+| iam-db     | 0.12.0  | **0.12.1**  | actions-hooks bump only. No migration.                                                                                                                     |
+| project    | 0.4.2   | **0.4.3**   | actions-hooks bump only.                                                                                                                                   |
+| project-db | 0.8.3   | **0.8.4**   | actions-hooks bump only. No migration.                                                                                                                     |
+| task       | 0.7.7   | **0.7.8**   | actions-hooks bump only.                                                                                                                                   |
+| task-db    | 0.9.6   | **0.9.7**   | actions-hooks bump only. No migration.                                                                                                                     |
+
+The seeder's rustls-webpki fix (seeder#4, `45c0ff8`) is NOT new here: it is
+tag v0.1.3, the seeder that already runs. Every new image is a rebuild of
+unchanged service source.
+
+**The contract holds here.** This Application declares `seeder.registry`
+(roots `yadgarhq` and `estate`, 23 projects, `allowMassArchive: false`), so
+0.34.0 renders. The red case, measured: the same values without
+`seeder.registry` refuse at 0.34.0 with `seeder: - (root): registry is
+required`; at 0.33.4 they render with no seeder Job.
+
+**Measured 2026-10-21 (ADR-0881 dry run).** helm v3.18.4 (sha256 verified),
+the live Application's `valuesObject` (equal to this file's), kind-yadgar's
+`api-versions` and `--kube-version v1.36.1`, 13 hook objects left out, Argo's
+tracking-id added; `kubectl --context kind-yadgar -n yadgar diff -f` per
+object:
+
+- 0.33.4: 81 objects, all empty (zero-diff baseline).
+- 0.34.0: 73 empty. Seven Deployments (gateway, iam, iam-db, project,
+  project-db, task, task-db) differ in `image` and `generation` only.
+  `Job/seeder` is refused by the dry run, `spec.template: field is
+immutable`. That refusal is expected: the Job carries
+  `argocd.argoproj.io/sync-options: Replace=true,Force=true`, so Argo deletes
+  and re-creates it. A field-by-field compare of the live Job's
+  `spec.template` against the 0.34.0 render differs in the `image` alone.
+- `ConfigMap/seeder-registry` and every label are unchanged.
+
+### After the roll — read-only
+
+```bash
+# 1. yadgar and the five operator Applications are Synced/Healthy at the new pins.
+kubectl --context kind-yadgar -n argocd get applications \
+  -o custom-columns=NAME:.metadata.name,REV:.status.sync.revision,SYNC:.status.sync.status,HEALTH:.status.health.status
+
+# 2. Every module pod runs its new digest.
+kubectl --context kind-yadgar -n yadgar get pods \
+  -o 'custom-columns=NAME:.metadata.name,IMAGEID:.status.containerStatuses[0].imageID'
+
+# 3. The re-created seeder Job completed on the 0.2.0 digest (sha256:ec2159d8…),
+#    and its log's "sync applied" line reads "archived":0 and "unchanged":25,
+#    as the 0.1.3 run did at 2026-10-21T09:25:38Z.
+kubectl --context kind-yadgar -n yadgar get job seeder \
+  -o jsonpath='{.metadata.creationTimestamp} {.status.succeeded} {.spec.template.spec.containers[0].image}{"\n"}'
+kubectl --context kind-yadgar -n yadgar logs job/seeder
+
+# 4. The settled gate ran green on this merge's epoch.
+gh-personal api 'repos/yadgarhq/argocd-verify/actions/workflows/settled.yaml/runs?event=workflow_dispatch&per_page=5' \
+  --jq '.workflow_runs[] | [.id, .event, .triggering_actor.login, .created_at, .conclusion] | @tsv'
+```
+
+**Rollback.** Two-way: revert the merge. No schema or state moves, and the
+operator renders are byte-identical at 0.2.6 and 0.2.7. If `yadgar`'s
+operation is Running or retrying, first run (NEEDS-MAX)
+`argocd app terminate-op yadgar`.

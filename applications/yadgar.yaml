@@ -436,6 +436,11 @@ spec:
         # ARCHIVED on the next sync, never deleted (ADR-0934); restoring the line
         # reactivates it.
         #
+        # REQUIRED FROM PARENT 0.34.0 (seeder 0.2.0, seeder#6, the ADR-0857 contract
+        # step): a render without `seeder.registry` refuses with "registry is
+        # required". Before that (seeder 0.1.x, the expand step) a missing block
+        # rendered no seeder objects at all.
+        #
         # WHAT IS DECLARED, by Max's ruling of 2026-10-18: "Declare every yadgarhq repo
         # that holds tasks, plus the estate roots." Every non-archived repository of the
         # yadgarhq organisation, read with `gh repo list yadgarhq` on 2026-10-18. The
