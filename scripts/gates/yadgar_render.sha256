@@ -1,6 +1,6 @@
 # K3: sha256 of each object `applications/yadgar.yaml` renders, as canonical JSON.
 # Regenerate: python3 scripts/gates/test_yadgar_application.py --write
-targetRevision  0.34.6
+targetRevision  0.34.8
 2355fad035bd3696b4fc741ed21eba814d3f4941a75fa16fb16cc73d4a4f0696  /ConfigMap//audit
 d19a8a2ae018718b5fd1626dade2ec71e47cd2516e203491e319a02e4dab0968  /ConfigMap//gateway-knobs
 a2f6a8433dcff0b94a6031f1dd4f4f2e8dacbcdc77802163b6221755c4b93173  /ConfigMap//nats-config
@@ -27,13 +27,13 @@ a09d6e21f3be46bc1e95a3f81493a41a51535ecba1cea48c44bb1516e64f541a  /ServiceAccoun
 b461e2773973968a929a5f7468fe29497a7cb24ccb30ebe69684c4b21b906aac  /ServiceAccount//seeder
 c0e197e038ddb56ee493c89d54a9f31a7a28989db10e6b62499af0d35298bc60  /ServiceAccount//task
 edb82b5473dc6e2170e034831628de8b51bc03c3dbc474c487c285b8e25ee7bb  /ServiceAccount//task-db
-c40c952ef039358c39e1e70c141bdf0263ba01cb69154e526d395f6a4a25f39b  apps/Deployment//gateway
+960098f28d3772790035d52875d37cd99e1c9c1c204a7829ad58d0a8f1adb30d  apps/Deployment//gateway
 7fc2a4b69a621ef7560d7548ad3d3890d5e44e5c20056c034fd88c8987164569  apps/Deployment//iam
 e726accf73c4fab447ce3b8dce201070b52d3812665d59c95489ca338028c4d6  apps/Deployment//iam-db
 b24e57207e0fffd95abd63c101c619eb04b8a345806e9a7c9406d3d2a59bf6e3  apps/Deployment//project
 41a06f664c3d4b3708a87715b93aca8692a93c7eaa33662728a97d87c075cbc8  apps/Deployment//project-db
 cf7df7992932379909a50f72e0249951e5daf6526d9e5518461d405f1e311905  apps/Deployment//task
-509ae0b2be48aad54ec202ac59885680781ffe5e938a24727b112d7c5c7fb28f  apps/Deployment//task-db
+3fe793ae24d0b353202962f7aec7a11c03ee3dcb56eb7a337e65926ca33fa9a6  apps/Deployment//task-db
 9ce974ab2ec1355f6db1207010f3ca0ce9e865452a7326abac5b05abf5aae5ab  apps/Deployment//valkey
 d9dba169be58a3e989d1e5f898e7b4d5967d5c9194b0d31d6c46f8f24f644ee1  apps/StatefulSet//nats
 aac3d30b38147f49357856fbda3ec9d299a019c556fad5c73d37a64c48c3c206  batch/Job//admin-bootstrap-token
