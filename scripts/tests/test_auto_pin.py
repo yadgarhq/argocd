@@ -919,6 +919,8 @@ def gate_api() -> Fake:
         {
             ("GET", f"{R}/branches/main"): {"commit": {"sha": MAIN}},
             ("GET", f"{R}/issues?labels=auto-pin-hold&state=open"): [],
+            # C6: a version hold a human closed is the clear for that version (`hold_cleared`).
+            ("GET", f"{R}/issues?labels=auto-pin-hold&state=all"): [],
             ("GET", f"{R}/pulls?state=all&sort=created&direction=desc"): [],
             ("GET", MATCHING): [],
         }
