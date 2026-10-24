@@ -121,7 +121,7 @@ jobs:
             --only-binary=:all: -r scripts/auto_pin.requirements.txt
 
       # READ ONLY: the gate reads settled verdicts (runs and artifacts) and writes nothing.
-      - name: mint a token for argocd-verify (actions read), for the gate
+      - name: mint a token for argocd-verify (actions read, contents read), for the gate
         id: verify1
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
@@ -130,6 +130,7 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: argocd-verify
           permission-actions: read
+          permission-contents: read
 
       # Read-only. Hold issue, main's settled epoch, the target (waits up to
       # 15 minutes for the newest chart to resolve), the open automatic PRs,

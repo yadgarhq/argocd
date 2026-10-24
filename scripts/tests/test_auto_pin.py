@@ -901,6 +901,20 @@ def test_the_gate_token_only_reads() -> None:
     assert steps["verify2"]["with"]["permission-actions"] == "write"
 
 
+def test_every_settled_dispatch_mint_reads_contents() -> None:
+    """ADR-1015: the gate calls GET argocd-verify/branches/main (settled_gate), and a token minted with named
+    permissions carries only those. So every SETTLED_DISPATCH mint in this workflow must ask for contents: read."""
+    mints = [
+        (name, step)
+        for name, job in yaml.safe_load(WORKFLOW.read_text())["jobs"].items()
+        for step in job["steps"]
+        if "create-github-app-token" in step.get("uses", "") and "SETTLED_DISPATCH" in step["with"]["client-id"]
+    ]
+    assert len(mints) == 3
+    for name, step in mints:
+        assert step["with"]["permission-contents"] == "read", (name, step["name"])
+
+
 # ── the gate's own reads ────────────────────────────────────────────────────
 
 
