@@ -459,13 +459,51 @@ spec:
         #
         # The TLS Secrets (`project-tls`, `seeder-client-tls`) are the parent chart's
         # defaults under `seeder.project.tls`, minted by `platform`; not restated here.
+        #
+        # TEAMS AND GRANTS (team access, plans/team-access.md stage 9; ADR-0962,
+        # ADR-0963, ADR-0966). DRAFT, GATED: this declaration must not merge until
+        # stages 2-8 are live and the pinned parent carries seeder chart >= stage 6,
+        # because the pinned chart (0.34.8, seeder 0.2.0) closes every level of the
+        # registry and refuses `teams` and `grants`. `scripts/gates/test_yadgar_application.py`
+        # (`TEAM_*`) pins this block.
+        #
+        # THE UUIDS ARE PLACEHOLDERS, and the gate refuses them. Each member is the
+        # `account_segment` that `GET /auth/whoami` answers for that account
+        # (ADR-0959): a lowercase uuidv7. Max writes the three real ones; nobody
+        # reads a Secret to get them. The probe user is in `estate-runners` and never
+        # in `administrators` (ADR-0966 B): it has no `/admin` privilege and no grant
+        # under `yadgarhq`.
+        #
+        # `seeder.iam.tls.caSecret` is REQUIRED, WITH NO DEFAULT, once `teams` is
+        # declared (seeder chart, stage 6; ADR-0854): the Secret holding the
+        # authority that signed iam's serving certificate, which is `iam-tls`. The
+        # rest of the `iam` block (host, port, requestTimeoutSeconds, caSecretKey)
+        # keeps the chart's defaults. The Job's `activeDeadlineSeconds` default is
+        # 1200 (two retry loops); argocd pins no lower value.
         seeder:
+          iam: { tls: { caSecret: iam-tls } }
           registry:
+            teams:
+              - name: administrators
+                members:
+                  - PLACEHOLDER-max-account-segment
+              - name: estate-runners
+                members:
+                  - PLACEHOLDER-probe-user-account-segment
+                  - PLACEHOLDER-smoke-user-account-segment
             roots:
               - path: yadgarhq
                 sourceRepo: yadgarhq/argocd
+                grants:
+                  - team: administrators
+                    level: readWrite
               - path: estate
                 sourceRepo: yadgarhq/estate
+                grants:
+                  - team: administrators
+                    level: readWrite
+                  - team: estate-runners
+                    level: readWrite
             projects:
               - path: yadgarhq/actions
                 displayName: actions
@@ -544,6 +582,7 @@ spec:
               # `PROJECT_ARCHIVED`. DO NOT DECLARE IT AGAIN: that reactivates the row.
               # `ARCHIVED_ON_PURPOSE` in the gate holds this.
             allowMassArchive: false
+            allowMassRevoke: false
 
         # ── THE PLATFORM LAYER, COMING ON ONE OBJECT AT A TIME ───────────────────────
         # EVERY `false` BELOW MARKS SOMETHING `deploy` STILL OWNS, and each one is moved
