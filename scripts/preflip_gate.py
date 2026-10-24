@@ -7,6 +7,7 @@ observation window: 0 refusals. It runs on the argocd-verify runner (ADR-0840),
 from `preflip.yaml` there, which executes argocd main's copy (ADR-0844).
 
     preflip_gate.py --start ISO [--end ISO] [--min-resolutions N] [--leg-c-max-age S]
+                    [--series refusal|grant-shadow]
 
 WHAT A PASS MEANS. The plan's stage 5 gate has three legs, in order: (c) one
 deliberate probe per reason class, observed to increment its counter BEFORE
@@ -45,6 +46,21 @@ therefore switches the probe off (`PROJECT_PROBE_ENABLED=false`) before the
 window opens, and this gate CHECKS that rather than trusting it: any
 non-skipped `project-probe` job that ran inside the window, or within
 `--probe-slack` seconds before it, fails the gate.
+
+`--series grant-shadow` (team access stage 9, `plans/team-access.md` section 5)
+is the gate for the `orgGrants` counting -> enforcing flip. It reads
+`yadgar_gateway_project_grant_shadow_total{verdict}` (verdict in `no_grant`,
+`read_only`) in place of the refusal counter in leg 5, and it adds one leg:
+the gauge `org_rows_without_effective_grant` must read 0 in every sample of the
+window, and every scrape of a target whose `registry_loaded` reads 1 must carry
+it (a missing series fails, per pod). A scrape that lands between the two
+gauge writes in `registry::install` (gateway#140 sets `registry_loaded` first)
+fails this leg: a false FAIL, never a false PASS. And leg (c) gains a per-pod
+read: every pod loaded at `start` must already carry a
+`grant_shadow_total{verdict="no_grant"}` sample at or before `start`, because
+the probe's verdict shows the `no_grant` arm only once `project_probe.py` has it.
+Every other leg is unchanged. A `refusal_total` sample is not read in this
+mode, and a shadow sample is not read in the default mode: the two flips have separate series (ruling 9, Q4).
 
 THE LEGS, all read, all reported, any one failing fails the gate:
   1. `PROJECT_PROBE_ENABLED` (passed in from the workflow's `vars`) is exactly
@@ -146,12 +162,20 @@ import urllib.request
 from typing import Callable, Protocol
 
 REFUSALS = "yadgar_gateway_project_refusal_total"
+# The `orgGrants` counting series (plans/team-access.md section 5). Stage 8
+# (gateway#140) names the gauge in the `_registry_` family, beside
+# `yadgar_gateway_project_registry_loaded`.
+SHADOW = "yadgar_gateway_project_grant_shadow_total"
+ORG_GAP = "yadgar_gateway_project_registry_org_rows_without_effective_grant"
+SHADOW_VERDICTS = frozenset({"no_grant", "read_only"})
+SERIES_REFUSAL, SERIES_GRANT_SHADOW = "refusal", "grant-shadow"
 RESOLUTIONS = "yadgar_gateway_project_resolution_total"
 LOADED = "yadgar_gateway_project_registry_loaded"
 LOWEST_QUERY = 'min(prometheus_tsdb_lowest_timestamp_seconds{job="prometheus"})'
 # The metric names are the gateway's own, so the counters need no `app` label:
 # a relabelled pod still counts. `up` carries no gateway-specific name and does.
 SELECTOR = f'{{__name__=~"{REFUSALS}|{RESOLUTIONS}|{LOADED}",namespace="yadgar"}}'
+SHADOW_SELECTOR = f'{{__name__=~"{SHADOW}|{RESOLUTIONS}|{LOADED}|{ORG_GAP}",namespace="yadgar"}}'
 UP_SELECTOR = 'up{namespace="yadgar",app="gateway"}'
 # Leg 8's instant read: every pod's gauge, with no pod, instance or app filter.
 LOADED_NOW_QUERY = f'{LOADED}{{namespace="yadgar"}}'
@@ -228,9 +252,11 @@ def parse_matrix(body: dict) -> list[Series]:
             if math.isnan(value):
                 raise GateError(f"{name} {pod}: NaN sample at {iso(float(t))}")
             samples.append((float(t), value))
-        label = metric.get("reason") or metric.get("outcome") or ""
+        label = metric.get("reason") or metric.get("outcome") or metric.get("verdict") or ""
         if name == REFUSALS and not metric.get("reason"):
             raise GateError(f"a refusal series without a reason: {metric}")
+        if name == SHADOW and metric.get("verdict") not in SHADOW_VERDICTS:
+            raise GateError(f"a grant-shadow series with verdict {metric.get('verdict')!r}, not one of {sorted(SHADOW_VERDICTS)}: {metric}")
         out.append(Series(name, pod, label, metric.get("instance", ""), tuple(sorted(samples)), metric.get("job", "")))
     return out
 
@@ -338,6 +364,60 @@ def up_failures(ups: list[Series], start: float, end: float) -> list[str]:
         down = [t for t, v in u.samples if start <= t <= end and v == 0]
         if down:
             out.append(f"up == 0 on pod {u.pod} ({len(down)} scrape(s) from {iso(down[0])} to {iso(down[-1])}): that pod was blind")
+    return out
+
+
+def org_gap_failures(gaps: list[Series], gauges: list[Series], start: float, end: float) -> list[str]:
+    """The grant-shadow series' extra leg: `org_rows_without_effective_grant` is 0
+    in every sample of [start, end], and exists. A missing series is never zero.
+
+    PER TARGET: the gateway sets the gap in the same step as `registry_loaded = 1`,
+    so every scrape of a target whose `registry_loaded` reads 1 must carry a gap
+    sample at that timestamp. A loaded target without one runs a gateway with no
+    shadow counter (an older image, a rollback); one healthy pod must not vouch
+    for it."""
+    name = "org_rows_without_effective_grant"
+    inside = [(g.pod, t, v) for g in gaps for t, v in g.samples if start <= t <= end]
+    if not inside:
+        return [f"no {name} sample in [{iso(start)}, {iso(end)}]: the gauge is unscraped, so it is not zero"]
+    out = []
+    stamped: dict[tuple[str, str, str], set[float]] = {}
+    for g in gaps:
+        stamped.setdefault(g.target(), set()).update(t for t, _ in g.samples)
+    for g in gauges:
+        missing = [t for t, v in g.samples if start <= t <= end and v == 1 and t not in stamped.get(g.target(), set())]
+        if missing:
+            out.append(
+                f"pod {g.pod}: {len(missing)} loaded scrape(s) in the window carry no {name} sample, "
+                f"first at {iso(missing[0])}: that replica counts no grant-shadow verdict"
+            )
+    bad = [(pod, t, v) for pod, t, v in inside if v != 0]
+    if bad:
+        pod, t, v = bad[0]
+        out.append(f"{name} reads {v:g} on pod {pod} at {iso(t)} ({len(bad)} sample(s) above 0): a declared row has no effective grant")
+    return out
+
+
+def no_grant_baseline_failures(shadows: list[Series], gauges: list[Series], start: float) -> list[str]:
+    """The grant-shadow series' leg (c), per pod, from Prometheus (plan section 5:
+    the probe's `no_grant` arm raised the counter "per pod before the window").
+
+    Every target whose last `registry_loaded` sample at or before `start` reads 1
+    must carry a `verdict="no_grant"` shadow series with a sample at or before
+    `start`. The counter registers lazily, so its presence proves an increment
+    reached that pod; its absence means a flat window there proves nothing. The
+    probe's green verdict (leg 7) is read as well, but it shows the arm only once
+    `project_probe.py` has one (stage 9 step 4). A pod born inside the window is
+    not checked here; its first shadow value counts in full (unknown baseline)."""
+    seen = {s.target() for s in shadows if s.label == "no_grant" and any(t <= start for t, _ in s.samples)}
+    out = []
+    for g in gauges:
+        before = [v for t, v in g.samples if t <= start]
+        if before and before[-1] == 1 and g.target() not in seen:
+            out.append(
+                f'pod {g.pod}: no {SHADOW}{{verdict="no_grant"}} sample at or before {iso(start)}: '
+                "the probe's no_grant arm never reached this replica, so its flat window proves nothing"
+            )
     return out
 
 
@@ -613,6 +693,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=86400.0,
         help="the leg-c run must end within this many seconds before start: finite, > 0, at most 7 days",
     )
+    p.add_argument(
+        "--series",
+        choices=[SERIES_REFUSAL, SERIES_GRANT_SHADOW],
+        default=SERIES_REFUSAL,
+        help="the counter that must not rise: the refusal counter (default) or the orgGrants grant-shadow counter",
+    )
     p.add_argument("--prometheus-url", default="http://prometheus-server.observability.svc:80")
     p.add_argument("--kube-url", default="https://kubernetes.default.svc", help="the API server, read with the pod's own token")
     return p.parse_args(argv)
@@ -669,6 +755,9 @@ def run(
         except GateError as e:
             failures.append(str(e))
 
+    shadow_mode = args.series == SERIES_GRANT_SHADOW
+    counted_name, selector = (SHADOW, SHADOW_SELECTOR) if shadow_mode else (REFUSALS, SELECTOR)
+    what = "shadow samples" if shadow_mode else "refusals"
     refusals = Count()
     resolutions = Count()
     try:
@@ -684,8 +773,11 @@ def run(
             )
 
         span = int(math.ceil(end - start + args.lookback))
-        series = parse_matrix(transport.prom_query({"query": f"{SELECTOR}[{span}s]", "time": f"{end:.3f}"}))
+        series = parse_matrix(transport.prom_query({"query": f"{selector}[{span}s]", "time": f"{end:.3f}"}))
         gauges = [s for s in series if s.name == LOADED]
+        if shadow_mode:
+            failures.extend(org_gap_failures([s for s in series if s.name == ORG_GAP], gauges, start, end))
+            failures.extend(no_grant_baseline_failures([s for s in series if s.name == SHADOW], gauges, start))
 
         # Leg 4: coverage.
         failures.extend(scrape_gaps(gauges, start, end, args.max_gap))
@@ -700,7 +792,7 @@ def run(
 
         # Legs 5 and 6.
         for s in series:
-            if s.name == REFUSALS:
+            if s.name == counted_name:
                 c = count(s, start, unknown_baseline_counts=True, restarts=restarts.get(s.target(), Restarts()))
                 refusals.total += c.total
                 refusals.events += c.events
@@ -715,12 +807,12 @@ def run(
                 resolutions.total += c.total
                 resolutions.events += c.events
         say(f"gateway pods seen: {sorted({s.pod for s in series})}")
-        say(f"refusals in window: {refusals.total:g} (all reasons)")
+        say(f"{what} in window: {refusals.total:g} (all {'verdicts' if shadow_mode else 'reasons'})")
         for e in sorted(refusals.events):
-            say(f"  refusal {e}")
+            say(f"  {'shadow' if shadow_mode else 'refusal'} {e}")
         say(f"resolutions in window: {resolutions.total:g}")
         if refusals.total != 0:
-            failures.append(f"{refusals.total:g} refusal(s) in the window; the condition is 0")
+            failures.append(f"{refusals.total:g} {what} in the window; the condition is 0")
         if resolutions.total < args.min_resolutions:
             failures.append(
                 f"{resolutions.total:g} resolution(s) in the window, below {args.min_resolutions:g}: "
@@ -744,7 +836,7 @@ def run(
 
     for f in failures:
         say(f"FAIL: {f}")
-    tally = f"refusals {refusals.total:g}, resolutions {resolutions.total:g}, window {iso(start)} .. {iso(end)}"
+    tally = f"{what} {refusals.total:g}, resolutions {resolutions.total:g}, window {iso(start)} .. {iso(end)}"
     if failures:
         say(f"FAIL: {tally}")
     else:

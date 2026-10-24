@@ -945,3 +945,177 @@ def test_the_in_cluster_read_without_a_token_fails_closed(tmp_path, monkeypatch)
     monkeypatch.setattr(pg, "SERVICE_ACCOUNT_DIR", str(tmp_path))
     with pytest.raises(pg.GateError, match="ServiceAccount token"):
         pg.Network("http://prom", "x").kube_get("/apis/apps/v1/namespaces/yadgar/deployments/gateway")
+
+
+# --- --series grant-shadow (team access stage 9, plans/team-access.md section 5) ---
+
+SHADOW_ARGV = ["--start", iso(START), "--end", iso(END), "--series", "grant-shadow"]
+
+
+def shadow(pod: str, steps, verdict: str = "no_grant", last: float = END) -> dict:
+    return counter(pg.SHADOW, pod, ("verdict", verdict), steps, last)
+
+
+def org_gap(pod: str, steps, last: float = END) -> dict:
+    """The gauge `org_rows_without_effective_grant`: a gauge, held per step like a counter."""
+    return counter(pg.ORG_GAP, pod, ("kind", ""), steps, last)
+
+
+GAP_ZERO = org_gap("a", [(START - LOOKBACK, 0)])
+
+
+def shadow_gate(body: dict, **kw) -> tuple[int, str]:
+    return gate(FakeTransport(body), argv=SHADOW_ARGV, **kw)
+
+
+def test_grant_shadow_one_shadow_sample_in_the_window_fails() -> None:
+    body = matrix(gauge("a"), shadow("a", [(START - LOOKBACK, 2), (START + 1800, 3)]), GAP_ZERO, TRAFFIC)
+    code, out = shadow_gate(body)
+    assert code == pg.EXIT_FAIL, out
+    assert "shadow samples in window: 1" in out
+
+
+def test_grant_shadow_a_series_born_mid_window_at_one_is_one_sample_not_zero() -> None:
+    body = matrix(gauge("a"), shadow("a", [(START + 1800, 1)], verdict="read_only"), GAP_ZERO, TRAFFIC)
+    code, out = shadow_gate(body)
+    assert code == pg.EXIT_FAIL, out
+    assert "shadow samples in window: 1" in out
+
+
+def test_grant_shadow_zero_shadow_and_zero_resolutions_fails_as_vacuous() -> None:
+    body = matrix(gauge("a"), GAP_ZERO, resolution("a", [(START - LOOKBACK, 3)]))
+    code, out = shadow_gate(body)
+    assert code == pg.EXIT_FAIL, out
+    assert "resolutions in window: 0" in out
+
+
+def test_grant_shadow_flat_shadow_counter_with_traffic_passes() -> None:
+    # The probe's `no_grant` arm raised the counter before the window: baseline.
+    body = matrix(gauge("a"), shadow("a", [(START - LOOKBACK, 2)]), GAP_ZERO, TRAFFIC)
+    code, out = shadow_gate(body)
+    assert code == pg.EXIT_PASS, out
+    assert "shadow samples in window: 0" in out
+
+
+def test_grant_shadow_a_refusal_total_sample_does_not_affect_the_series() -> None:
+    body = matrix(
+        gauge("a"),
+        shadow("a", [(START - LOOKBACK, 2)]),
+        refusal("a", [(START - LOOKBACK, 4), (START + 1800, 5)]),
+        GAP_ZERO,
+        TRAFFIC,
+    )
+    code, out = shadow_gate(body)
+    assert code == pg.EXIT_PASS, out
+
+
+def test_default_series_ignores_a_shadow_sample() -> None:
+    # The refusal series is the default and is unchanged: a shadow rise is not a refusal.
+    body = matrix(gauge("a"), refusal("a", [(START - LOOKBACK, 4)]), shadow("a", [(START + 1800, 1)]), TRAFFIC)
+    code, out = gate(FakeTransport(body))
+    assert code == pg.EXIT_PASS, out
+
+
+def test_grant_shadow_reads_the_shadow_series_and_not_the_refusal_series() -> None:
+    t = FakeTransport(matrix(gauge("a"), GAP_ZERO, TRAFFIC))
+    gate(t, argv=SHADOW_ARGV)
+    q = next(p for p in t.queries if p["query"].startswith("{"))["query"]
+    assert pg.SHADOW in q and pg.ORG_GAP in q and pg.REFUSALS not in q
+
+
+def test_grant_shadow_an_unknown_verdict_fails_closed() -> None:
+    body = matrix(gauge("a"), shadow("a", [(START - LOOKBACK, 0)], verdict="mystery"), GAP_ZERO, TRAFFIC)
+    code, out = shadow_gate(body)
+    assert code == pg.EXIT_FAIL, out
+    assert "mystery" in out
+
+
+def test_grant_shadow_a_nonzero_org_gap_gauge_fails() -> None:
+    body = matrix(gauge("a"), org_gap("a", [(START - LOOKBACK, 0), (START + 600, 1)]), TRAFFIC)
+    code, out = shadow_gate(body)
+    assert code == pg.EXIT_FAIL, out
+    assert "org_rows_without_effective_grant" in out
+
+
+def test_grant_shadow_a_missing_org_gap_gauge_fails_closed() -> None:
+    code, out = shadow_gate(matrix(gauge("a"), TRAFFIC))
+    assert code == pg.EXIT_FAIL, out
+    assert "org_rows_without_effective_grant sample" in out and "the gauge is unscraped" in out
+
+
+def test_grant_shadow_keeps_the_other_legs() -> None:
+    body = matrix(gauge("a"), GAP_ZERO, TRAFFIC)
+    code, out = gate(FakeTransport(body), env={"PROJECT_PROBE_ENABLED": "true", "GITHUB_TOKEN": "x"}, argv=SHADOW_ARGV)
+    assert code == pg.EXIT_FAIL and "PROJECT_PROBE_ENABLED" in out
+    code, out = gate(FakeTransport(body, lowest=START), argv=SHADOW_ARGV)
+    assert code == pg.EXIT_FAIL and "retention" in out
+    code, out = gate(FakeTransport(body, leg_c=()), argv=SHADOW_ARGV)
+    assert code == pg.EXIT_FAIL and "leg-c" in out
+
+
+def test_an_unknown_series_value_is_refused() -> None:
+    with pytest.raises(SystemExit):
+        pg.parse_args(["--start", iso(START), "--series", "refusals"])
+
+
+# THE GAUGE IS READ PER TARGET, NOT ONCE FOR THE ESTATE. The gateway sets
+# `org_rows_without_effective_grant` in the same step as `registry_loaded = 1`
+# (gateway#140, `registry::install`), so a scrape of a loaded stage 8 pod carries
+# both. A loaded pod without it is a gateway that has no shadow counter at all
+# (an older image, a rollback), whose org misses nobody counts: one healthy pod
+# must not vouch for it.
+def test_grant_shadow_a_loaded_pod_without_the_org_gap_gauge_fails() -> None:
+    body = matrix(gauge("a"), gauge("b"), GAP_ZERO, TRAFFIC)
+    code, out = shadow_gate(body)
+    assert code == pg.EXIT_FAIL, out
+    assert "pod b" in out and "org_rows_without_effective_grant" in out
+
+
+def test_grant_shadow_the_org_gap_gauge_vanishing_mid_window_fails() -> None:
+    gap = counter(pg.ORG_GAP, "a", ("kind", ""), [(START - LOOKBACK, 0)], last=START + 1800)
+    code, out = shadow_gate(matrix(gauge("a"), gap, TRAFFIC))
+    assert code == pg.EXIT_FAIL, out
+    assert "pod a" in out and "org_rows_without_effective_grant" in out
+
+
+def test_grant_shadow_a_pod_not_yet_loaded_needs_no_org_gap_gauge() -> None:
+    # Gauge 0 at boot: `install` has not run, so the gateway has not set the gap yet.
+    boot = gauge_steps("a", [(START - LOOKBACK, 0), (START + 600, 1)])
+    gap = counter(pg.ORG_GAP, "a", ("kind", ""), [(START + 600, 0)])
+    code, out = shadow_gate(matrix(boot, gap, TRAFFIC))
+    assert code == pg.EXIT_PASS, out
+
+
+# LEG (C) FOR THIS SERIES, PER POD, FROM PROMETHEUS (plan section 5: the probe's
+# `no_grant` arm "raised grant_shadow_total{verdict="no_grant"} per pod before
+# the window"). The counter registers lazily, so a pod loaded at `start` with no
+# `no_grant` series has never counted one: a flat window there proves nothing.
+# The probe's green verdict alone does not show this until the probe has the arm.
+def test_grant_shadow_no_no_grant_series_before_the_window_fails() -> None:
+    code, out = shadow_gate(matrix(gauge("a"), GAP_ZERO, TRAFFIC))
+    assert code == pg.EXIT_FAIL, out
+    assert "pod a" in out and 'verdict="no_grant"' in out
+
+
+def test_grant_shadow_one_pod_without_a_no_grant_series_fails() -> None:
+    body = matrix(
+        gauge("a"), gauge("b"), GAP_ZERO, org_gap("b", [(START - LOOKBACK, 0)]),
+        shadow("a", [(START - LOOKBACK, 2)]), TRAFFIC,
+    )
+    code, out = shadow_gate(body)
+    assert code == pg.EXIT_FAIL, out
+    assert "pod b" in out and 'verdict="no_grant"' in out and "pod a" not in out.split("FAIL: ")[1]
+
+
+def test_grant_shadow_a_read_only_series_does_not_stand_in_for_no_grant() -> None:
+    body = matrix(gauge("a"), GAP_ZERO, shadow("a", [(START - LOOKBACK, 2)], verdict="read_only"), TRAFFIC)
+    code, out = shadow_gate(body)
+    assert code == pg.EXIT_FAIL, out
+    assert 'verdict="no_grant"' in out
+
+
+def test_grant_shadow_a_no_grant_series_born_after_the_start_is_not_a_baseline() -> None:
+    body = matrix(gauge("a"), GAP_ZERO, shadow("a", [(START + 1800, 0)]), TRAFFIC)
+    code, out = shadow_gate(body)
+    assert code == pg.EXIT_FAIL, out
+    assert "pod a" in out and 'verdict="no_grant"' in out
