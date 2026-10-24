@@ -98,6 +98,7 @@ counterpart, not its replacement.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -282,10 +283,28 @@ def tuples_of(documents) -> set[tuple[str, str, str]]:
 
 
 def helm(*arguments: str) -> str:
-    """`helm` with its stderr folded into the failure, never swallowed."""
-    finished = subprocess.run(
-        ["helm", *arguments], capture_output=True, text=True, check=False
-    )
+    """`helm` with its stderr folded into the failure, never swallowed.
+
+    EACH CALL GETS ITS OWN HELM CACHE, CONFIG AND DATA DIRECTORIES (yaadgaar
+    #178). The flake seen (`test_the_render_is_the_committed_table`, once in a
+    full run, never alone) was not reproduced, so this MITIGATES a plausible
+    cause and does not prove one. On helm v4.3.0 an OCI `helm pull` writes
+    nothing to the cache, config or data directories (measured), so the OCI
+    parent pull is not the shared state. The plausible shared state is the
+    classic `--repo` path: `helm template --repo` in `owned_tuples` and the
+    argo-helm `helm pull --repo` in the CRD gate both write the chart-repository
+    index cache under HELM_CACHE_HOME, which a parallel run or a developer's own
+    helm also uses. A half-written or stale index there could change a render.
+    Nothing in a gate render needs that state.
+    """
+    with tempfile.TemporaryDirectory() as home:
+        env = {
+            **os.environ,
+            "HELM_CACHE_HOME": f"{home}/cache",
+            "HELM_CONFIG_HOME": f"{home}/config",
+            "HELM_DATA_HOME": f"{home}/data",
+        }
+        finished = subprocess.run(["helm", *arguments], capture_output=True, text=True, check=False, env=env)
     if finished.returncode != 0:
         raise AssertionError(
             f"`helm {' '.join(arguments)}` exited {finished.returncode}:\n"
@@ -2296,3 +2315,18 @@ def test_a_cluster_scoped_copy_from_another_namespace_reddens(tmp_path: Path) ->
     }, render(failures, examined)
     assert all("estate-front" in failure.d_owner for failure in failures), render(failures, examined)
     assert examined == EXPECTED_D_TUPLES + 1, render(failures, examined)
+
+
+def test_each_helm_call_gets_its_own_cache_config_and_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """yaadgaar #178: no gate render shares helm's user-wide cache, registry config or data."""
+    fake = tmp_path / "bin" / "helm"
+    fake.parent.mkdir()
+    fake.write_text('#!/bin/sh\necho "$HELM_CACHE_HOME $HELM_CONFIG_HOME $HELM_DATA_HOME"\n')
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake.parent}:{os.environ['PATH']}")
+    monkeypatch.setenv("HELM_CACHE_HOME", "/shared/cache")
+    first = helm("version").split()
+    second = helm("version").split()
+    assert len(first) == 3 and not any(path.startswith("/shared") for path in first)
+    assert set(first).isdisjoint(second)
+    assert len({Path(path).parent for path in first}) == 1
