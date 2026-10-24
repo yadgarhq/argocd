@@ -246,6 +246,7 @@ READS: dict[tuple[str, str], tuple[str, bool]] = {
     ("", "ServiceAccount"): ("serviceaccounts", True),
     ("cert-manager.io", "Certificate"): ("certificates.cert-manager.io", True),
     ("cert-manager.io", "Issuer"): ("issuers.cert-manager.io", True),
+    ("gateway.envoyproxy.io", "BackendTrafficPolicy"): ("backendtrafficpolicies.gateway.envoyproxy.io", True),
     ("gateway.envoyproxy.io", "EnvoyProxy"): ("envoyproxies.gateway.envoyproxy.io", True),
     ("gateway.networking.k8s.io", "Gateway"): ("gateways.gateway.networking.k8s.io", True),
     ("gateway.networking.k8s.io", "GatewayClass"): ("gatewayclasses.gateway.networking.k8s.io", False),
