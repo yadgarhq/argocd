@@ -69,11 +69,16 @@ which is what merging the PR makes main.
    Failing that verdict on every PR would make a migration unmergeable until
    C10, and a moved `yadgar-store` unmergeable for good (C10 does not lift it).
 5. E2: the commit status `pin / kind-dryrun` on the PR head sha (never the
-   merge commit, which carries no status). It counts only when it is the
-   NEWEST status of that context (GitHub lists a sha's statuses newest first),
-   its state is `success`, its creator is `github-actions[bot]`, and its
-   description names the head sha. A downgrade is exempt (`pin_dryrun.py`
-   refuses one, so its status can never exist).
+   merge commit, which carries no status). It counts only when EVERY status
+   of that context on the sha is `success`, created by `github-actions[bot]`,
+   and its description parses as `auto_pin.DESCRIPTION` with check `e2`,
+   result `green`, `sha=` the head, `main=` the merge commit's first parent
+   and a run id (yaadgaar #420: no substring match, and a forged green after
+   a red cannot win). The creator check cannot tell one argocd workflow from
+   another; the dispatch App's identity is checked on the argocd-verify run
+   itself by `auto_pin_merge.py`, which holds the token this job must not.
+   A downgrade is exempt (`pin_dryrun.py` refuses one, so its status can
+   never exist).
 
    ON AN AUTOMATIC HEAD E2 IS ALWAYS REQUIRED: a missing or non-green E2
    FAILS. C5's `auto-pin.yaml` posts `pin / kind-dryrun` on the branch head
@@ -111,6 +116,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import auto_pin  # noqa: E402  (stdlib only: the one status description form, `auto_pin.DESCRIPTION`)
 import pin_bump as pb  # after the path insert: scripts/ is not a package
 
 # Human heads only: report, do not require. An automatic head always requires E2.
@@ -146,6 +152,9 @@ class Pr:
     head_ref: str
     automatic: bool
     repository: str
+    # The base E2 must name (`main=`). `pr_of` reads the event's; `main` replaces it with
+    # the merge commit's first parent (`merge_parent`), the base this job actually renders.
+    base_sha: str = ""
 
 
 @dataclass
@@ -170,7 +179,12 @@ def pr_of(event: dict) -> Pr:
     if not SHA.match(sha):
         raise Refused(f"the event's head sha {sha!r} is not a full commit sha")
     automatic = same_repository and bool(AUTO_BRANCH.fullmatch(str(head["ref"])))
-    return Pr(sha, str(head["ref"]), automatic, repository)
+    return Pr(sha, str(head["ref"]), automatic, repository, str(base.get("sha") or ""))
+
+
+def merge_parent(repo: Path) -> str:
+    """The merge commit's first parent: the base the PR is merged onto and rendered against."""
+    return subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD^1"], capture_output=True, text=True, check=True).stdout.strip()
 
 
 def texts(repo: Path, head_sha: str) -> tuple[str, str]:
@@ -245,21 +259,43 @@ def statuses(repository: str, sha: str) -> list[dict]:
         return json.load(response)
 
 
-def e2_problem(found: list[dict], sha: str) -> str | None:
-    """None when the newest `pin / kind-dryrun` on `sha` is a green bot status naming `sha`; else why not."""
-    for status in found:
-        if status.get("context") != E2_CONTEXT:
-            continue
+def e2_problem(found: list[dict], sha: str, base: str) -> str | None:
+    """None when EVERY `pin / kind-dryrun` on `sha` is a green bot status for this head and this base; else why not.
+
+    YAAGAAR #420. Any workflow in argocd can post a status as
+    `github-actions[bot]`, so neither the creator nor the newest status can
+    decide alone. Each one must parse as `auto_pin.DESCRIPTION` exactly (no
+    substring match) with check `e2`, result `green`, `sha` the head, `main`
+    the base and a run id. A forged green therefore cannot outvote the bot's
+    red; it can only make E2 red. What binds E2 to the dispatch App is the
+    argocd-verify run itself, which `auto_pin_merge.py` reads with the
+    settled-dispatch token before it merges; this job holds no secret.
+    """
+    mine = [status for status in found if status.get("context") == E2_CONTEXT]
+    if not mine:
+        return f"no `{E2_CONTEXT}` status on {sha}"
+    for status in mine:
         state = status.get("state")
         creator = (status.get("creator") or {}).get("login")
         if state != "success":
             return f"`{E2_CONTEXT}` on {sha} is {state}"
         if creator != E2_CREATOR:
             return f"`{E2_CONTEXT}` on {sha} was created by {creator}, not {E2_CREATOR}"
-        if sha not in (status.get("description") or ""):
-            return f"`{E2_CONTEXT}` on {sha} does not name the sha it judged in its description"
-        return None
-    return f"no `{E2_CONTEXT}` status on {sha}"
+        text = str(status.get("description") or "")
+        parsed = auto_pin.parse_status_description(text)
+        if not parsed:
+            return f"`{E2_CONTEXT}` on {sha}: description {text[:160]!r} is not the form `e2 <result> sha=<40 hex> main=<40 hex> run=<id>`"
+        if parsed["check"] != "e2":
+            return f"`{E2_CONTEXT}` on {sha} carries check {parsed['check']}, not e2"
+        if parsed["result"] != "green":
+            return f"`{E2_CONTEXT}` on {sha} records result {parsed['result']}, not green"
+        if parsed["sha"] != sha:
+            return f"`{E2_CONTEXT}` on {sha} names judged sha {parsed['sha']}, not the head"
+        if parsed["main"] != base:
+            return f"`{E2_CONTEXT}` on {sha} was judged against main {parsed['main']}, not the base {base or 'unknown'}"
+        if "run" not in parsed:
+            return f"`{E2_CONTEXT}` on {sha} names no run"
+    return None
 
 
 def judge(
@@ -319,7 +355,7 @@ def judge(
             outcome.notes.append("a human pin PR: NEEDS-HUMAN reasons are reported for the human reviewer, not enforced")
 
     try:
-        problem = e2_problem(statuses_of(pr.head_sha), pr.head_sha)
+        problem = e2_problem(statuses_of(pr.head_sha), pr.head_sha, pr.base_sha)
     except Exception as error:  # noqa: BLE001  (an unreadable status is a missing status)
         problem = f"`{E2_CONTEXT}` on {pr.head_sha} could not be read ({type(error).__name__}: {error})"
     # An automatic head always requires E2: C5 posts the status before it opens the PR.
@@ -405,6 +441,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         pr = pr_of(json.loads(arguments.event.read_text()))
         base_text, head_text = texts(arguments.repo, pr.head_sha)
+        pr.base_sha = merge_parent(arguments.repo)
         changed = changed_files(arguments.repo)
         if arguments.command == "detect":
             move = move_of(base_text, head_text)

@@ -23,9 +23,11 @@ And the rules C3 carries:
   warns on a human one: a human pin PR is the human review the verdict asks
   for (argocd#139, task-db migration 7, reviewed by hand). A downgrade (a
   revert) is refused on an automatic head and warned on a human one;
-- the E2 status counts only when it is the newest `pin / kind-dryrun` on the
-  head sha, `success`, created by `github-actions[bot]`, and its description
-  names the sha.
+- the E2 status counts only when every `pin / kind-dryrun` on the head sha
+  is `success`, created by `github-actions[bot]`, and its description parses
+  exactly as `auto_pin.DESCRIPTION` with check e2, result green, the head sha,
+  the base as main and a run id (yaadgaar #420: no substring match, and a
+  forged green after the bot's red cannot win).
 """
 
 from __future__ import annotations
@@ -69,12 +71,17 @@ def moved(text: str = BASE, target: str = TARGET) -> str:
     return pb.rewrite_target_revision(text, target)[0]
 
 
-def green_status(sha: str = HEAD_SHA) -> dict:
+BASE_SHA = "a" * 40
+
+
+def green_status(sha: str = HEAD_SHA, main: str = BASE_SHA) -> dict:
+    """What `auto_pin.post_e2` posts: `auto_pin.status_description`'s exact form."""
     return {
         "context": "pin / kind-dryrun",
         "state": "success",
         "creator": {"login": "github-actions[bot]"},
-        "description": f"green for {sha}, argocd-verify run 39420396928",
+        "description": f"e2 green sha={sha} main={main} run=39420396928",
+        "target_url": "https://github.com/yadgarhq/argocd-verify/actions/runs/39420396928",
     }
 
 
@@ -367,9 +374,22 @@ def test_a_green_pin_with_its_e2_status_passes_when_required() -> None:
         ({"state": "pending"}, "pending"),
         ({"state": "failure"}, "failure"),
         ({"creator": {"login": "m-agahi"}}, "m-agahi"),
-        ({"description": "green, argocd-verify run 1"}, "does not name"),
+        ({"description": "green, argocd-verify run 1"}, "not the form"),
+        # YAAGAAR #420: the sha only as a substring of a longer text is not the sha judged.
+        ({"description": f"green for {HEAD_SHA}, argocd-verify run 39420396928"}, "not the form"),
+        ({"description": f"e2 green sha={HEAD_SHA}0 main={BASE_SHA} run=1"}, "not the form"),
+        ({"description": f"e2 green sha={'c' * 40} main={BASE_SHA} run=1 {HEAD_SHA}"}, "not the form"),
+        ({"description": f"e2 green sha={'c' * 40} main={BASE_SHA} run=1"}, "judged sha"),
+        # YAAGAAR #420: judged against another main than the base this merge commit renders.
+        ({"description": f"e2 green sha={HEAD_SHA} main={'c' * 40} run=1"}, "judged against main"),
+        ({"description": f"e1 accept sha={HEAD_SHA} main={BASE_SHA}"}, "check e1"),
+        ({"description": f"e2 red sha={HEAD_SHA} main={BASE_SHA} run=1"}, "result red"),
+        ({"description": f"e2 green sha={HEAD_SHA} main={BASE_SHA}"}, "no run"),
     ],
-    ids=["pending", "failure", "wrong-creator", "sha-not-named"],
+    ids=[
+        "pending", "failure", "wrong-creator", "free-text", "sha-substring", "sha-with-suffix", "sha-trailing",
+        "other-sha", "wrong-main", "wrong-check", "red-result", "no-run",
+    ],
 )
 def test_an_e2_status_that_is_not_a_green_bot_status_for_this_sha_fails_when_required(change: dict, expected: str) -> None:
     outcome, _ = judge("event-auto.json", moved(), statuses=[{**green_status(), **change}], required=True)
@@ -377,11 +397,42 @@ def test_an_e2_status_that_is_not_a_green_bot_status_for_this_sha_fails_when_req
     assert any(expected in f for f in outcome.failures), outcome.failures
 
 
-def test_the_newest_e2_status_decides() -> None:
+def test_a_red_after_a_green_is_red() -> None:
     """GitHub lists a sha's statuses newest first: a red after a green is red."""
     statuses = [{**green_status(), "state": "failure"}, green_status()]
     outcome, _ = judge("event-auto.json", moved(), statuses=statuses, required=True)
     assert not outcome.passed
+
+
+def test_a_forged_green_after_a_red_is_refused() -> None:
+    """YAAGAAR #420: any workflow in argocd can post a status as `github-actions[bot]`.
+
+    So the newest status cannot decide alone: a green posted after the bot's
+    red would turn E2 green. EVERY `pin / kind-dryrun` on the sha must be a
+    green for this head and this base, so a forgery can only make E2 red.
+    """
+    statuses = [green_status(), {**green_status(), "state": "failure", "description": f"e2 red sha={HEAD_SHA} main={BASE_SHA} run=1"}]
+    outcome, _ = judge("event-auto.json", moved(), statuses=statuses, required=True)
+    assert not outcome.passed
+    assert any("failure" in f for f in outcome.failures), outcome.failures
+
+
+def test_two_agreeing_greens_pass() -> None:
+    outcome, _ = judge("event-auto.json", moved(), statuses=[green_status(), green_status()], required=True)
+    assert outcome.passed, outcome.failures
+
+
+def test_main_sets_the_base_to_the_merge_commits_first_parent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The base E2 must name is the one this merge commit renders (HEAD^1), not the event's."""
+    seen: list = []
+    monkeypatch.setattr(pe, "texts", lambda repo, sha: (BASE, moved()))
+    monkeypatch.setattr(pe, "changed_files", lambda repo: list(pb.MECHANICAL_FILES))
+    monkeypatch.setattr(pe, "merge_parent", lambda repo: "c" * 40)
+    monkeypatch.setattr(pe, "judge", lambda pr, *a, **k: seen.append(pr.base_sha) or pe.Outcome())
+    event_file = tmp_path / "event.json"
+    event_file.write_text(json.dumps(event("event-auto.json")))
+    assert pe.main(["judge", "--event", str(event_file)]) == 0
+    assert seen == ["c" * 40]
 
 
 def test_other_contexts_are_not_the_e2_status() -> None:
