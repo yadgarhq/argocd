@@ -1084,6 +1084,139 @@ def test_a_dropped_repository_names_it() -> None:
     assert registry_failures(registry) == {"projects": {"missing": ["yadgarhq/docs"], "extra": [], "sourceRepo": []}}
 
 
+# ── THE TEAMS AND GRANTS (team access stage 9, plans/team-access.md; ADR-0962, ADR-0966) ──
+
+# Ruling 5 made mechanical, plus ADR-0966 B: `administrators` is Max alone and
+# holds `readWrite` on both roots; `estate-runners` is the probe user and the
+# smoke user and holds `readWrite` on `estate` only. The probe user is never in
+# `administrators`. A member is the `account_segment` GET /auth/whoami answers
+# (ADR-0954, ADR-0959): a lowercase canonical uuidv7. The committed values hold
+# PLACEHOLDERS until Max writes the three real ones, and this pin refuses every
+# placeholder, so the declaration cannot merge unfilled.
+TEAM_MEMBER_COUNTS = {"administrators": 1, "estate-runners": 2}
+TEAM_ROOT_GRANTS = {
+    "yadgarhq": {("administrators", "readWrite")},
+    "estate": {("administrators", "readWrite"), ("estate-runners", "readWrite")},
+}
+UUIDV7 = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+
+
+def team_failures(registry: object) -> dict[str, object]:
+    """Every way the declared teams and grants differ from the ruling above."""
+    if not isinstance(registry, dict):
+        return {"seeder.registry": registry}
+    failures: dict[str, object] = {}
+    teams = {t.get("name"): list(t.get("members") or []) for t in registry.get("teams") or []}
+    if sorted(teams) != sorted(TEAM_MEMBER_COUNTS):
+        failures["teams"] = sorted(map(str, teams))
+    for name, count in TEAM_MEMBER_COUNTS.items():
+        members = teams.get(name, [])
+        if len(members) != count or len(set(members)) != len(members):
+            failures[f"teams[{name}].members"] = f"{len(members)} listed, {count} expected, no duplicates"
+        bad = sorted(m for m in members if not (isinstance(m, str) and UUIDV7.fullmatch(m)))
+        if bad:
+            failures[f"teams[{name}].members not a lowercase uuidv7"] = bad
+    overlap = sorted(set(teams.get("administrators", [])) & set(teams.get("estate-runners", [])))
+    if overlap:
+        failures["estate-runners members also in administrators (ADR-0966 B)"] = overlap
+    roots = {
+        r.get("path"): {(g.get("team"), g.get("level")) for g in r.get("grants") or []} for r in registry.get("roots") or []
+    }
+    if roots != TEAM_ROOT_GRANTS:
+        failures["roots[].grants"] = {k: sorted(v) for k, v in roots.items()}
+    granted = sorted(p.get("path") for p in registry.get("projects") or [] if p.get("grants"))
+    if granted:
+        failures["projects[].grants (a project inherits its root's grants)"] = granted
+    if registry.get("allowMassRevoke") is not False:
+        failures["allowMassRevoke"] = registry.get("allowMassRevoke")
+    return failures
+
+
+def with_real_members(registry: dict) -> dict:
+    """The committed declaration, its placeholder members swapped for well-formed ones."""
+    registry = json.loads(json.dumps(registry))
+    n = 0
+    for team in registry["teams"]:
+        team["members"] = [f"0192f0a0-0000-7000-8000-{n + i:012x}" for i, _ in enumerate(team["members"])]
+        n += len(team["members"])
+    return registry
+
+
+def test_the_declared_teams_and_grants_are_the_ruling_with_real_uuids() -> None:
+    assert team_failures(declared_registry()) == {}
+
+
+def test_the_declaration_is_the_ruling_once_the_placeholders_are_filled() -> None:
+    # The shape alone, so a red above names the placeholders and nothing else.
+    assert team_failures(with_real_members(declared_registry())) == {}
+
+
+def test_a_placeholder_member_is_refused() -> None:
+    registry = with_real_members(declared_registry())
+    registry["teams"][0]["members"] = ["PLACEHOLDER-max-account-segment"]
+    assert team_failures(registry) == {
+        "teams[administrators].members not a lowercase uuidv7": ["PLACEHOLDER-max-account-segment"]
+    }
+
+
+def test_an_uppercase_or_non_v7_member_is_refused() -> None:
+    registry = with_real_members(declared_registry())
+    registry["teams"][0]["members"] = ["0192F0A0-0000-7000-8000-000000000000"]
+    assert "teams[administrators].members not a lowercase uuidv7" in team_failures(registry)
+    registry["teams"][0]["members"] = ["0192f0a0-0000-4000-8000-000000000000"]
+    assert "teams[administrators].members not a lowercase uuidv7" in team_failures(registry)
+
+
+def test_the_probe_user_in_administrators_names_it() -> None:
+    registry = with_real_members(declared_registry())
+    probe = registry["teams"][1]["members"][0]
+    registry["teams"][0]["members"].append(probe)
+    failures = team_failures(registry)
+    assert failures["estate-runners members also in administrators (ADR-0966 B)"] == [probe]
+
+
+def test_a_dropped_root_grant_names_it() -> None:
+    registry = with_real_members(declared_registry())
+    registry["roots"][1]["grants"] = [{"team": "administrators", "level": "readWrite"}]
+    assert list(team_failures(registry)) == ["roots[].grants"]
+
+
+def test_a_read_only_administrators_grant_names_it() -> None:
+    registry = with_real_members(declared_registry())
+    registry["roots"][0]["grants"] = [{"team": "administrators", "level": "read"}]
+    assert list(team_failures(registry)) == ["roots[].grants"]
+
+
+def test_estate_runners_on_yadgarhq_names_it() -> None:
+    registry = with_real_members(declared_registry())
+    registry["roots"][0]["grants"].append({"team": "estate-runners", "level": "readWrite"})
+    assert list(team_failures(registry)) == ["roots[].grants"]
+
+
+def test_a_grant_on_a_project_names_it() -> None:
+    registry = with_real_members(declared_registry())
+    registry["projects"][0]["grants"] = [{"team": "estate-runners", "level": "read"}]
+    assert list(team_failures(registry)) == ["projects[].grants (a project inherits its root's grants)"]
+
+
+def test_a_mass_revoke_flag_names_it() -> None:
+    registry = with_real_members(declared_registry())
+    registry["allowMassRevoke"] = True
+    assert team_failures(registry) == {"allowMassRevoke": True}
+
+
+def test_the_seeder_names_iams_ca_secret_once_teams_are_declared() -> None:
+    # Stage 6 (seeder chart): no default, ADR-0854. iam's serving authority is `iam-tls`.
+    values = committed()["spec"]["source"]["helm"]["valuesObject"]["seeder"]
+    assert values["registry"]["teams"], "the pin is meaningful only while teams are declared"
+    assert values["iam"]["tls"]["caSecret"] == "iam-tls"
+
+
+def test_the_rendered_registry_carries_the_teams_and_grants(rendered: list) -> None:
+    configmap = next(d for d in rendered if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "seeder-registry")
+    assert team_failures(json.loads(configmap["data"]["registry.json"])) == {}
+
+
 # ── THE BROKER'S TLS LISTENER (B-N4.1, B-N5, ledger 925, ADR-0852) ───────────
 
 # The broker's side of the NATS hop, stated beside the two clients' side above.
