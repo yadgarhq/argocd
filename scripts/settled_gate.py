@@ -995,7 +995,17 @@ def find_verdict(github, repository: str, workflow_path: str, epoch: dict, *, ex
 
     The same filters `verify.yaml` applies to its baseline: this repository and
     head repository, the default branch, this workflow's path, a `schedule` or
-    `workflow_dispatch` run, not expired. NOT the run's conclusion: a red
+    `workflow_dispatch` run, not expired. The run's `head_sha` must be the
+    default branch head or an ancestor of it: a TAG named like the default
+    branch reports the same `head_branch`, so the name alone proves nothing.
+
+    LIMITS, stated so nobody reads this as more than it is. The check proves
+    ANCESTRY, not the ref type: a tag `main` that points at an ancestor of the
+    default branch still passes (yaadgaar #165 is narrowed, not closed). A
+    rejected tag run still takes one of the `MAX_VERDICT_CANDIDATES` slots, so
+    enough tag runs can crowd real verdicts out; that fails closed (no verdict
+    found, the gate re-runs), as a denial of service and not a bypass. The
+    reads need Contents: read on `repository` (`branches/`, `compare/`). NOT the run's conclusion: a red
     verdict's run may conclude failure, and a red verdict is still the
     verdict. `settled-trial` is never read.
     """
@@ -1016,12 +1026,14 @@ def find_verdict(github, repository: str, workflow_path: str, epoch: dict, *, ex
         key=lambda a: utc(a["created_at"]),
         reverse=True,
     )
+    default_head = _branch_head(github, repository, own["default_branch"]) if candidates else None
     for candidate in candidates[:MAX_VERDICT_CANDIDATES]:
         run = github.get(f"/repos/{repository}/actions/runs/{candidate['workflow_run']['id']}")
         if (
             run.get("path") != workflow_path
             or run.get("event") not in VERDICT_EVENTS
             or (run.get("head_repository") or {}).get("id") != own["id"]
+            or not _on_branch_head(github, repository, default_head, run.get("head_sha"))
         ):
             continue
         verdict = _read_verdict(github.download(candidate["archive_download_url"]))
@@ -1030,24 +1042,44 @@ def find_verdict(github, repository: str, workflow_path: str, epoch: dict, *, ex
     return None
 
 
+def _branch_head(github, repository: str, branch: str) -> str:
+    """The head sha of a BRANCH. `branches/{name}` never resolves a tag of the same name."""
+    sha = (github.get(f"/repos/{repository}/branches/{quote(branch, safe='/')}").get("commit") or {}).get("sha")
+    if not isinstance(sha, str) or not FULL_SHA.fullmatch(sha):
+        raise InfrastructureError(f"branch {branch!r} of {repository} reports no full head sha")
+    return sha
+
+
+def _on_branch_head(github, repository: str, head: str, sha) -> bool:
+    """True when `sha` is `head` or an ancestor of it. Both sides are shas, never names."""
+    if not isinstance(sha, str) or not FULL_SHA.fullmatch(sha):
+        return False
+    try:
+        status = github.get(f"/repos/{repository}/compare/{head}...{sha}").get("status")
+    except GitHubError as error:
+        if error.status == 404:
+            return False
+        raise
+    return status in {"behind", "identical"}
+
+
 def reachable(github, repository: str, sha: str) -> str | None:
     """The first branch of `repository` that contains `sha`, or None.
 
-    `compare/{branch}...{sha}` reads `behind` or `identical` exactly when `sha`
-    is an ancestor of (or is) the branch head. Never `commits/{sha}`: GitHub
+    `compare/{branch head sha}...{sha}` reads `behind` or `identical` exactly
+    when `sha` is an ancestor of (or is) the branch head. The base is the head
+    sha from the branch listing, never the bare name: a tag `refs/tags/main`
+    resolves before the branch `main`. Never `commits/{sha}`: GitHub
     serves commits from the whole fork network through the parent's API, so a
     fork-only sha resolves there. A 404 compare means "not on this branch".
     """
     if not FULL_SHA.fullmatch(sha):
         raise InfrastructureError(f"{sha!r} is not a full 40-hex commit sha")
     for branch in github.paginate(f"/repos/{repository}/branches"):
-        try:
-            status = github.get(f"/repos/{repository}/compare/{quote(branch['name'], safe='/')}...{sha}").get("status")
-        except GitHubError as error:
-            if error.status == 404:
-                continue
-            raise
-        if status in {"behind", "identical"}:
+        head = (branch.get("commit") or {}).get("sha")
+        if not isinstance(head, str) or not FULL_SHA.fullmatch(head):
+            continue
+        if _on_branch_head(github, repository, head, sha):
             return branch["name"]
     return None
 

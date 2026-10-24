@@ -31,9 +31,13 @@ WHAT IS ASSERTED, and each has a red case below:
      this repository's default branch and this workflow's path, whatever the
      run's conclusion; it ignores other branches, fork head repositories,
      `settled-trial`, other workflows, other events and expired artifacts.
-  7. `reachable` accepts a sha only when `compare/{branch}...{sha}` says
-     `behind` or `identical` for some branch, and never asks `commits/{sha}`,
-     which GitHub answers from the whole fork network.
+  7. `reachable` accepts a sha only when `compare/{branch head sha}...{sha}`
+     says `behind` or `identical` for some branch, and never asks
+     `commits/{sha}`, which GitHub answers from the whole fork network. It
+     never compares by branch NAME: a tag of the same name resolves first.
+  8. `find-verdict` also requires the run's `head_sha` to be the default
+     branch head or an ancestor of it. A run on a TAG named like the default
+     branch reports the same `head_branch`; its sha is not on the branch.
 """
 
 from __future__ import annotations
@@ -744,14 +748,22 @@ def artifact(artifact_id: int, created: str, *, name="settled-verdict", branch="
     }
 
 
-def workflow_run(run_id: int, *, path=WORKFLOW, event="schedule", head_repo=SELF_ID, conclusion="success") -> dict:
-    return {"id": run_id, "path": path, "event": event, "conclusion": conclusion, "head_repository": {"id": head_repo}}
+MAIN_HEAD = "a" * 40
+RUN_SHA = "b" * 40
+TAG_SHA = "c" * 40
+
+
+def workflow_run(run_id: int, *, path=WORKFLOW, event="schedule", head_repo=SELF_ID, conclusion="success", head_sha=RUN_SHA) -> dict:
+    return {"id": run_id, "path": path, "event": event, "conclusion": conclusion, "head_repository": {"id": head_repo}, "head_sha": head_sha}
 
 
 def github_with(artifacts: list[dict], runs: dict[int, dict], zips: dict[int, bytes]) -> FakeGitHub:
     responses = {
         "/repos/yadgarhq/argocd-verify": {"id": SELF_ID, "default_branch": "main"},
         "/repos/yadgarhq/argocd-verify/actions/artifacts?name=settled-verdict": {"artifacts": artifacts},
+        "/repos/yadgarhq/argocd-verify/branches/main": {"name": "main", "commit": {"sha": MAIN_HEAD}},
+        f"/repos/yadgarhq/argocd-verify/compare/{MAIN_HEAD}...{RUN_SHA}": {"status": "behind"},
+        f"/repos/yadgarhq/argocd-verify/compare/{MAIN_HEAD}...{TAG_SHA}": {"status": "diverged"},
     }
     responses.update({f"/repos/yadgarhq/argocd-verify/actions/runs/{rid}": run_ for rid, run_ in runs.items()})
     return FakeGitHub(responses, {f"https://api/zip/{aid}": data for aid, data in zips.items()})
@@ -834,6 +846,59 @@ def test_find_verdict_ignores_an_ineligible_artifact(bad_artifact: dict, bad_run
     assert "https://api/zip/9" not in github.requested
 
 
+def test_find_verdict_rejects_a_run_on_a_tag_named_like_the_default_branch() -> None:
+    """A tag `main` reports head_branch `main`. Its sha is not on the branch, so its verdict is not read."""
+    github = github_with(
+        [artifact(1, "2026-10-03T10:00:00Z"), artifact(9, "2026-10-03T12:00:00Z")],
+        {10: workflow_run(10), 90: workflow_run(90, head_sha=TAG_SHA)},
+        {1: verdict_zip(EPOCH, "green"), 9: verdict_zip(EPOCH, "green")},
+    )
+    found = find(github)
+    assert found["artifact_id"] == 1
+    assert "https://api/zip/9" not in github.requested
+
+
+def test_find_verdict_answers_none_when_only_a_tag_run_names_the_epoch() -> None:
+    github = github_with([artifact(9, "2026-10-03T12:00:00Z")], {90: workflow_run(90, head_sha=TAG_SHA)}, {9: verdict_zip(EPOCH)})
+    assert find(github) is None
+
+
+def test_find_verdict_accepts_a_run_at_the_default_branch_head() -> None:
+    github = github_with([artifact(1, "2026-10-03T10:00:00Z")], {10: workflow_run(10, head_sha=MAIN_HEAD)}, {1: verdict_zip(EPOCH)})
+    github.responses[f"/repos/yadgarhq/argocd-verify/compare/{MAIN_HEAD}...{MAIN_HEAD}"] = {"status": "identical"}
+    assert find(github)["artifact_id"] == 1
+
+
+@pytest.mark.parametrize("sha", [None, "", "main", "b" * 12])
+def test_find_verdict_skips_a_run_without_a_full_head_sha(sha) -> None:
+    github = github_with([artifact(1, "2026-10-03T10:00:00Z")], {10: workflow_run(10, head_sha=sha)}, {1: verdict_zip(EPOCH)})
+    assert find(github) is None
+
+
+@pytest.mark.parametrize("branch_answer", [{"name": "main"}, {"name": "main", "commit": {}}, {"name": "main", "commit": {"sha": "a" * 12}}, {"name": "main", "commit": {"sha": None}}])
+def test_find_verdict_refuses_a_default_branch_answer_without_a_full_sha(branch_answer: dict) -> None:
+    github = github_with([artifact(1, "2026-10-03T10:00:00Z")], {10: workflow_run(10)}, {1: verdict_zip(EPOCH)})
+    github.responses["/repos/yadgarhq/argocd-verify/branches/main"] = branch_answer
+    with pytest.raises(sg.InfrastructureError):
+        find(github)
+
+
+def test_find_verdict_cli_exits_3_when_the_default_branch_reports_no_sha(tmp_path: Path) -> None:
+    github = github_with([artifact(1, "2026-10-03T10:00:00Z")], {10: workflow_run(10)}, {1: verdict_zip(EPOCH)})
+    github.responses["/repos/yadgarhq/argocd-verify/branches/main"] = {"name": "main"}
+    out = tmp_path / "found.json"
+    argv = ["find-verdict", "--repository", "yadgarhq/argocd-verify", "--key", EPOCH["key"], "--anchor", S, "--out", str(out)]
+    assert sg.main(argv, github=github) == 3
+    assert not out.exists()
+
+
+def test_find_verdict_compares_shas_never_names() -> None:
+    github = github_with([artifact(1, "2026-10-03T10:00:00Z")], {10: workflow_run(10)}, {1: verdict_zip(EPOCH)})
+    find(github)
+    compares = [p for p in github.requested if "/compare/" in p]
+    assert compares == [f"/repos/yadgarhq/argocd-verify/compare/{MAIN_HEAD}...{RUN_SHA}"]
+
+
 def test_find_verdict_never_trusts_a_verdict_without_its_epoch() -> None:
     github = github_with([artifact(1, "2026-10-03T10:00:00Z")], {10: workflow_run(10)}, {1: b"not a zip"})
     with pytest.raises(sg.InfrastructureError):
@@ -862,10 +927,14 @@ def test_find_verdict_cli_api_error_exits_3(tmp_path: Path) -> None:
 # ── 7. reachable ─────────────────────────────────────────────────────────────
 
 
+def head_of(branch: str) -> str:
+    return (branch.encode().hex() * 40)[:40]
+
+
 def reach(branches: list[str], compare: dict[str, object]) -> FakeGitHub:
-    responses = {"/repos/yadgarhq/argocd/branches": [{"name": b} for b in branches]}
+    responses = {"/repos/yadgarhq/argocd/branches": [{"name": b, "commit": {"sha": head_of(b)}} for b in branches]}
     for branch, status in compare.items():
-        path = f"/repos/yadgarhq/argocd/compare/{branch}...{TRIAL}"
+        path = f"/repos/yadgarhq/argocd/compare/{head_of(branch)}...{TRIAL}"
         responses[path] = status if isinstance(status, Exception) else {"status": status}
     responses[f"/repos/yadgarhq/argocd/commits/{TRIAL}"] = {"sha": TRIAL}
     return FakeGitHub(responses)
@@ -886,6 +955,14 @@ def test_a_fork_only_sha_is_refused_and_commits_is_never_asked() -> None:
 def test_a_sha_ahead_of_every_branch_is_refused() -> None:
     github = reach(["main"], {"main": "ahead"})
     assert sg.reachable(github, "yadgarhq/argocd", TRIAL) is None
+
+
+def test_a_tag_named_like_a_branch_cannot_make_a_sha_reachable() -> None:
+    """The compare uses the branch head sha, never the name `main`, which a tag `main` would shadow."""
+    github = reach(["main"], {"main": "diverged"})
+    github.responses[f"/repos/yadgarhq/argocd/compare/main...{TRIAL}"] = {"status": "behind"}
+    assert sg.reachable(github, "yadgarhq/argocd", TRIAL) is None
+    assert not any("/compare/main..." in path for path in github.requested), github.requested
 
 
 def test_a_compare_404_means_not_on_that_branch() -> None:
