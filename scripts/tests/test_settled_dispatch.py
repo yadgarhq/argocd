@@ -150,7 +150,11 @@ class FakeGitHub:
         if path == RUNS:
             return {"workflow_runs": self.runs}
         if path == f"/repos/{REPO}/actions/runs/77":
-            return {"id": 77, "path": WORKFLOW, "event": "workflow_dispatch", "head_repository": {"id": SELF_ID}}
+            return {"id": 77, "path": WORKFLOW, "event": "workflow_dispatch", "head_repository": {"id": SELF_ID}, "head_sha": "b" * 40}
+        if path == f"/repos/{REPO}/branches/main":
+            return {"name": "main", "commit": {"sha": "a" * 40}}
+        if path == f"/repos/{REPO}/compare/{'a' * 40}...{'b' * 40}":
+            return {"status": "behind"}
         raise sg.GitHubError(404, path)
 
     def paginate(self, path: str, key: str | None = None) -> list:

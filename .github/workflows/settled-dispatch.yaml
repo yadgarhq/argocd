@@ -85,6 +85,8 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: argocd-verify
           permission-actions: write
+          # find_verdict reads branches/<default> and compare/... on the private argocd-verify.
+          permission-contents: read
 
       - name: dispatch until judged, slice 1
         id: slice1
@@ -108,6 +110,8 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: argocd-verify
           permission-actions: write
+          # find_verdict reads branches/<default> and compare/... on the private argocd-verify.
+          permission-contents: read
 
       # Slice 2 reaches past the worst-case window, so it ends done (exit 0
       # with a verdict, exit 1 with none) and never hands on.
