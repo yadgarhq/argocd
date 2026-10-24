@@ -76,3 +76,12 @@ def test_the_seeder_declares_nothing_under_the_reserved_local_root() -> None:
 
 def test_the_not_member_claim_is_undeclared() -> None:
     assert nearest(pp.NOT_MEMBER_CLAIM) is None
+
+
+def test_the_no_grant_claim_is_a_declared_row_outside_the_probe_users_grants() -> None:
+    # The probe user is in `estate-runners`, which grants `estate` only (ADR-0966 B),
+    # so a declared `yadgarhq/...` row is one it holds no grant on.
+    assert pp.NO_GRANT_CLAIM.lower() in declared()
+    assert pp.NO_GRANT_CLAIM.split("/")[0] == "yadgarhq"
+    assert not any(pp.NO_GRANT_CLAIM.lower().startswith(f"{p['path'].lower()}/") for p in registry().get("projects", [])
+                   if p.get("grants"))
