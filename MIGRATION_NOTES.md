@@ -8526,3 +8526,72 @@ iam-db 0.12.1 and project-db 0.8.4 against a newer schema, and their
 Revert only if no `-db` pod on the new image has logged a migration. If
 `yadgar`'s operation is Running or retrying, first run (NEEDS-MAX)
 `argocd app terminate-op yadgar`.
+
+## The yadgar pin moves to parent chart 0.47.0: gateway 0.14.0 (team access stage 3b) and store release B
+
+A pin bump with no migration and no platform move. It moves
+`applications/yadgar.yaml`'s `targetRevision` from 0.46.13 to 0.47.0,
+`scripts/chart_pin.json` to `v0.47.0` (`platform_version` stays 0.2.9), and
+regenerates `scripts/gates/yadgar_render.sha256`. `valuesObject` does not
+change.
+
+| Module     | From   | To         | Carries                                                                                                                                                                                                                                                                                                                             |
+| ---------- | ------ | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| gateway    | 0.13.2 | **0.14.0** | gateway#139 (team access stage 3b): bootstrap `create-user` `user_id` arm with the echo check, `adminBootstrap.refusePreMintedUserId` (renders `YADGAR_ADMIN_REFUSE_PRE_MINTED_USER_ID="0"`), per-route `FAILED_PRECONDITION` bodies (yaadgaar #202), bootstrap `issue-enrolment` carries `revoke_existing_credentials` (ADR-1014). |
+| iam-db     | 0.15.2 | **0.15.3** | iam-db#108: `yadgar-store` v0.6.0, release B. No migration.                                                                                                                                                                                                                                                                         |
+| project-db | 0.10.4 | **0.10.5** | project-db#82: `yadgar-store` v0.6.0, release B. No migration.                                                                                                                                                                                                                                                                      |
+| task-db    | 0.11.3 | **0.11.4** | task-db#105: `yadgar-store` v0.6.0, release B. No migration.                                                                                                                                                                                                                                                                        |
+
+Every other module is unchanged: config 0.2.2, iam 0.17.3, project 0.5.3,
+task 0.8.2, seeder 0.2.2, platform 0.2.9.
+
+**Store release B (yaadgaar #368, ADR-1006).** v0.6.0 takes only the
+per-database migration lock. Release A (v0.5.0, live on all three `-db` since
+the 0.46.13 pin) takes the legacy lock and then the per-database lock, so old
+(A) and new (B) pods still serialise on the per-database lock during the roll.
+Each module's `vA..vB` range is the single store-bump commit (2 files, 3 lines).
+
+**The gateway with iam's setting off (today).** `IAM_ADMIN_FROM_TEAM` stays
+`false`, so iam refuses every bootstrap `create-user` with a `user_id`
+`FAILED_PRECONDITION`, before any store call, and gateway 0.14.0 answers the
+opaque 503. The bootstrap `issue-enrolment` with `revoke_existing_credentials`
+is refused by iam-db `INVALID_ARGUMENT` before any write (opaque 503).
+
+**Measured 2026-10-25 (ADR-0881 dry run, by hand).** helm v3.18.4 through the
+gates' `parent_render` (the file's `valuesObject`, kind-yadgar's
+`api-versions`), 13 hook objects left out, Argo's tracking-id added;
+`kubectl --context kind-yadgar -n yadgar diff -f` per object:
+
+- 0.46.13: 82 objects, all empty (zero-diff baseline).
+- 0.47.0: 82 objects, 78 empty. Four Deployments differ: gateway in `image`
+  and one added env entry (`YADGAR_ADMIN_REFUSE_PRE_MINTED_USER_ID: "0"`),
+  iam-db, project-db and task-db in `image` alone; each also in
+  `metadata.generation`. `Job/seeder` is unchanged.
+- Every new image digest equals its GHCR tag digest (`skopeo inspect
+--no-creds`): gateway `ad004426…` (0.14.0), iam-db `ff47b097…` (0.15.3),
+  project-db `23fef58e…` (0.10.5), task-db `8db4f954…` (0.11.4).
+- Live schema before the roll: iam-db at migration 21, project-db at 7,
+  task-db at 7.
+
+### After the roll — read-only
+
+```bash
+# 1. yadgar is Synced/Healthy at 0.47.0.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.status.sync.revision} {.status.sync.status} {.status.health.status}{"\n"}'
+
+# 2. The four moved Deployments run their new digests, with no restarts.
+kubectl --context kind-yadgar -n yadgar get pods \
+  -o 'custom-columns=NAME:.metadata.name,RESTARTS:.status.containerStatuses[0].restartCount,IMAGEID:.status.containerStatuses[0].imageID'
+
+# 3. The schema did not move: iam-db 21, project-db 7, task-db 7.
+kubectl --context kind-yadgar -n yadgar logs -l app=iam-db --tail=-1 | grep 'schema at migration'
+
+# 4. The settled gate ran green on this merge's epoch.
+gh-personal api 'repos/yadgarhq/argocd-verify/actions/workflows/settled.yaml/runs?event=workflow_dispatch&per_page=5' \
+  --jq '.workflow_runs[] | [.id, .event, .triggering_actor.login, .created_at, .conclusion] | @tsv'
+```
+
+**Rollback: a revert of this merge.** No migration ran, and the `-db` modules
+go back to release A, which still takes the per-database lock. The gateway
+goes back to 0.13.2, whose chart does not render the new env variable.
