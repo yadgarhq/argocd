@@ -581,6 +581,15 @@ spec:
               - path: estate/smoke
                 displayName: estate smoke
                 sourceRepo: yadgarhq/estate
+              # NO REPOSITORY, AND DECLARED ONLY UNTIL THE SEEDER HAS INSERTED IT (team
+              # access stage 9 step 3; ADR-0966: the probe's archived arm moves under
+              # `estate/`, where `estate-runners` holds its grant). The next registry
+              # change removes this entry so the seeder ARCHIVES the row (ADR-0934), and
+              # `project_probe.py --leg-c` then moves its archived arm here. Archiving 1
+              # of 27 active org rows does not trip the guard (ADR-0939).
+              - path: estate/probe-archived
+                displayName: probe-archived (leg (c) probe, archived on purpose)
+                sourceRepo: yadgarhq/argocd
               # ABSENT ON PURPOSE: `yadgarhq/probe-archived` (ledger 1624, Max's ruling).
               # No repository: the pre-flip gate's leg (c) probe row. argocd#112 declared
               # it once so the seeder inserted it; leaving it out here makes the seeder

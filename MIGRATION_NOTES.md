@@ -8659,3 +8659,49 @@ kubectl --context kind-yadgar -n yadgar get clienttrafficpolicy edge-request-hea
 (NEEDS-MAX): `kubectl --context kind-yadgar -n yadgar delete clienttrafficpolicy edge-request-headers`.
 If `yadgar`'s operation is Running or retrying, first run (NEEDS-MAX)
 `argocd app terminate-op yadgar`.
+
+## The seeder declares `estate/probe-archived`, step 1 of 2 of moving the leg (c) ARCHIVED probe row under `estate/` (team access stage 9 step 3)
+
+**What the merge does.** It adds one project to `seeder.registry` in
+`applications/yadgar.yaml`: `estate/probe-archived` (sourceRepo
+`yadgarhq/argocd`), under the root `estate`. It is no repository. ADR-0966
+moves the probe's archived arm under `estate/`, where `estate-runners` (the
+probe user's team) holds its grant, so the probe user needs no grant on
+`yadgarhq`. Step 2, a later PR, removes the line, and the seeder then archives
+the row (ADR-0934). Only after the row reads `ARCHIVED` does a third PR move
+`ARCHIVED_CLAIM` in `project_probe.py`. `yadgarhq/probe-archived` stays
+archived and undeclared. The pin does not move.
+
+Measured 2026-10-25 (helm 3.18.4):
+
+- `yadgar`: 96 → 96 objects in the K3 table. One changed:
+  `ConfigMap/seeder-registry`, whose `registry.json` gains the one project.
+- Server-side `kubectl diff` against `kind-yadgar` (ADR-0881), tracking
+  annotation added, the 13 hook objects left out, all 83 objects. At
+  `origin/main`: empty diff. On this branch: `ConfigMap/seeder-registry` only.
+
+**What runs.** Argo syncs the ConfigMap. `Replace=true,Force=true` deletes and
+re-creates `Job/seeder`, which sends `SyncTeams` (every team and member
+`unchanged`) and then the declaration: `inserted 1`, `unchanged 25`, grants
+`unchanged 3`. Nothing archives. Within one registry poll (60 s) the gateways
+load the new path.
+
+### After this merge, read-only
+
+```bash
+# 1. yadgar Synced/Healthy.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+
+# 2. The seeder inserted the row. Expect inserted 1, archived 0, unchanged 25.
+kubectl --context kind-yadgar -n yadgar logs job/seeder | tail -1
+```
+
+If step 2 still shows the previous run (no insert), the Job was not
+re-created. NEEDS-MAX: `argocd app sync yadgar`.
+
+### Rollback
+
+Revert. The next sync then omits the path, and the seeder ARCHIVES the row,
+which is step 2's outcome anyway. An archived row is never deleted
+(ADR-0934).
