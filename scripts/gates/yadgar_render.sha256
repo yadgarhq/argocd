@@ -4,7 +4,7 @@ targetRevision  0.47.5
 2355fad035bd3696b4fc741ed21eba814d3f4941a75fa16fb16cc73d4a4f0696  /ConfigMap//audit
 d19a8a2ae018718b5fd1626dade2ec71e47cd2516e203491e319a02e4dab0968  /ConfigMap//gateway-knobs
 a2f6a8433dcff0b94a6031f1dd4f4f2e8dacbcdc77802163b6221755c4b93173  /ConfigMap//nats-config
-806533fa00533668c4b581b15b9b43384684ccdc77579bb8dbe38a6212c3f5a2  /ConfigMap//seeder-registry
+c41e7b572b4d8807db7c068c50c5c9f334e4bf261f274dd7c4f50c22c9ca647e  /ConfigMap//seeder-registry
 d02e53254e0bbef174ebc63af6acf6b3b3e2435f0bf57c6dfd1f20d8542ba7a0  /ConfigMap//shared
 a1e3033465306b15522eb8259b8d756c5378bb7f1722ee3edc62239181c3e72c  /Service//gateway
 1f9f9e9e22cce6ab3fafa55822a51d7f3fbf0c79371866313a380424eb91e359  /Service//iam

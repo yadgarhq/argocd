@@ -1001,14 +1001,8 @@ DECLARED_REPOSITORIES = (
 # The namespace anchors (ADR-0673) and the estate's one landing path, ledger
 # 1244 option B: smoke runs claim `estate/smoke`, a project under the root
 # `estate`, because the store refuses a root that contains `/`.
-#
-# `estate/probe-archived` is NO REPOSITORY. It is the leg (c) probe's archived
-# row moving under `estate/` (team access stage 9 step 3, ADR-0966): declared
-# once so the seeder inserts it, then removed by the next registry change so
-# the seeder ARCHIVES it (ADR-0934). Its `sourceRepo` is this repository,
-# whose PR flow declares and removes it.
 DECLARED_ROOTS = {"yadgarhq": "yadgarhq/argocd", "estate": "yadgarhq/estate"}
-DECLARED_EXTRA_PROJECTS = {"estate/smoke": "yadgarhq/estate", "estate/probe-archived": "yadgarhq/argocd"}
+DECLARED_EXTRA_PROJECTS = {"estate/smoke": "yadgarhq/estate"}
 # ARCHIVED ON PURPOSE, AND THEREFORE NEVER DECLARED AGAIN (ledger 1624, Max's
 # ruling). `yadgarhq/probe-archived` is no repository: it is the pre-flip
 # gate's leg (c) probe row. argocd#112 declared it once so the seeder inserted

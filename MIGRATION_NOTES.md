@@ -8705,3 +8705,38 @@ re-created. NEEDS-MAX: `argocd app sync yadgar`.
 Revert. The next sync then omits the path, and the seeder ARCHIVES the row,
 which is step 2's outcome anyway. An archived row is never deleted
 (ADR-0934).
+
+## The seeder archives `estate/probe-archived`, step 2 of 2 of moving the leg (c) ARCHIVED probe row under `estate/` (team access stage 9 step 3)
+
+**Merge only after step 1 (argocd#155) has synced** and `Job/seeder` logged
+`inserted 1`. Read 2026-10-25 09:25 UTC: `inserted 1`, `unchanged 25`,
+`grants_unchanged 3`. This merge removes the declaration, so the seeder
+ARCHIVES the row (ADR-0934): `archived 1`, `unchanged 25`. 1 of 26 active org
+rows is under ADR-0939's half-way guard. The row carries no grant of its own,
+so no grant is deleted and the mass-revoke guard does not apply. The rendered
+registry then equals the one before step 1 byte for byte (K3 table identical
+to `84eca1c`'s). The store now holds one more archived row that the declaration
+does not name, by design.
+
+**ADR-0881 dry run.** The baseline is the cluster at step 1's state, so the
+server-side diff is taken after step 1 synced: exactly
+`ConfigMap/seeder-registry`, losing the one project.
+
+### After this merge, read-only
+
+```bash
+# 1. yadgar Synced/Healthy.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+
+# 2. The seeder archived the row. Expect archived 1, unchanged 25.
+kubectl --context kind-yadgar -n yadgar logs job/seeder | tail -1
+```
+
+The next PR moves `ARCHIVED_CLAIM` in `scripts/project_probe.py` to
+`estate/probe-archived`. It must land before `orgGrants` flips to `enforcing`.
+
+### Rollback
+
+Revert: the next sync declares the path again and the seeder REACTIVATES the
+row (`reactivated 1`).
