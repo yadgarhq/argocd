@@ -8595,3 +8595,67 @@ gh-personal api 'repos/yadgarhq/argocd-verify/actions/workflows/settled.yaml/run
 **Rollback: a revert of this merge.** No migration ran, and the `-db` modules
 go back to release A, which still takes the per-database lock. The gateway
 goes back to 0.13.2, whose chart does not render the new env variable.
+
+## The yadgar pin moves to parent chart 0.47.2: platform 0.2.10 (the edge's request-headers timeout)
+
+A pin bump with no migration and no image change. It moves
+`applications/yadgar.yaml`'s `targetRevision` from 0.47.0 to 0.47.2,
+`scripts/chart_pin.json` to `v0.47.2` and `platform_version` 0.2.10, and the
+five operator Applications (cert-manager, envoy-gateway, keda,
+mariadb-operator, prometheus) from platform 0.2.9 to 0.2.10. It regenerates
+`scripts/gates/yadgar_render.sha256`. `valuesObject` does not change.
+
+| Module   | From  | To         | Carries                                                                                                                                                      |
+| -------- | ----- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| platform | 0.2.9 | **0.2.10** | platform#50 (yaadgaar #218): `ClientTrafficPolicy/edge-request-headers` on the edge Gateway, `requestHeadersReceivedTimeout: 10s`, `Prune=false`.            |
+| (parent) |       |            | chart#69: refuses an edge request-headers timeout above `gateway.server.limits.headerReadTimeoutSeconds`, and a gateway bound with no edge value. No object. |
+
+Every other module is unchanged: config 0.2.2, gateway 0.14.0, iam 0.17.3,
+iam-db 0.15.3, project 0.5.3, project-db 0.10.5, task 0.8.2, task-db 0.11.4,
+seeder 0.2.2.
+
+**Why.** Envoy forwards no request until its head is complete, so through the
+edge the gateway's 10 s header-read bound never sees a client that stalls
+mid-head. Measured on kind at 0.47.0, before this pin: a half-sent head
+through `127.0.0.1:18443` (SNI `gateway.yadgar.internal`) was still open at
+50 s, and a full `GET /auth/whoami` answered 401. The policy bounds the edge's
+own wait at 10 s. It does not bound a connection that sends no byte at all;
+Envoy's `timeout.http.idleTimeout` (default 1 h) still holds that one.
+
+**Measured 2026-10-25 (ADR-0881 dry run, by hand).** helm v3.18.4 through the
+gates' `parent_render` (the file's `valuesObject`, kind-yadgar's
+`api-versions`), 13 hook objects left out (byte-identical at both pins), Argo's
+tracking-id added; `kubectl --context kind-yadgar -n yadgar diff -f` per object:
+
+- 0.47.0: 82 objects, all empty (zero-diff baseline).
+- 0.47.2: 83 objects, 82 empty. The one diff is the create of
+  `ClientTrafficPolicy/edge-request-headers`. Its CRD
+  (`clienttrafficpolicies.gateway.envoyproxy.io` v1alpha1) is served, and the
+  `post-merge-verifier` ClusterRole already grants `get`, `list` and `watch` on
+  it. No ClientTrafficPolicy existed before.
+- The five operator Applications render byte-identical at 0.2.9 and 0.2.10
+  (helm v3.18.4, their live values, kind-yadgar's 36 api-versions,
+  `--kube-version v1.36.1`): cert-manager 50, envoy-gateway 19, keda 29,
+  mariadb-operator 32, prometheus 7 objects.
+
+### After the roll — read-only
+
+```bash
+# 1. yadgar is Synced/Healthy at 0.47.2.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.status.sync.revision} {.status.sync.status} {.status.health.status}{"\n"}'
+
+# 2. Envoy Gateway accepted the policy (an unaccepted policy does nothing).
+kubectl --context kind-yadgar -n yadgar get clienttrafficpolicy edge-request-headers \
+  -o jsonpath='{range .status.ancestors[*].conditions[*]}{.type}={.status} {.reason}{"\n"}{end}'
+
+# 3. A half-sent head through the edge closes at about 10 s, and a full
+#    GET /auth/whoami still answers 401 (a TLS client to 127.0.0.1:18443 with
+#    SNI gateway.yadgar.internal).
+```
+
+**Rollback: a revert of this merge.** No migration ran. The policy carries
+`Prune=false`, so a revert leaves it on the cluster; delete it by hand
+(NEEDS-MAX): `kubectl --context kind-yadgar -n yadgar delete clienttrafficpolicy edge-request-headers`.
+If `yadgar`'s operation is Running or retrying, first run (NEEDS-MAX)
+`argocd app terminate-op yadgar`.

@@ -1,6 +1,6 @@
 # K3: sha256 of each object `applications/yadgar.yaml` renders, as canonical JSON.
 # Regenerate: python3 scripts/gates/test_yadgar_application.py --write
-targetRevision  0.47.0
+targetRevision  0.47.2
 2355fad035bd3696b4fc741ed21eba814d3f4941a75fa16fb16cc73d4a4f0696  /ConfigMap//audit
 d19a8a2ae018718b5fd1626dade2ec71e47cd2516e203491e319a02e4dab0968  /ConfigMap//gateway-knobs
 a2f6a8433dcff0b94a6031f1dd4f4f2e8dacbcdc77802163b6221755c4b93173  /ConfigMap//nats-config
@@ -59,6 +59,7 @@ c549a87ad65de73b303b7d10987da80aa9a195708ed9c8381bb01520db8f8719  cert-manager.i
 d832c27c4ac70ab3c13e06bd583d39383e4be0bf460a8ec5f18d8be2c0489820  cert-manager.io/Issuer//yadgar-internal-ca
 fcd3e6ea9f619b587172afc1c52de347d81259c47c320dcacfcc47e03e06aef6  cert-manager.io/Issuer//yadgar-internal-selfsign
 cb9470c09420d6231fa73cd468a20fb0997530e3dd553d5eba3673008e8b8b07  gateway.envoyproxy.io/BackendTrafficPolicy//edge-upstream-idle
+c1a62219523e775eb5bdc39def5cc737e46985b5ae5d51f9d1ac4f0e98ca9b4d  gateway.envoyproxy.io/ClientTrafficPolicy//edge-request-headers
 3188ba9f45302639b407da2d521604d71d509d3020a571c339abdd22f0b3388e  gateway.envoyproxy.io/EnvoyProxy//edge
 de68089833c009309b044e422f00922c4d04b0cb8a1189357bedbd17e44a0b6e  gateway.networking.k8s.io/Gateway//edge
 f0286700da9644f4b2f60ce17fe9c693f2356e497b8ba4f7286091c275ce0af6  gateway.networking.k8s.io/GatewayClass//eg

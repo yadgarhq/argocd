@@ -1658,7 +1658,16 @@ STEP_7_OBJECTS = frozenset(
 # the gateway's header-read bound. It never existed in `manifests/tls`, so it
 # has no deleted copy, and it is not one of the four objects compared below.
 # Reverting step 7 drops it with the listener, so the values move adds it too.
-STEP_7_LISTENER_ADDED = frozenset({("BackendTrafficPolicy", "edge-upstream-idle")})
+#
+# THE SIXTH, FROM PARENT 0.47.2 (platform 0.2.10, platform#50, yaadgaar #218):
+# `ClientTrafficPolicy/edge-request-headers`, the edge's request-headers
+# timeout. Same reasoning: no deleted copy, and it rides the listener toggle.
+STEP_7_LISTENER_ADDED = frozenset(
+    {
+        ("BackendTrafficPolicy", "edge-upstream-idle"),
+        ("ClientTrafficPolicy", "edge-request-headers"),
+    }
+)
 DELETED_EDGE_COPIES = """
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -2063,9 +2072,12 @@ PIN_ALONE_OVERRIDES_AFTER: tuple[str, ...] = (
 # current side renders them whole. `project`'s ingress list carries `seeder`
 # on both sides, so `NetworkPolicy/project-ingress` does not move here.
 # `BackendTrafficPolicy/edge-upstream-idle` arrives with parent 0.46.13
-# (platform 0.2.9, ADR-1016); see `STEP_7_LISTENER_ADDED`.
+# (platform 0.2.9, ADR-1016), and `ClientTrafficPolicy/edge-request-headers`
+# with parent 0.47.2 (platform 0.2.10, yaadgaar #218); see
+# `STEP_7_LISTENER_ADDED`.
 PIN_ADDED: set[tuple[str, str]] = {
     ("BackendTrafficPolicy", "edge-upstream-idle"),
+    ("ClientTrafficPolicy", "edge-request-headers"),
     ("Certificate", "seeder-client-tls"),
     ("Job", "seeder"),
     ("ConfigMap", "seeder-registry"),
