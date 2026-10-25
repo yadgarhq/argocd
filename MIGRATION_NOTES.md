@@ -8740,3 +8740,55 @@ The next PR moves `ARCHIVED_CLAIM` in `scripts/project_probe.py` to
 
 Revert: the next sync declares the path again and the seeder REACTIVATES the
 row (`reactivated 1`).
+
+## The yadgar pin moves to parent chart 0.47.7: platform 0.2.11 (the edge's client idle timeout)
+
+A pin bump with no migration and no image change. It moves
+`applications/yadgar.yaml`'s `targetRevision` from 0.47.5 to 0.47.7,
+`scripts/chart_pin.json` to `v0.47.7` and `platform_version` 0.2.11, and the
+five operator Applications (cert-manager, envoy-gateway, keda,
+mariadb-operator, prometheus) from platform 0.2.10 to 0.2.11. It regenerates
+`scripts/gates/yadgar_render.sha256`. `valuesObject` does not change, and no
+object is added or removed.
+
+| Module   | From   | To         | Carries                                                                                                                             |
+| -------- | ------ | ---------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| platform | 0.2.10 | **0.2.11** | platform#51 (ADR-1022): `idleTimeout: 30s` on the existing `ClientTrafficPolicy/edge-request-headers`.                              |
+| (parent) |        |            | chart#72: refuses a gateway bound with no `platform.gatewayListener.idleTimeoutSeconds`, and an idle value below the headers value. |
+
+**Why.** The request-headers bound starts at a request's first byte. A client
+that completes TLS and then sends nothing is held by Envoy's idle timeout,
+default 1 h. Measured on kind at 0.47.5, before this pin: such a connection
+through `127.0.0.1:18443` (SNI `gateway.yadgar.internal`) was still open at
+150 s. Max ruled 2026-10-25: "Set idleTimeout ~10–30 s".
+
+**Measured 2026-10-25 (ADR-0881 dry run, by hand).** The gates'
+`parent_render` (the file's `valuesObject`), the hook objects left out, Argo's
+tracking-id added; `kubectl --context kind-yadgar -n yadgar diff -f` per object:
+
+- 0.47.5 (`origin/main`): 83 objects, all empty (zero-diff baseline).
+- 0.47.7: 83 objects, 82 empty. The one diff is `ClientTrafficPolicy/edge-request-headers`:
+  `+ idleTimeout: 30s` (and `generation` 1 → 2).
+- The five operator Applications render byte-identical at platform 0.2.10 and
+  0.2.11 (their live values, kind-yadgar's api-versions, `--kube-version v1.36.1`).
+
+### After the roll — read-only
+
+```bash
+# 1. yadgar is Synced/Healthy at 0.47.7.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status} {.status.health.status}{"\n"}'
+
+# 2. Envoy Gateway accepted the policy, with the idle field.
+kubectl --context kind-yadgar -n yadgar get clienttrafficpolicy edge-request-headers \
+  -o jsonpath='{.spec.timeout.http} {range .status.ancestors[*].conditions[*]}{.type}={.status}{end}{"\n"}'
+
+# 3. A TLS client to 127.0.0.1:18443 (SNI gateway.yadgar.internal) that sends
+#    nothing is closed at about 30 s; two GET /auth/whoami 5 s apart on one
+#    connection both answer 401.
+```
+
+**Rollback: a revert of this merge.** No migration ran. A revert re-renders the
+policy without `idleTimeout`, and Envoy returns to its 1 h default. If
+`yadgar`'s operation is Running or retrying, first run (NEEDS-MAX)
+`argocd app terminate-op yadgar`.
