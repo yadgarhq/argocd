@@ -8792,3 +8792,66 @@ kubectl --context kind-yadgar -n yadgar get clienttrafficpolicy edge-request-hea
 policy without `idleTimeout`, and Envoy returns to its 1 h default. If
 `yadgar`'s operation is Running or retrying, first run (NEEDS-MAX)
 `argocd app terminate-op yadgar`.
+
+## iam derives admin from the `administrators` team (team access stage 10, the admin switch)
+
+`iam.adminFromTeam: true` in `applications/yadgar.yaml` renders
+`IAM_ADMIN_FROM_TEAM=true` in `Deployment/iam` (ADR-0962, ADR-0963;
+`plans/team-access.md` "Stage 10 — the admin switch" in `yadgarhq/docs`). iam
+then answers `is_admin` from membership of the declared, live `administrators`
+team, not from the `iam_user.is_admin` column. No pin moves; the chart stays
+at 0.47.7. Argo auto-syncs `yadgar`, and the change rolls `iam` alone.
+
+**Measured 2026-10-25 (ADR-0881 dry run, by hand).** The gates'
+`parent_render` of `Deployment/iam`, Argo's tracking-id added,
+`kubectl --context kind-yadgar -n yadgar diff -f`: one env value,
+`IAM_ADMIN_FROM_TEAM` `"false"` → `"true"`, and `generation` 75 → 76. K3
+moves `apps/Deployment//iam` alone.
+
+**Who loses `/admin` at the switch.** The three `administrators` members keep
+it. Two users whose column is true and who are not declared lose it:
+`01a09149-db3e-7eb1-b2ad-5a27cfe28d84` (probe-fresh-0911) and
+`01a15093-5e07-77ce-ad32-0c58907ff299` (probe-1569-revoke). Max accepted this
+in writing on 2026-10-25, in the pull request that set the value.
+
+### After the sync — gates on kind-yadgar
+
+Each probe is refused after authorization and writes nothing. `$MAX_TOKEN`,
+`$PROBE_TOKEN` (`estate-probe`, not in `administrators`) and
+`$BOOTSTRAP_TOKEN` (the operator's) come from the operator's own store; never
+paste one into a file. Expected bodies are gateway 0.14.0's
+(`src/http/authority.rs`, `src/http/admin/create_user.rs`).
+
+```bash
+G=https://gateway.yadgar.internal:18443
+
+# 0. iam rolled with the setting on.
+kubectl --context kind-yadgar -n yadgar get deploy iam \
+  -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="IAM_ADMIN_FROM_TEAM")].value}{"\n"}'   # true
+
+# 1. Max, set-user-admin: 503 and the retirement body (iam FAILED_PRECONDITION).
+curl -sS -w '\n%{http_code}\n' -X POST "$G/admin/set-user-admin" \
+  -H "Authorization: Bearer $MAX_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"user_id":"yadgar:user:01a14b5f-09cc-778e-a7d2-d73135411799","is_admin":true}'
+# {"error":"set-user-admin is retired on this deployment: admin is membership of the declared administrators team (ADR-0962), so declare the user there"}
+# 503
+
+# 2. The same call as estate-probe: 403, not authorized.
+#    {"error":"this endpoint requires an administrator"}
+
+# 3. Bootstrap create-user, the user_id arm, a FRESH well-formed uuidv7, no is_admin:
+curl -sS -w '\n%{http_code}\n' -X POST "$G/admin/create-user" \
+  -H "X-Yadgar-Bootstrap-Token: $BOOTSTRAP_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"external_id":"stage10-gate3","display_name":"stage10-gate3","user_id":"<fresh uuidv7>"}'
+# {"error":"the administrative service is unavailable"}
+# 503
+# iam-db warn "the bootstrap create-user was refused", step=administrator_exists,
+# for the call's request id; yadgar_iamdb_bootstrap_create_refused_total{step="administrator_exists"} +1.
+```
+
+**Rollback: a revert of this merge.** The revert restores the chart's `false`,
+which is the plan's rollback (`IAM_ADMIN_FROM_TEAM=false`), and deletes the two
+tests that pin `true`. Admin then comes from the column again. On kind-yadgar
+Max's column is still true, so his `/admin` returns at once; the two
+undeclared users above get theirs back too, because their column is also
+still true. Do not use this rollback on an F2 install (plan, stage 10).

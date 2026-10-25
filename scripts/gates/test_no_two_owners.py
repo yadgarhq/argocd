@@ -2217,6 +2217,8 @@ def test_the_pin_alone_changes_only_the_named_fields(tmp_path: Path) -> None:
     # The previous pin has no `seeder` section and refuses the key (see PIN_ADDED).
     document = yaml.safe_load(application.read_text())
     document["spec"]["source"]["helm"]["valuesObject"].pop("seeder", None)
+    # Nor an `adminFromTeam` key: its iam schema refuses it (team access stage 10).
+    document["spec"]["source"]["helm"]["valuesObject"]["iam"].pop("adminFromTeam", None)
     application.write_text(yaml.safe_dump(document, sort_keys=False))
     before = parent_render(tree, PIN_ALONE_OVERRIDES_BEFORE)
     after = parent_render(REPOSITORY, PIN_ALONE_OVERRIDES_AFTER)
