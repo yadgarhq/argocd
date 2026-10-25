@@ -301,6 +301,18 @@ spec:
           # own `nats.tls.clientCertSecret` (ADR-0885), default `iam-client-tls`, on its
           # own mount. B-N4.2 (ledger 925) turns it on, with the CA from `nats-tls`.
           nats: { tls: { enabled: true } }
+          # ADMIN IS MEMBERSHIP OF `administrators` (team access stage 10, ADR-0962,
+          # ADR-0963). Renders `IAM_ADMIN_FROM_TEAM=true`: iam answers `is_admin` from
+          # the declared, live `administrators` team under `seeder.registry.teams`
+          # below, not from the `iam_user.is_admin` column. `SetUserAdmin`, and
+          # `CreateUser` with `is_admin` true, are refused `FAILED_PRECONDITION`. The
+          # chart ships `false`. The stage 10 preconditions, measured read-only on
+          # 2026-10-25, are in the pull request that set this. Rollback is a revert of
+          # that merge, which restores the chart's `false` and deletes the two tests
+          # below; on kind-yadgar Max's column is still true, so his `/admin` returns.
+          # Pinned offline by `scripts/tests/test_iam_admin_from_team.py` and on the
+          # render by `scripts/gates/test_iam_admin_from_team_render.py`.
+          adminFromTeam: true
           # `seeder` JOINS `gateway` ONCE `teams` IS DECLARED (team access stage 7):
           # the seeder Job sends `SyncTeams` to iam before `SyncProjects` to
           # `project`. This list REPLACES the chart's `[gateway]`; it does not add to
