@@ -66,7 +66,7 @@ from test_no_two_owners import REPOSITORY, parent_render, tuples_of  # noqa: F40
 APPLICATION = REPOSITORY / "applications" / "yadgar.yaml"
 TABLE = Path(__file__).resolve().parent / "yadgar_render.sha256"
 EXAMPLE_URL = "https://raw.githubusercontent.com/yadgarhq/chart/v{revision}/example/application.yaml"
-EXPECTED_OBJECTS = 95
+EXPECTED_OBJECTS = 96
 
 # The two paths E3 excepts, and nothing else.
 EXCEPTED = (("spec", "syncPolicy"), ("spec", "source", "helm", "valuesObject"))
