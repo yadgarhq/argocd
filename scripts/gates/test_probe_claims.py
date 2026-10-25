@@ -78,6 +78,16 @@ def test_the_not_member_claim_is_undeclared() -> None:
     assert nearest(pp.NOT_MEMBER_CLAIM) is None
 
 
+def test_the_archived_claim_is_undeclared_and_under_a_root_the_probe_users_team_holds() -> None:
+    # ADR-0966: the probe user is in `estate-runners`. The archived row must sit
+    # under a root that team holds a grant on, or under `orgGrants: enforcing`
+    # the grant check (which precedes the archived check) counts NOT_MEMBER.
+    assert pp.ARCHIVED_CLAIM.lower() not in declared()
+    root = pp.ARCHIVED_CLAIM.lower().split("/")[0]
+    grants = {r["path"].lower(): {g["team"] for g in r.get("grants") or []} for r in registry()["roots"]}
+    assert "estate-runners" in grants.get(root, set()), (root, grants)
+
+
 def test_the_no_grant_claim_is_a_declared_row_outside_the_probe_users_grants() -> None:
     # The probe user is in `estate-runners`, which grants `estate` only (ADR-0966 B),
     # so a declared `yadgarhq/...` row is one it holds no grant on.

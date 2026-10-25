@@ -800,7 +800,12 @@ def test_leg_c_claims_reach_the_classes_the_gateway_assigns() -> None:
     # archived claim is its own declared row; the other two have no ancestor.
     assert pp.INVALID_CLAIM.endswith("/")
     assert pp.ORG_CLAIM.split("/")[0] == "yadgarhq" and pp.ORG_CLAIM != pp.ARCHIVED_CLAIM
-    assert pp.ARCHIVED_CLAIM == "yadgarhq/probe-archived"
+    # ADR-0966: the archived arm lives under `estate/`, where `estate-runners`
+    # holds the probe user's grant, so under `orgGrants: enforcing` it still
+    # reaches the archived check instead of counting PROJECT_NOT_MEMBER.
+    assert pp.ARCHIVED_CLAIM == "estate/probe-archived"
+    assert pp.ARCHIVED_CLAIM not in pp.RETIRED_ARCHIVED_CLAIMS
+    assert pp.RETIRED_ARCHIVED_CLAIMS == ("yadgarhq/probe-archived",)
 
 
 def test_leg_c_passes_only_when_every_reason_rose(capsys) -> None:
