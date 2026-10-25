@@ -1004,10 +1004,12 @@ DECLARED_REPOSITORIES = (
 DECLARED_ROOTS = {"yadgarhq": "yadgarhq/argocd", "estate": "yadgarhq/estate"}
 DECLARED_EXTRA_PROJECTS = {"estate/smoke": "yadgarhq/estate"}
 # ARCHIVED ON PURPOSE, AND THEREFORE NEVER DECLARED AGAIN (ledger 1624, Max's
-# ruling). `yadgarhq/probe-archived` is no repository: it is the pre-flip
-# gate's leg (c) probe row. argocd#112 declared it once so the seeder inserted
-# it; it is now absent, so the seeder archived it (ADR-0934). argocd's
-# `project_probe.py --leg-c` writes to it to count `PROJECT_ARCHIVED`.
+# ruling; team access stage 9 step 3). `estate/probe-archived` is no
+# repository: it is the pre-flip gate's leg (c) probe row. argocd#155 declared
+# it once so the seeder inserted it; argocd#156 removed it, so the seeder
+# archived it (ADR-0934). argocd's `project_probe.py --leg-c` writes to it to
+# count `PROJECT_ARCHIVED`. `yadgarhq/probe-archived` (argocd#112, argocd#114)
+# is the retired arm's row and stays archived and undeclared too.
 # Declaring it again REACTIVATES the row and silently turns that arm into a
 # resolution. IMPORTED from the probe, never retyped: the guard must name the
 # path the probe actually writes to. Imported LAZILY, inside the two tests that
@@ -1015,14 +1017,14 @@ DECLARED_EXTRA_PROJECTS = {"estate/smoke": "yadgarhq/estate"}
 # holds only the mechanical files and the two writers, and a module-level load
 # of `scripts/project_probe.py` would die there with FileNotFoundError.
 def archived_on_purpose():
-    """`(project_probe.ARCHIVED_CLAIM, lower-cased)`, loading the probe on first call."""
+    """The probe's current and retired archived claims, lower-cased, loading the probe on first call."""
     if "project_probe" not in sys.modules:
         spec = importlib.util.spec_from_file_location("project_probe", REPOSITORY / "scripts" / "project_probe.py")
         module = importlib.util.module_from_spec(spec)
         sys.modules["project_probe"] = module
         spec.loader.exec_module(module)
     project_probe = sys.modules["project_probe"]
-    ARCHIVED_ON_PURPOSE = (project_probe.ARCHIVED_CLAIM.lower(),)
+    ARCHIVED_ON_PURPOSE = (project_probe.ARCHIVED_CLAIM.lower(), *(c.lower() for c in project_probe.RETIRED_ARCHIVED_CLAIMS))
     return ARCHIVED_ON_PURPOSE
 
 
@@ -1071,9 +1073,22 @@ def test_the_probe_row_archived_on_purpose_is_not_declared() -> None:
 def test_the_row_archived_on_purpose_is_the_probes_own_claim_not_a_copy() -> None:
     # Imported, never retyped: a rename of the probe's claim must move this
     # guard with it, or the guard protects a path nothing writes to.
-    assert archived_on_purpose() == (sys.modules["project_probe"].ARCHIVED_CLAIM.lower(),)
+    project_probe = sys.modules["project_probe"]
+    assert archived_on_purpose() == (
+        project_probe.ARCHIVED_CLAIM.lower(),
+        *(c.lower() for c in project_probe.RETIRED_ARCHIVED_CLAIMS),
+    )
     (assignment,) = [line.strip() for line in Path(__file__).read_text().splitlines() if line.strip().startswith("ARCHIVED_ON_PURPOSE =")]
     assert "project_probe.ARCHIVED_CLAIM" in assignment and '"' not in assignment, assignment
+
+
+@pytest.mark.parametrize("path", ["estate/probe-archived", "yadgarhq/probe-archived"])
+def test_redeclaring_either_archived_probe_row_is_caught(path: str) -> None:
+    # The current arm's row and the retired one both stay archived and
+    # undeclared (team access stage 9 step 3): declaring either reactivates it.
+    archived_on_purpose()
+    declared = {p["path"].lower() for p in declared_registry()["projects"]} | {path}
+    assert not declared.isdisjoint(archived_on_purpose())
 
 
 def test_a_mass_archive_flag_names_it() -> None:

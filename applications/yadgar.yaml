@@ -582,18 +582,17 @@ spec:
                 displayName: estate smoke
                 sourceRepo: yadgarhq/estate
               # ABSENT ON PURPOSE: `estate/probe-archived` (team access stage 9 step 3;
-              # ADR-0966). No repository: the leg (c) probe's archived row under
-              # `estate/`, where `estate-runners` holds its grant. argocd#155 declared it
-              # once so the seeder inserted it; leaving it out here makes the seeder
-              # ARCHIVE it (ADR-0934; 1 of 26 active org rows, under ADR-0939's guard).
-              # DO NOT DECLARE IT AGAIN: that reactivates the row.
-              # ABSENT ON PURPOSE: `yadgarhq/probe-archived` (ledger 1624, Max's ruling).
-              # No repository: the pre-flip gate's leg (c) probe row. argocd#112 declared
-              # it once so the seeder inserted it; leaving it out here makes the seeder
-              # ARCHIVE it (ADR-0934; 1 of 26 active org rows, under ADR-0939's guard).
-              # argocd's `project_probe.py --leg-c` writes to it to count
-              # `PROJECT_ARCHIVED`. DO NOT DECLARE IT AGAIN: that reactivates the row.
-              # `ARCHIVED_ON_PURPOSE` in the gate holds this.
+              # ADR-0966). No repository: the pre-flip gate's leg (c) probe row, under
+              # `estate/`, where `estate-runners` holds the probe user's grant.
+              # argocd#155 declared it once so the seeder inserted it; leaving it out
+              # here makes the seeder ARCHIVE it (ADR-0934; 1 of 26 active org rows,
+              # under ADR-0939's guard). argocd's `project_probe.py --leg-c` writes to it
+              # to count `PROJECT_ARCHIVED`. DO NOT DECLARE IT AGAIN: that reactivates
+              # the row. `ARCHIVED_ON_PURPOSE` in the gate holds this.
+              # ABSENT ON PURPOSE, RETIRED: `yadgarhq/probe-archived` (ledger 1624).
+              # The archived arm's earlier row (argocd#112, argocd#114). The probe no
+              # longer writes to it; it stays archived. DO NOT DECLARE IT AGAIN.
+              # `ARCHIVED_ON_PURPOSE` holds it too.
             allowMassArchive: false
             allowMassRevoke: false
 

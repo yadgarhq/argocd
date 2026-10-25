@@ -103,7 +103,7 @@ probe can reach, in one login, then polls until every class's counter rose:
   PROJECT_UNREGISTERED_PERSONAL  find_tasks   local/<own>/probe-never-registered
   PROJECT_UNREGISTERED_ORG       find_tasks   yadgarhq/probe-never-registered
   PROJECT_INVALID                find_tasks   probe-invalid/
-  PROJECT_ARCHIVED               create_task  yadgarhq/probe-archived
+  PROJECT_ARCHIVED               create_task  estate/probe-archived
   PROJECT_NOT_MEMBER             find_tasks   local/<FOREIGN_SEGMENT>/probe
   no_grant (MODE-AWARE)          find_tasks   yadgarhq/docs
 
@@ -129,8 +129,9 @@ probe can reach, in one login, then polls until every class's counter rose:
   - ORG needs the root `yadgarhq` declared and the claim itself undeclared:
     the walk then lands on the anchor (`classify.rs`, ADR-0673).
   - INVALID: a trailing `/` fails the grammar before any resolution.
-  - ARCHIVED needs `yadgarhq/probe-archived` to be an ARCHIVED row, which the
+  - ARCHIVED needs `estate/probe-archived` to be an ARCHIVED row, which the
     seeder makes by declaring the path once and then removing it (ADR-0934).
+    It sits under `estate`, the root `estate-runners` holds (ADR-0966).
     Until both argocd changes have synced, this arm counts ORG (never
     declared) or resolves (declared and active), and leg (c) is red.
   - ARCHIVED is the only class decided by the call (ADR-0941): only a WRITE
@@ -219,13 +220,22 @@ NOT_MEMBER_CLAIM = f"local/{FOREIGN_SEGMENT}/probe"
 USER_ID_PREFIX = "yadgar:user:"  # gateway `src/project/account.rs`
 WHOAMI = "/auth/whoami"
 # Leg (c)'s three further claims; see the docstring for why each reaches its
-# class. `scripts/gates/test_probe_claims.py` binds the first to the declared
-# registry. The last is bound by argocd#113 (the step that archives the row):
-# its `ARCHIVED_ON_PURPOSE` in `test_yadgar_application.py` is imported from
-# this `ARCHIVED_CLAIM`, so the declaration can never re-declare it.
+# class. `scripts/gates/test_probe_claims.py` binds the first and the last to
+# the declared registry. `ARCHIVED_ON_PURPOSE` in `test_yadgar_application.py`
+# is imported from `ARCHIVED_CLAIM` and `RETIRED_ARCHIVED_CLAIMS`, so the
+# declaration can never re-declare either archived row.
+#
+# THE ARCHIVED ARM LIVES UNDER `estate/` (team access stage 9 step 3, ADR-0966).
+# The probe user is in `estate-runners`, which holds `readWrite` on `estate`
+# only. Under `orgGrants: enforcing` the grant check precedes the archived
+# check, so an archived row under `yadgarhq` would count PROJECT_NOT_MEMBER.
+# argocd#155 declared `estate/probe-archived` and argocd#156 removed it, so the
+# seeder archived it. The retired row `yadgarhq/probe-archived` (argocd#112,
+# argocd#114) stays archived and undeclared.
 ORG_CLAIM = "yadgarhq/probe-never-registered"
 INVALID_CLAIM = "probe-invalid/"
-ARCHIVED_CLAIM = "yadgarhq/probe-archived"
+ARCHIVED_CLAIM = "estate/probe-archived"
+RETIRED_ARCHIVED_CLAIMS = ("yadgarhq/probe-archived",)
 
 # argocd's own Application, beside this script in the same checkout (the
 # argocd-verify workflow checks argocd out at one sha and runs this file there).
