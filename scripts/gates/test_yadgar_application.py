@@ -1105,13 +1105,16 @@ def test_a_dropped_repository_names_it() -> None:
 
 # ── THE TEAMS AND GRANTS (team access stage 9, plans/team-access.md; ADR-0962, ADR-0966) ──
 
-# Ruling 5 made mechanical, plus ADR-0966 B: `administrators` is Max alone and
-# holds `readWrite` on both roots; `estate-runners` is the probe user and the
-# smoke user and holds `readWrite` on `estate` only. The probe user is never in
-# `administrators`. A member is the `account_segment` GET /auth/whoami answers
-# (ADR-0954, ADR-0959): a lowercase canonical uuidv7. This pin refuses a
-# placeholder or any other member that is not one.
-TEAM_MEMBER_COUNTS = {"administrators": 1, "estate-runners": 2}
+# Ruling 5 made mechanical, plus ADR-0966 B: `administrators` holds `readWrite`
+# on both roots; `estate-runners` holds `readWrite` on `estate` only. ADR-0966 B
+# read "administrators is Max alone"; Max amended that on 2026-10-25: Max,
+# `max-admin` and `claude-probe` are the three administrators, and
+# `estate-runners` is the probe user (`estate-probe`) and the two smoke users
+# (`estate-suite`, `estate-suite-2`). No member is in both teams: the probe user
+# is never in `administrators`. A member is the `account_segment` GET
+# /auth/whoami answers (ADR-0954, ADR-0959): a lowercase canonical uuidv7. This
+# pin refuses a placeholder or any other member that is not one.
+TEAM_MEMBER_COUNTS = {"administrators": 3, "estate-runners": 3}
 TEAM_ROOT_GRANTS = {
     "yadgarhq": {("administrators", "readWrite")},
     "estate": {("administrators", "readWrite"), ("estate-runners", "readWrite")},
@@ -1171,7 +1174,7 @@ def test_the_declaration_is_the_ruling_once_the_placeholders_are_filled() -> Non
 
 def test_a_placeholder_member_is_refused() -> None:
     registry = with_real_members(declared_registry())
-    registry["teams"][0]["members"] = ["PLACEHOLDER-max-account-segment"]
+    registry["teams"][0]["members"][0] = "PLACEHOLDER-max-account-segment"
     assert team_failures(registry) == {
         "teams[administrators].members not a lowercase uuidv7": ["PLACEHOLDER-max-account-segment"]
     }

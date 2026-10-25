@@ -481,6 +481,12 @@ spec:
         # `administrators` (ADR-0966 B): it has no `/admin` privilege and no grant
         # under `yadgarhq`.
         #
+        # Max amended ADR-0966 B's "administrators is Max alone" on 2026-10-25:
+        # `max-admin` and `claude-probe` join `administrators`, and
+        # `estate-suite-2` (estate smoke's secondary login) joins `estate-runners`.
+        # Their uuids are as Max gave them on 2026-10-25; the seeder's
+        # `unknown_member_user_ids` (empty, or the Job fails) checks each one.
+        #
         # `seeder.iam.tls.caSecret` is REQUIRED, WITH NO DEFAULT, once `teams` is
         # declared (seeder chart, stage 6; ADR-0854): the Secret holding the
         # authority that signed iam's serving certificate, which is `iam-tls`. The
@@ -494,10 +500,13 @@ spec:
               - name: administrators
                 members:
                   - 01a14b5f-09cc-778e-a7d2-d73135411799 # Max
+                  - 01a09141-fcbc-70d1-b857-36a1e9234025 # max-admin
+                  - 01a11f6a-65eb-7060-9157-4449c91f8324 # claude-probe
               - name: estate-runners
                 members:
                   - 01a11f7a-2947-770c-9599-efea3427ca13 # estate-probe (argocd-verify project-probe)
                   - 01a072e5-e97d-70b1-a9c5-e99b1c01a8ca # estate-suite (estate smoke, primary)
+                  - 01a072e7-2a3b-77f1-b9ff-9790a1a72830 # estate-suite-2 (estate smoke, secondary)
             roots:
               - path: yadgarhq
                 sourceRepo: yadgarhq/argocd
