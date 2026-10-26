@@ -61,6 +61,12 @@ def test_mode_back_on_counting_reddens() -> None:
     assert mode_errors(document) == ["valuesObject.gateway.projectValidation.mode is 'counting', not 'enforcing'"]
 
 
+def test_org_grants_is_enforcing() -> None:
+    """Team access stage 12: the grant refusal answers. Rollback is `counting`; this pin goes with it."""
+    validation = committed()["spec"]["source"]["helm"]["valuesObject"]["gateway"]["projectValidation"]
+    assert validation.get("orgGrants") == "enforcing"
+
+
 def test_a_removed_gateway_block_reddens() -> None:
     document = copy.deepcopy(committed())
     del document["spec"]["source"]["helm"]["valuesObject"]["gateway"]
