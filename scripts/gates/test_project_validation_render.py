@@ -23,7 +23,8 @@ from test_no_two_owners import REPOSITORY, a_copy_of_the_tree, parent_render
 from test_yadgar_application import env_of, env_value, mutated, set_env
 
 PROJECT_VALIDATION_ENV = "YADGAR_PROJECT_VALIDATION_MODE"
-PROJECT_VALIDATION_LINE = "projectValidation: { mode: enforcing }"
+ORG_GRANTS_ENV = "YADGAR_PROJECT_VALIDATION_ORG_GRANTS"
+PROJECT_VALIDATION_LINE = "projectValidation: { mode: enforcing, orgGrants: enforcing }"
 
 
 def project_validation_failures(documents: list) -> dict[str, object]:
@@ -31,6 +32,14 @@ def project_validation_failures(documents: list) -> dict[str, object]:
     if not any(d["kind"] == "Deployment" and d["metadata"]["name"] == "gateway" for d in documents):
         return {"Deployment/gateway": "not rendered"}
     value = env_value(documents, "Deployment", "gateway", PROJECT_VALIDATION_ENV)
+    return {} if value == "enforcing" else {"Deployment/gateway": value}
+
+
+def org_grants_failures(documents: list) -> dict[str, object]:
+    """`{object: rendered value}` when the gateway Deployment does not render `orgGrants: enforcing`."""
+    if not any(d["kind"] == "Deployment" and d["metadata"]["name"] == "gateway" for d in documents):
+        return {"Deployment/gateway": "not rendered"}
+    value = env_value(documents, "Deployment", "gateway", ORG_GRANTS_ENV)
     return {} if value == "enforcing" else {"Deployment/gateway": value}
 
 
@@ -45,6 +54,15 @@ def rendered() -> list:
 
 def test_the_gateway_renders_enforcing(rendered: list) -> None:
     assert project_validation_failures(rendered) == {}
+
+
+def test_the_gateway_renders_org_grants_enforcing(rendered: list) -> None:
+    assert org_grants_failures(rendered) == {}
+
+
+def test_a_gateway_rendering_org_grants_counting_names_it(rendered: list) -> None:
+    flipped = mutated(rendered, "Deployment", "gateway", set_env(ORG_GRANTS_ENV, "counting"))
+    assert org_grants_failures(flipped) == {"Deployment/gateway": "counting"}
 
 
 def test_a_gateway_rendering_counting_names_it(rendered: list) -> None:
