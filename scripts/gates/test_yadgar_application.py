@@ -66,7 +66,7 @@ from test_no_two_owners import REPOSITORY, parent_render, tuples_of  # noqa: F40
 APPLICATION = REPOSITORY / "applications" / "yadgar.yaml"
 TABLE = Path(__file__).resolve().parent / "yadgar_render.sha256"
 EXAMPLE_URL = "https://raw.githubusercontent.com/yadgarhq/chart/v{revision}/example/application.yaml"
-EXPECTED_OBJECTS = 94
+EXPECTED_OBJECTS = 96
 
 # The two paths E3 excepts, and nothing else.
 EXCEPTED = (("spec", "syncPolicy"), ("spec", "source", "helm", "valuesObject"))
@@ -904,9 +904,12 @@ def test_an_unpinned_hop_with_no_switch_names_it(rendered: list) -> None:
 # Each gRPC server's ingress allow-list on its gRPC port, by the `app` label of
 # the pods it admits. `project` admits the gateway and the seeder; `project-db`
 # admits `project` alone, because no module but its twin reaches a `-db`
-# (ADR-0936, ADR-0938). K3 alone cannot hold this: `--write` blesses whatever
-# renders, so a seeder added to `project-db`'s list would pass K3.
+# (ADR-0936, ADR-0938). `iam` admits the gateway and, once `teams` is declared,
+# the seeder, which sends `SyncTeams` before `SyncProjects` (team access stage 6
+# and 7, plans/team-access.md). K3 alone cannot hold this: `--write` blesses
+# whatever renders, so a seeder added to `project-db`'s list would pass K3.
 INGRESS_PEERS = {
+    "iam-ingress": (50052, {"gateway", "seeder"}),
     "project-ingress": (50052, {"gateway", "seeder"}),
     "project-db-ingress": (50051, {"project"}),
 }
@@ -940,7 +943,7 @@ def ingress_peer_failures(documents: list) -> dict[str, object]:
     return failures
 
 
-def test_project_admits_the_gateway_and_the_seeder_and_project_db_admits_project_only(rendered: list) -> None:
+def test_iam_and_project_admit_the_gateway_and_the_seeder_and_project_db_admits_project_only(rendered: list) -> None:
     assert ingress_peer_failures(rendered) == {}
 
 
@@ -959,7 +962,8 @@ def test_a_seeder_pod_without_its_label_names_the_peer(rendered: list) -> None:
         job["spec"]["template"]["metadata"]["labels"]["app"] = "seeder-job"
 
     assert ingress_peer_failures(mutated(rendered, "Job", "seeder", relabel)) == {
-        "project-ingress: peers no pod carries": ["seeder"]
+        "iam-ingress: peers no pod carries": ["seeder"],
+        "project-ingress: peers no pod carries": ["seeder"],
     }
 
 
@@ -1000,10 +1004,12 @@ DECLARED_REPOSITORIES = (
 DECLARED_ROOTS = {"yadgarhq": "yadgarhq/argocd", "estate": "yadgarhq/estate"}
 DECLARED_EXTRA_PROJECTS = {"estate/smoke": "yadgarhq/estate"}
 # ARCHIVED ON PURPOSE, AND THEREFORE NEVER DECLARED AGAIN (ledger 1624, Max's
-# ruling). `yadgarhq/probe-archived` is no repository: it is the pre-flip
-# gate's leg (c) probe row. argocd#112 declared it once so the seeder inserted
-# it; it is now absent, so the seeder archived it (ADR-0934). argocd's
-# `project_probe.py --leg-c` writes to it to count `PROJECT_ARCHIVED`.
+# ruling; team access stage 9 step 3). `estate/probe-archived` is no
+# repository: it is the pre-flip gate's leg (c) probe row. argocd#155 declared
+# it once so the seeder inserted it; argocd#156 removed it, so the seeder
+# archived it (ADR-0934). argocd's `project_probe.py --leg-c` writes to it to
+# count `PROJECT_ARCHIVED`. `yadgarhq/probe-archived` (argocd#112, argocd#114)
+# is the retired arm's row and stays archived and undeclared too.
 # Declaring it again REACTIVATES the row and silently turns that arm into a
 # resolution. IMPORTED from the probe, never retyped: the guard must name the
 # path the probe actually writes to. Imported LAZILY, inside the two tests that
@@ -1011,14 +1017,14 @@ DECLARED_EXTRA_PROJECTS = {"estate/smoke": "yadgarhq/estate"}
 # holds only the mechanical files and the two writers, and a module-level load
 # of `scripts/project_probe.py` would die there with FileNotFoundError.
 def archived_on_purpose():
-    """`(project_probe.ARCHIVED_CLAIM, lower-cased)`, loading the probe on first call."""
+    """The probe's current and retired archived claims, lower-cased, loading the probe on first call."""
     if "project_probe" not in sys.modules:
         spec = importlib.util.spec_from_file_location("project_probe", REPOSITORY / "scripts" / "project_probe.py")
         module = importlib.util.module_from_spec(spec)
         sys.modules["project_probe"] = module
         spec.loader.exec_module(module)
     project_probe = sys.modules["project_probe"]
-    ARCHIVED_ON_PURPOSE = (project_probe.ARCHIVED_CLAIM.lower(),)
+    ARCHIVED_ON_PURPOSE = (project_probe.ARCHIVED_CLAIM.lower(), *(c.lower() for c in project_probe.RETIRED_ARCHIVED_CLAIMS))
     return ARCHIVED_ON_PURPOSE
 
 
@@ -1067,9 +1073,22 @@ def test_the_probe_row_archived_on_purpose_is_not_declared() -> None:
 def test_the_row_archived_on_purpose_is_the_probes_own_claim_not_a_copy() -> None:
     # Imported, never retyped: a rename of the probe's claim must move this
     # guard with it, or the guard protects a path nothing writes to.
-    assert archived_on_purpose() == (sys.modules["project_probe"].ARCHIVED_CLAIM.lower(),)
+    project_probe = sys.modules["project_probe"]
+    assert archived_on_purpose() == (
+        project_probe.ARCHIVED_CLAIM.lower(),
+        *(c.lower() for c in project_probe.RETIRED_ARCHIVED_CLAIMS),
+    )
     (assignment,) = [line.strip() for line in Path(__file__).read_text().splitlines() if line.strip().startswith("ARCHIVED_ON_PURPOSE =")]
     assert "project_probe.ARCHIVED_CLAIM" in assignment and '"' not in assignment, assignment
+
+
+@pytest.mark.parametrize("path", ["estate/probe-archived", "yadgarhq/probe-archived"])
+def test_redeclaring_either_archived_probe_row_is_caught(path: str) -> None:
+    # The current arm's row and the retired one both stay archived and
+    # undeclared (team access stage 9 step 3): declaring either reactivates it.
+    archived_on_purpose()
+    declared = {p["path"].lower() for p in declared_registry()["projects"]} | {path}
+    assert not declared.isdisjoint(archived_on_purpose())
 
 
 def test_a_mass_archive_flag_names_it() -> None:
@@ -1082,6 +1101,141 @@ def test_a_dropped_repository_names_it() -> None:
     registry = json.loads(json.dumps(declared_registry()))
     registry["projects"] = [p for p in registry["projects"] if p["path"] != "yadgarhq/docs"]
     assert registry_failures(registry) == {"projects": {"missing": ["yadgarhq/docs"], "extra": [], "sourceRepo": []}}
+
+
+# ── THE TEAMS AND GRANTS (team access stage 9, plans/team-access.md; ADR-0962, ADR-0966) ──
+
+# Ruling 5 made mechanical, plus ADR-0966 B: `administrators` holds `readWrite`
+# on both roots; `estate-runners` holds `readWrite` on `estate` only. ADR-0966 B
+# read "administrators is Max alone"; Max amended that on 2026-10-25: Max,
+# `max-admin` and `claude-probe` are the three administrators, and
+# `estate-runners` is the probe user (`estate-probe`) and the two smoke users
+# (`estate-suite`, `estate-suite-2`). No member is in both teams: the probe user
+# is never in `administrators`. A member is the `account_segment` GET
+# /auth/whoami answers (ADR-0954, ADR-0959): a lowercase canonical uuidv7. This
+# pin refuses a placeholder or any other member that is not one.
+TEAM_MEMBER_COUNTS = {"administrators": 3, "estate-runners": 3}
+TEAM_ROOT_GRANTS = {
+    "yadgarhq": {("administrators", "readWrite")},
+    "estate": {("administrators", "readWrite"), ("estate-runners", "readWrite")},
+}
+UUIDV7 = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+
+
+def team_failures(registry: object) -> dict[str, object]:
+    """Every way the declared teams and grants differ from the ruling above."""
+    if not isinstance(registry, dict):
+        return {"seeder.registry": registry}
+    failures: dict[str, object] = {}
+    teams = {t.get("name"): list(t.get("members") or []) for t in registry.get("teams") or []}
+    if sorted(teams) != sorted(TEAM_MEMBER_COUNTS):
+        failures["teams"] = sorted(map(str, teams))
+    for name, count in TEAM_MEMBER_COUNTS.items():
+        members = teams.get(name, [])
+        if len(members) != count or len(set(members)) != len(members):
+            failures[f"teams[{name}].members"] = f"{len(members)} listed, {count} expected, no duplicates"
+        bad = sorted(m for m in members if not (isinstance(m, str) and UUIDV7.fullmatch(m)))
+        if bad:
+            failures[f"teams[{name}].members not a lowercase uuidv7"] = bad
+    overlap = sorted(set(teams.get("administrators", [])) & set(teams.get("estate-runners", [])))
+    if overlap:
+        failures["estate-runners members also in administrators (ADR-0966 B)"] = overlap
+    roots = {
+        r.get("path"): {(g.get("team"), g.get("level")) for g in r.get("grants") or []} for r in registry.get("roots") or []
+    }
+    if roots != TEAM_ROOT_GRANTS:
+        failures["roots[].grants"] = {k: sorted(v) for k, v in roots.items()}
+    granted = sorted(p.get("path") for p in registry.get("projects") or [] if p.get("grants"))
+    if granted:
+        failures["projects[].grants (a project inherits its root's grants)"] = granted
+    if registry.get("allowMassRevoke") is not False:
+        failures["allowMassRevoke"] = registry.get("allowMassRevoke")
+    return failures
+
+
+def with_real_members(registry: dict) -> dict:
+    """The committed declaration, its placeholder members swapped for well-formed ones."""
+    registry = json.loads(json.dumps(registry))
+    n = 0
+    for team in registry["teams"]:
+        team["members"] = [f"0192f0a0-0000-7000-8000-{n + i:012x}" for i, _ in enumerate(team["members"])]
+        n += len(team["members"])
+    return registry
+
+
+def test_the_declared_teams_and_grants_are_the_ruling_with_real_uuids() -> None:
+    assert team_failures(declared_registry()) == {}
+
+
+def test_the_declaration_is_the_ruling_once_the_placeholders_are_filled() -> None:
+    # The shape alone, so a red above names the placeholders and nothing else.
+    assert team_failures(with_real_members(declared_registry())) == {}
+
+
+def test_a_placeholder_member_is_refused() -> None:
+    registry = with_real_members(declared_registry())
+    registry["teams"][0]["members"][0] = "PLACEHOLDER-max-account-segment"
+    assert team_failures(registry) == {
+        "teams[administrators].members not a lowercase uuidv7": ["PLACEHOLDER-max-account-segment"]
+    }
+
+
+def test_an_uppercase_or_non_v7_member_is_refused() -> None:
+    registry = with_real_members(declared_registry())
+    registry["teams"][0]["members"] = ["0192F0A0-0000-7000-8000-000000000000"]
+    assert "teams[administrators].members not a lowercase uuidv7" in team_failures(registry)
+    registry["teams"][0]["members"] = ["0192f0a0-0000-4000-8000-000000000000"]
+    assert "teams[administrators].members not a lowercase uuidv7" in team_failures(registry)
+
+
+def test_the_probe_user_in_administrators_names_it() -> None:
+    registry = with_real_members(declared_registry())
+    probe = registry["teams"][1]["members"][0]
+    registry["teams"][0]["members"].append(probe)
+    failures = team_failures(registry)
+    assert failures["estate-runners members also in administrators (ADR-0966 B)"] == [probe]
+
+
+def test_a_dropped_root_grant_names_it() -> None:
+    registry = with_real_members(declared_registry())
+    registry["roots"][1]["grants"] = [{"team": "administrators", "level": "readWrite"}]
+    assert list(team_failures(registry)) == ["roots[].grants"]
+
+
+def test_a_read_only_administrators_grant_names_it() -> None:
+    registry = with_real_members(declared_registry())
+    registry["roots"][0]["grants"] = [{"team": "administrators", "level": "read"}]
+    assert list(team_failures(registry)) == ["roots[].grants"]
+
+
+def test_estate_runners_on_yadgarhq_names_it() -> None:
+    registry = with_real_members(declared_registry())
+    registry["roots"][0]["grants"].append({"team": "estate-runners", "level": "readWrite"})
+    assert list(team_failures(registry)) == ["roots[].grants"]
+
+
+def test_a_grant_on_a_project_names_it() -> None:
+    registry = with_real_members(declared_registry())
+    registry["projects"][0]["grants"] = [{"team": "estate-runners", "level": "read"}]
+    assert list(team_failures(registry)) == ["projects[].grants (a project inherits its root's grants)"]
+
+
+def test_a_mass_revoke_flag_names_it() -> None:
+    registry = with_real_members(declared_registry())
+    registry["allowMassRevoke"] = True
+    assert team_failures(registry) == {"allowMassRevoke": True}
+
+
+def test_the_seeder_names_iams_ca_secret_once_teams_are_declared() -> None:
+    # Stage 6 (seeder chart): no default, ADR-0854. iam's serving authority is `iam-tls`.
+    values = committed()["spec"]["source"]["helm"]["valuesObject"]["seeder"]
+    assert values["registry"]["teams"], "the pin is meaningful only while teams are declared"
+    assert values["iam"]["tls"]["caSecret"] == "iam-tls"
+
+
+def test_the_rendered_registry_carries_the_teams_and_grants(rendered: list) -> None:
+    configmap = next(d for d in rendered if d["kind"] == "ConfigMap" and d["metadata"]["name"] == "seeder-registry")
+    assert team_failures(json.loads(configmap["data"]["registry.json"])) == {}
 
 
 # ── THE BROKER'S TLS LISTENER (B-N4.1, B-N5, ledger 925, ADR-0852) ───────────

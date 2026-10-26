@@ -103,8 +103,9 @@ probe can reach, in one login, then polls until every class's counter rose:
   PROJECT_UNREGISTERED_PERSONAL  find_tasks   local/<own>/probe-never-registered
   PROJECT_UNREGISTERED_ORG       find_tasks   yadgarhq/probe-never-registered
   PROJECT_INVALID                find_tasks   probe-invalid/
-  PROJECT_ARCHIVED               create_task  yadgarhq/probe-archived
+  PROJECT_ARCHIVED               create_task  estate/probe-archived
   PROJECT_NOT_MEMBER             find_tasks   local/<FOREIGN_SEGMENT>/probe
+  no_grant (MODE-AWARE)          find_tasks   yadgarhq/docs
 
   - PERSONAL needs the caller's OWN segment: gateway v0.12.16 counts any
     well-formed `local/<seg>/...` claim whose `<seg>` is not the caller's as
@@ -117,11 +118,20 @@ probe can reach, in one login, then polls until every class's counter rose:
     with (a v7 uuid with a zero timestamp). The run refuses before sending
     anything if it equals the own segment, compared ASCII-case-insensitively
     as the gateway compares it.
+  - no_grant (team access stage 9) is a declared org row the probe user holds
+    no grant on: the probe user is in `estate-runners`, which grants `estate`
+    only (ADR-0966 B). The arm reads `orgGrants` from the Application (the
+    `projectValidation` line, `declared_org_grants`; none is `counting`). Under
+    `counting` the call is SERVED and `grant_shadow_total{verdict="no_grant"}`
+    must rise. Under `enforcing` it is refused HTTP 403 `PROJECT_NOT_MEMBER` and
+    `refusal_total{reason="PROJECT_NOT_MEMBER"}` must rise by 2 (this arm and the
+    foreign-segment arm), and the shadow counter must NOT rise.
   - ORG needs the root `yadgarhq` declared and the claim itself undeclared:
     the walk then lands on the anchor (`classify.rs`, ADR-0673).
   - INVALID: a trailing `/` fails the grammar before any resolution.
-  - ARCHIVED needs `yadgarhq/probe-archived` to be an ARCHIVED row, which the
+  - ARCHIVED needs `estate/probe-archived` to be an ARCHIVED row, which the
     seeder makes by declaring the path once and then removing it (ADR-0934).
+    It sits under `estate`, the root `estate-runners` holds (ADR-0966).
     Until both argocd changes have synced, this arm counts ORG (never
     declared) or resolves (declared and active), and leg (c) is red.
   - ARCHIVED is the only class decided by the call (ADR-0941): only a WRITE
@@ -165,6 +175,7 @@ import http.client
 import json
 import math
 import os
+import re
 import socket
 import ssl
 import sys
@@ -176,6 +187,9 @@ from pathlib import Path
 from typing import Callable, Protocol
 
 REFUSALS = "yadgar_gateway_project_refusal_total"
+# The `orgGrants` counting series (plans/team-access.md section 5): it rises
+# only while `gateway.projectValidation.orgGrants` is `counting`.
+SHADOW = "yadgar_gateway_project_grant_shadow_total"
 LOADED = "yadgar_gateway_project_registry_loaded"
 UNRESOLVABLE = "PROJECT_UNRESOLVABLE"
 PERSONAL = "PROJECT_UNREGISTERED_PERSONAL"
@@ -184,6 +198,12 @@ INVALID = "PROJECT_INVALID"
 ARCHIVED = "PROJECT_ARCHIVED"
 NOT_MEMBER = "PROJECT_NOT_MEMBER"  # gateway `src/project.rs` Reason::NotMember
 REASONS = (UNRESOLVABLE, PERSONAL, UNREGISTERED_ORG, INVALID, ARCHIVED, NOT_MEMBER)
+# The no_grant arm's counter under `orgGrants: counting`, held in `Reading.refusals`
+# beside the reasons under a key no reason can equal.
+SHADOW_NO_GRANT = "shadow:no_grant"
+# A declared org row the probe user holds no grant on (the probe user is in
+# `estate-runners`, which grants `estate` only; ADR-0966 B).
+NO_GRANT_CLAIM = "yadgarhq/docs"
 
 # No ancestor of this claim is registered: `classify` (gateway
 # `src/project/classify.rs`) returns `Unresolvable`.
@@ -200,13 +220,22 @@ NOT_MEMBER_CLAIM = f"local/{FOREIGN_SEGMENT}/probe"
 USER_ID_PREFIX = "yadgar:user:"  # gateway `src/project/account.rs`
 WHOAMI = "/auth/whoami"
 # Leg (c)'s three further claims; see the docstring for why each reaches its
-# class. `scripts/gates/test_probe_claims.py` binds the first to the declared
-# registry. The last is bound by argocd#113 (the step that archives the row):
-# its `ARCHIVED_ON_PURPOSE` in `test_yadgar_application.py` is imported from
-# this `ARCHIVED_CLAIM`, so the declaration can never re-declare it.
+# class. `scripts/gates/test_probe_claims.py` binds the first and the last to
+# the declared registry. `ARCHIVED_ON_PURPOSE` in `test_yadgar_application.py`
+# is imported from `ARCHIVED_CLAIM` and `RETIRED_ARCHIVED_CLAIMS`, so the
+# declaration can never re-declare either archived row.
+#
+# THE ARCHIVED ARM LIVES UNDER `estate/` (team access stage 9 step 3, ADR-0966).
+# The probe user is in `estate-runners`, which holds `readWrite` on `estate`
+# only. Under `orgGrants: enforcing` the grant check precedes the archived
+# check, so an archived row under `yadgarhq` would count PROJECT_NOT_MEMBER.
+# argocd#155 declared `estate/probe-archived` and argocd#156 removed it, so the
+# seeder archived it. The retired row `yadgarhq/probe-archived` (argocd#112,
+# argocd#114) stays archived and undeclared.
 ORG_CLAIM = "yadgarhq/probe-never-registered"
 INVALID_CLAIM = "probe-invalid/"
-ARCHIVED_CLAIM = "yadgarhq/probe-archived"
+ARCHIVED_CLAIM = "estate/probe-archived"
+RETIRED_ARCHIVED_CLAIMS = ("yadgarhq/probe-archived",)
 
 # argocd's own Application, beside this script in the same checkout (the
 # argocd-verify workflow checks argocd out at one sha and runs this file there).
@@ -214,13 +243,15 @@ APPLICATION = Path(__file__).resolve().parents[1] / "applications" / "yadgar.yam
 
 COUNTING, ENFORCING = "counting", "enforcing"
 # The ONLY forms of the mode line this probe reads, matched whole after
-# stripping indentation. `scripts/gates/test_project_validation_render.py`
+# stripping indentation: `projectValidation: { mode: M }`, or with the org-grants
+# knob beside it, `projectValidation: { mode: M, orgGrants: G }` (team access,
+# plans/team-access.md section 5). `scripts/gates/test_project_validation_render.py`
 # pins the enforcing one (`PROJECT_VALIDATION_LINE`). No line at all is the
-# gateway chart's default, `counting`. Anything else mentioning
+# gateway chart's defaults, `counting` for both. Anything else mentioning
 # `projectValidation` outside a comment fails the run closed.
-MODE_LINES = {f"projectValidation: {{ mode: {m} }}": m for m in (COUNTING, ENFORCING)}
+MODE_LINE = re.compile(r"projectValidation: \{ mode: (counting|enforcing)(?:, orgGrants: (counting|enforcing))? \}")
 
-QUERY = f'{{__name__=~"{REFUSALS}|{LOADED}",namespace="yadgar",app="gateway"}}'
+QUERY = f'{{__name__=~"{REFUSALS}|{SHADOW}|{LOADED}",namespace="yadgar",app="gateway"}}'
 
 PROTOCOL_VERSION = "2026-07-28"  # gateway `src/mcp.rs` PROTOCOL_VERSION
 TOOL = "find_tasks"
@@ -261,8 +292,14 @@ def same_segment(a: str, b: str) -> bool:
     return a.lower() == b.lower()
 
 
-def leg_c_arms(own_segment: str) -> tuple[Arm, ...]:
-    """Leg (c)'s arms, one per probed reason. The PERSONAL claim is the caller's own."""
+def leg_c_arms(own_segment: str, org_grants: str = COUNTING) -> tuple[Arm, ...]:
+    """Leg (c)'s arms, one per probed reason. The PERSONAL claim is the caller's own.
+
+    The last arm is MODE-AWARE (team access stage 9): `find_tasks` on a declared
+    row the probe user has no grant on. Under `orgGrants: counting` the call is
+    served and `grant_shadow_total{verdict="no_grant"}` rises; under `enforcing`
+    it is refused 403 `PROJECT_NOT_MEMBER` and the refusal counter rises.
+    """
     if same_segment(FOREIGN_SEGMENT, own_segment):
         raise ProbeError(
             f"the NOT_MEMBER arm's segment {FOREIGN_SEGMENT} is this account's own; "
@@ -276,6 +313,7 @@ def leg_c_arms(own_segment: str) -> tuple[Arm, ...]:
         # NO `title`: the one argument whose absence makes the write a no-op.
         Arm(ARCHIVED, ARCHIVED_CLAIM, WRITE_TOOL, {}),
         Arm(NOT_MEMBER, NOT_MEMBER_CLAIM, TOOL, {"page_size": 1}),
+        Arm(NOT_MEMBER if org_grants == ENFORCING else SHADOW_NO_GRANT, NO_GRANT_CLAIM, TOOL, {"page_size": 1}),
     )
 
 PASS, FAIL, INCONCLUSIVE = "PASS", "FAIL", "INCONCLUSIVE"
@@ -312,7 +350,7 @@ class Reading:
     def render(self) -> str:
         rows = []
         for pod in sorted(self.pods()):
-            values = " ".join(f"{r}={self.refusals.get((pod, r), '-')}" for r in REASONS)
+            values = " ".join(f"{r}={self.refusals.get((pod, r), '-')}" for r in REASONS + (SHADOW_NO_GRANT,))
             rows.append(f"{pod}[loaded={self.loaded.get(pod, '-')} {values}]")
         return " ".join(rows)
 
@@ -331,6 +369,8 @@ def parse_reading(body: dict) -> Reading:
             loaded[pod] = value
         elif metric.get("__name__") == REFUSALS and metric.get("reason"):
             refusals[(pod, metric["reason"])] = value
+        elif metric.get("__name__") == SHADOW and metric.get("verdict") == "no_grant":
+            refusals[(pod, SHADOW_NO_GRANT)] = value
     if not any(v == 1 for v in loaded.values()):
         raise ProbeError(
             f"no gateway pod reports {LOADED} == 1: the scrape is dead or no registry has loaded, "
@@ -499,14 +539,8 @@ class Network:
             conn.close()
 
 
-def declared_mode(application: Path) -> str:
-    """The `projectValidation` mode argocd declares for the gateway. Fails closed.
-
-    Standard library only, so an exact text match on the one line the render
-    gate pins rather than a YAML parse. Raises `ProbeError` when the file cannot
-    be read, or when any non-comment line mentions `projectValidation` in a form
-    `MODE_LINES` does not name, or when more than one does.
-    """
+def _mode_lines(application: Path) -> list[re.Match[str]]:
+    """The `projectValidation` lines of the Application, each matched whole. Fails closed."""
     try:
         text = application.read_text()
     except OSError as e:
@@ -516,14 +550,33 @@ def declared_mode(application: Path) -> str:
         for line in text.splitlines()
         if "projectValidation" in line and not line.lstrip().startswith("#")
     ]
-    if not found:
-        return COUNTING
-    if len(found) > 1 or found[0] not in MODE_LINES:
+    matches = [MODE_LINE.fullmatch(line) for line in found]
+    if len(found) > 1 or any(m is None for m in matches):
         raise ProbeError(
             f"{application}: cannot read the declared projectValidation mode from {found!r}; "
-            f"expected exactly one of {sorted(MODE_LINES)!r} or none"
+            "expected exactly one line `projectValidation: { mode: counting|enforcing"
+            "[, orgGrants: counting|enforcing] }` or none"
         )
-    return MODE_LINES[found[0]]
+    return [m for m in matches if m]
+
+
+def declared_mode(application: Path) -> str:
+    """The `projectValidation` mode argocd declares for the gateway. Fails closed.
+
+    Standard library only, so an exact text match on the one line the render
+    gate pins rather than a YAML parse. Raises `ProbeError` when the file cannot
+    be read, or when any non-comment line mentions `projectValidation` in a form
+    `MODE_LINE` does not name, or when more than one does. No line is the chart
+    default, `counting`.
+    """
+    lines = _mode_lines(application)
+    return lines[0].group(1) if lines else COUNTING
+
+
+def declared_org_grants(application: Path) -> str:
+    """The `orgGrants` knob argocd declares beside the mode; `counting` when absent (the chart default)."""
+    lines = _mode_lines(application)
+    return (lines[0].group(2) or COUNTING) if lines else COUNTING
 
 
 def answer_for_mode(arm: Arm, status: int, answer: dict, mode: str) -> tuple[bool, str]:
@@ -776,6 +829,24 @@ def answer_ok(arm: Arm, status: int, answer: dict) -> tuple[bool, str]:
     return False, f"HTTP {status} isError, but not the missing-title refusal: {text[:200]!r}"
 
 
+def no_grant_answer(arm: Arm, status: int, answer: dict, org_grants: str) -> tuple[bool, str]:
+    """The no_grant arm's answer: the declared `orgGrants` mode's, and only that.
+
+    `counting`: served. `enforcing`: HTTP 403 whose JSON-RPC `data.reason` is
+    `PROJECT_NOT_MEMBER`. Anything else is mode drift or a wrong refusal.
+    """
+    refused = isinstance(answer.get("error"), dict)
+    if org_grants == COUNTING:
+        if refused:
+            return False, f"HTTP {status} refused, but argocd declares orgGrants counting: mode drift, the gateway refused a claim it must serve"
+        return answer_ok(arm, status, answer)
+    if not refused:
+        return False, f"HTTP {status} served, but argocd declares orgGrants enforcing: mode drift, the gateway served a claim it must refuse"
+    if status != 403:
+        return False, f"HTTP {status} refused, expected 403 {NOT_MEMBER}"
+    return answer_ok(arm, status, answer)
+
+
 def run_leg_c(
     args: argparse.Namespace,
     transport: Transport,
@@ -790,6 +861,10 @@ def run_leg_c(
         return EXIT_FAIL
     failures: list[str] = []
     try:
+        # The no_grant arm is mode-aware: it reads the declared `orgGrants` knob
+        # (and only that; leg (c) accepts either `mode`) before anything is sent.
+        org_grants = declared_org_grants(Path(args.application))
+        say(f"declared orgGrants: {org_grants}")
         start = now()
         overlap = smoke_overlaps(transport, args.estate_repo, args.smoke_workflow, start, start)
         if overlap:
@@ -806,23 +881,43 @@ def run_leg_c(
             say(f"FAIL: login as {args.username} answered HTTP {status} with no token")
             return EXIT_FAIL
         own = own_segment(transport, token)
-        arms = leg_c_arms(own)
+        arms = leg_c_arms(own, org_grants)
+        # One rise per arm: under `enforcing` the no_grant arm and the foreign
+        # segment arm both count NOT_MEMBER, so that counter must rise by 2.
+        needed = {r: 1 for r in REASONS}
+        if org_grants == ENFORCING:
+            needed[NOT_MEMBER] = 2
+        else:
+            needed[SHADOW_NO_GRANT] = 1
 
         for arm in arms:
             headers, body = mcp_call(token, arm.claim, arm.tool, arm.arguments)
             status, raw = transport.edge_post("/", headers, body)
-            ok, detail = answer_ok(arm, status, _json(raw))
+            answer = _json(raw)
+            if arm.claim == NO_GRANT_CLAIM:
+                ok, detail = no_grant_answer(arm, status, answer, org_grants)
+            else:
+                ok, detail = answer_ok(arm, status, answer)
             say(f"call {arm.reason}: tools/call {arm.tool} claim={arm.claim} -> {detail}")
             if not ok:
                 failures.append(f"{arm.reason} arm: {detail}")
 
-        after, deltas = before, {r: Delta() for r in REASONS}
+        watched = tuple(needed)
+        after, deltas = before, {r: Delta() for r in watched}
         for attempt in range(1, math.ceil(args.poll_timeout / args.poll_interval) + 1):
             sleep(args.poll_interval)
             after = read(transport, f"poll {attempt}")
-            deltas = {r: compare(before, after, r) for r in REASONS}
-            if all(d.rise >= 1 for d in deltas.values()):
+            deltas = {r: compare(before, after, r) for r in watched}
+            if all(d.rise >= needed[r] for r, d in deltas.items()):
                 break
+        if org_grants == ENFORCING:
+            # `grant_shadow_total` rises only under `counting`: a rise here is drift.
+            shadow = compare(before, after, SHADOW_NO_GRANT)
+            if shadow.rise >= 1:
+                failures.append(
+                    f"{SHADOW_NO_GRANT} rose by {shadow.rise:g} but argocd declares orgGrants enforcing: "
+                    "mode drift, the gateway counted a verdict it must refuse"
+                )
         end = now()
         say("deltas: " + "; ".join(f"{r} +{d.rise:g} resets={d.resets} unknown={d.unknown} missing={d.missing}" for r, d in deltas.items()))
 
@@ -836,6 +931,10 @@ def run_leg_c(
     for reason, d in deltas.items():
         verdict = evaluate(reason, deltas)
         if verdict.kind == PASS:
+            if d.rise < needed[reason]:
+                failures.append(
+                    f"{reason} rose by {d.rise:g}, expected at least {needed[reason]} (one per arm that counts it)"
+                )
             continue
         if verdict.kind == INCONCLUSIVE:
             failures.append(f"{verdict.message}; leg (c) needs a clean proof, dispatch again")

@@ -1,0 +1,341 @@
+name: auto-pin
+
+# OPEN, SUPERSEDE AND RELAY EVIDENCE FOR AUTOMATIC PIN PRS (ledger 1632 C5,
+# ledger 1670; ADR-0946, ADR-0948). The plan is `yadgarhq/docs`
+# `plans/auto-deploy-parent-chart.md`, sections 1, 3 ("Check E2") and 7. Every
+# decision lives in `scripts/auto_pin.py` (its docstring has the design) and
+# `scripts/pin_bump.py`, both tested offline in `scripts/tests`. This file
+# runs them, one step each, at argocd `main`.
+#
+# IT NEVER MERGES. Merging is car C6's `auto-pin-merge.yaml`, gated on
+# `vars.AUTO_PIN_MERGE`. This workflow opens PRs only while
+# `vars.AUTO_PIN_ENABLED == 'true'` (the comparison with 'true' matters: a
+# bare variable is truthy for the string "false"). With the variable off, no
+# job runs, so no token is minted and nothing is dispatched.
+#
+# THREE TRIGGERS, ONE WORK PATH. `repository_dispatch` `chart-published` is
+# the release's nudge (car C7); its payload is NEVER read: the target is the
+# highest `yadgarhq/chart` release whose OCI chart resolves, computed here. The
+# schedule is the backstop for a nudge that never arrives (a dispatch answers
+# 204 whether or not a workflow matched); GitHub throttles cron on this
+# repository to every few hours at worst, so 15 minutes is a ceiling, not a
+# promise. `workflow_dispatch` is the manual run, plus two inputs:
+#   regenerate     close that automatic PR and open a fresh one on current
+#                  main (C6 dispatches this for a spent sha or a moved base);
+#   evidence_only  run E2 for a human pin PR's head and post its status; open
+#                  nothing.
+#
+# CONCURRENCY IS PER JOB. `pin` runs one at a time in group `auto-pin`, and a
+# running `pin` is never cancelled. But GitHub keeps only ONE pending run per
+# group and cancels it when a newer one queues, cancel-in-progress or not. So a
+# burst of releases collapses to one PR for the newest (a queued run reads the
+# newest version when it starts), and a pending `regenerate` dispatch can be
+# evicted by the cron. That loss is accepted: C6 re-checks the PR on its next
+# pass and dispatches again. `evidence` is a different question about a human's
+# PR, so it has its own group per PR and the cron never evicts it.
+#
+# IDENTITIES (plan section 7). Each step mints its own token, so none outlives
+# the step that needs it (App tokens live 60 minutes; the registry wait plus
+# the dry-run wait can reach that):
+#   release App `yadgarhq-bot` (R3-a), argocd only, contents + pull-requests
+#     write: push `auto/pin-<v>-<sha12>` (through the Git Data API, so GitHub
+#     signs the commit), open and label the PR, then close the superseded ones. An App's PR
+#     starts `ci` (a GITHUB_TOKEN one would not): argocd#135, authored by
+#     app/yadgarhq-bot, ran `ci / passed` on a1c4700.
+#   `yadgarhq-settled-dispatch` (R4), argocd-verify only: actions READ for the
+#     gate (settled verdicts), actions write for the relay (dispatch
+#     `pin-dryrun.yaml`, read its artifact).
+#   this job's GITHUB_TOKEN: read argocd, post the `pin / e1` and
+#     `pin / kind-dryrun` statuses (`statuses: write`, this job only), and
+#     write the `auto-pin-hold` issues (`issues: write`, plan section 7).
+#
+# THESE LOGS ARE PUBLIC, and the settled-dispatch token can read every
+# argocd-verify artifact: the scripts print results, run ids and shas only.
+#
+# THE HOLD WRITER (C6). Two kinds, each keyed by a hidden marker in the issue:
+#   epoch    after `gate`: main's settled epoch is red, or past close with no
+#            verdict → ensure one `auto-pin-hold` issue for K (plan section 5;
+#            this is the guarantee, settled-dispatch.yaml the fast path);
+#   version  pin_bump exit 3, NEEDS-HUMAN → NO PR (ADR-1015): ensure one hold
+#            naming the version and the reasons, updated in place, then close
+#            the bot's own open PRs for that version. Nothing is pushed and
+#            the private runner is not dispatched. A version whose hold a
+#            human closed is never held or opened again.
+# Any open hold stops the gate at its first step, so a version hold blocks
+# every newer version too until a human closes it. `auto-pin-merge.yaml`
+# re-checks its PRs on its schedule, so a lost `regenerate` (see CONCURRENCY)
+# is dispatched again on its next pass.
+
+on:
+  repository_dispatch:
+    types: [chart-published]
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+    inputs:
+      regenerate:
+        description: "An automatic pin PR number to close and regenerate on current main (C6 uses this)."
+        type: string
+        required: false
+        default: ""
+      evidence_only:
+        description: "A human pin PR number: run E2 for its head and post pin / kind-dryrun; open nothing."
+        type: string
+        required: false
+        default: ""
+
+permissions: {}
+
+jobs:
+  pin:
+    name: open or supersede the automatic pin PR
+    if: vars.AUTO_PIN_ENABLED == 'true' && github.ref == 'refs/heads/main' && (github.event_name != 'workflow_dispatch' || inputs.evidence_only == '')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: auto-pin
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+      statuses: write
+    env:
+      OUT: ${{ github.workspace }}/../auto-pin
+    steps:
+      - name: check out main, read-only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Full history: the settled epoch's anchor A is found by walking it.
+          fetch-depth: 0
+
+      # Pinned, not "3.x": the hash-pinned PyYAML 6.0.3 has wheels up to CPython 3.14.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: install PyYAML and pytest (hash-pinned, wheels only)
+        run: |
+          python3 -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary=:all: -r scripts/auto_pin.requirements.txt
+
+      # READ ONLY: the gate reads settled verdicts (runs and artifacts) and writes nothing.
+      - name: mint a token for argocd-verify (actions read, contents read), for the gate
+        id: verify1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.SETTLED_DISPATCH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SETTLED_DISPATCH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: argocd-verify
+          permission-actions: read
+          permission-contents: read
+
+      # Read-only. Hold issue, main's settled epoch, the target (waits up to
+      # 15 minutes for the newest chart to resolve), the open automatic PRs,
+      # the back-off. Outputs action=open, tidy or none.
+      - name: decide
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          VERIFY_TOKEN: ${{ steps.verify1.outputs.token }}
+          REGENERATE: ${{ inputs.regenerate }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT"
+          python3 scripts/auto_pin.py gate --repo . --out "$OUT/state.json" ${REGENERATE:+--regenerate "$REGENERATE"}
+
+      # Plan section 5, the guarantee: a red or past-close epoch gets its one hold issue.
+      - name: ensure the hold issue for main's red epoch
+        id: hold_epoch
+        if: steps.gate.outputs.hold == 'epoch'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/auto_pin.py hold-epoch --state "$OUT/state.json"
+
+      # An earlier run opened the new PR but failed before closing the older
+      # one: close it now, naming the PR in flight.
+      - name: mint a release App token (argocd, contents and pull-requests write), for the tidy
+        id: pin0
+        if: steps.gate.outputs.action == 'tidy'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: argocd
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: close older automatic PRs beside the one in flight
+        if: steps.gate.outputs.action == 'tidy'
+        env:
+          PIN_TOKEN: ${{ steps.pin0.outputs.token }}
+        run: python3 scripts/auto_pin.py tidy --state "$OUT/state.json"
+
+      # Both helms, by checksum: pin_bump's classifier accepts only when two
+      # distinct helms render byte for byte alike (C1); v3.18.4 is the one Argo
+      # CD v3.1.8 bundles and the K3 table is written with.
+      - name: install helm v3.18.4 and v4.3.0
+        if: steps.gate.outputs.action == 'open'
+        run: |
+          set -euo pipefail
+          install_helm() {
+            mkdir -p "$RUNNER_TEMP/helm-$1"
+            curl -sSfL -o "$RUNNER_TEMP/helm-$1.tgz" "https://get.helm.sh/helm-$1-linux-amd64.tar.gz"
+            echo "$2  $RUNNER_TEMP/helm-$1.tgz" | sha256sum -c -
+            tar -xzf "$RUNNER_TEMP/helm-$1.tgz" -C "$RUNNER_TEMP/helm-$1"
+          }
+          install_helm v3.18.4 f8180838c23d7c7d797b208861fecb591d9ce1690d8704ed1e4cb8e2add966c1
+          install_helm v4.3.0 86584a54def73570558f66f5111cc53dfed56689637ae32c1201205d494f54fb
+          echo "PIN_BUMP_HELMS=$RUNNER_TEMP/helm-v3.18.4/linux-amd64/helm:$RUNNER_TEMP/helm-v4.3.0/linux-amd64/helm" >> "$GITHUB_ENV"
+
+      # The org's one definition of a valid body, at a full sha and by hash.
+      # ci-pr's template job exempts bot-authored PRs, so this run checks the
+      # body itself before it opens anything.
+      - name: fetch pr_body.py from yadgarhq/actions
+        if: steps.gate.outputs.action == 'open'
+        env:
+          ACTIONS_SHA: 3c1050a649ebd59772090b46725ede4b33ba239e
+          PR_BODY_SHA256: 20838263fc2e1d40b34a1fcba62b8c6dce3b6a55ad788c012d23404b028b0c2c
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "$RUNNER_TEMP/pr_body.py" "https://raw.githubusercontent.com/yadgarhq/actions/${ACTIONS_SHA}/scripts/pr_body.py"
+          echo "${PR_BODY_SHA256}  $RUNNER_TEMP/pr_body.py" | sha256sum -c -
+
+      # E1, E3, E4 offline, then the three files. Exit 0 ACCEPT, 3 NEEDS-HUMAN
+      # (no PR: the hold step below, ADR-1015); anything else fails.
+      - name: generate the pin (pin_bump.py --check --body --write)
+        id: generate
+        if: steps.gate.outputs.action == 'open'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TARGET: ${{ steps.gate.outputs.target }}
+        run: |
+          set -uo pipefail
+          python3 scripts/pin_bump.py --target "$TARGET" --check --body --write --evidence "$OUT/evidence.json" > "$OUT/body.md"
+          status=$?
+          case "$status" in
+            0) echo "verdict=accept" >> "$GITHUB_OUTPUT" ;;
+            3) echo "verdict=needs-human" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::pin_bump.py exited $status"; exit 1 ;;
+          esac
+
+      - name: mint a release App token (argocd, contents and pull-requests write), for the push or the hold
+        id: pin1
+        if: steps.gate.outputs.action == 'open'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: argocd
+          permission-contents: write
+          permission-pull-requests: write
+
+      # ADR-1015: NEEDS-HUMAN opens no PR. The hold first (GITHUB_TOKEN, issues),
+      # then the bot's own PRs for that version close (the App token).
+      - name: NEEDS-HUMAN, ensure the version's hold issue and open no PR
+        id: hold_version
+        if: steps.gate.outputs.action == 'open' && steps.generate.outputs.verdict == 'needs-human'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PIN_TOKEN: ${{ steps.pin1.outputs.token }}
+        run: python3 scripts/auto_pin.py hold-version --state "$OUT/state.json" --evidence "$OUT/evidence.json"
+
+      - name: push the pin commit to a new auto/pin-<version>-<sha12>
+        id: push
+        if: steps.gate.outputs.action == 'open' && steps.generate.outputs.verdict == 'accept'
+        env:
+          PIN_TOKEN: ${{ steps.pin1.outputs.token }}
+        run: python3 scripts/auto_pin.py push --repo . --state "$OUT/state.json"
+
+      # Contents: read (ADR-1015): `pin_dryrun.find` reads argocd-verify's main
+      # branch head. A token minted with named permissions carries only those,
+      # so the grant alone does not reach it (run 40087449313: HTTP 403).
+      - name: mint a token for argocd-verify (actions write, contents read), for the dry run
+        id: verify2
+        if: steps.push.outputs.done == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.SETTLED_DISPATCH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SETTLED_DISPATCH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: argocd-verify
+          permission-actions: write
+          permission-contents: read
+
+      # E2: dispatch pin-dryrun.yaml, bind to that run, bounded waits and
+      # re-dispatches; post pin / e1 and pin / kind-dryrun on the pushed sha.
+      - name: E2 dry run and the evidence statuses
+        id: dryrun
+        if: steps.push.outputs.done == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          VERIFY_TOKEN: ${{ steps.verify2.outputs.token }}
+        run: python3 scripts/auto_pin.py dryrun --state "$OUT/state.json" --evidence "$OUT/evidence.json" --out "$OUT/dryrun.json"
+
+      - name: mint a release App token (argocd, contents and pull-requests write), for the PR
+        id: pin2
+        if: steps.dryrun.outputs.done == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: argocd
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: open the pin PR, then close the PRs it supersedes (never merged here)
+        if: steps.dryrun.outputs.done == 'true'
+        env:
+          PIN_TOKEN: ${{ steps.pin2.outputs.token }}
+          # Reads the hold issues once more; the App token is not asked for an issues scope.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/auto_pin.py open --state "$OUT/state.json" --evidence "$OUT/evidence.json" \
+            --dryrun "$OUT/dryrun.json" --body "$OUT/body.md" --checker "$RUNNER_TEMP/pr_body.py"
+
+  evidence:
+    name: E2 for a human pin PR
+    if: vars.AUTO_PIN_ENABLED == 'true' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.evidence_only != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Its own group per PR: the cron's `auto-pin` group never evicts it.
+    concurrency:
+      group: auto-pin-evidence-${{ inputs.evidence_only }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - name: check out main, read-only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: mint a token for argocd-verify (actions write, contents read)
+        id: verify
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.SETTLED_DISPATCH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SETTLED_DISPATCH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: argocd-verify
+          permission-actions: write
+          permission-contents: read
+
+      # Standard library only: pin_dryrun.py find imports nothing installed.
+      - name: E2 dry run for the PR's head, and its status
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          VERIFY_TOKEN: ${{ steps.verify.outputs.token }}
+          PR: ${{ inputs.evidence_only }}
+        run: python3 scripts/auto_pin.py evidence --repo . --pr "$PR"

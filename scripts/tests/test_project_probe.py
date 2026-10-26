@@ -51,6 +51,15 @@ def vector(loaded: dict[str, float], refusals: dict[tuple[str, str], float]) -> 
             "value": [1.0, str(v)],
         }
         for (pod, reason), v in refusals.items()
+        if reason != pp.SHADOW_NO_GRANT
+    ]
+    result += [
+        {
+            "metric": {"__name__": pp.SHADOW, "app": "gateway", "namespace": "yadgar", "pod": pod, "verdict": "no_grant"},
+            "value": [1.0, str(v)],
+        }
+        for (pod, reason), v in refusals.items()
+        if reason == pp.SHADOW_NO_GRANT
     ]
     return {"status": "success", "data": {"resultType": "vector", "result": result}}
 
@@ -660,7 +669,9 @@ def test_the_internet_rule_is_443_only_and_excepts_every_cluster_range() -> None
 O = pp.UNREGISTERED_ORG
 I = pp.INVALID
 A = pp.ARCHIVED
-ALL = (U, P, O, I, A, N)
+NG = pp.SHADOW_NO_GRANT
+# Every counter leg (c) watches under the default `orgGrants: counting`.
+ALL = (U, P, O, I, A, N, NG)
 
 
 class Arms(Fake):
@@ -698,15 +709,17 @@ def test_leg_c_sends_one_call_per_reason_class_with_matching_mirror_headers(caps
     assert run(fake, "--leg-c") == pp.EXIT_PASS, capsys.readouterr().out
     calls = fake.posts[1:]
     by_claim = {h["x-yadgar-project"]: (h, b) for _, h, b in calls}
-    assert set(by_claim) == {pp.CLAIM, OWN_CLAIM, pp.ORG_CLAIM, pp.INVALID_CLAIM, pp.ARCHIVED_CLAIM, pp.NOT_MEMBER_CLAIM}
-    assert len(calls) == 6
+    assert set(by_claim) == {
+        pp.CLAIM, OWN_CLAIM, pp.ORG_CLAIM, pp.INVALID_CLAIM, pp.ARCHIVED_CLAIM, pp.NOT_MEMBER_CLAIM, pp.NO_GRANT_CLAIM
+    }
+    assert len(calls) == 7
     for headers, body in by_claim.values():
         # The gateway cross-checks Mcp-Name against the body's tool name.
         assert headers["mcp-name"] == body["params"]["name"]
     assert by_claim[pp.ARCHIVED_CLAIM][1]["params"]["name"] == "create_task"
     # No title: the tool refuses before `task` is dialled, so nothing is written.
     assert "title" not in by_claim[pp.ARCHIVED_CLAIM][1]["params"]["arguments"]
-    for claim in (pp.CLAIM, OWN_CLAIM, pp.ORG_CLAIM, pp.INVALID_CLAIM, pp.NOT_MEMBER_CLAIM):
+    for claim in (pp.CLAIM, OWN_CLAIM, pp.ORG_CLAIM, pp.INVALID_CLAIM, pp.NOT_MEMBER_CLAIM, pp.NO_GRANT_CLAIM):
         assert by_claim[claim][1]["params"]["name"] == "find_tasks"
     # Reads only, bar the ARCHIVED arm's title-less create_task.
     assert sorted(b["params"]["name"] for _, _, b in calls).count("create_task") == 1
@@ -714,7 +727,9 @@ def test_leg_c_sends_one_call_per_reason_class_with_matching_mirror_headers(caps
 
 def test_leg_c_has_one_arm_per_probed_reason_and_every_reason_is_watched() -> None:
     arms = pp.leg_c_arms(OWN)
-    assert sorted(a.reason for a in arms) == sorted(pp.REASONS)
+    assert sorted(a.reason for a in arms) == sorted(pp.REASONS + (NG,))
+    # Under enforcing the no_grant arm is a second NOT_MEMBER arm.
+    assert sorted(a.reason for a in pp.leg_c_arms(OWN, pp.ENFORCING)) == sorted(pp.REASONS + (N,))
     assert pp.NOT_MEMBER == "PROJECT_NOT_MEMBER"  # gateway `src/project.rs` Reason::NotMember
     (personal,) = [a for a in arms if a.reason == P]
     assert personal.claim == OWN_CLAIM
@@ -785,7 +800,12 @@ def test_leg_c_claims_reach_the_classes_the_gateway_assigns() -> None:
     # archived claim is its own declared row; the other two have no ancestor.
     assert pp.INVALID_CLAIM.endswith("/")
     assert pp.ORG_CLAIM.split("/")[0] == "yadgarhq" and pp.ORG_CLAIM != pp.ARCHIVED_CLAIM
-    assert pp.ARCHIVED_CLAIM == "yadgarhq/probe-archived"
+    # ADR-0966: the archived arm lives under `estate/`, where `estate-runners`
+    # holds the probe user's grant, so under `orgGrants: enforcing` it still
+    # reaches the archived check instead of counting PROJECT_NOT_MEMBER.
+    assert pp.ARCHIVED_CLAIM == "estate/probe-archived"
+    assert pp.ARCHIVED_CLAIM not in pp.RETIRED_ARCHIVED_CLAIMS
+    assert pp.RETIRED_ARCHIVED_CLAIMS == ("yadgarhq/probe-archived",)
 
 
 def test_leg_c_passes_only_when_every_reason_rose(capsys) -> None:
@@ -1019,8 +1039,106 @@ def test_leg_c_fails_on_a_refusal_outside_4xx_even_carrying_the_arms_reason(stat
     assert run(Arms([BEFORE, rose(*ALL)], answers=answers), "--leg-c") == pp.EXIT_FAIL
 
 
-def test_leg_c_accepts_either_mode_and_never_reads_the_declared_one() -> None:
-    garbage = application(text="projectValidation: nonsense\n")
-    assert run(Arms([BEFORE, rose(*ALL)]), "--leg-c", app=garbage) == pp.EXIT_PASS
+def test_leg_c_accepts_either_mode_and_reads_only_the_org_grants_knob() -> None:
+    # No line at all, and the plain `mode` lines of either value, leave `orgGrants` at counting.
+    assert run(Arms([BEFORE, rose(*ALL)]), "--leg-c", app=application(None)) == pp.EXIT_PASS
     answers = {pp.ORG_CLAIM: refusal(400, pp.UNREGISTERED_ORG), pp.NOT_MEMBER_CLAIM: refusal(403, N)}
     assert run(Arms([BEFORE, rose(*ALL)], answers=answers), "--leg-c", app=application("counting")) == pp.EXIT_PASS
+
+
+# --- leg (c)'s no_grant arm: MODE-AWARE on `orgGrants` (team access stage 9) ----
+
+def org_grants_app(grants: str | None, mode: str = "enforcing") -> str:
+    beside = "" if grants is None else f", orgGrants: {grants}"
+    return application(text=f"        gateway:\n          projectValidation: {{ mode: {mode}{beside} }}\n")
+
+
+NO_GRANT_REFUSED = {pp.NO_GRANT_CLAIM: refusal(403, N)}
+
+
+def rose_enforcing(not_member: float, shadow: float = 0) -> dict:
+    refusals = {("a", r): 1 for r in (U, P, O, I, A)} | {("a", N): not_member}
+    if shadow:
+        refusals[("a", NG)] = shadow
+    return vector({"a": 1, "b": 1}, refusals)
+
+
+def test_the_org_grants_knob_is_read_beside_the_mode_and_defaults_to_counting() -> None:
+    assert pp.declared_org_grants(Path(org_grants_app(None))) == pp.COUNTING
+    assert pp.declared_org_grants(Path(org_grants_app("counting"))) == pp.COUNTING
+    assert pp.declared_org_grants(Path(org_grants_app("enforcing"))) == pp.ENFORCING
+    assert pp.declared_org_grants(Path(application(None))) == pp.COUNTING
+    assert pp.declared_org_grants(REPOSITORY / "applications" / "yadgar.yaml") == pp.ENFORCING
+    # The mode reads the same line.
+    assert pp.declared_mode(Path(org_grants_app("counting"))) == pp.ENFORCING
+    assert pp.declared_mode(Path(org_grants_app("enforcing", mode="counting"))) == pp.COUNTING
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "projectValidation: { mode: enforcing, orgGrants: maybe }",
+        "projectValidation: { mode: enforcing, orgGrants: enforcing, x: 1 }",
+        "projectValidation: { orgGrants: enforcing, mode: enforcing }",
+    ],
+)
+def test_an_unknown_org_grants_form_fails_closed_before_any_call(line, capsys) -> None:
+    fake = Arms([BEFORE, rose(*ALL)])
+    assert run(fake, "--leg-c", app=application(text=f"          {line}\n")) == pp.EXIT_FAIL
+    assert fake.posts == []
+    assert "cannot read the declared projectValidation" in capsys.readouterr().out
+
+
+def test_leg_c_under_counting_needs_the_shadow_counter_to_rise(capsys) -> None:
+    # NOT_MEMBER rose twice (the enforcing shape) but the shadow counter did not: red.
+    refusals = {("a", r): 1 for r in (U, P, O, I, A)} | {("a", N): 2}
+    assert run(Arms([BEFORE, vector({"a": 1, "b": 1}, refusals)]), "--leg-c", app=org_grants_app("counting")) == pp.EXIT_FAIL
+    assert f"{NG} did not rise" in capsys.readouterr().out
+
+
+def test_leg_c_under_counting_serves_the_no_grant_claim() -> None:
+    fake = Arms([BEFORE, rose(*ALL)])
+    assert run(fake, "--leg-c", app=org_grants_app("counting")) == pp.EXIT_PASS
+    (call,) = [b for _, h, b in fake.posts if h.get("x-yadgar-project") == pp.NO_GRANT_CLAIM]
+    assert call["params"]["name"] == "find_tasks"
+
+
+def test_leg_c_under_counting_fails_when_the_no_grant_call_was_refused(capsys) -> None:
+    fake = Arms([BEFORE, rose(*ALL)], answers=NO_GRANT_REFUSED)
+    assert run(fake, "--leg-c", app=org_grants_app("counting")) == pp.EXIT_FAIL
+    assert "mode drift" in capsys.readouterr().out
+
+
+def test_leg_c_under_enforcing_passes_on_a_403_and_two_not_member_rises() -> None:
+    fake = Arms([BEFORE, rose_enforcing(2)], answers=NO_GRANT_REFUSED)
+    assert run(fake, "--leg-c", app=org_grants_app("enforcing")) == pp.EXIT_PASS
+
+
+def test_leg_c_under_enforcing_needs_the_second_not_member_rise(capsys) -> None:
+    # One NOT_MEMBER rise is the foreign-segment arm's own: the no_grant arm counted nothing.
+    fake = Arms([BEFORE, rose_enforcing(1)], answers=NO_GRANT_REFUSED)
+    assert run(fake, "--leg-c", app=org_grants_app("enforcing")) == pp.EXIT_FAIL
+    assert f"{N} rose by 1, expected at least 2" in capsys.readouterr().out
+
+
+def test_leg_c_under_enforcing_fails_when_the_shadow_counter_rises(capsys) -> None:
+    fake = Arms([BEFORE, rose_enforcing(2, shadow=1)], answers=NO_GRANT_REFUSED)
+    assert run(fake, "--leg-c", app=org_grants_app("enforcing")) == pp.EXIT_FAIL
+    assert "mode drift" in capsys.readouterr().out
+
+
+def test_leg_c_under_enforcing_fails_when_the_no_grant_call_was_served(capsys) -> None:
+    fake = Arms([BEFORE, rose_enforcing(2)])
+    assert run(fake, "--leg-c", app=org_grants_app("enforcing")) == pp.EXIT_FAIL
+    assert "mode drift" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("call", [refusal(400, N), refusal(403, U), refusal(403, None), refusal(500, N)])
+def test_leg_c_under_enforcing_fails_on_any_other_refusal(call) -> None:
+    fake = Arms([BEFORE, rose_enforcing(2)], answers={pp.NO_GRANT_CLAIM: call})
+    assert run(fake, "--leg-c", app=org_grants_app("enforcing")) == pp.EXIT_FAIL
+
+
+def test_the_query_reads_the_shadow_series_in_the_same_read() -> None:
+    assert pp.SHADOW in pp.QUERY and pp.REFUSALS in pp.QUERY and pp.LOADED in pp.QUERY
+    assert "shadow" not in pp.REASONS and all(not r.startswith("shadow") for r in pp.REASONS)

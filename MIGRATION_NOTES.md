@@ -8449,3 +8449,409 @@ gh-personal api 'repos/yadgarhq/argocd-verify/actions/workflows/settled.yaml/run
 operator renders are byte-identical at 0.2.6 and 0.2.7. If `yadgar`'s
 operation is Running or retrying, first run (NEEDS-MAX)
 `argocd app terminate-op yadgar`.
+
+## The yadgar pin moves to parent chart 0.46.13: ADR-1006 limits, team-access schema, store release A, and the operators move to platform 0.2.9
+
+A pin bump with a platform move and forward-only migrations. It moves
+`applications/yadgar.yaml`'s `targetRevision` from 0.34.8 to 0.46.13,
+`scripts/chart_pin.json` to `v0.46.13` and `platform_version` 0.2.9, the five
+operator Applications' `targetRevision` from 0.2.7 to 0.2.9, and regenerates
+`scripts/gates/yadgar_render.sha256`. `valuesObject` does not change.
+
+| Module     | From    | To         | Carries                                                                                                                       |
+| ---------- | ------- | ---------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| platform   | 0.2.7   | **0.2.9**  | platform#49: `BackendTrafficPolicy/edge-upstream-idle` (Envoy upstream idle 8 s, below the 10 s header-read bound, ADR-1016). |
+| gateway    | 0.12.27 | **0.13.2** | `LISTEN_HEADER_READ_TIMEOUT_SECS=10` (yaadgaar #218), org grants at `counting`, grpc-timeout per call (ADR-1019).             |
+| iam        | 0.15.1  | **0.17.3** | ADR-1006 listener limits, `IAM_ADMIN_FROM_TEAM=false`, SyncTeams, iam-db request 14 s.                                        |
+| iam-db     | 0.12.1  | **0.15.2** | **Migrations 19, 20, 21** (team tables); store v0.5.0; pool 3, acquire 12 s.                                                  |
+| project    | 0.4.3   | **0.5.3**  | ADR-1006 listener limits, grant relay, project-db request 14 s.                                                               |
+| project-db | 0.8.4   | **0.10.4** | **Migration 7** (`project_grant`); store v0.5.0; pool 3, acquire 12 s; RegisterProject gated to project's leaf.               |
+| task       | 0.7.10  | **0.8.2**  | ADR-1006 listener limits, edit_task literal patch, task-db request 14 s.                                                      |
+| task-db    | 0.9.9   | **0.11.3** | No migration; store v0.5.0; pool 3, acquire 12 s.                                                                             |
+| seeder     | 0.2.0   | **0.2.2**  | SyncTeams only when teams are declared; none are, so no iam wiring renders.                                                   |
+
+**Store release A (yaadgaar #368).** All three `-db` modules move from
+`yadgar-store` v0.4.0 to v0.5.0. v0.5.0 takes the legacy server-wide
+migration lock first and then the per-database lock, so old pods (legacy lock
+only) and new pods still serialise during the roll. v0.5.0 also refuses at
+boot a pool larger than the account's `@@max_user_connections`: 3 x 6 KEDA
+replicas = 18, under the 20 that each `-db` user has (`User` CRs, read
+2026-10-24).
+
+**Measured 2026-10-24 (ADR-0881 dry run).** helm v3.18.4, the live
+Application's `valuesObject` (equal to this file's), kind-yadgar's 36
+`api-versions` and `--kube-version v1.36.1`, 13 hook objects left out (the
+same 13, byte-identical, at both pins), Argo's tracking-id added;
+`kubectl --context kind-yadgar -n yadgar diff -f` per object:
+
+- 0.34.8: 81 objects, all empty (zero-diff baseline).
+- 0.46.13: 82 objects, 73 empty. Seven Deployments differ in `image`, `env`
+  and `generation` only. `BackendTrafficPolicy/edge-upstream-idle` is a
+  create (its CRD is already served). `Job/seeder` is refused by the dry run,
+  `spec.template: field is immutable`, as expected: `Replace=true,Force=true`
+  re-creates it; its container differs from the live Job in `image` alone.
+- Every new image digest equals its GHCR tag digest.
+- The five operator renders are byte-identical at platform 0.2.7 and 0.2.9
+  with their live values (cert-manager 50, envoy-gateway 19, keda 29,
+  mariadb-operator 32, prometheus 7 objects).
+- Live schema before the roll: iam-db at migration 18, project-db at 6,
+  task-db at 7.
+
+### After the roll — read-only
+
+```bash
+# 1. yadgar and the five operator Applications are Synced/Healthy at the new pins.
+kubectl --context kind-yadgar -n argocd get applications \
+  -o custom-columns=NAME:.metadata.name,REV:.status.sync.revision,SYNC:.status.sync.status,HEALTH:.status.health.status
+
+# 2. Every module pod runs its new digest, with no restarts.
+kubectl --context kind-yadgar -n yadgar get pods \
+  -o 'custom-columns=NAME:.metadata.name,RESTARTS:.status.containerStatuses[0].restartCount,IMAGEID:.status.containerStatuses[0].imageID'
+
+# 3. The migrations applied: iam-db logs "schema at migration 21", project-db 7, task-db 7.
+kubectl --context kind-yadgar -n yadgar logs -l app=iam-db --tail=-1 | grep 'schema at migration'
+
+# 4. The re-created seeder Job completed on sha256:9bbe18f3…, "archived":0.
+kubectl --context kind-yadgar -n yadgar logs job/seeder | grep 'sync applied'
+
+# 5. The settled gate ran green on this merge's epoch.
+gh-personal api 'repos/yadgarhq/argocd-verify/actions/workflows/settled.yaml/runs?event=workflow_dispatch&per_page=5' \
+  --jq '.workflow_runs[] | [.id, .event, .triggering_actor.login, .created_at, .conclusion] | @tsv'
+```
+
+**Rollback. ONE-WAY once a `-db` has migrated.** iam-db migrations 19-21 and
+project-db migration 7 are forward-only. A revert of this merge would run
+iam-db 0.12.1 and project-db 0.8.4 against a newer schema, and their
+`check_not_ahead` refuses to boot (crash-loop). Fix forward with a new pin.
+Revert only if no `-db` pod on the new image has logged a migration. If
+`yadgar`'s operation is Running or retrying, first run (NEEDS-MAX)
+`argocd app terminate-op yadgar`.
+
+## The yadgar pin moves to parent chart 0.47.0: gateway 0.14.0 (team access stage 3b) and store release B
+
+A pin bump with no migration and no platform move. It moves
+`applications/yadgar.yaml`'s `targetRevision` from 0.46.13 to 0.47.0,
+`scripts/chart_pin.json` to `v0.47.0` (`platform_version` stays 0.2.9), and
+regenerates `scripts/gates/yadgar_render.sha256`. `valuesObject` does not
+change.
+
+| Module     | From   | To         | Carries                                                                                                                                                                                                                                                                                                                             |
+| ---------- | ------ | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| gateway    | 0.13.2 | **0.14.0** | gateway#139 (team access stage 3b): bootstrap `create-user` `user_id` arm with the echo check, `adminBootstrap.refusePreMintedUserId` (renders `YADGAR_ADMIN_REFUSE_PRE_MINTED_USER_ID="0"`), per-route `FAILED_PRECONDITION` bodies (yaadgaar #202), bootstrap `issue-enrolment` carries `revoke_existing_credentials` (ADR-1014). |
+| iam-db     | 0.15.2 | **0.15.3** | iam-db#108: `yadgar-store` v0.6.0, release B. No migration.                                                                                                                                                                                                                                                                         |
+| project-db | 0.10.4 | **0.10.5** | project-db#82: `yadgar-store` v0.6.0, release B. No migration.                                                                                                                                                                                                                                                                      |
+| task-db    | 0.11.3 | **0.11.4** | task-db#105: `yadgar-store` v0.6.0, release B. No migration.                                                                                                                                                                                                                                                                        |
+
+Every other module is unchanged: config 0.2.2, iam 0.17.3, project 0.5.3,
+task 0.8.2, seeder 0.2.2, platform 0.2.9.
+
+**Store release B (yaadgaar #368, ADR-1006).** v0.6.0 takes only the
+per-database migration lock. Release A (v0.5.0, live on all three `-db` since
+the 0.46.13 pin) takes the legacy lock and then the per-database lock, so old
+(A) and new (B) pods still serialise on the per-database lock during the roll.
+Each module's `vA..vB` range is the single store-bump commit (2 files, 3 lines).
+
+**The gateway with iam's setting off (today).** `IAM_ADMIN_FROM_TEAM` stays
+`false`, so iam refuses every bootstrap `create-user` with a `user_id`
+`FAILED_PRECONDITION`, before any store call, and gateway 0.14.0 answers the
+opaque 503. The bootstrap `issue-enrolment` with `revoke_existing_credentials`
+is refused by iam-db `INVALID_ARGUMENT` before any write (opaque 503).
+
+**Measured 2026-10-25 (ADR-0881 dry run, by hand).** helm v3.18.4 through the
+gates' `parent_render` (the file's `valuesObject`, kind-yadgar's
+`api-versions`), 13 hook objects left out, Argo's tracking-id added;
+`kubectl --context kind-yadgar -n yadgar diff -f` per object:
+
+- 0.46.13: 82 objects, all empty (zero-diff baseline).
+- 0.47.0: 82 objects, 78 empty. Four Deployments differ: gateway in `image`
+  and one added env entry (`YADGAR_ADMIN_REFUSE_PRE_MINTED_USER_ID: "0"`),
+  iam-db, project-db and task-db in `image` alone; each also in
+  `metadata.generation`. `Job/seeder` is unchanged.
+- Every new image digest equals its GHCR tag digest (`skopeo inspect
+--no-creds`): gateway `ad004426…` (0.14.0), iam-db `ff47b097…` (0.15.3),
+  project-db `23fef58e…` (0.10.5), task-db `8db4f954…` (0.11.4).
+- Live schema before the roll: iam-db at migration 21, project-db at 7,
+  task-db at 7.
+
+### After the roll — read-only
+
+```bash
+# 1. yadgar is Synced/Healthy at 0.47.0.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.status.sync.revision} {.status.sync.status} {.status.health.status}{"\n"}'
+
+# 2. The four moved Deployments run their new digests, with no restarts.
+kubectl --context kind-yadgar -n yadgar get pods \
+  -o 'custom-columns=NAME:.metadata.name,RESTARTS:.status.containerStatuses[0].restartCount,IMAGEID:.status.containerStatuses[0].imageID'
+
+# 3. The schema did not move: iam-db 21, project-db 7, task-db 7.
+kubectl --context kind-yadgar -n yadgar logs -l app=iam-db --tail=-1 | grep 'schema at migration'
+
+# 4. The settled gate ran green on this merge's epoch.
+gh-personal api 'repos/yadgarhq/argocd-verify/actions/workflows/settled.yaml/runs?event=workflow_dispatch&per_page=5' \
+  --jq '.workflow_runs[] | [.id, .event, .triggering_actor.login, .created_at, .conclusion] | @tsv'
+```
+
+**Rollback: a revert of this merge.** No migration ran, and the `-db` modules
+go back to release A, which still takes the per-database lock. The gateway
+goes back to 0.13.2, whose chart does not render the new env variable.
+
+## The yadgar pin moves to parent chart 0.47.2: platform 0.2.10 (the edge's request-headers timeout)
+
+A pin bump with no migration and no image change. It moves
+`applications/yadgar.yaml`'s `targetRevision` from 0.47.0 to 0.47.2,
+`scripts/chart_pin.json` to `v0.47.2` and `platform_version` 0.2.10, and the
+five operator Applications (cert-manager, envoy-gateway, keda,
+mariadb-operator, prometheus) from platform 0.2.9 to 0.2.10. It regenerates
+`scripts/gates/yadgar_render.sha256`. `valuesObject` does not change.
+
+| Module   | From  | To         | Carries                                                                                                                                                      |
+| -------- | ----- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| platform | 0.2.9 | **0.2.10** | platform#50 (yaadgaar #218): `ClientTrafficPolicy/edge-request-headers` on the edge Gateway, `requestHeadersReceivedTimeout: 10s`, `Prune=false`.            |
+| (parent) |       |            | chart#69: refuses an edge request-headers timeout above `gateway.server.limits.headerReadTimeoutSeconds`, and a gateway bound with no edge value. No object. |
+
+Every other module is unchanged: config 0.2.2, gateway 0.14.0, iam 0.17.3,
+iam-db 0.15.3, project 0.5.3, project-db 0.10.5, task 0.8.2, task-db 0.11.4,
+seeder 0.2.2.
+
+**Why.** Envoy forwards no request until its head is complete, so through the
+edge the gateway's 10 s header-read bound never sees a client that stalls
+mid-head. Measured on kind at 0.47.0, before this pin: a half-sent head
+through `127.0.0.1:18443` (SNI `gateway.yadgar.internal`) was still open at
+50 s, and a full `GET /auth/whoami` answered 401. The policy bounds the edge's
+own wait at 10 s. It does not bound a connection that sends no byte at all;
+Envoy's `timeout.http.idleTimeout` (default 1 h) still holds that one.
+
+**Measured 2026-10-25 (ADR-0881 dry run, by hand).** helm v3.18.4 through the
+gates' `parent_render` (the file's `valuesObject`, kind-yadgar's
+`api-versions`), 13 hook objects left out (byte-identical at both pins), Argo's
+tracking-id added; `kubectl --context kind-yadgar -n yadgar diff -f` per object:
+
+- 0.47.0: 82 objects, all empty (zero-diff baseline).
+- 0.47.2: 83 objects, 82 empty. The one diff is the create of
+  `ClientTrafficPolicy/edge-request-headers`. Its CRD
+  (`clienttrafficpolicies.gateway.envoyproxy.io` v1alpha1) is served, and the
+  `post-merge-verifier` ClusterRole already grants `get`, `list` and `watch` on
+  it. No ClientTrafficPolicy existed before.
+- The five operator Applications render byte-identical at 0.2.9 and 0.2.10
+  (helm v3.18.4, their live values, kind-yadgar's 36 api-versions,
+  `--kube-version v1.36.1`): cert-manager 50, envoy-gateway 19, keda 29,
+  mariadb-operator 32, prometheus 7 objects.
+
+### After the roll — read-only
+
+```bash
+# 1. yadgar is Synced/Healthy at 0.47.2.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.status.sync.revision} {.status.sync.status} {.status.health.status}{"\n"}'
+
+# 2. Envoy Gateway accepted the policy (an unaccepted policy does nothing).
+kubectl --context kind-yadgar -n yadgar get clienttrafficpolicy edge-request-headers \
+  -o jsonpath='{range .status.ancestors[*].conditions[*]}{.type}={.status} {.reason}{"\n"}{end}'
+
+# 3. A half-sent head through the edge closes at about 10 s, and a full
+#    GET /auth/whoami still answers 401 (a TLS client to 127.0.0.1:18443 with
+#    SNI gateway.yadgar.internal).
+```
+
+**Rollback: a revert of this merge.** No migration ran. The policy carries
+`Prune=false`, so a revert leaves it on the cluster; delete it by hand
+(NEEDS-MAX): `kubectl --context kind-yadgar -n yadgar delete clienttrafficpolicy edge-request-headers`.
+If `yadgar`'s operation is Running or retrying, first run (NEEDS-MAX)
+`argocd app terminate-op yadgar`.
+
+## The seeder declares `estate/probe-archived`, step 1 of 2 of moving the leg (c) ARCHIVED probe row under `estate/` (team access stage 9 step 3)
+
+**What the merge does.** It adds one project to `seeder.registry` in
+`applications/yadgar.yaml`: `estate/probe-archived` (sourceRepo
+`yadgarhq/argocd`), under the root `estate`. It is no repository. ADR-0966
+moves the probe's archived arm under `estate/`, where `estate-runners` (the
+probe user's team) holds its grant, so the probe user needs no grant on
+`yadgarhq`. Step 2, a later PR, removes the line, and the seeder then archives
+the row (ADR-0934). Only after the row reads `ARCHIVED` does a third PR move
+`ARCHIVED_CLAIM` in `project_probe.py`. `yadgarhq/probe-archived` stays
+archived and undeclared. The pin does not move.
+
+Measured 2026-10-25 (helm 3.18.4):
+
+- `yadgar`: 96 → 96 objects in the K3 table. One changed:
+  `ConfigMap/seeder-registry`, whose `registry.json` gains the one project.
+- Server-side `kubectl diff` against `kind-yadgar` (ADR-0881), tracking
+  annotation added, the 13 hook objects left out, all 83 objects. At
+  `origin/main`: empty diff. On this branch: `ConfigMap/seeder-registry` only.
+
+**What runs.** Argo syncs the ConfigMap. `Replace=true,Force=true` deletes and
+re-creates `Job/seeder`, which sends `SyncTeams` (every team and member
+`unchanged`) and then the declaration: `inserted 1`, `unchanged 25`, grants
+`unchanged 3`. Nothing archives. Within one registry poll (60 s) the gateways
+load the new path.
+
+### After this merge, read-only
+
+```bash
+# 1. yadgar Synced/Healthy.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=REV:.spec.source.targetRevision,SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+
+# 2. The seeder inserted the row. Expect inserted 1, archived 0, unchanged 25.
+kubectl --context kind-yadgar -n yadgar logs job/seeder | tail -1
+```
+
+If step 2 still shows the previous run (no insert), the Job was not
+re-created. NEEDS-MAX: `argocd app sync yadgar`.
+
+### Rollback
+
+Revert. The next sync then omits the path, and the seeder ARCHIVES the row,
+which is step 2's outcome anyway. An archived row is never deleted
+(ADR-0934).
+
+## The seeder archives `estate/probe-archived`, step 2 of 2 of moving the leg (c) ARCHIVED probe row under `estate/` (team access stage 9 step 3)
+
+**Merge only after step 1 (argocd#155) has synced** and `Job/seeder` logged
+`inserted 1`. Read 2026-10-25 09:25 UTC: `inserted 1`, `unchanged 25`,
+`grants_unchanged 3`. This merge removes the declaration, so the seeder
+ARCHIVES the row (ADR-0934): `archived 1`, `unchanged 25`. 1 of 26 active org
+rows is under ADR-0939's half-way guard. The row carries no grant of its own,
+so no grant is deleted and the mass-revoke guard does not apply. The rendered
+registry then equals the one before step 1 byte for byte (K3 table identical
+to `84eca1c`'s). The store now holds one more archived row that the declaration
+does not name, by design.
+
+**ADR-0881 dry run.** The baseline is the cluster at step 1's state, so the
+server-side diff is taken after step 1 synced: exactly
+`ConfigMap/seeder-registry`, losing the one project.
+
+### After this merge, read-only
+
+```bash
+# 1. yadgar Synced/Healthy.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o 'custom-columns=SYNC:.status.sync.status,HEALTH:.status.health.status,OP:.status.operationState.phase'
+
+# 2. The seeder archived the row. Expect archived 1, unchanged 25.
+kubectl --context kind-yadgar -n yadgar logs job/seeder | tail -1
+```
+
+The next PR moves `ARCHIVED_CLAIM` in `scripts/project_probe.py` to
+`estate/probe-archived`. It must land before `orgGrants` flips to `enforcing`.
+
+### Rollback
+
+Revert: the next sync declares the path again and the seeder REACTIVATES the
+row (`reactivated 1`).
+
+## The yadgar pin moves to parent chart 0.47.7: platform 0.2.11 (the edge's client idle timeout)
+
+A pin bump with no migration and no image change. It moves
+`applications/yadgar.yaml`'s `targetRevision` from 0.47.5 to 0.47.7,
+`scripts/chart_pin.json` to `v0.47.7` and `platform_version` 0.2.11, and the
+five operator Applications (cert-manager, envoy-gateway, keda,
+mariadb-operator, prometheus) from platform 0.2.10 to 0.2.11. It regenerates
+`scripts/gates/yadgar_render.sha256`. `valuesObject` does not change, and no
+object is added or removed.
+
+| Module   | From   | To         | Carries                                                                                                                             |
+| -------- | ------ | ---------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| platform | 0.2.10 | **0.2.11** | platform#51 (ADR-1022): `idleTimeout: 30s` on the existing `ClientTrafficPolicy/edge-request-headers`.                              |
+| (parent) |        |            | chart#72: refuses a gateway bound with no `platform.gatewayListener.idleTimeoutSeconds`, and an idle value below the headers value. |
+
+**Why.** The request-headers bound starts at a request's first byte. A client
+that completes TLS and then sends nothing is held by Envoy's idle timeout,
+default 1 h. Measured on kind at 0.47.5, before this pin: such a connection
+through `127.0.0.1:18443` (SNI `gateway.yadgar.internal`) was still open at
+150 s. Max ruled 2026-10-25: "Set idleTimeout ~10–30 s".
+
+**Measured 2026-10-25 (ADR-0881 dry run, by hand).** The gates'
+`parent_render` (the file's `valuesObject`), the hook objects left out, Argo's
+tracking-id added; `kubectl --context kind-yadgar -n yadgar diff -f` per object:
+
+- 0.47.5 (`origin/main`): 83 objects, all empty (zero-diff baseline).
+- 0.47.7: 83 objects, 82 empty. The one diff is `ClientTrafficPolicy/edge-request-headers`:
+  `+ idleTimeout: 30s` (and `generation` 1 → 2).
+- The five operator Applications render byte-identical at platform 0.2.10 and
+  0.2.11 (their live values, kind-yadgar's api-versions, `--kube-version v1.36.1`).
+
+### After the roll — read-only
+
+```bash
+# 1. yadgar is Synced/Healthy at 0.47.7.
+kubectl --context kind-yadgar -n argocd get application yadgar \
+  -o jsonpath='{.spec.source.targetRevision} {.status.sync.status} {.status.health.status}{"\n"}'
+
+# 2. Envoy Gateway accepted the policy, with the idle field.
+kubectl --context kind-yadgar -n yadgar get clienttrafficpolicy edge-request-headers \
+  -o jsonpath='{.spec.timeout.http} {range .status.ancestors[*].conditions[*]}{.type}={.status}{end}{"\n"}'
+
+# 3. A TLS client to 127.0.0.1:18443 (SNI gateway.yadgar.internal) that sends
+#    nothing is closed at about 30 s; two GET /auth/whoami 5 s apart on one
+#    connection both answer 401.
+```
+
+**Rollback: a revert of this merge.** No migration ran. A revert re-renders the
+policy without `idleTimeout`, and Envoy returns to its 1 h default. If
+`yadgar`'s operation is Running or retrying, first run (NEEDS-MAX)
+`argocd app terminate-op yadgar`.
+
+## iam derives admin from the `administrators` team (team access stage 10, the admin switch)
+
+`iam.adminFromTeam: true` in `applications/yadgar.yaml` renders
+`IAM_ADMIN_FROM_TEAM=true` in `Deployment/iam` (ADR-0962, ADR-0963;
+`plans/team-access.md` "Stage 10 — the admin switch" in `yadgarhq/docs`). iam
+then answers `is_admin` from membership of the declared, live `administrators`
+team, not from the `iam_user.is_admin` column. No pin moves; the chart stays
+at 0.47.7. Argo auto-syncs `yadgar`, and the change rolls `iam` alone.
+
+**Measured 2026-10-25 (ADR-0881 dry run, by hand).** The gates'
+`parent_render` of `Deployment/iam`, Argo's tracking-id added,
+`kubectl --context kind-yadgar -n yadgar diff -f`: one env value,
+`IAM_ADMIN_FROM_TEAM` `"false"` → `"true"`, and `generation` 75 → 76. K3
+moves `apps/Deployment//iam` alone.
+
+**Who loses `/admin` at the switch.** The three `administrators` members keep
+it. Two users whose column is true and who are not declared lose it:
+`01a09149-db3e-7eb1-b2ad-5a27cfe28d84` (probe-fresh-0911) and
+`01a15093-5e07-77ce-ad32-0c58907ff299` (probe-1569-revoke). Max accepted this
+in writing on 2026-10-25, in the pull request that set the value.
+
+### After the sync — gates on kind-yadgar
+
+Each probe is refused after authorization and writes nothing. `$MAX_TOKEN`,
+`$PROBE_TOKEN` (`estate-probe`, not in `administrators`) and
+`$BOOTSTRAP_TOKEN` (the operator's) come from the operator's own store; never
+paste one into a file. Expected bodies are gateway 0.14.0's
+(`src/http/authority.rs`, `src/http/admin/create_user.rs`).
+
+```bash
+G=https://gateway.yadgar.internal:18443
+
+# 0. iam rolled with the setting on.
+kubectl --context kind-yadgar -n yadgar get deploy iam \
+  -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="IAM_ADMIN_FROM_TEAM")].value}{"\n"}'   # true
+
+# 1. Max, set-user-admin: 503 and the retirement body (iam FAILED_PRECONDITION).
+curl -sS -w '\n%{http_code}\n' -X POST "$G/admin/set-user-admin" \
+  -H "Authorization: Bearer $MAX_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"user_id":"yadgar:user:01a14b5f-09cc-778e-a7d2-d73135411799","is_admin":true}'
+# {"error":"set-user-admin is retired on this deployment: admin is membership of the declared administrators team (ADR-0962), so declare the user there"}
+# 503
+
+# 2. The same call as estate-probe: 403, not authorized.
+#    {"error":"this endpoint requires an administrator"}
+
+# 3. Bootstrap create-user, the user_id arm, a FRESH well-formed uuidv7, no is_admin:
+curl -sS -w '\n%{http_code}\n' -X POST "$G/admin/create-user" \
+  -H "X-Yadgar-Bootstrap-Token: $BOOTSTRAP_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"external_id":"stage10-gate3","display_name":"stage10-gate3","user_id":"<fresh uuidv7>"}'
+# {"error":"the administrative service is unavailable"}
+# 503
+# iam-db warn "the bootstrap create-user was refused", step=administrator_exists,
+# for the call's request id; yadgar_iamdb_bootstrap_create_refused_total{step="administrator_exists"} +1.
+```
+
+**Rollback: a revert of this merge.** The revert restores the chart's `false`,
+which is the plan's rollback (`IAM_ADMIN_FROM_TEAM=false`), and deletes the two
+tests that pin `true`. Admin then comes from the column again. On kind-yadgar
+Max's column is still true, so his `/admin` returns at once; the two
+undeclared users above get theirs back too, because their column is also
+still true. Do not use this rollback on an F2 install (plan, stage 10).

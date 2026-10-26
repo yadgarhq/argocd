@@ -47,17 +47,18 @@ jobs:
   #
   # `needs:` FOLDS THIS REPOSITORY'S OWN NETWORK GATES INTO THAT ONE REQUIRED
   # CHECK, with no ruleset change. `signature` and `two-owners` (below) came
-  # with the five Applications `infra` released (ADR-0828). `passed` is a job
+  # with the five Applications `infra` released (ADR-0828); `pin-evidence`
+  # (below) is the automatic pin's evidence (ledger 1632 C3). `passed` is a job
   # INSIDE the shared workflow, so its own `needs:` cannot name a job here;
-  # this caller job can. If either gate fails, this job is skipped, the shared
+  # this caller job can. If any gate fails, this job is skipped, the shared
   # workflow never runs, and `ci / passed` is never reported. The ruleset then
   # waits for a check that never arrives, so the pull request cannot merge.
   # It reads as "expected, waiting", not as a red `ci / passed` — the red is
   # on the failed gate itself. The cost is time: the shared checks start only
-  # after both gates finish.
+  # after every gate finishes.
   ci:
     if: github.event_name == 'pull_request'
-    needs: [signature, two-owners]
+    needs: [signature, two-owners, pin-evidence]
     uses: yadgarhq/actions/.github/workflows/ci-pr.yaml@main
     permissions:
       contents: read
@@ -283,3 +284,74 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: python3 -m pytest scripts/gates -q -rP
+
+  # THE AUTOMATIC PIN'S EVIDENCE (ledger 1632 C3, ADR-0946, ADR-0881):
+  # `scripts/pin_evidence.py`, whose docstring has the whole argument. E1 (the
+  # render diff on two helms), E3 (the boot audit) and E4 (the migration diff)
+  # run here through C1's `scripts/pin_bump.py` classifier; E2 (the kind-yadgar
+  # dry run) is read as the commit status `pin / kind-dryrun`: required on an
+  # automatic head (`auto/pin-*`, which C5 posts it on before opening the PR),
+  # reported only on a human one (`E2_REQUIRED`).
+  #
+  # A MERGE GATE THROUGH `ci`'s `needs:` (above). PULL REQUESTS ONLY.
+  #
+  # A PR THAT DOES NOT MOVE `targetRevision` PASSES IN THE FIRST STEP. `detect`
+  # reads both sides of `applications/yadgar.yaml` from the merge commit
+  # (`fetch-depth: 2`: its first parent is the base, its second the PR head) and
+  # writes `moved=false`; every later step is gated on `moved`, so such a PR
+  # downloads no helm and renders nothing.
+  #
+  # TWO HELMS, NOT `azure/setup-helm`, which takes no checksum (C1 review
+  # finding). `install-helms` downloads v3.18.4 (the helm Argo CD v3.1.8
+  # bundles) and v4.3.0 from get.helm.sh and refuses either tarball unless its
+  # sha256 equals the one pinned in `scripts/pin_evidence.py`.
+  #
+  # `statuses: read` IS FOR E2 ALONE: the job reads the head sha's commit
+  # statuses. `GITHUB_TOKEN` only raises the rate limit, as in `chart-pin`;
+  # every read is public and the script never prints the token.
+  #
+  # `timeout-minutes` BOUNDS THE HEAVY RUN. Measured 2026-10-24 off CI for
+  # 0.34.8 -> 0.34.11: `judge` took 18-23 s in three runs (helm pulls on two
+  # helms, GHCR digests, module tarballs), and one other run hung past 15
+  # minutes with no output. The gates' `helm pull` and `helm template` take no
+  # timeout of their own (yaadgaar #164), so this bound is theirs too.
+  pin-evidence:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      statuses: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.x"
+
+      - name: install PyYAML
+        run: python3 -m pip install --disable-pip-version-check "pyyaml==6.0.3"
+
+      - name: does this pull request move the yadgar pin
+        id: detect
+        run: python3 scripts/pin_evidence.py detect --event "$GITHUB_EVENT_PATH" --output "$GITHUB_OUTPUT"
+
+      # `pin_bump.check` takes `parent_render` and the K3 digests from
+      # `scripts/gates/`, whose modules import pytest at the top. The same
+      # pytest `two-owners` pins. Gated, so a PR that moves no pin skips it.
+      - name: install pytest for the gates' helpers
+        if: steps.detect.outputs.moved == 'true'
+        run: python3 -m pip install --disable-pip-version-check "pytest==9.1.1"
+
+      - name: install helm v3.18.4 and v4.3.0, each pinned by sha256
+        if: steps.detect.outputs.moved == 'true'
+        run: python3 scripts/pin_evidence.py install-helms --dir "$RUNNER_TEMP/helms" --env "$GITHUB_ENV"
+
+      - name: E1 render diff on both helms, E3 boot audit, E4 migration diff, E2 status
+        if: steps.detect.outputs.moved == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/pin_evidence.py judge --event "$GITHUB_EVENT_PATH" --summary "$GITHUB_STEP_SUMMARY"

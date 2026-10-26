@@ -1652,6 +1652,22 @@ STEP_7_OBJECTS = frozenset(
         ("Gateway", "edge"),
     }
 )
+# THE LISTENER'S FIFTH OBJECT, FROM PARENT 0.46.13 (platform 0.2.9, platform#49,
+# ADR-1016). `platform.gatewayListener.create` now also renders
+# `BackendTrafficPolicy/edge-upstream-idle`, Envoy's upstream idle timeout below
+# the gateway's header-read bound. It never existed in `manifests/tls`, so it
+# has no deleted copy, and it is not one of the four objects compared below.
+# Reverting step 7 drops it with the listener, so the values move adds it too.
+#
+# THE SIXTH, FROM PARENT 0.47.2 (platform 0.2.10, platform#50, yaadgaar #218):
+# `ClientTrafficPolicy/edge-request-headers`, the edge's request-headers
+# timeout. Same reasoning: no deleted copy, and it rides the listener toggle.
+STEP_7_LISTENER_ADDED = frozenset(
+    {
+        ("BackendTrafficPolicy", "edge-upstream-idle"),
+        ("ClientTrafficPolicy", "edge-request-headers"),
+    }
+)
 DELETED_EDGE_COPIES = """
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -1792,9 +1808,9 @@ def test_step_7_adds_the_four_edge_objects_and_changes_nothing_else(
     after = parent_render(working_tree, PREFLIGHT_OFF)
     changes = field_changes(before, after)
     print(f"[K3 step 7] {len(before)} -> {len(after)} object(s), {len(changes)} change(s)")
-    assert changes == {(*o, "<object added or removed>") for o in STEP_7_OBJECTS}, sorted(
-        changes
-    )
+    assert changes == {
+        (*o, "<object added or removed>") for o in STEP_7_OBJECTS | STEP_7_LISTENER_ADDED
+    }, sorted(changes)
 
 
 def test_the_four_edge_objects_equal_the_deleted_copies(working_tree: Path) -> None:
@@ -1818,7 +1834,7 @@ def test_the_hostname_without_the_enrolment_port_reddens(working_tree: Path) -> 
     before = parent_render(working_tree, STEP_7_REVERTED)
     after = parent_render(working_tree, (*PREFLIGHT_OFF, "--set", "iam.enrolment.gateway="))
     unexpected = field_changes(before, after) - {
-        (*o, "<object added or removed>") for o in STEP_7_OBJECTS
+        (*o, "<object added or removed>") for o in STEP_7_OBJECTS | STEP_7_LISTENER_ADDED
     }
     assert len(unexpected) == 1, unexpected
     ((kind, name, field),) = unexpected
@@ -1950,7 +1966,9 @@ def test_a_narrowed_peer_reddens_the_policy_comparison(working_tree: Path) -> No
 #     (ADR-0924);
 #   - nats `checksum/config` annotation: 0.23.1 (B-N2);
 #   - seeder, in `PIN_ADDED`: 0.25.8;
-#   - iam-db's client-auth env value: 0.30.0 (A0, ledger 1732; see below).
+#   - iam-db's client-auth env value: 0.30.0 (A0, ledger 1732; see below);
+#   - iam-db, project-db and task-db env: 0.46.13 (ADR-1006);
+#   - `BackendTrafficPolicy/edge-upstream-idle`, in `PIN_ADDED`: 0.46.13.
 # The per-bump measurements that used to be logged here are gone (ledger 1632,
 # car C2). `PIN_BEFORE_B9` stays 0.3.7: `test_the_old_pin_names_both_probe_defects`
 # needs a pin whose probes are defective.
@@ -2053,7 +2071,13 @@ PIN_ALONE_OVERRIDES_AFTER: tuple[str, ...] = (
 # `seeder` block (`test_the_pin_alone_changes_only_the_named_fields`); the
 # current side renders them whole. `project`'s ingress list carries `seeder`
 # on both sides, so `NetworkPolicy/project-ingress` does not move here.
+# `BackendTrafficPolicy/edge-upstream-idle` arrives with parent 0.46.13
+# (platform 0.2.9, ADR-1016), and `ClientTrafficPolicy/edge-request-headers`
+# with parent 0.47.2 (platform 0.2.10, yaadgaar #218); see
+# `STEP_7_LISTENER_ADDED`.
 PIN_ADDED: set[tuple[str, str]] = {
+    ("BackendTrafficPolicy", "edge-upstream-idle"),
+    ("ClientTrafficPolicy", "edge-request-headers"),
     ("Certificate", "seeder-client-tls"),
     ("Job", "seeder"),
     ("ConfigMap", "seeder-registry"),
@@ -2082,8 +2106,14 @@ PIN_CHANGES = {
     ),
     # A0 (ledger 1732, parent 0.30.0): `iam-db` renders at `"required"` on the
     # after side only (`PIN_ALONE_OVERRIDES_AFTER`), so its client-auth env value
-    # moves. `iam`'s env is already listed above, from 0.24.17.
-    ("Deployment", "iam-db", "spec.template.spec.containers[0].env[6].value"),
+    # moved. `iam`'s env is already listed above, from 0.24.17. From 0.46.13
+    # (ADR-1006: the four `LISTEN_*` limits, pool 3, acquire 12) every `-db`'s
+    # env list grows, so the whole list is the changed field and it subsumes
+    # A0's single value.
+    *(
+        ("Deployment", module, "spec.template.spec.containers[0].env")
+        for module in ("iam-db", "project-db", "task-db")
+    ),
     ("StatefulSet", "nats", "spec.template.metadata.annotations"),
     *(
         ("StatefulSet", "nats", f"spec.template.spec.{field}")
@@ -2187,6 +2217,10 @@ def test_the_pin_alone_changes_only_the_named_fields(tmp_path: Path) -> None:
     # The previous pin has no `seeder` section and refuses the key (see PIN_ADDED).
     document = yaml.safe_load(application.read_text())
     document["spec"]["source"]["helm"]["valuesObject"].pop("seeder", None)
+    # Nor an `adminFromTeam` key: its iam schema refuses it (team access stage 10).
+    document["spec"]["source"]["helm"]["valuesObject"]["iam"].pop("adminFromTeam", None)
+    # Nor `projectValidation.orgGrants`: its gateway schema refuses it (team access stage 12).
+    document["spec"]["source"]["helm"]["valuesObject"]["gateway"]["projectValidation"].pop("orgGrants", None)
     application.write_text(yaml.safe_dump(document, sort_keys=False))
     before = parent_render(tree, PIN_ALONE_OVERRIDES_BEFORE)
     after = parent_render(REPOSITORY, PIN_ALONE_OVERRIDES_AFTER)
