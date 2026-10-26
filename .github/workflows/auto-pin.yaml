@@ -123,7 +123,7 @@ jobs:
       # READ ONLY: the gate reads settled verdicts (runs and artifacts) and writes nothing.
       - name: mint a token for argocd-verify (actions read, contents read), for the gate
         id: verify1
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.SETTLED_DISPATCH_APP_CLIENT_ID }}
           private-key: ${{ secrets.SETTLED_DISPATCH_APP_PRIVATE_KEY }}
@@ -159,7 +159,7 @@ jobs:
       - name: mint a release App token (argocd, contents and pull-requests write), for the tidy
         id: pin0
         if: steps.gate.outputs.action == 'tidy'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
@@ -225,7 +225,7 @@ jobs:
       - name: mint a release App token (argocd, contents and pull-requests write), for the push or the hold
         id: pin1
         if: steps.gate.outputs.action == 'open'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
@@ -257,7 +257,7 @@ jobs:
       - name: mint a token for argocd-verify (actions write, contents read), for the dry run
         id: verify2
         if: steps.push.outputs.done == 'true'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.SETTLED_DISPATCH_APP_CLIENT_ID }}
           private-key: ${{ secrets.SETTLED_DISPATCH_APP_PRIVATE_KEY }}
@@ -279,7 +279,7 @@ jobs:
       - name: mint a release App token (argocd, contents and pull-requests write), for the PR
         id: pin2
         if: steps.dryrun.outputs.done == 'true'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
@@ -323,7 +323,7 @@ jobs:
 
       - name: mint a token for argocd-verify (actions write, contents read)
         id: verify
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.SETTLED_DISPATCH_APP_CLIENT_ID }}
           private-key: ${{ secrets.SETTLED_DISPATCH_APP_PRIVATE_KEY }}
