@@ -1068,7 +1068,7 @@ def test_the_org_grants_knob_is_read_beside_the_mode_and_defaults_to_counting() 
     assert pp.declared_org_grants(Path(org_grants_app("counting"))) == pp.COUNTING
     assert pp.declared_org_grants(Path(org_grants_app("enforcing"))) == pp.ENFORCING
     assert pp.declared_org_grants(Path(application(None))) == pp.COUNTING
-    assert pp.declared_org_grants(REPOSITORY / "applications" / "yadgar.yaml") == pp.COUNTING
+    assert pp.declared_org_grants(REPOSITORY / "applications" / "yadgar.yaml") == pp.ENFORCING
     # The mode reads the same line.
     assert pp.declared_mode(Path(org_grants_app("counting"))) == pp.ENFORCING
     assert pp.declared_mode(Path(org_grants_app("enforcing", mode="counting"))) == pp.COUNTING
