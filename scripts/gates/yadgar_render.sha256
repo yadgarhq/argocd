@@ -1,6 +1,6 @@
 # K3: sha256 of each object `applications/yadgar.yaml` renders, as canonical JSON.
 # Regenerate: python3 scripts/gates/test_yadgar_application.py --write
-targetRevision  0.49.5
+targetRevision  0.49.13
 2355fad035bd3696b4fc741ed21eba814d3f4941a75fa16fb16cc73d4a4f0696  /ConfigMap//audit
 d19a8a2ae018718b5fd1626dade2ec71e47cd2516e203491e319a02e4dab0968  /ConfigMap//gateway-knobs
 a2f6a8433dcff0b94a6031f1dd4f4f2e8dacbcdc77802163b6221755c4b93173  /ConfigMap//nats-config
@@ -27,13 +27,13 @@ a09d6e21f3be46bc1e95a3f81493a41a51535ecba1cea48c44bb1516e64f541a  /ServiceAccoun
 b461e2773973968a929a5f7468fe29497a7cb24ccb30ebe69684c4b21b906aac  /ServiceAccount//seeder
 c0e197e038ddb56ee493c89d54a9f31a7a28989db10e6b62499af0d35298bc60  /ServiceAccount//task
 edb82b5473dc6e2170e034831628de8b51bc03c3dbc474c487c285b8e25ee7bb  /ServiceAccount//task-db
-5d39603b393fb824a5649d5203cc47e964228614ff5fceae842aa84b033b1461  apps/Deployment//gateway
+bff9a8d09587019a848d37d823f0a52ec0187176c527023b5b1c95c60a6add30  apps/Deployment//gateway
 2f74d742c4421e045ef39c428352c220373234c4aa03bda1845e939497a95547  apps/Deployment//iam
 94f18b6d75656c094cbc1fd136d3c22457212f6c956c9c9d7bfc61d637393303  apps/Deployment//iam-db
 95742099fc9d2539675e6f91dc6edafbfe44da93c0f87ffec663b7ae88ba1346  apps/Deployment//project
 d5e81285f0cec3bc7739b7c0f3e5871c2593d71e49487b295dc47c1ed69fcc8a  apps/Deployment//project-db
-fa7abddc43e84a88602982724f4a44f3c23bcc02a53c4c93b353af0d4d311456  apps/Deployment//task
-dbb2b30459290902dca830683643fff3635de1d6679290ccbe1fec4ea3525cf2  apps/Deployment//task-db
+78263ae6932972b19f05d1725a8694639b1d2486ccdd2c5ac3cf74c6516ffa3c  apps/Deployment//task
+cac4c93c8c599873bc05764450ed46fbe429086851ad339bc4da5c604ce253e3  apps/Deployment//task-db
 9ce974ab2ec1355f6db1207010f3ca0ce9e865452a7326abac5b05abf5aae5ab  apps/Deployment//valkey
 d9dba169be58a3e989d1e5f898e7b4d5967d5c9194b0d31d6c46f8f24f644ee1  apps/StatefulSet//nats
 aac3d30b38147f49357856fbda3ec9d299a019c556fad5c73d37a64c48c3c206  batch/Job//admin-bootstrap-token
@@ -59,7 +59,7 @@ c549a87ad65de73b303b7d10987da80aa9a195708ed9c8381bb01520db8f8719  cert-manager.i
 d832c27c4ac70ab3c13e06bd583d39383e4be0bf460a8ec5f18d8be2c0489820  cert-manager.io/Issuer//yadgar-internal-ca
 fcd3e6ea9f619b587172afc1c52de347d81259c47c320dcacfcc47e03e06aef6  cert-manager.io/Issuer//yadgar-internal-selfsign
 cb9470c09420d6231fa73cd468a20fb0997530e3dd553d5eba3673008e8b8b07  gateway.envoyproxy.io/BackendTrafficPolicy//edge-upstream-idle
-76337c3c1094287af9746024a226958411bccc0a4bfcc51ca4e0cd47be9fa398  gateway.envoyproxy.io/ClientTrafficPolicy//edge-request-headers
+c575b130125edf5da407a5c9418946a169ae5e196e8a59f85f433337823570b1  gateway.envoyproxy.io/ClientTrafficPolicy//edge-request-headers
 3188ba9f45302639b407da2d521604d71d509d3020a571c339abdd22f0b3388e  gateway.envoyproxy.io/EnvoyProxy//edge
 de68089833c009309b044e422f00922c4d04b0cb8a1189357bedbd17e44a0b6e  gateway.networking.k8s.io/Gateway//edge
 f0286700da9644f4b2f60ce17fe9c693f2356e497b8ba4f7286091c275ce0af6  gateway.networking.k8s.io/GatewayClass//eg
