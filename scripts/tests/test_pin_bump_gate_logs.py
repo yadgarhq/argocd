@@ -11,7 +11,7 @@ its PR body. Two arms:
   and `pb.WRITER`, and an AST check holds that the real writer file writes
   `TABLE` and nothing else, so the stub stands for what the writer does;
 - neither gate source carries a per-pin log any more; the render gate says
-  where a measurement lives, and the other gate says what it still diffs against.
+  where a measurement lives, and the other gate keeps no previous-pin baseline.
 """
 
 from __future__ import annotations
@@ -150,7 +150,8 @@ def test_the_render_gate_points_at_the_pr_body() -> None:
     assert len(re.findall(r"Each later pin bump's or values change's measurement is in the pull request body that made it", text)) == 1
 
 
-def test_the_ownership_gate_states_what_it_still_diffs_against_and_not_the_pr_body() -> None:
+def test_the_ownership_gate_keeps_no_previous_pin_baseline_and_not_the_pr_body() -> None:
     text = flat((REPOSITORY / GATES[1]).read_text())
-    assert "`PREVIOUS_PIN` stays 0.19.1; every later pin is still diffed against it, not against the pin before (task 1507)." in text
+    assert "PREVIOUS_PIN" not in text
+    assert "PIN_ALONE_OVERRIDES" not in text
     assert "measurement is in the pull request body" not in text
