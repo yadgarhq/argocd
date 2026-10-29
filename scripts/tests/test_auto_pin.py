@@ -818,9 +818,53 @@ def test_e1_and_e2_green_leaves_only_the_auto_pin_label() -> None:
 
 
 @pytest.mark.parametrize(("e1", "e2"), [(False, "green"), (True, "red"), (False, "red")])
-def test_anything_but_e1_and_e2_green_is_needs_human(e1: bool, e2: str) -> None:
-    api, number = opened(e1, e2)
-    assert number == 30 and labels_of(api) == ["auto-pin", "auto-pin-needs-human"]
+def test_anything_but_e1_and_e2_green_opens_no_pr(e1: bool, e2: str) -> None:
+    """ADR-1015 and ADR-1075: NEEDS-HUMAN (E1) and E2 red both hold (`hold-version`); `open` refuses them, writing nothing."""
+    with pytest.raises(ap.Refused, match="hold-version"):
+        opened(e1, e2)
+
+
+@pytest.mark.parametrize("e1,e2", [(False, "green"), (True, "red")])
+def test_open_refuses_before_any_write(e1: bool, e2: str) -> None:
+    api = Fake(open_routes())
+    with pytest.raises(ap.Refused):
+        ap.open_pr(api, state(sha=PUSHED), e1_accept=e1, dryrun=ap.DryRun(result=e2, run_id=7, reason=""), pin_body=PIN_BODY, check_body=lambda b: [])
+    assert api.writes() == []
+
+
+def flaky_labels(failures: int):
+    seen = {"n": 0}
+
+    def answer(_body: object) -> list:
+        seen["n"] += 1
+        if seen["n"] <= failures:
+            raise ap.ApiError(502, "POST", "/labels")
+        return []
+
+    return answer
+
+
+def test_a_label_write_that_fails_once_is_retried() -> None:
+    """YAAGAAR #424 item 5: without `auto-pin` the merge bot skips the PR for good, so one failure is retried."""
+    api = Fake({**open_routes(), ("POST", f"{R}/issues/30/labels"): flaky_labels(1)})
+    number = ap.open_pr(
+        api, state(sha=PUSHED, superseded=(12,)), e1_accept=True, dryrun=ap.DryRun(result="green", run_id=7, reason=""),
+        pin_body=PIN_BODY, check_body=lambda b: [], superseded=[pr(12, "0.34.10")], sleep=lambda s: None,
+    )
+    assert number == 30
+    assert len([c for c in api.calls if c[1].endswith("/30/labels")]) == 2
+
+
+def test_a_label_write_that_keeps_failing_closes_the_superseded_then_fails_loud(capsys: pytest.CaptureFixture) -> None:
+    """The PR exists, so the superseded ones still close (never zero open PRs); then the run goes red, naming the PR."""
+    api = Fake({**open_routes(), ("POST", f"{R}/issues/30/labels"): flaky_labels(9)})
+    with pytest.raises(ap.InfrastructureError, match="#30"):
+        ap.open_pr(
+            api, state(sha=PUSHED, superseded=(12,)), e1_accept=True, dryrun=ap.DryRun(result="green", run_id=7, reason=""),
+            pin_body=PIN_BODY, check_body=lambda b: [], superseded=[pr(12, "0.34.10")], sleep=lambda s: None,
+        )
+    assert ("PATCH", f"{R}/pulls/12") in [(m, p) for m, p, _ in api.writes()]
+    assert "::error::" in capsys.readouterr().out
 
 
 def test_main_is_read_again_before_the_pr_opens() -> None:

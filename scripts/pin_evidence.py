@@ -39,7 +39,12 @@ which is what merging the PR makes main.
 1. Pin-only. The head `yadgar.yaml` must be the base one with the one
    `targetRevision:` line rewritten (`pin_bump.rewrite_target_revision`), byte
    for byte. A values change in the same PR is not a pin-only PR: FAIL, before
-   any render (plan, E1).
+   any render (plan, E1). After the helm check (3.), all three mechanical files
+   are bound too (yaadgaar #424 item 3): `regenerated_differences` seeds a tree
+   with the base's three files and the checkout's two writers, runs
+   `pin_bump.write_files` for the target, and compares each file with the head
+   byte for byte. A difference, or a regeneration that fails, FAILS an
+   automatic head and WARNS on a human one.
 2. The direction. A prerelease or unreadable target: FAIL. A target lower than
    the base pin is a downgrade (a revert, plan section 6). `pin_bump.check` and
    `pin_dryrun.py` judge forward moves only, so a downgrade is not judged:
@@ -106,6 +111,7 @@ import io
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -138,6 +144,10 @@ HELM_MEMBER = "linux-amd64/helm"
 # `auto/pin-<v>-<sha12>` (argocd#141). Never the author: the release App
 # `yadgarhq-bot[bot]` also opens PRs that are no pin (argocd#135,
 # `actions-adopt`, a hooks bump). Never a label: anyone with triage sets one.
+# The two writers `pin_bump.write_files` runs for the K3 table, copied (never linked: both resolve their
+# repository from `Path(__file__).resolve()`) into the regeneration tree, as `test_pin_bump_replay` does.
+WRITERS = ("test_yadgar_application.py", "test_no_two_owners.py")
+
 AUTO_BRANCH = re.compile(r"^auto/pin-\d+\.\d+\.\d+(-[0-9a-f]{12})?$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
 
@@ -243,6 +253,32 @@ def automatic_problem(pr: Pr, move: tuple[str, str] | None, changed: list[str]) 
     return None
 
 
+def base_file(repo: Path, path: str) -> bytes:
+    """`path` at the merge commit's first parent, the base."""
+    return subprocess.run(["git", "-C", str(repo), "show", f"HEAD^1:{path}"], capture_output=True, check=True).stdout
+
+
+def regenerated_differences(
+    repo: Path, target: str, *, base_of: Callable[[str], bytes] | None = None, write: Callable[[Path, str], None] | None = None
+) -> list[str]:
+    """The mechanical files of the checkout `repo` that differ from what `pin_bump.write_files` makes for `target`.
+
+    The tree holds the BASE's three files and the checkout's two writers, nothing else, exactly as
+    `test_pin_bump_replay` builds it; `write_files` then moves it to `target` (helm v3.18.4 from `PIN_BUMP_HELMS`).
+    """
+    base_of = base_of or (lambda path: base_file(repo, path))
+    write = write or pb.write_files
+    with tempfile.TemporaryDirectory() as scratch:
+        tree = Path(scratch)
+        for path in pb.MECHANICAL_FILES:
+            (tree / path).parent.mkdir(parents=True, exist_ok=True)
+            (tree / path).write_bytes(base_of(path))
+        for writer in WRITERS:
+            shutil.copyfile(repo / "scripts" / "gates" / writer, tree / "scripts" / "gates" / writer)
+        write(tree, target)
+        return [path for path in pb.MECHANICAL_FILES if (tree / path).read_bytes() != (repo / path).read_bytes()]
+
+
 def evidence(head_text: str, pin: str, target: str, helms: dict[str, str], net=None) -> dict:
     """E1, E3 and E4 by `pin_bump.check`: both pins rendered with the HEAD `valuesObject`."""
     with tempfile.TemporaryDirectory() as scratch:
@@ -307,6 +343,7 @@ def judge(
     statuses_of: Callable[[str], list[dict]],
     helms: dict[str, str],
     changed: list[str],
+    regenerated_of: Callable[[str], list[str]],
     e2_required: bool = E2_REQUIRED,
 ) -> Outcome:
     """The verdict of `pin-evidence` on one PR (see the module docstring for the order)."""
@@ -346,6 +383,21 @@ def judge(
     if missing:
         outcome.failures.append(f"helm {', '.join(missing)} not installed; E1 renders on exactly {', '.join(HELMS)}")
         return outcome
+    # Pin-only binds all three mechanical files, not `yadgar.yaml` alone: each must be what `pin_bump.write_files`
+    # makes from the base for this target (yaadgaar #424 item 3). FAIL on an automatic head, WARN on a human one.
+    try:
+        differs = regenerated_of(target)
+        problem = (
+            f"not the regenerated pin: {', '.join(differs)} differ(s) from what `pin_bump.write_files` makes from the base for {target}"
+            if differs
+            else None
+        )
+    except (pb.Refused, subprocess.CalledProcessError, OSError) as error:
+        problem = f"the three mechanical files could not be regenerated for {target}: {error}"
+    if problem:
+        (outcome.failures if pr.automatic else outcome.warnings).append(problem)
+    else:
+        outcome.notes.append(f"{', '.join(pb.MECHANICAL_FILES)} are the regenerated ones for {target}, byte for byte")
     found = evidence_of(head_text, pin, target, {version: helms[version] for version in HELMS})
     outcome.evidence = found
     if not found["accept"]:
@@ -460,6 +512,7 @@ def main(argv: list[str] | None = None) -> int:
             statuses_of=lambda sha: statuses(pr.repository, sha),
             helms=pb.discover_helms(),
             changed=changed,
+            regenerated_of=lambda target: regenerated_differences(arguments.repo, target),
         )
     except (Refused, pb.Refused) as refused:
         print(f"::error::pin-evidence refused: {refused}")

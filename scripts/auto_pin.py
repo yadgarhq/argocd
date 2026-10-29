@@ -8,7 +8,7 @@
     auto_pin.py open     --state STATE --evidence E1.json --dryrun DRYRUN.json --body BODY.md --checker PR_BODY_PY
     auto_pin.py evidence --repo DIR --pr N
     auto_pin.py hold-epoch   --state STATE
-    auto_pin.py hold-version --state STATE --evidence E1.json
+    auto_pin.py hold-version --state STATE --evidence E1.json [--dryrun DRYRUN.json]
     auto_pin.py hold-settled --repo DIR --sha SHA --outcome SLICE.json [SLICE.json ...]
 
 THE PLAN IS `yadgarhq/docs` `plans/auto-deploy-parent-chart.md`, sections 1
@@ -66,6 +66,10 @@ PRs): pin_bump exited 3, NEEDS-HUMAN. ADR-1015: no PR. It ensures one open
 place, and only then closes the bot's own open PRs for that version (head
 still the bot's; a human's is left alone). Nothing is pushed and the private
 runner is not dispatched. A hold a human closed is the clear for that version.
+With `--dryrun` (after `dryrun`, ADR-1075): an E2 that is red is NEEDS-HUMAN
+too, even when E1 accepted. The same hold names the E2 run and its reason, and
+the branch `push` made is KEPT as the evidence; no PR is opened, because
+pin-evidence fails E2 on every automatic head and such a PR could never pass.
 
 `hold-settled` (GITHUB_TOKEN): `settled-dispatch.yaml`'s fast path. The last
 outcome file it wrote decides: red, or done with no verdict → the epoch hold.
@@ -74,7 +78,12 @@ Green, unfinished, no render key or no file at all (exit 3) → nothing.
 EVERY HOLD IS KEYED BY A HIDDEN MARKER in its body, `<!-- auto-pin-hold
 kind=epoch|version key=<K or version> -->`, never by its title. Any open hold
 stops the gate at step 1, so a version hold blocks every newer version too
-until a human closes it. The automation never closes a hold.
+until a human closes it. The automation never closes a hold. Two writers can
+race for one epoch (`hold-epoch` here, `hold-settled` in settled-dispatch.yaml):
+each re-reads after its create and keeps the LOWEST open hold for the key; a
+duplicate loses its label and gets a comment, and is never closed (a closed
+version hold would read as a clear). A writer that dies between its create and
+its re-read leaves the duplicate to the next `ensure_hold`.
 
 `push` (release App token, contents + pull-requests write, R3-a). Reads main
 again (moved → stop). Deletes stale orphan branches of the target that are
@@ -107,9 +116,11 @@ Both statuses are `success` or `failure`, with a parseable description
 the E2 line and a hidden marker added; it is final here and never edited after
 (a body edit starts a second `ci` run on the same sha, ADR-0692). It must pass
 `pr_body.py` from `yadgarhq/actions` (`--checker`); the PR is opened only if it
-does. Labels: `auto-pin`, plus `auto-pin-needs-human` unless E1 accepted AND
-E2 is green (an E1 NEEDS-HUMAN never reaches `open` since C6: it holds; an
-E2 red still opens, labelled). ONLY THEN are the superseded PRs closed, each with a comment
+does. It opens ONLY when E1 accepted AND E2 is green: anything else is
+refused before any write, since an E1 NEEDS-HUMAN and an E2 red both hold
+(`hold-version`, ADR-1015, ADR-1075). Label: `auto-pin`, retried once; a second
+failure turns the run red after the closes below, because the merge bot skips
+a PR without it. ONLY THEN are the superseded PRs closed, each with a comment
 naming the new one, its branch deleted only when its head is still the sha the
 bot pushed. So no failure path leaves zero automatic PRs open. NOTHING HERE
 MERGES. Merging is C6 (`auto_pin_merge.py`, `auto-pin-merge.yaml`).
@@ -203,6 +214,8 @@ DRYRUN_INTERVAL_SECONDS = 30
 RELAY_SECONDS = 3000
 # A failed attempt on the same main waits this long before the cron tries the same version again.
 BACKOFF_HOURS = 6
+# One retry of a failed `auto-pin` label write, after this pause (yaadgaar #424 item 5).
+LABEL_RETRY_SECONDS = 5
 STATUS_LIMIT = 140
 
 RELEASE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
@@ -460,20 +473,48 @@ def ensure_hold(api: Client, *, kind: str, key: str, title: str, body: str) -> i
     body = hold_marker(kind, key) + "\n\n" + body
     if len(body) > HOLD_BODY_LIMIT:
         body = body[: HOLD_BODY_LIMIT - 40] + "\n\n(truncated)\n"
-    mine = [i for i in hold_issues(api) if i["kind"] == kind and i["key"] == key and i.get("state") == "open"]
+    mine = _open_holds_for(api, kind, key)
     if mine:
-        issue = min(mine, key=lambda i: int(i["number"]))
+        issue = mine[0]
         number = int(issue["number"])
         if issue.get("body") != body or issue.get("title") != title:
             api.patch(f"/repos/{REPOSITORY}/issues/{number}", {"title": title, "body": body})
             print(f"hold #{number} ({kind} {key[:12]}) updated in place")
         else:
             print(f"hold #{number} ({kind} {key[:12]}) is already open and current")
-        return number
+        return _demote_duplicates(api, mine)
     created = api.post(f"/repos/{REPOSITORY}/issues", {"title": title, "body": body, "labels": [LABEL_HOLD]})
     number = int(created["number"])
     print(f"opened hold #{number} ({kind} {key[:12]})")
-    return number
+    # Two writers (`hold-epoch` here, `hold-settled` in settled-dispatch.yaml) can both read no hold for K and both
+    # create. Re-read after the create: every writer keeps the LOWEST open one, so the racers converge.
+    return _demote_duplicates(api, _open_holds_for(api, kind, key) or [created])
+
+
+def _open_holds_for(api: Client, kind: str, key: str) -> list[dict]:
+    """The open holds for (`kind`, `key`), lowest number first."""
+    found = [i for i in hold_issues(api) if i["kind"] == kind and i["key"] == key and i.get("state") == "open"]
+    return sorted(found, key=lambda i: int(i["number"]))
+
+
+def _demote_duplicates(api: Client, mine: Sequence[dict]) -> int:
+    """Keep the lowest open hold; take the label off every other one and say why. A duplicate is NEVER closed: the
+    automation closes no hold, and a closed version hold is a human's clear (`hold_cleared`). Without the label it is
+    no longer read as a hold (`open_holds`, `hold_issues`), by any writer or reader."""
+    keep = int(mine[0]["number"])
+    for issue in mine[1:]:
+        number = int(issue["number"])
+        try:
+            api.delete(f"/repos/{REPOSITORY}/issues/{number}/labels/{LABEL_HOLD}")
+        except ApiError as error:
+            # GitHub answers 404 when the label is already gone: the other racer demoted it first, and commented.
+            if error.status != 404:
+                raise
+            print(f"hold #{number} is a duplicate of #{keep}: already demoted")
+            continue
+        api.post(f"/repos/{REPOSITORY}/issues/{number}/comments", {"body": f"Duplicate of #{keep}: two hold writers raced. #{keep} is the hold; this issue no longer counts as one."})
+        print(f"hold #{number} is a duplicate of #{keep}: label removed")
+    return keep
 
 
 def ensure_epoch_hold(api: Client, epoch: EpochState, *, merge_sha: str) -> int | None:
@@ -494,16 +535,35 @@ def ensure_epoch_hold(api: Client, epoch: EpochState, *, merge_sha: str) -> int 
     return ensure_hold(api, kind="epoch", key=epoch.key, title=f"auto-pin hold: epoch {epoch.key[:12]} red", body="\n".join(lines) + "\n")
 
 
-def ensure_version_hold(api: Client, *, target: str, pin: str, main_sha: str, reasons: Sequence[str]) -> int:
-    """ADR-1015: a NEEDS-HUMAN verdict for `target` opens no PR; one open hold names the version and the reasons."""
+def ensure_version_hold(
+    api: Client, *, target: str, pin: str, main_sha: str, reasons: Sequence[str], e2: "DryRun | None" = None, branch: str | None = None, sha: str | None = None
+) -> int:
+    """ADR-1015: a NEEDS-HUMAN verdict for `target` opens no PR; one open hold names the version and the reasons.
+
+    ADR-1075: an E2 that is not green is NEEDS-HUMAN too. `e2` names that dry run, and `branch` / `sha` the pushed
+    commit it judged, which is kept as the evidence. `reasons` are E1's (`pin_bump.py --check`), empty when E1 accepted.
+    """
     lines = [
         f"auto-pin computed **NEEDS-HUMAN** for parent chart {target} (pin {pin}, main `{main_sha}`), so it opens no pull request (ADR-1015).",
         "",
-        "Reasons (`pin_bump.py --check`):",
-        "",
-        *[f"- {reason}" for reason in reasons],
-        *([] if reasons else ["- (pin_bump gave no reason)"]),
-        "",
+    ]
+    if reasons or e2 is None:
+        lines += [
+            "Reasons (`pin_bump.py --check`):",
+            "",
+            *[f"- {reason}" for reason in reasons],
+            *([] if reasons else ["- (pin_bump gave no reason)"]),
+            "",
+        ]
+    if e2 is not None:
+        run = f"[argocd-verify run {e2.run_id}]({run_url(e2.run_id)})" if e2.run_id is not None else "no run"
+        lines += [
+            f"E2, the kind-yadgar dry run, is **{e2.result}** ({run}, ADR-1075): {e2.reason or 'no reason given'}",
+            "",
+            f"- **Kept as evidence:** branch `{branch}`, head `{sha}`. No PR is opened for it; a human may open one by hand.",
+            "",
+        ]
+    lines += [
         HOLD_CLEAR,
         f"A human makes any pin PR for {target} by hand (`auto-pin.yaml` `evidence_only` posts its E2). "
         f"Once this hold is closed, auto-pin never holds or opens {target} again; a newer version resumes.",
@@ -966,8 +1026,6 @@ def compose_body(pin_body: str, state: State, *, e1_accept: bool, dryrun: DryRun
     """pin_bump's body with the E2 line, the supersede note and the hidden marker. Final at creation."""
     run = f"[argocd-verify run {dryrun.run_id}]({run_url(dryrun.run_id)})" if dryrun.run_id is not None else "no run"
     e2 = f"- **E2 kind-yadgar dry run (interim, read-only).** {dryrun.result}, {run}, judged against main `{state.main_sha}`."
-    if dryrun.result != "green":
-        e2 += f" Not green, so this PR is `{LABEL_NEEDS_HUMAN}`: {dryrun.reason}"
     if state.superseded:
         e2 += "\n- **Supersedes** " + ", ".join(f"#{n}" for n in state.superseded) + "; each closes once this PR exists."
     e2 += f"\n- **Opened by** `auto-pin.yaml`; head commit `{state.sha}`, built on main `{state.main_sha}`. Nothing here merges it."
@@ -995,11 +1053,15 @@ def open_pr(
     check_body: Callable[[str], list[str]],
     reader: Client | None = None,
     superseded: Sequence[PinPR] = (),
+    sleep: Callable[[float], None] | None = None,
 ) -> int | None:
     """Open the pin PR for `state`, THEN close `superseded`; None when a hold opened meanwhile. MainMoved when main moved.
 
     `reader` (the job's GITHUB_TOKEN, `issues: read`) reads the holds; the release App token holds no issues scope.
+    Only E1 accept AND E2 green opens: anything else is NEEDS-HUMAN, which `hold-version` holds (ADR-1015, ADR-1075).
     """
+    if not (e1_accept and dryrun.result == "green"):
+        raise Refused(f"E1 {'accept' if e1_accept else 'needs-human'}, E2 {dryrun.result}: NEEDS-HUMAN opens no PR; hold-version holds it")
     if main_head(api) != state.main_sha:
         raise MainMoved(f"main moved since {state.main_sha}: the evidence is for an older main")
     holds = open_holds(reader or api)
@@ -1013,11 +1075,26 @@ def open_pr(
     title = changelog_title(pin_body) or state.title
     created = api.post(f"/repos/{REPOSITORY}/pulls", {"title": title, "head": branch_for(state.target, str(state.sha)), "base": "main", "body": body})
     number = int(created["number"])
-    labels = [LABEL_PIN] if (e1_accept and dryrun.result == "green") else [LABEL_PIN, LABEL_NEEDS_HUMAN]
-    api.post(f"/repos/{REPOSITORY}/issues/{number}/labels", {"labels": labels})
-    print(f"opened #{number} for {state.target} with {', '.join(labels)}")
+    # Without `auto-pin` the merge bot skips the PR for good (a missing label is a human's brake), so a failed write
+    # is retried once, and a second failure turns the run red, AFTER the superseded PRs close.
+    unlabelled = None
+    for attempt in (1, 2):
+        try:
+            api.post(f"/repos/{REPOSITORY}/issues/{number}/labels", {"labels": [LABEL_PIN]})
+            unlabelled = None
+            break
+        except ApiError as error:
+            unlabelled = error
+            if attempt == 1:
+                (sleep or _sleep)(LABEL_RETRY_SECONDS)
+    if unlabelled is None:
+        print(f"opened #{number} for {state.target} with {LABEL_PIN}")
+    else:
+        print(f"::error::opened #{number} for {state.target} but its `{LABEL_PIN}` label write failed twice ({unlabelled}); auto-pin-merge skips it until a human adds the label")
     for pr in superseded:
         close_superseded(api, pr, state.target, by=number)
+    if unlabelled is not None:
+        raise InfrastructureError(f"#{number} has no `{LABEL_PIN}` label: {unlabelled}")
     return number
 
 
@@ -1203,15 +1280,29 @@ def command_hold_epoch(args: argparse.Namespace) -> int:
 
 
 def command_hold_version(args: argparse.Namespace) -> int:
-    """NEEDS-HUMAN (pin_bump exit 3): the hold first (GITHUB_TOKEN, issues), then the bot's PRs for the target close (PIN_TOKEN)."""
+    """NEEDS-HUMAN (pin_bump exit 3, or E2 red with `--dryrun`): the hold first (GITHUB_TOKEN, issues), then the bot's PRs for the target close (PIN_TOKEN)."""
     state = load_state(args.state)
     evidence = json.loads(args.evidence.read_text())
     if evidence.get("target") != state.target or evidence.get("pin") != state.pin:
         raise Refused(f"the evidence is for {evidence.get('pin')} -> {evidence.get('target')}, not {state.pin} -> {state.target}")
-    if evidence.get("accept") is not False:
-        raise Refused("the evidence accepts this pin: there is nothing to hold")
-    reasons = [str(reason) for reason in evidence.get("reasons") or []]
-    issue = ensure_version_hold(Api(os.environ.get("GITHUB_TOKEN")), target=state.target, pin=state.pin, main_sha=state.main_sha, reasons=reasons)
+    dryrun = DryRun(**json.loads(args.dryrun.read_text())) if args.dryrun else None
+    e1_red = evidence.get("accept") is False
+    e2_red = dryrun is not None and dryrun.result != "green"
+    if not (e1_red or e2_red):
+        raise Refused("the evidence accepts this pin and E2 is not red: there is nothing to hold")
+    if e2_red and not state.sha:
+        raise Refused("an E2 hold names the pushed commit, and the state file names none")
+    reasons = [str(reason) for reason in evidence.get("reasons") or []] if e1_red else []
+    issue = ensure_version_hold(
+        Api(os.environ.get("GITHUB_TOKEN")),
+        target=state.target,
+        pin=state.pin,
+        main_sha=state.main_sha,
+        reasons=reasons,
+        e2=dryrun if e2_red else None,
+        branch=branch_for(state.target, str(state.sha)) if e2_red else None,
+        sha=state.sha if e2_red else None,
+    )
     api = Api(os.environ.get("PIN_TOKEN"))
     for pr in pin_prs(api):
         if pr.state == "open" and pr.version == state.target:
@@ -1361,6 +1452,7 @@ def _parser() -> argparse.ArgumentParser:
     version = sub.add_parser("hold-version", help="NEEDS-HUMAN: ensure the version's hold issue, close the bot's PRs for it (ADR-1015)")
     version.add_argument("--state", type=Path, required=True)
     version.add_argument("--evidence", type=Path, required=True)
+    version.add_argument("--dryrun", type=Path, default=None, help="E2's result (`dryrun --out`): red holds too (ADR-1075)")
     fast = sub.add_parser("hold-settled", help="settled-dispatch's fast path: hold a red or verdict-less closed epoch")
     fast.add_argument("--repo", type=Path, required=True)
     fast.add_argument("--sha", required=True)

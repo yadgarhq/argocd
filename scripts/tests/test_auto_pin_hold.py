@@ -16,6 +16,12 @@ body (never the title alone):
     NO PR; it ensures one issue naming V and the reasons, updated in place,
     and closes any open automatic PR for V the bot still owns. A hold a human
     closed for V is the clear: V is never held or opened again automatically.
+    An E2 red is NEEDS-HUMAN too (ADR-1075): `hold-version --dryrun` holds V,
+    names the E2 run, opens no PR and keeps the pushed branch.
+
+TWO EPOCH WRITERS CAN RACE (yaadgaar #424 item 1): each re-reads after its
+create and keeps the lowest open hold; a duplicate loses its label, never its
+open state.
 """
 
 from __future__ import annotations
@@ -103,17 +109,34 @@ class Issues:
 
         return apply
 
+    def unlabel(self, number: int):
+        def apply(_body: object) -> list:
+            item = next(i for i in self.items if i["number"] == number)
+            labels = item.get("labels")
+            if labels is not None and not any(label["name"] == "auto-pin-hold" for label in labels):
+                # GitHub's remove-a-label answers 404 when the label is not on the issue.
+                raise ap.ApiError(404, "DELETE", f"/issues/{number}/labels/auto-pin-hold")
+            item["labels"] = [label for label in labels or [] if label["name"] != "auto-pin-hold"]
+            return item["labels"]
+
+        return apply
+
+    def held(self) -> list[dict]:
+        """The `labels=auto-pin-hold` filter: an item with no `labels` key is a fixture that carries the label."""
+        return [i for i in self.items if "labels" not in i or any(label["name"] == "auto-pin-hold" for label in i["labels"])]
+
     def routes(self) -> dict:
         routes = {
-            ("GET", ALL_HOLDS): lambda _b: list(self.items),
-            ("GET", OPEN_HOLDS): lambda _b: [i for i in self.items if i["state"] == "open"],
-            ("GET", CLOSED_HOLDS): lambda _b: [i for i in self.items if i["state"] == "closed"],
+            ("GET", ALL_HOLDS): lambda _b: list(self.held()),
+            ("GET", OPEN_HOLDS): lambda _b: [i for i in self.held() if i["state"] == "open"],
+            ("GET", CLOSED_HOLDS): lambda _b: [i for i in self.held() if i["state"] == "closed"],
             ("POST", f"{R}/issues"): self.create,
         }
-        for item in self.items:
-            routes[("PATCH", f"{R}/issues/{item['number']}")] = self.edit(item["number"])
-        for number in range(900, 910):
-            routes.setdefault(("PATCH", f"{R}/issues/{number}"), self.edit(number))
+        numbers = {item["number"] for item in self.items} | set(range(900, 910))
+        for number in numbers:
+            routes[("PATCH", f"{R}/issues/{number}")] = self.edit(number)
+            routes[("DELETE", f"{R}/issues/{number}/labels/auto-pin-hold")] = self.unlabel(number)
+            routes[("POST", f"{R}/issues/{number}/comments")] = {}
         return routes
 
 
@@ -183,6 +206,80 @@ def test_a_title_alone_is_not_the_key() -> None:
     issues = Issues([lookalike])
     api = Fake(issues.routes())
     assert ap.ensure_epoch_hold(api, red_epoch(), merge_sha=MAIN) == 901
+
+
+def test_two_writers_racing_for_one_epoch_converge_on_the_lowest_hold() -> None:
+    """YAAGAAR #424 item 1: `hold-epoch` (auto-pin) and `hold-settled` (settled-dispatch) both read no hold for K, then
+    both create. Each re-reads after its create and demotes every open duplicate above the lowest: the label goes, a
+    comment names the kept hold, and the duplicate is NEVER closed (a closed version hold is a human's clear)."""
+    issues = Issues()
+    racer = issues.create
+
+    def create_after_the_other_writer(body: dict) -> dict:
+        racer({**body, "title": body["title"]})  # the other writer's issue lands first: #900
+        return racer(body)  # ours: #901
+
+    routes = issues.routes()
+    routes[("POST", f"{R}/issues")] = create_after_the_other_writer
+    api = Fake(routes)
+    assert ap.ensure_epoch_hold(api, red_epoch(), merge_sha=MAIN) == 900
+    assert [i["number"] for i in issues.held() if i["state"] == "open"] == [900]
+    duplicate = next(i for i in issues.items if i["number"] == 901)
+    assert duplicate["state"] == "open", "a duplicate is demoted, never closed"
+    comment = next(w[2]["body"] for w in api.writes() if w[1] == f"{R}/issues/901/comments")
+    assert "#900" in comment
+    assert not [w for w in api.writes() if w[0] == "PATCH" and (w[2] or {}).get("state") == "closed"]
+
+
+def test_both_racers_demote_the_same_duplicate_and_neither_fails() -> None:
+    """Both writers re-read [900, 901] and both remove 901's label. The second remove answers 404 (the label is
+    gone): that is "already demoted", not an infrastructure failure, and it adds no second comment."""
+    body = ap.hold_marker("epoch", "k" * 64) + "\n\nx"
+    issues = Issues([{"number": 900, "state": "open", "title": "t", "body": body}, {"number": 901, "state": "open", "title": "t", "body": body}])
+    snapshot = [dict(i) for i in issues.items]
+    first, second = Fake(issues.routes()), Fake(issues.routes())
+    second.routes[("GET", ALL_HOLDS)] = snapshot  # the second writer read before the first demoted
+    assert ap._demote_duplicates(first, ap._open_holds_for(first, "epoch", "k" * 64)) == 900
+    assert ap._demote_duplicates(second, ap._open_holds_for(second, "epoch", "k" * 64)) == 900
+    comments = [w for api in (first, second) for w in api.writes() if w[1].endswith("/901/comments")]
+    assert len(comments) == 1
+
+
+@pytest.mark.parametrize("status", [403, 422, 502])
+def test_a_label_delete_that_fails_other_than_404_propagates(status: int) -> None:
+    """Only 404 (label already gone) means "already demoted". Any other answer is a real failure: it propagates,
+    and no comment claims a demotion that did not happen."""
+    body = ap.hold_marker("epoch", "k" * 64) + "\n\nx"
+    issues = Issues([{"number": 900, "state": "open", "title": "t", "body": body}, {"number": 901, "state": "open", "title": "t", "body": body}])
+    api = Fake(issues.routes())
+
+    def refuse(_body: object) -> None:
+        raise ap.ApiError(status, "DELETE", "/issues/901/labels/auto-pin-hold")
+
+    api.routes[("DELETE", f"{R}/issues/901/labels/auto-pin-hold")] = refuse
+    with pytest.raises(ap.ApiError) as raised:
+        ap._demote_duplicates(api, ap._open_holds_for(api, "epoch", "k" * 64))
+    assert raised.value.status == status
+    assert not [w for w in api.writes() if w[1].endswith("/901/comments")]
+
+
+def test_an_already_open_duplicate_is_demoted_on_the_next_write() -> None:
+    """The writer that lost the race may die before its re-read; the next ensure demotes what it left."""
+    body = ap.hold_marker("epoch", "k" * 64) + "\n\nx"
+    issues = Issues([{"number": 7, "state": "open", "title": "t", "body": body}, {"number": 9, "state": "open", "title": "t", "body": body}])
+    api = Fake(issues.routes())
+    assert ap.ensure_epoch_hold(api, red_epoch(), merge_sha=MAIN) == 7
+    assert [i["number"] for i in issues.held()] == [7]
+    assert ("DELETE", f"{R}/issues/9/labels/auto-pin-hold", None) in api.writes()
+
+
+def test_a_demoted_version_duplicate_never_reads_as_cleared() -> None:
+    body = ap.hold_marker("version", "0.34.12") + "\n\nx"
+    issues = Issues([{"number": 7, "state": "open", "title": "t", "body": body}, {"number": 9, "state": "open", "title": "t", "body": body}])
+    api = Fake(issues.routes())
+    assert ap.ensure_version_hold(api, target="0.34.12", pin="0.34.8", main_sha=MAIN, reasons=REASONS) == 7
+    assert ap.hold_cleared(Fake(issues.routes()), "0.34.12") is False
+    assert ap.open_holds(Fake(issues.routes())) == [7]
 
 
 def test_the_gate_reports_an_epoch_hold_and_opens_nothing(tmp_path: Path) -> None:
@@ -395,6 +492,77 @@ def test_hold_cleared_reads_closed_version_holds() -> None:
     api = Fake(Issues([closed]).routes())
     assert ap.hold_cleared(api, "0.34.12") is True
     assert ap.hold_cleared(api, "0.34.13") is False
+
+
+# ── E2 red is NEEDS-HUMAN too (ADR-1075, yaadgaar #423) ─────────────────────
+
+OLDER = "e" * 40
+
+
+def e2_red_files(tmp_path: Path, *, accept: bool = True, result: str = "red") -> tuple[Path, Path, Path]:
+    state = tmp_path / "state.json"
+    ap.save_state(state, ap.State(main_sha=MAIN, pin="0.34.8", target="0.34.12", title="t", sha=PUSHED))
+    evidence = tmp_path / "evidence.json"
+    evidence.write_text(json.dumps({"accept": accept, "reasons": [] if accept else REASONS, "pin": "0.34.8", "target": "0.34.12"}))
+    dryrun = tmp_path / "dryrun.json"
+    dryrun.write_text(json.dumps({"result": result, "run_id": 4242, "reason": "task-db rollout did not settle"}))
+    return state, evidence, dryrun
+
+
+def test_an_e2_red_pin_holds_its_version_opens_no_pr_and_keeps_the_pushed_branch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """ADR-1075: E1 accept, E2 red. The PR could never pass `ci / passed` (pin-evidence fails E2 on an automatic head),
+    so `hold-version --dryrun` holds the version instead: one hold naming E2's run and the kept branch, no PR, and
+    the branch that was pushed for the dry run is left for the human. An older bot PR for the version still closes."""
+    issues = Issues()
+    pulls = [bot_pr(61, "0.34.12", head=OLDER, mark_sha=OLDER)]
+    api = version_api(issues, pulls)
+    monkeypatch.setattr(ap, "Api", lambda token: api)
+    state, evidence, dryrun = e2_red_files(tmp_path)
+    assert ap.main(["hold-version", "--state", str(state), "--evidence", str(evidence), "--dryrun", str(dryrun)]) == 0
+    writes = api.writes()
+    assert [w[1] for w in writes if w[0] == "POST" and w[1] == f"{R}/issues"] == [f"{R}/issues"], "exactly one hold"
+    assert not [w for w in writes if w[1].endswith("/pulls")], "no PR is opened"
+    kept = f"auto/pin-0.34.12-{PUSHED[:12]}"
+    assert ("DELETE", f"{R}/git/refs/heads/{kept}", None) not in writes, "the pushed branch is kept as evidence"
+    assert [w[1] for w in writes if w[0] == "PATCH" and "/pulls/" in w[1]] == [f"{R}/pulls/61"]
+    (hold,) = issues.items
+    assert "kind=version key=0.34.12" in hold["body"]
+    assert "E2" in hold["body"] and "red" in hold["body"] and "task-db rollout did not settle" in hold["body"]
+    assert "https://github.com/yadgarhq/argocd-verify/actions/runs/4242" in hold["body"]
+    assert kept in hold["body"] and PUSHED in hold["body"]
+    assert "pin_bump gave no reason" not in hold["body"]
+
+
+def test_e1_and_e2_red_together_name_both_in_one_hold(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    issues = Issues()
+    api = version_api(issues, [])
+    monkeypatch.setattr(ap, "Api", lambda token: api)
+    state, evidence, dryrun = e2_red_files(tmp_path, accept=False)
+    assert ap.main(["hold-version", "--state", str(state), "--evidence", str(evidence), "--dryrun", str(dryrun)]) == 0
+    (hold,) = issues.items
+    assert all(reason in hold["body"] for reason in REASONS) and "argocd-verify/actions/runs/4242" in hold["body"]
+
+
+def test_hold_version_refuses_e1_accept_with_e2_green(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    api = version_api(Issues(), [])
+    monkeypatch.setattr(ap, "Api", lambda token: api)
+    state, evidence, dryrun = e2_red_files(tmp_path, result="green")
+    assert ap.main(["hold-version", "--state", str(state), "--evidence", str(evidence), "--dryrun", str(dryrun)]) == 1
+    assert api.writes() == []
+
+
+def test_auto_pin_holds_an_e2_red_pin_and_opens_only_a_green_one() -> None:
+    """The workflow half of ADR-1075: the dry run's `result` routes red to hold-version and only green to `open`."""
+    steps = {s.get("id"): s for s in yaml.safe_load(AUTO_PIN.read_text())["jobs"]["pin"]["steps"]}
+    hold = steps["hold_e2"]
+    assert "steps.dryrun.outputs.result == 'red'" in hold["if"] and "steps.dryrun.outputs.done == 'true'" in hold["if"]
+    assert "hold-version" in hold["run"] and '--dryrun "$OUT/dryrun.json"' in hold["run"]
+    assert hold["env"]["GITHUB_TOKEN"] == "${{ github.token }}"
+    # The relay can spend most of pin1's 60 minutes: the hold closes PRs with the token minted after it.
+    assert hold["env"]["PIN_TOKEN"] == "${{ steps.pin2.outputs.token }}"
+    opened = steps["open"]
+    assert "steps.dryrun.outputs.result == 'green'" in opened["if"]
+    assert "steps.dryrun.outputs.done == 'true'" in steps["pin2"]["if"]
 
 
 # ── the workflows ───────────────────────────────────────────────────────────

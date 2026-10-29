@@ -59,8 +59,12 @@ name: auto-pin
 #   version  pin_bump exit 3, NEEDS-HUMAN → NO PR (ADR-1015): ensure one hold
 #            naming the version and the reasons, updated in place, then close
 #            the bot's own open PRs for that version. Nothing is pushed and
-#            the private runner is not dispatched. A version whose hold a
-#            human closed is never held or opened again.
+#            the private runner is not dispatched. E2 red is NEEDS-HUMAN too
+#            (ADR-1075): after the dry run, the same hold names the E2 run and
+#            the pushed branch, which is kept; no PR is opened. A version
+#            whose hold a human closed is never held or opened again.
+# Both writers of an epoch hold (here and settled-dispatch.yaml) re-read after
+# a create and keep the lowest open hold for K; a duplicate loses its label.
 # Any open hold stops the gate at its first step, so a version hold blocks
 # every newer version too until a human closes it. `auto-pin-merge.yaml`
 # re-checks its PRs on its schedule, so a lost `regenerate` (see CONCURRENCY)
@@ -278,7 +282,8 @@ jobs:
           VERIFY_TOKEN: ${{ steps.verify2.outputs.token }}
         run: python3 scripts/auto_pin.py dryrun --state "$OUT/state.json" --evidence "$OUT/evidence.json" --out "$OUT/dryrun.json"
 
-      - name: mint a release App token (argocd, contents and pull-requests write), for the PR
+      # Minted after the relay for both paths below: the relay can spend most of pin1's 60 minutes.
+      - name: mint a release App token (argocd, contents and pull-requests write), for the PR or the E2 hold
         id: pin2
         if: steps.dryrun.outputs.done == 'true'
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
@@ -290,8 +295,21 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
+      # ADR-1075: E2 red is NEEDS-HUMAN under ADR-1015. pin-evidence fails E2 on every automatic head, so
+      # such a PR could never pass `ci / passed`. Hold the version, open no PR, keep the pushed branch.
+      - name: E2 red, NEEDS-HUMAN, ensure the version's hold issue and open no PR
+        id: hold_e2
+        if: steps.dryrun.outputs.done == 'true' && steps.dryrun.outputs.result == 'red'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PIN_TOKEN: ${{ steps.pin2.outputs.token }}
+        run: |
+          python3 scripts/auto_pin.py hold-version --state "$OUT/state.json" --evidence "$OUT/evidence.json" \
+            --dryrun "$OUT/dryrun.json"
+
       - name: open the pin PR, then close the PRs it supersedes (never merged here)
-        if: steps.dryrun.outputs.done == 'true'
+        id: open
+        if: steps.dryrun.outputs.done == 'true' && steps.dryrun.outputs.result == 'green'
         env:
           PIN_TOKEN: ${{ steps.pin2.outputs.token }}
           # Reads the hold issues once more; the App token is not asked for an issues scope.

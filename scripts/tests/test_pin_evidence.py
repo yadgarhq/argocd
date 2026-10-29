@@ -90,7 +90,7 @@ ACCEPT = {"accept": True, "reasons": [], "helms": sorted(HELMS), "changed": [], 
 
 def judge(
     pr_event: str, head: str, *, evidence=None, statuses=None, required=False, helms=None, base: str = BASE,
-    changed=pb.MECHANICAL_FILES,
+    changed=pb.MECHANICAL_FILES, differs=(),
 ):
     calls: list = []
 
@@ -107,6 +107,7 @@ def judge(
         helms=HELMS if helms is None else helms,
         e2_required=required,
         changed=list(changed),
+        regenerated_of=lambda target: list(differs),
     )
     return outcome, calls
 
@@ -428,11 +429,68 @@ def test_main_sets_the_base_to_the_merge_commits_first_parent(tmp_path: Path, mo
     monkeypatch.setattr(pe, "texts", lambda repo, sha: (BASE, moved()))
     monkeypatch.setattr(pe, "changed_files", lambda repo: list(pb.MECHANICAL_FILES))
     monkeypatch.setattr(pe, "merge_parent", lambda repo: "c" * 40)
-    monkeypatch.setattr(pe, "judge", lambda pr, *a, **k: seen.append(pr.base_sha) or pe.Outcome())
+    monkeypatch.setattr(pe, "judge", lambda pr, *a, **k: seen.append((pr.base_sha, callable(k.get("regenerated_of")))) or pe.Outcome())
     event_file = tmp_path / "event.json"
     event_file.write_text(json.dumps(event("event-auto.json")))
     assert pe.main(["judge", "--event", str(event_file)]) == 0
-    assert seen == ["c" * 40]
+    assert seen == [("c" * 40, True)], "main binds the regenerated files (yaadgaar #424 item 3)"
+
+
+# ── the three mechanical files, regenerated (yaadgaar #424 item 3) ──────────
+
+
+def test_an_automatic_pin_whose_chart_pin_or_table_is_not_the_regenerated_one_fails() -> None:
+    """E1 compared only `yadgar.yaml`. `chart_pin.json` and the K3 table must be what `pin_bump.write_files` makes
+    from the base for this target, byte for byte: anything else is a hand edit under an automatic head."""
+    for differs in ([pb.CHART_PIN], [pb.TABLE], [pb.CHART_PIN, pb.TABLE]):
+        outcome, _ = judge("event-auto.json", moved(), statuses=[green_status()], differs=differs)
+        assert not outcome.passed
+        assert all(any(path in failure for failure in outcome.failures) for path in differs), outcome.failures
+
+
+def test_a_human_pin_whose_files_differ_from_the_regenerated_ones_warns() -> None:
+    outcome, _ = judge("event-human.json", moved(), statuses=[green_status()], differs=[pb.TABLE])
+    assert outcome.passed and any(pb.TABLE in warning for warning in outcome.warnings)
+
+
+def test_the_regenerated_files_pass_when_they_match() -> None:
+    outcome, _ = judge("event-auto.json", moved(), statuses=[green_status()])
+    assert outcome.passed, outcome.failures
+    assert any("regenerated" in note for note in outcome.notes)
+
+
+def test_a_regeneration_that_fails_fails_an_automatic_pin() -> None:
+    def broken(target):
+        raise pb.Refused("scripts/gates/test_yadgar_application.py --write exited 1")
+
+    outcome = pe.judge(
+        pe.pr_of(event("event-auto.json")), BASE, moved(), evidence_of=lambda *a: copy.deepcopy(ACCEPT),
+        statuses_of=lambda sha: [green_status()], helms=HELMS, changed=list(pb.MECHANICAL_FILES), regenerated_of=broken,
+    )
+    assert not outcome.passed and any("--write exited 1" in failure for failure in outcome.failures)
+
+
+def test_regenerated_differences_seeds_the_base_and_compares_with_the_head(tmp_path: Path) -> None:
+    """The tree is the BASE's three files plus the merge checkout's two writers; `write_files` runs on it for the
+    target, and every file that differs from the head (the checkout) is named."""
+    head = tmp_path / "head"
+    for path, text in ((pb.APPLICATION, "app@target"), (pb.CHART_PIN, "pin@target"), (pb.TABLE, "hand-edited table")):
+        (head / path).parent.mkdir(parents=True, exist_ok=True)
+        (head / path).write_text(text)
+    for writer in pe.WRITERS:
+        (head / "scripts" / "gates" / writer).write_text(f"# {writer}")
+    seen: dict = {}
+
+    def write(tree: Path, target: str) -> None:
+        seen["base"] = {path: (tree / path).read_text() for path in pb.MECHANICAL_FILES}
+        seen["writers"] = sorted(p.name for p in (tree / "scripts" / "gates").glob("*.py"))
+        for path, text in ((pb.APPLICATION, "app@target"), (pb.CHART_PIN, "pin@target"), (pb.TABLE, "table@target")):
+            (tree / path).write_text(text)
+
+    differs = pe.regenerated_differences(head, TARGET, base_of=lambda path: f"base {path}".encode(), write=write)
+    assert differs == [pb.TABLE]
+    assert seen["base"] == {path: f"base {path}" for path in pb.MECHANICAL_FILES}
+    assert seen["writers"] == sorted(pe.WRITERS)
 
 
 def test_other_contexts_are_not_the_e2_status() -> None:
@@ -455,6 +513,7 @@ def test_an_unreadable_status_api_warns_in_report_mode_and_fails_when_required()
             helms=HELMS,
             e2_required=required,
             changed=list(pb.MECHANICAL_FILES),
+            regenerated_of=lambda target: [],
         )
         assert outcome.passed is passed, (required, outcome.failures)
 
