@@ -617,12 +617,12 @@ INNER_BLOCK = (
 
 
 def test_a_bare_get_after_the_inner_block_that_binds_the_closure_is_not_an_env_read() -> None:
-    new = {"src/upstream/tls.rs": INNER_BLOCK.replace("    None\n", "    let _r = get(handler);\n    None\n")}
+    new = {"src/upstream/tls.rs": INNER_BLOCK + "fn other() {\n    let _r = get(handler);\n}\n"}
     assert pb.boot_audit("gateway", {"src/upstream/tls.rs": INNER_BLOCK}, new, set()) == []
 
 
 def test_a_bare_get_before_the_closure_binding_is_not_an_env_read() -> None:
-    new = {"src/upstream/tls.rs": closure_tls("get").replace("    let get =", "    let _r = get(handler);\n    let get =")}
+    new = {"src/upstream/tls.rs": "fn other() {\n    let _r = get(handler);\n}\n" + closure_tls("get")}
     assert pb.boot_audit("gateway", {"src/upstream/tls.rs": closure_tls("get")}, new, set()) == []
 
 
@@ -871,3 +871,105 @@ def test_the_writer_loads_without_the_probe_in_its_tree(tmp_path: Path) -> None:
         [sys.executable, str(writer), "--write"], capture_output=True, text=True, check=False, cwd=tmp_path
     )
     assert "project_probe" not in finished.stderr, finished.stderr
+
+
+# ── E3: an unresolved call site follows its fn across files (yaadgaar 238) ──
+
+
+def keyed_fn(prefix: str, name: str = "timeout") -> str:
+    return f'pub fn {name}() -> Option<String> {{\n    let prefix = "{prefix}";\n    std::env::var(&format!("{{prefix}}_X")).ok()\n}}\n'
+
+
+REQUEST_FN = (
+    "pub fn timeout(req: &str) -> Option<String> {\n"
+    "    let prefix = req;\n"
+    '    std::env::var(&format!("{prefix}_X")).ok()\n}\n'
+)
+
+
+def audit(old_files: dict[str, str], new_files: dict[str, str]) -> list[str]:
+    old, new = tree("e3-old"), tree("e3-old")
+    old.update(old_files)
+    new.update(new_files)
+    return pb.boot_audit("gateway", old, new, RENDERED)
+
+
+def test_a_fn_moved_verbatim_between_files_is_green() -> None:
+    assert audit({"src/a.rs": keyed_fn("APP")}, {"src/a.rs": "// gone\n", "src/b.rs": keyed_fn("APP")}) == []
+
+
+def test_a_moved_fn_with_a_changed_binding_and_the_same_site_text_is_needs_human() -> None:
+    reasons = audit({"src/a.rs": keyed_fn("APP")}, {"src/a.rs": "// gone\n", "src/b.rs": keyed_fn("SECRET")})
+    assert any("cannot resolve" in r and "src/b.rs" in r for r in reasons), reasons
+
+
+def test_a_changed_binding_with_the_same_site_text_in_the_same_file_is_needs_human() -> None:
+    reasons = audit({"src/a.rs": keyed_fn("APP")}, {"src/a.rs": keyed_fn("SECRET")})
+    assert any("cannot resolve" in r and "src/a.rs" in r for r in reasons), reasons
+
+
+def test_a_different_fn_of_the_same_name_in_another_file_is_needs_human() -> None:
+    reasons = audit({"src/a.rs": keyed_fn("APP")}, {"src/a.rs": "// gone\n", "src/b.rs": REQUEST_FN})
+    assert any("cannot resolve" in r and "src/b.rs" in r for r in reasons), reasons
+
+
+def test_a_rewritten_fn_of_the_same_name_in_the_same_file_is_needs_human() -> None:
+    reasons = audit({"src/a.rs": keyed_fn("APP")}, {"src/a.rs": REQUEST_FN})
+    assert any("cannot resolve" in r for r in reasons), reasons
+
+
+def test_a_copy_of_a_fn_into_another_file_is_still_needs_human() -> None:
+    assert audit({"src/a.rs": keyed_fn("APP")}, {"src/a.rs": keyed_fn("APP"), "src/b.rs": keyed_fn("APP")})
+
+
+def test_one_site_moved_and_a_second_added_across_files_is_needs_human() -> None:
+    new = {"src/a.rs": "// gone\n", "src/b.rs": keyed_fn("APP") + keyed_fn("APP")}
+    assert audit({"src/a.rs": keyed_fn("APP")}, new)
+
+
+def test_a_moved_fn_renamed_is_needs_human() -> None:
+    assert audit({"src/a.rs": keyed_fn("APP")}, {"src/a.rs": "// gone\n", "src/b.rs": keyed_fn("APP", "timeout2")})
+
+
+NESTED_AFTER = (
+    "pub fn timeout() -> Option<String> {\n"
+    '    fn inner() -> u8 {\n        1\n    }\n'
+    '    let prefix = "{P}";\n'
+    '    std::env::var(&format!("{prefix}_X")).ok()\n'
+    "}\n"
+)
+
+
+def test_a_site_after_a_nested_fn_is_hashed_with_its_own_fn() -> None:
+    old = {"src/a.rs": NESTED_AFTER.replace("{P}", "APP")}
+    new = {"src/a.rs": NESTED_AFTER.replace("{P}", "KEY")}
+    assert any("cannot resolve" in r for r in audit(old, new))
+
+
+ARRAY_PARAM = (
+    "pub fn timeout(key: [u8; 4]) -> Result<Option<String>, [u8; 4]>\n"
+    "where\n    Vec<[u8; 4]>: Sized,\n{\n"
+    '    let prefix = "{P}";\n'
+    '    Ok(std::env::var(&format!("{prefix}_X")).ok())\n'
+    "}\n"
+)
+
+
+def test_a_semicolon_in_an_array_parameter_does_not_hide_the_body() -> None:
+    old = {"src/a.rs": ARRAY_PARAM.replace("{P}", "APP")}
+    new = {"src/a.rs": ARRAY_PARAM.replace("{P}", "KEY")}
+    assert any("cannot resolve" in r and "fn timeout" in r for r in audit(old, new))
+
+
+def test_a_fn_with_an_array_signature_moved_verbatim_between_files_is_green() -> None:
+    fn = ARRAY_PARAM.replace("{P}", "APP")
+    assert audit({"src/a.rs": fn}, {"src/a.rs": "// gone\n", "src/b.rs": fn}) == []
+
+
+TOP_LEVEL = 'static P: &str = "{P}";\nstatic T: Option<String> = std::env::var(&format!("{p}_X")).ok();\n'
+
+
+def test_a_top_level_site_that_changes_is_needs_human() -> None:
+    old = {"src/a.rs": TOP_LEVEL.replace("{P}", "APP")}
+    new = {"src/a.rs": TOP_LEVEL.replace("{P}", "KEY")}
+    assert any("cannot resolve" in r for r in audit(old, new))
