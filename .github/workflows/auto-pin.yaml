@@ -213,9 +213,11 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           TARGET: ${{ steps.gate.outputs.target }}
         run: |
+          # The runner shell is `bash -e`; `set -uo pipefail` does not clear it. Capture the status
+          # with `||` so exit 3 (NEEDS-HUMAN) reaches the case instead of aborting the step.
           set -uo pipefail
-          python3 scripts/pin_bump.py --target "$TARGET" --check --body --write --evidence "$OUT/evidence.json" > "$OUT/body.md"
-          status=$?
+          status=0
+          python3 scripts/pin_bump.py --target "$TARGET" --check --body --write --evidence "$OUT/evidence.json" > "$OUT/body.md" || status=$?
           case "$status" in
             0) echo "verdict=accept" >> "$GITHUB_OUTPUT" ;;
             3) echo "verdict=needs-human" >> "$GITHUB_OUTPUT" ;;
