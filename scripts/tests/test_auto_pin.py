@@ -31,6 +31,7 @@ import datetime as dt
 import importlib.util
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -913,6 +914,36 @@ def test_every_settled_dispatch_mint_reads_contents() -> None:
     assert len(mints) == 3
     for name, step in mints:
         assert step["with"]["permission-contents"] == "read", (name, step["name"])
+
+
+@pytest.mark.parametrize("code,expected", [(0, "verdict=accept"), (3, "verdict=needs-human")])
+def test_the_generate_step_maps_pin_bump_exit_codes_under_the_runner_shell(tmp_path: Path, code: int, expected: str) -> None:
+    """GitHub runs `run:` under `bash -e {0}`; `set -uo pipefail` does not clear -e. A bare `python3 ...; status=$?` dies
+    on exit 3 (NEEDS-HUMAN) before the case maps it. Run the real step script with a fake python3 exiting `code`."""
+    step = next(s for s in yaml.safe_load(WORKFLOW.read_text())["jobs"]["pin"]["steps"] if s.get("id") == "generate")
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "python3").write_text(f"#!/bin/sh\nexit {code}\n")
+    (fake / "python3").chmod(0o755)
+    out = tmp_path / "output"
+    out.touch()
+    env = {"PATH": str(fake), "OUT": str(tmp_path), "TARGET": "0.0.0", "GITHUB_OUTPUT": str(out)}
+    result = subprocess.run([shutil.which("bash") or "bash", "-e", "-c", step["run"]], env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert out.read_text().strip() == expected
+
+
+def test_the_generate_step_fails_on_an_unexpected_pin_bump_exit(tmp_path: Path) -> None:
+    step = next(s for s in yaml.safe_load(WORKFLOW.read_text())["jobs"]["pin"]["steps"] if s.get("id") == "generate")
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "python3").write_text("#!/bin/sh\nexit 2\n")
+    (fake / "python3").chmod(0o755)
+    out = tmp_path / "output"
+    out.touch()
+    env = {"PATH": str(fake), "OUT": str(tmp_path), "TARGET": "0.0.0", "GITHUB_OUTPUT": str(out)}
+    result = subprocess.run([shutil.which("bash") or "bash", "-e", "-c", step["run"]], env=env, capture_output=True, text=True)
+    assert result.returncode == 1 and out.read_text() == ""
 
 
 # ── the gate's own reads ────────────────────────────────────────────────────
