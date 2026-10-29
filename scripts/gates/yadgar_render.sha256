@@ -1,6 +1,6 @@
 # K3: sha256 of each object `applications/yadgar.yaml` renders, as canonical JSON.
 # Regenerate: python3 scripts/gates/test_yadgar_application.py --write
-targetRevision  0.49.27
+targetRevision  0.49.33
 2355fad035bd3696b4fc741ed21eba814d3f4941a75fa16fb16cc73d4a4f0696  /ConfigMap//audit
 d19a8a2ae018718b5fd1626dade2ec71e47cd2516e203491e319a02e4dab0968  /ConfigMap//gateway-knobs
 a2f6a8433dcff0b94a6031f1dd4f4f2e8dacbcdc77802163b6221755c4b93173  /ConfigMap//nats-config
@@ -27,13 +27,13 @@ a09d6e21f3be46bc1e95a3f81493a41a51535ecba1cea48c44bb1516e64f541a  /ServiceAccoun
 b461e2773973968a929a5f7468fe29497a7cb24ccb30ebe69684c4b21b906aac  /ServiceAccount//seeder
 c0e197e038ddb56ee493c89d54a9f31a7a28989db10e6b62499af0d35298bc60  /ServiceAccount//task
 edb82b5473dc6e2170e034831628de8b51bc03c3dbc474c487c285b8e25ee7bb  /ServiceAccount//task-db
-8179c8a7ac75435dedfb6bac797356e28c0d335c485239efc3d56535a24e9873  apps/Deployment//gateway
-0183116d9725bd555db5ce3fa4d6f5d1c7f8db599d61c1b211424cb8cd453fb3  apps/Deployment//iam
-8efde37ae788713d568c8064fcd6408c7c1458d35ba6fe9216c009ff677159c0  apps/Deployment//iam-db
-ec0b758abe0eac4e7d68936593c564d90f0a5b8501556af800856478a824706a  apps/Deployment//project
-46a32039f4297efc261b0ef8dcc743482fdbb4bc3ee818a6f49f58424f9eea3d  apps/Deployment//project-db
+3aa1a3d1ff141767e1f91feed181613fee7325674deae66e7902384544985f4c  apps/Deployment//gateway
+61fb239b079858338334340060e9aa682cb74011db077e58cc11078e5c36d310  apps/Deployment//iam
+67c60238a99fc028f4ac85d9b85027dd5ec8c47ba66addccc243ccf9f568e96e  apps/Deployment//iam-db
+f4fe7ce8672407a3f8dd817854814873d423ea05c5cb2b18330871aeebda71c0  apps/Deployment//project
+70906eb196783a4e1034c2bbae21da9c198ec08777f2cce853fdd167dc757e9d  apps/Deployment//project-db
 d01f0ce228f5d3e16a1879282d6503584fce5ecdd61e6f1e6315dbaab098c68e  apps/Deployment//task
-2ae95017bc761765272b50c17343e2c69a1b0ce18b4afba4b6764b3e6430e57b  apps/Deployment//task-db
+248b72e794515793c1e6401ba4f2f2691afa66f2765e1eaf6cb337e5f3413a96  apps/Deployment//task-db
 9ce974ab2ec1355f6db1207010f3ca0ce9e865452a7326abac5b05abf5aae5ab  apps/Deployment//valkey
 d9dba169be58a3e989d1e5f898e7b4d5967d5c9194b0d31d6c46f8f24f644ee1  apps/StatefulSet//nats
 aac3d30b38147f49357856fbda3ec9d299a019c556fad5c73d37a64c48c3c206  batch/Job//admin-bootstrap-token
