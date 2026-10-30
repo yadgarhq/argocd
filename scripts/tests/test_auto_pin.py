@@ -434,7 +434,7 @@ ORPHAN = "9" * 40
 MATCHING = f"{R}/git/matching-refs/heads/auto/pin-0.34.11"
 
 
-def e1_status(age_hours: float, main: str = MAIN, creator: str = "github-actions[bot]") -> dict:
+def e1_status(age_hours: float, main: str = MAIN, creator: str = "yadgarhq-settled-dispatch[bot]") -> dict:
     created = NOW - dt.timedelta(hours=age_hours)
     return {
         "context": "pin / e1",
@@ -464,7 +464,10 @@ def test_an_orphan_with_a_young_e1_on_the_same_main_backs_off() -> None:
     [
         ([e1_status(ap.BACKOFF_HOURS + 1)], "old"),
         ([e1_status(1, main=NEW_MAIN)], "another main"),
-        ([e1_status(1, creator="m-agahi")], "not github-actions"),
+        ([e1_status(1, creator="m-agahi")], "not the status App"),
+        ([e1_status(1, creator="yadgarhq-bot[bot]")], "the PR-authoring release App never posts E1"),
+        # YAAGAAR #422: an E1 posted with some workflow's GITHUB_TOKEN is not the bot's attempt.
+        ([e1_status(1, creator="github-actions[bot]")], "github-actions[bot]"),
         ([], "no status"),
     ],
 )
@@ -818,9 +821,53 @@ def test_e1_and_e2_green_leaves_only_the_auto_pin_label() -> None:
 
 
 @pytest.mark.parametrize(("e1", "e2"), [(False, "green"), (True, "red"), (False, "red")])
-def test_anything_but_e1_and_e2_green_is_needs_human(e1: bool, e2: str) -> None:
-    api, number = opened(e1, e2)
-    assert number == 30 and labels_of(api) == ["auto-pin", "auto-pin-needs-human"]
+def test_anything_but_e1_and_e2_green_opens_no_pr(e1: bool, e2: str) -> None:
+    """ADR-1015 and ADR-1075: NEEDS-HUMAN (E1) and E2 red both hold (`hold-version`); `open` refuses them, writing nothing."""
+    with pytest.raises(ap.Refused, match="hold-version"):
+        opened(e1, e2)
+
+
+@pytest.mark.parametrize("e1,e2", [(False, "green"), (True, "red")])
+def test_open_refuses_before_any_write(e1: bool, e2: str) -> None:
+    api = Fake(open_routes())
+    with pytest.raises(ap.Refused):
+        ap.open_pr(api, state(sha=PUSHED), e1_accept=e1, dryrun=ap.DryRun(result=e2, run_id=7, reason=""), pin_body=PIN_BODY, check_body=lambda b: [])
+    assert api.writes() == []
+
+
+def flaky_labels(failures: int):
+    seen = {"n": 0}
+
+    def answer(_body: object) -> list:
+        seen["n"] += 1
+        if seen["n"] <= failures:
+            raise ap.ApiError(502, "POST", "/labels")
+        return []
+
+    return answer
+
+
+def test_a_label_write_that_fails_once_is_retried() -> None:
+    """YAAGAAR #424 item 5: without `auto-pin` the merge bot skips the PR for good, so one failure is retried."""
+    api = Fake({**open_routes(), ("POST", f"{R}/issues/30/labels"): flaky_labels(1)})
+    number = ap.open_pr(
+        api, state(sha=PUSHED, superseded=(12,)), e1_accept=True, dryrun=ap.DryRun(result="green", run_id=7, reason=""),
+        pin_body=PIN_BODY, check_body=lambda b: [], superseded=[pr(12, "0.34.10")], sleep=lambda s: None,
+    )
+    assert number == 30
+    assert len([c for c in api.calls if c[1].endswith("/30/labels")]) == 2
+
+
+def test_a_label_write_that_keeps_failing_closes_the_superseded_then_fails_loud(capsys: pytest.CaptureFixture) -> None:
+    """The PR exists, so the superseded ones still close (never zero open PRs); then the run goes red, naming the PR."""
+    api = Fake({**open_routes(), ("POST", f"{R}/issues/30/labels"): flaky_labels(9)})
+    with pytest.raises(ap.InfrastructureError, match="#30"):
+        ap.open_pr(
+            api, state(sha=PUSHED, superseded=(12,)), e1_accept=True, dryrun=ap.DryRun(result="green", run_id=7, reason=""),
+            pin_body=PIN_BODY, check_body=lambda b: [], superseded=[pr(12, "0.34.10")], sleep=lambda s: None,
+        )
+    assert ("PATCH", f"{R}/pulls/12") in [(m, p) for m, p, _ in api.writes()]
+    assert "::error::" in capsys.readouterr().out
 
 
 def test_main_is_read_again_before_the_pr_opens() -> None:
@@ -868,6 +915,73 @@ def test_holds_are_read_with_the_reader_token_when_one_is_given() -> None:
     assert result is None and api.writes() == []
 
 
+# ── who posts the statuses: the settled-dispatch App, never GITHUB_TOKEN (yaadgaar #422) ──
+
+
+def token_clients(monkeypatch: pytest.MonkeyPatch, **routes: dict) -> dict[str, Fake]:
+    """`ap.Api(token)` answers with the Fake named by the token, so a test sees which token made which call."""
+    tokens = {"GITHUB_TOKEN": "gh", "VERIFY_TOKEN": "verify", "STATUS_TOKEN": "status"}
+    clients = {name: Fake(routes.get(name)) for name in tokens.values()}
+    for env, value in tokens.items():
+        monkeypatch.setenv(env, value)
+    monkeypatch.setattr(ap, "Api", lambda token: clients[token])
+    monkeypatch.setattr(ap, "_finder", lambda: None)
+    monkeypatch.setattr(ap, "_output", lambda **values: None)
+    return clients
+
+
+def posted(client: Fake) -> list[str]:
+    return [body["context"] for method, path, body in client.calls if method == "POST" and "/statuses/" in path]
+
+
+def test_dryrun_posts_e1_and_e2_with_the_status_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clients = token_clients(monkeypatch)
+    clients["status"].routes[("POST", f"{R}/statuses/{PUSHED}")] = {}
+    monkeypatch.setattr(ap, "relay_dryrun", lambda *a, **k: ap.DryRun(result="green", run_id=7, reason=""))
+    ap.save_state(tmp_path / "state.json", state(sha=PUSHED))
+    (tmp_path / "e1.json").write_text(json.dumps({"accept": True}))
+    code = ap.main(["dryrun", "--state", str(tmp_path / "state.json"), "--evidence", str(tmp_path / "e1.json"), "--out", str(tmp_path / "d.json")])
+    assert code == ap.EXIT_OK
+    assert posted(clients["status"]) == [ap.STATUS_E1, ap.STATUS_E2]
+    assert posted(clients["gh"]) == [] and posted(clients["verify"]) == []
+
+
+def test_evidence_posts_e2_with_the_status_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    clients = token_clients(monkeypatch)
+    clients["status"].routes[("POST", f"{R}/statuses/{PUSHED}")] = {}
+    clients["gh"].routes[("GET", f"{R}/branches/main")] = {"commit": {"sha": MAIN}}
+    monkeypatch.setattr(ap, "evidence_target", lambda api, number: PUSHED)
+    monkeypatch.setattr(ap, "checkout_sha", lambda tree: MAIN)
+    monkeypatch.setattr(ap, "current_pin", lambda tree: "0.34.8")
+    monkeypatch.setattr(ap, "relay_dryrun", lambda *a, **k: ap.DryRun(result="green", run_id=7, reason=""))
+    assert ap.main(["evidence", "--repo", str(tmp_path), "--pr", "61"]) == ap.EXIT_OK
+    assert posted(clients["status"]) == [ap.STATUS_E2]
+    assert posted(clients["gh"]) == []
+
+
+@pytest.mark.parametrize("command", ["dryrun", "evidence"])
+def test_no_status_token_is_refused_before_anything_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str) -> None:
+    """Without STATUS_TOKEN a status would go out unauthenticated (401) or, worse, with another token: refuse first."""
+    clients = token_clients(monkeypatch)
+    monkeypatch.delenv("STATUS_TOKEN")
+    relayed: list = []
+    monkeypatch.setattr(ap, "relay_dryrun", lambda *a, **k: relayed.append(1))
+    monkeypatch.setattr(ap, "evidence_target", lambda api, number: relayed.append(2))
+    ap.save_state(tmp_path / "state.json", state(sha=PUSHED))
+    (tmp_path / "e1.json").write_text(json.dumps({"accept": True}))
+    argv = {
+        "dryrun": ["dryrun", "--state", str(tmp_path / "state.json"), "--evidence", str(tmp_path / "e1.json"), "--out", str(tmp_path / "d.json")],
+        "evidence": ["evidence", "--repo", str(tmp_path), "--pr", "61"],
+    }[command]
+    assert ap.main(argv) == ap.EXIT_REFUSED
+    assert relayed == [] and all(client.calls == [] for client in clients.values())
+
+
+def test_the_status_login_is_the_settled_dispatch_app_not_the_pr_author() -> None:
+    assert ap.STATUS_LOGIN == ap.DISPATCH_LOGIN == "yadgarhq-settled-dispatch[bot]"
+    assert ap.STATUS_LOGIN != ap.PIN_LOGIN
+
+
 # ── the workflow: gated, never merges, never reads the payload ─────────────
 
 WORKFLOW = REPOSITORY / ".github" / "workflows" / "auto-pin.yaml"
@@ -896,6 +1010,39 @@ def test_an_evidence_dispatch_is_never_evicted_by_the_cron() -> None:
     assert "inputs.evidence_only" in evidence["group"] and evidence["group"] != "auto-pin" and evidence["cancel-in-progress"] is False
 
 
+def test_the_statuses_are_posted_with_a_settled_dispatch_token_and_no_job_token_writes_them() -> None:
+    """YAAGAAR #422: every step that posts a status gets STATUS_TOKEN from a settled-dispatch App mint (argocd
+    repository secrets, not the release App's org secrets) asking for statuses write on argocd and nothing else,
+    minted in that job; no job's GITHUB_TOKEN can write a status. In `pin` the mint runs before `push`, under
+    push's own condition, so a failed mint stops before an orphan branch exists."""
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    posting = 0
+    for name, job in workflow["jobs"].items():
+        assert job["permissions"].get("statuses") in (None, "read"), name
+        steps = job["steps"]
+        for index, step in enumerate(steps):
+            run = step.get("run", "")
+            if "auto_pin.py dryrun" not in run and "auto_pin.py evidence" not in run:
+                assert "STATUS_TOKEN" not in step.get("env", {}), (name, step.get("name"))
+                continue
+            posting += 1
+            token = step["env"]["STATUS_TOKEN"]
+            mint_id = token.removeprefix("${{ steps.").removesuffix(".outputs.token }}")
+            mint = next(s for s in steps[:index] if s.get("id") == mint_id)
+            assert "create-github-app-token" in mint["uses"], (name, mint_id)
+            assert mint["with"]["client-id"] == "${{ secrets.SETTLED_DISPATCH_APP_CLIENT_ID }}", (name, mint_id)
+            assert mint["with"]["private-key"] == "${{ secrets.SETTLED_DISPATCH_APP_PRIVATE_KEY }}", (name, mint_id)
+            assert mint["with"]["repositories"] == "argocd"
+            assert {k: v for k, v in mint["with"].items() if k.startswith("permission-")} == {"permission-statuses": "write"}
+            pushes = [i for i, s in enumerate(steps) if s.get("id") == "push"]
+            if pushes:
+                assert steps.index(mint) < pushes[0], (name, "minted before the branch is pushed")
+                assert mint.get("if") == steps[pushes[0]].get("if"), (name, "minted only when the push runs")
+            else:
+                assert mint.get("if") == step.get("if"), (name, "minted only when the posting step runs")
+    assert posting == 2
+
+
 def test_the_gate_token_only_reads() -> None:
     steps = {s.get("id"): s for s in yaml.safe_load(WORKFLOW.read_text())["jobs"]["pin"]["steps"]}
     assert steps["verify1"]["with"]["permission-actions"] == "read"
@@ -904,12 +1051,14 @@ def test_the_gate_token_only_reads() -> None:
 
 def test_every_settled_dispatch_mint_reads_contents() -> None:
     """ADR-1015: the gate calls GET argocd-verify/branches/main (settled_gate), and a token minted with named
-    permissions carries only those. So every SETTLED_DISPATCH mint in this workflow must ask for contents: read."""
+    permissions carries only those. So every SETTLED_DISPATCH mint for argocd-verify must ask for contents: read.
+    (The argocd status mints, yaadgaar #422, ask for statuses write only: the test above.)"""
     mints = [
         (name, step)
         for name, job in yaml.safe_load(WORKFLOW.read_text())["jobs"].items()
         for step in job["steps"]
         if "create-github-app-token" in step.get("uses", "") and "SETTLED_DISPATCH" in step["with"]["client-id"]
+        and step["with"]["repositories"] == "argocd-verify"
     ]
     assert len(mints) == 3
     for name, step in mints:

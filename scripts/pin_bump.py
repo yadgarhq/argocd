@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import importlib
 import io
 import json
@@ -105,6 +106,10 @@ APPLICATION = "applications/yadgar.yaml"
 CHART_PIN = "scripts/chart_pin.json"
 TABLE = "scripts/gates/yadgar_render.sha256"
 WRITER = "scripts/gates/test_yadgar_application.py"
+# Bound on one `--write` run (yaadgaar #164 item 3). The writer pulls and renders the
+# parent with helm: measured 2026-10-30 at about 1 s with a warm network, so 300 s is
+# far over it and still far under the CI job limit a hung helm would otherwise reach.
+WRITER_TIMEOUT_SECONDS = 300
 MECHANICAL_FILES = (APPLICATION, CHART_PIN, TABLE)
 
 EXIT_ACCEPT = 0
@@ -529,8 +534,11 @@ def production_sources(source: dict[str, str]) -> dict[str, str]:
 # (a false NEEDS-HUMAN is cheap; a false ACCEPT deploys something unvetted):
 #
 #   - a call site whose key is none of those (`lookup(&format!(…))`, a
-#     variable, a const from another crate), counted per (file, enclosing fn,
-#     normalised text): any growth is NEEDS-HUMAN;
+#     variable, a const from another crate), counted per (enclosing fn,
+#     normalised text, hash of the enclosing fn's normalised body): any
+#     growth is NEEDS-HUMAN. The file is not in the key, so a fn moved
+#     verbatim between files is no growth; the body hash makes a different
+#     fn of the same name, or the same fn with a changed binding, growth;
 #   - a call into an env entry point whose reads happen elsewhere —
 #     `*from_env*`, `*from_lookup*` (lifecycle's `ServerTls::from_env` reads
 #     `{prefix}_TLS_*`, dial's `request_timeout_from_lookup` its own key), or
@@ -699,15 +707,54 @@ def readers_of(files: dict[str, str], masks: dict[str, str]) -> tuple[set[str], 
             return required, read, scopes
 
 
-def enclosing_fn(mask: str, position: int) -> str:
-    names = [m.group(1) for m in FN_DEFINITION.finditer(mask, 0, position)]
-    return names[-1] if names else "<top>"
+def fn_body_brace(mask: str, start: int) -> int:
+    """Index of the `{` opening the body of the fn whose `(` is at `start`, or -1 for a fn with no body.
+
+    A `;` ends the search only outside `[]`, `<>` and `()`: `[u8; 4]` and `where` clauses are signature.
+    """
+    depth = 0
+    index = matching_paren(mask, start)
+    while index < len(mask):
+        char = mask[index]
+        if char == "-" and mask[index + 1 : index + 2] == ">":
+            index += 2  # the `>` of `->` closes nothing
+            continue
+        if char in "[<(":
+            depth += 1
+        elif char in "]>)":
+            depth = max(0, depth - 1)
+        elif depth == 0 and char == "{":
+            return index
+        elif depth == 0 and char == ";":
+            return -1
+        index += 1
+    return -1
+
+
+def enclosing_fn(path: str, text: str, mask: str, position: int) -> tuple[str, str]:
+    """`(name, SHA-256 of the whitespace-normalised source)` of the innermost fn whose body contains `position`.
+
+    Fails closed: with no containing body (a top-level site, or a fn this scan cannot span) the name is
+    `<top>` and the hash is of `path`, `position` and the whole file, so any change to that file is growth.
+    """
+    best: tuple[int, str, int] | None = None
+    for function in FN_DEFINITION.finditer(mask, 0, position):
+        brace = fn_body_brace(mask, function.end() - 1)
+        if brace < 0:
+            continue
+        stop = matching_brace(mask, brace)
+        if brace < position < stop and (best is None or function.start() > best[0]):
+            best = (function.start(), function.group(1), stop)
+    if best is None:
+        return "<top>", hashlib.sha256(f"{path}:{position}:{text}".encode()).hexdigest()
+    start, name, stop = best
+    return name, hashlib.sha256(" ".join(text[start:stop].split()).encode()).hexdigest()
 
 
 def env_sites(source: dict[str, str]) -> tuple[set[str], set[str], Counter]:
     """`(required keys, every key read, unresolved call sites)` of the non-test source.
 
-    An unresolved site is counted per `(file, enclosing fn, normalised text)`, so a
+    An unresolved site is counted per `(enclosing fn, normalised text)`, so a
     duplicate of an existing site in a new fn is a new site.
     """
     files = production_sources(source)
@@ -722,6 +769,7 @@ def env_sites(source: dict[str, str]) -> tuple[set[str], set[str], Counter]:
     required: set[str] = set()
     reads: set[str] = set()
     unresolved: Counter = Counter()
+    locations: dict[tuple, set[str]] = {}
     for path, text in files.items():
         mask = masks[path]
         for match in call.finditer(mask):
@@ -737,17 +785,20 @@ def env_sites(source: dict[str, str]) -> tuple[set[str], set[str], Counter]:
             if not keys:
                 opening = mask.find("(", match.end())
                 site = " ".join(text[match.start() : matching_paren(mask, opening)].split())
-                unresolved[(path, enclosing_fn(mask, match.start()), site)] += 1
+                name, body = enclosing_fn(path, text, mask, match.start())
+                key = (name, site, body)
+                unresolved[key] += 1
+                locations.setdefault(key, set()).add(path)
                 continue
             reads.update(keys)
             if match.group("required"):
                 required.update(keys)
-    return required, reads, unresolved
+    return required, reads, unresolved, {key: sorted(paths) for key, paths in locations.items()}
 
 
 def env_keys(source: dict[str, str]) -> tuple[set[str], set[str]]:
     """`(required keys, every key read)` at the env-read call sites of the non-test source."""
-    required, reads, _ = env_sites(source)
+    required, reads, _, _ = env_sites(source)
     return required, reads
 
 
@@ -867,8 +918,8 @@ def boot_audit(module: str, old_source: dict, new_source: dict, rendered: set[st
         return [f"{module}: a container takes `envFrom`, so the keys it sets cannot be read from the render"]
     if not production_sources(new_source):
         return [f"{module}: no Rust source under src/ at the new tag, so nothing could be audited"]
-    old_required, old_reads, old_unresolved = env_sites(old_source)
-    new_required, new_reads, new_unresolved = env_sites(new_source)
+    old_required, old_reads, old_unresolved, _ = env_sites(old_source)
+    new_required, new_reads, new_unresolved, new_paths = env_sites(new_source)
     reasons = [
         f"{module}: required key {key} is new at the new tag and the render does not set it"
         for key in sorted(new_required - old_required)
@@ -880,8 +931,9 @@ def boot_audit(module: str, old_source: dict, new_source: dict, rendered: set[st
         if name not in rendered and not optional(name)
     ]
     reasons += [
-        f"{module}: an env read at a new call site whose key E3 cannot resolve: `{site}` ({path}, fn {function})"
-        for (path, function, site) in sorted(new_unresolved - old_unresolved)
+        f"{module}: an env read at a new call site whose key E3 cannot resolve: `{site}` ({', '.join(new_paths[key])}, fn {function})"
+        for key in sorted(new_unresolved - old_unresolved)
+        for (function, site, _hash) in [key]
     ]
     grown_entries = entry_points(new_source) - entry_points(old_source)
     reasons += [
@@ -1113,9 +1165,21 @@ def write_files(tree: Path, target: str) -> None:
     application.write_text(rewritten)
     (tree / CHART_PIN).write_text(chart_pin)
     with helm_on_path(helm):
+        run_writer(tree / WRITER)
+
+
+def run_writer(writer: Path) -> None:
+    """Run the K3 writer, refusing by name if it outlives `WRITER_TIMEOUT_SECONDS` (yaadgaar #164 item 3)."""
+    try:
         finished = subprocess.run(
-            [sys.executable, str(tree / WRITER), "--write"], capture_output=True, text=True, check=False
+            [sys.executable, str(writer), "--write"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=WRITER_TIMEOUT_SECONDS,
         )
+    except subprocess.TimeoutExpired:
+        raise Refused(f"{WRITER} --write timed out after {WRITER_TIMEOUT_SECONDS} s (a hung helm pull or template)")
     if finished.returncode != 0:
         raise Refused(f"{WRITER} --write exited {finished.returncode}:\n{finished.stderr}")
 

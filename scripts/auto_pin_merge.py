@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """Merge an automatic argocd pin PR once every check holds, read fresh at merge time (ledger 1632 C6, ADR-0946, ADR-0948, ADR-1004).
 
-    auto_pin_merge.py --repo DIR [--run-head SHA --run-branch REF]
+    auto_pin_merge.py --repo DIR --verdicts OUT.json [--run-head SHA --run-branch REF]   # judge pass
+    auto_pin_merge.py --repo DIR --merge OUT.json                                        # merge pass
+    auto_pin_merge.py --repo DIR [--run-head SHA --run-branch REF]                       # both, one process
+
+TWO PASSES, SO THE RELEASE APP TOKEN IS MINTED ONLY FOR A MERGE (yaadgaar #424
+item 2). The judge pass reads with GITHUB_TOKEN and VERIFY_TOKEN only, carries
+out every regenerate, and writes the merge verdicts to `--verdicts`, plus the
+step outputs `merge=true|false` and `refused=true|false`. It exits 0 on a
+refusal, so a refused PR never stops another PR's merge; the workflow's last
+step turns the job red on `refused=true`. Only on `merge=true` does the
+workflow mint the release App token and run the merge pass, which reads
+PIN_TOKEN and carries out each merge verdict through `act` (holds, main and
+the head read once more right before the merge).
 
 THE PLAN IS `yadgarhq/docs` `plans/auto-deploy-parent-chart.md`, section 4
 ("Auto-merge") and section 7 ("Identity"). `.github/workflows/auto-pin-merge.yaml`
@@ -39,7 +51,8 @@ regenerate, wait or refuse. It MERGES only when all of these hold:
      None or still running: wait. Concluded otherwise: the sha is spent
      (ADR-0692): REGENERATE. Two or more: refuse.
   8. Every `pin / e1` and every `pin / kind-dryrun` status on the head is
-     `success`, by `github-actions[bot]`, parses as `auto_pin.DESCRIPTION`
+     `success`, by `auto_pin.STATUS_LOGIN` (`yadgarhq-settled-dispatch[bot]`,
+     yaadgaar #422; never `github-actions[bot]`), parses as `auto_pin.DESCRIPTION`
      (accept / green, `sha=` the head, `main=` main), and every E2 names the
      marker's run. A forged green beside the real one cannot win.
   9. YAAGAAR #420, the identity check: the E2 run, read on argocd-verify with
@@ -47,8 +60,10 @@ regenerate, wait or refuse. It MERGES only when all of these hold:
      `workflow_dispatch` started by `yadgarhq-settled-dispatch[bot]`, titled
      `pin-dryrun <head>`, completed success, on argocd-verify's default
      branch, with a `pin-dryrun` artifact whose result is green for this sha,
-     this main and main's pin. Any argocd workflow can post a status as
-     `github-actions[bot]`; only that App can start that run.
+     this main and main's pin. An argocd workflow that names the
+     settled-dispatch App's repository secrets can post a status as that App;
+     the status alone is therefore not enough, and the run it names must be
+     a green `pin-dryrun` for this head.
  10. Main's settled epoch is green (`auto_pin.epoch_state`).
  11. `mergeable_state` is `clean`, polled a bounded number of times while
      GitHub still computes it (`unknown`). `behind`: REGENERATE. Anything
@@ -75,19 +90,21 @@ forged or mismatched status, the wrong files, the wrong run identity, two
 `ci / passed`), and turns the job red.
 
 Exit codes: 0 done (merged, waiting, skipping or regenerating are decisions);
-1 a PR was refused or a merge was refused; 3 infrastructure.
+1 a PR was refused or a merge was refused; 3 infrastructure. The judge pass
+(`--verdicts`) exits 0 on a refused PR and says `refused=true` instead.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
 import time
 import urllib.parse
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -129,7 +146,7 @@ class MergeReads:
 
 
 def _statuses_problem(statuses: list[dict], *, head: str, main: str, run: int) -> str | None:
-    """Every `pin / e1` and `pin / kind-dryrun` on the head agrees: success, by the Actions bot, this head, this main, the marker's run."""
+    """Every `pin / e1` and `pin / kind-dryrun` on the head agrees: success, by ap.STATUS_LOGIN, this head, this main, the marker's run."""
     expected = {ap.STATUS_E1: ("e1", "accept"), ap.STATUS_E2: ("e2", "green")}
     for context, (check, result) in expected.items():
         mine = [s for s in statuses if s.get("context") == context]
@@ -361,41 +378,76 @@ def _e2_reader(pin: str) -> Callable[[int, str, str], str | None]:
     return read
 
 
+def judge_pass(reader: ap.Client, args: argparse.Namespace) -> tuple[int, list[Verdict]]:
+    """Judge every open automatic PR with GITHUB_TOKEN alone, regenerate where due, and return the merge verdicts."""
+    pb = ap._import("pin_bump")
+    reads = MergeReads(epoch=ap._epoch_reader(args.repo), e2_run=_e2_reader(ap.current_pin(args.repo)), mechanical=tuple(pb.MECHANICAL_FILES), sleep=time.sleep)
+    code = ap.EXIT_OK
+    merges: list[Verdict] = []
+    candidates = [p for p in ap.pin_prs(reader) if p.state == "open"]
+    if not candidates:
+        print("no open automatic pin PR")
+    for pr in candidates:
+        verdict = judge_pr(reader, pr.number, reads, run_head=args.run_head or None, run_branch=args.run_branch or None)
+        if verdict.action == "refuse":
+            print(f"::warning::#{pr.number} refused: {verdict.reason}")
+            code = ap.EXIT_REFUSED
+            continue
+        if verdict.action == "merge":
+            print(f"#{verdict.number}: merge: {verdict.reason}")
+            merges.append(verdict)
+            continue
+        left = regenerations_left(reader, verdict.version or "", verdict.main or "") if verdict.action == "regenerate" else True
+        # A regenerate needs GITHUB_TOKEN only; `act` touches its first argument only for a merge.
+        try:
+            act(reader, reader, verdict, regenerations_left=left)
+        except ap.ApiError as error:
+            print(f"::error::#{pr.number}: the {verdict.action} failed ({error}); not retried")
+            code = ap.EXIT_REFUSED
+    return code, merges
+
+
+def merge_pass(pin_api: ap.Client, reader: ap.Client, merges: list[Verdict]) -> int:
+    """Carry out each merge verdict with the release App token; `act` re-reads holds, main and the head first."""
+    code = ap.EXIT_OK
+    for verdict in merges:
+        try:
+            act(pin_api, reader, verdict, regenerations_left=True)
+        except ap.ApiError as error:
+            print(f"::error::#{verdict.number}: the merge was refused ({error}); not retried")
+            code = ap.EXIT_REFUSED
+    return code
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--repo", type=Path, required=True, help="main's checkout: MECHANICAL_FILES, the pin and the epoch come from here")
     parser.add_argument("--run-head", default="", help="the head sha of the ci run that triggered this pass, if any")
     parser.add_argument("--run-branch", default="", help="that run's head branch")
+    passes = parser.add_mutually_exclusive_group()
+    passes.add_argument("--verdicts", type=Path, default=None, help="judge pass: write the merge verdicts here; PIN_TOKEN is not read")
+    passes.add_argument("--merge", type=Path, default=None, help="merge pass: carry out the merge verdicts the judge pass wrote, with PIN_TOKEN")
     try:
         args = parser.parse_args(argv)
     except SystemExit as exit_:
         return ap.EXIT_USAGE if exit_.code else ap.EXIT_OK
     try:
         reader = ap.Api(os.environ.get("GITHUB_TOKEN"))
-        pin_api = ap.Api(os.environ.get("PIN_TOKEN"))
         main_sha = ap.main_head(reader)
         if ap.checkout_sha(args.repo) != main_sha:
             print(f"the checkout is not main's head {main_sha}; the next pass reads it")
+            if args.verdicts:
+                ap._output(merge="false", refused="false")
             return ap.EXIT_OK
-        pb = ap._import("pin_bump")
-        reads = MergeReads(epoch=ap._epoch_reader(args.repo), e2_run=_e2_reader(ap.current_pin(args.repo)), mechanical=tuple(pb.MECHANICAL_FILES), sleep=time.sleep)
-        code = ap.EXIT_OK
-        candidates = [p for p in ap.pin_prs(reader) if p.state == "open"]
-        if not candidates:
-            print("no open automatic pin PR")
-        for pr in candidates:
-            verdict = judge_pr(reader, pr.number, reads, run_head=args.run_head or None, run_branch=args.run_branch or None)
-            if verdict.action == "refuse":
-                print(f"::warning::#{pr.number} refused: {verdict.reason}")
-                code = ap.EXIT_REFUSED
-                continue
-            left = regenerations_left(reader, verdict.version or "", verdict.main or "") if verdict.action == "regenerate" else True
-            try:
-                act(pin_api, reader, verdict, regenerations_left=left)
-            except ap.ApiError as error:
-                print(f"::error::#{pr.number}: the merge was refused ({error}); not retried")
-                code = ap.EXIT_REFUSED
-        return code
+        if args.merge:
+            pin_api = ap.Api(os.environ.get("PIN_TOKEN"))
+            return merge_pass(pin_api, reader, [Verdict(**v) for v in json.loads(args.merge.read_text())["merge"]])
+        code, merges = judge_pass(reader, args)
+        if args.verdicts:
+            args.verdicts.write_text(json.dumps({"merge": [asdict(v) for v in merges]}, indent=2, sort_keys=True) + "\n")
+            ap._output(merge="true" if merges else "false", refused="true" if code != ap.EXIT_OK else "false")
+            return ap.EXIT_OK
+        return max(code, merge_pass(ap.Api(os.environ.get("PIN_TOKEN")), reader, merges))
     except ap.Refused as refused:
         print(f"::error::refused: {refused}")
         return ap.EXIT_REFUSED

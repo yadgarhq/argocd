@@ -35,11 +35,17 @@ which is what merging the PR makes main.
    never a label. It must move the pin, and the merge commit must change exactly the three
    mechanical files (`pin_bump.MECHANICAL_FILES`): FAIL otherwise, in
    `detect` already. C3 does NOT judge non-pin edits on a HUMAN head;
-   K3, two-owners and review cover those.
+   two-owners and review cover those (K3 is gone, argocd#193). The pin
+   move's own NEEDS-HUMAN verdict is enforced on a human head (step 4).
 1. Pin-only. The head `yadgar.yaml` must be the base one with the one
    `targetRevision:` line rewritten (`pin_bump.rewrite_target_revision`), byte
    for byte. A values change in the same PR is not a pin-only PR: FAIL, before
-   any render (plan, E1).
+   any render (plan, E1). After the helm check (3.), all three mechanical files
+   are bound too (yaadgaar #424 item 3): `regenerated_differences` seeds a tree
+   with the base's three files and the checkout's two writers, runs
+   `pin_bump.write_files` for the target, and compares each file with the head
+   byte for byte. A difference, or a regeneration that fails, FAILS an
+   automatic head and WARNS on a human one.
 2. The direction. A prerelease or unreadable target: FAIL. A target lower than
    the base pin is a downgrade (a revert, plan section 6). `pin_bump.check` and
    `pin_dryrun.py` judge forward moves only, so a downgrade is not judged:
@@ -62,21 +68,50 @@ which is what merging the PR makes main.
    digests), and never over raw bytes.
 
    A NEEDS-HUMAN verdict FAILS an automatic PR (step 0: a same-repository
-   head `auto/pin-X.Y.Z` or `auto/pin-X.Y.Z-<sha12>`, by branch alone) and
-   WARNS on a human one. A human pin PR is the human
-   review that NEEDS-HUMAN asks for: argocd#139 crossed task-db migration 7,
+   head `auto/pin-X.Y.Z` or `auto/pin-X.Y.Z-<sha12>`, by branch alone),
+   always. On a HUMAN head it FAILS too, as `NEEDS-HUMAN-UNACKNOWLEDGED`,
+   unless the PR commits the human's acknowledgement (Max, 2026-10-30: with
+   K3 dropped, argocd#193 and ADR-1075, a hand pin PR that changes non-image
+   fields had no hard red at all). The acknowledgement is an entry in
+   `ACK_FILE`, `scripts/pin_needs_human_ack.json`:
+   `{"target": X.Y.Z, "reasons": [...], "why": "..."}`. It clears the verdict
+   only when its `target` is this PR's target AND its `reasons` hold every
+   reason of the verdict, string for string; any reason it does not name
+   stays a failure. The failure prints the exact entry to commit. Nothing
+   else clears it: a label is set by anyone with triage, and a review
+   approval does not re-run this job (`ci.yaml` runs on `opened`,
+   `synchronize`, `reopened` and `edited` only). The ack is a commit in the
+   reviewed diff, and a commit re-runs this check; it also leaves the
+   acknowledged reasons in main's history. The file is read from the merge
+   checkout (`main`), never from the event.
+
+   THE CLEARING ENTRY MUST BE NEW IN THIS PR. An entry already on the base,
+   byte-equal after parsing, clears nothing (`base_ack_text` reads the base's
+   copy from the merge commit's first parent; no file there is no entry).
+   Otherwise an ack merged earlier for the same target, by a revert and a
+   re-pin or by an ack-only PR merged first, would clear a later PR nobody
+   acknowledged. To re-acknowledge, the PR rewrites the existing entry (a
+   new `why` at least). A malformed file on either side FAILS
+   (`acknowledgements`): a half-filled acknowledgement reads as reviewed when
+   it was not (the `crd_removals_ack.json` rule).
+
+   This keeps argocd#139's route open: that PR crossed task-db migration 7,
    C1's verdict was NEEDS-HUMAN, and Max reviewed it by hand and merged it.
-   Failing that verdict on every PR would make a migration unmergeable until
-   C10, and a moved `yadgar-store` unmergeable for good (C10 does not lift it).
+   Under this rule the same PR commits one ack entry naming that reason. A
+   migration, or a moved `yadgar-store`, stays mergeable by hand.
 5. E2: the commit status `pin / kind-dryrun` on the PR head sha (never the
    merge commit, which carries no status). It counts only when EVERY status
-   of that context on the sha is `success`, created by `github-actions[bot]`,
+   of that context on the sha is `success`, created by `yadgarhq-settled-dispatch[bot]`,
    and its description parses as `auto_pin.DESCRIPTION` with check `e2`,
    result `green`, `sha=` the head, `main=` the merge commit's first parent
    and a run id (yaadgaar #420: no substring match, and a forged green after
-   a red cannot win). The creator check cannot tell one argocd workflow from
-   another; the dispatch App's identity is checked on the argocd-verify run
-   itself by `auto_pin_merge.py`, which holds the token this job must not.
+   a red cannot win). The creator is the settled-dispatch App, whose token
+   auto-pin mints for argocd with `statuses: write` only (yaadgaar #422): a
+   job's GITHUB_TOKEN posts as `github-actions[bot]`, so such a status is
+   refused. The App's key is an argocd repository secret, so an argocd
+   workflow that names it can still post as the App; the dispatch App's
+   identity is checked on the argocd-verify run itself by
+   `auto_pin_merge.py`, which holds the token this job must not.
    A downgrade is exempt (`pin_dryrun.py` refuses one, so its status can
    never exist).
 
@@ -106,6 +141,7 @@ import io
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -121,8 +157,14 @@ import pin_bump as pb  # after the path insert: scripts/ is not a package
 
 # Human heads only: report, do not require. An automatic head always requires E2.
 E2_REQUIRED = False
+# A human head's acknowledgement of a NEEDS-HUMAN verdict, by target (module docstring, step 4).
+ACK_FILE = "scripts/pin_needs_human_ack.json"
+ACK_FIELDS = ("target", "reasons", "why")
+# The `why` the failure prints. Committed unchanged, it says nobody wrote what was checked: refused.
+ACK_WHY_PLACEHOLDER = "<what the reviewer checked, per reason>"
 E2_CONTEXT = "pin / kind-dryrun"
-E2_CREATOR = "github-actions[bot]"
+# auto-pin posts E2 with a settled-dispatch App token; any argocd workflow's GITHUB_TOKEN posts as github-actions[bot] (yaadgaar #422).
+E2_CREATOR = "yadgarhq-settled-dispatch[bot]"
 
 # Pinned by version AND by the sha256 of get.helm.sh's linux-amd64 tarball,
 # checked on 2026-10-24 against both get.helm.sh's `.sha256sum` and the
@@ -138,6 +180,10 @@ HELM_MEMBER = "linux-amd64/helm"
 # `auto/pin-<v>-<sha12>` (argocd#141). Never the author: the release App
 # `yadgarhq-bot[bot]` also opens PRs that are no pin (argocd#135,
 # `actions-adopt`, a hooks bump). Never a label: anyone with triage sets one.
+# The two writers `pin_bump.write_files` runs for the K3 table, copied (never linked: both resolve their
+# repository from `Path(__file__).resolve()`) into the regeneration tree, as `test_pin_bump_replay` does.
+WRITERS = ("test_yadgar_application.py", "test_no_two_owners.py")
+
 AUTO_BRANCH = re.compile(r"^auto/pin-\d+\.\d+\.\d+(-[0-9a-f]{12})?$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
 
@@ -243,6 +289,91 @@ def automatic_problem(pr: Pr, move: tuple[str, str] | None, changed: list[str]) 
     return None
 
 
+def base_file(repo: Path, path: str) -> bytes:
+    """`path` at the merge commit's first parent, the base."""
+    return subprocess.run(["git", "-C", str(repo), "show", f"HEAD^1:{path}"], capture_output=True, check=True).stdout
+
+
+def regenerated_differences(
+    repo: Path, target: str, *, base_of: Callable[[str], bytes] | None = None, write: Callable[[Path, str], None] | None = None
+) -> list[str]:
+    """The mechanical files of the checkout `repo` that differ from what `pin_bump.write_files` makes for `target`.
+
+    The tree holds the BASE's three files and the checkout's two writers, nothing else, exactly as
+    `test_pin_bump_replay` builds it; `write_files` then moves it to `target` (helm v3.18.4 from `PIN_BUMP_HELMS`).
+    """
+    base_of = base_of or (lambda path: base_file(repo, path))
+    write = write or pb.write_files
+    with tempfile.TemporaryDirectory() as scratch:
+        tree = Path(scratch)
+        for path in pb.MECHANICAL_FILES:
+            (tree / path).parent.mkdir(parents=True, exist_ok=True)
+            (tree / path).write_bytes(base_of(path))
+        for writer in WRITERS:
+            shutil.copyfile(repo / "scripts" / "gates" / writer, tree / "scripts" / "gates" / writer)
+        write(tree, target)
+        return [path for path in pb.MECHANICAL_FILES if (tree / path).read_bytes() != (repo / path).read_bytes()]
+
+
+def acknowledgements(path: Path) -> dict[str, dict]:
+    """`ACK_FILE`'s entries keyed by target; no file is no acknowledgement. Anything unreadable or malformed is refused."""
+    if not path.exists():
+        return {}
+    try:
+        text = path.read_text()
+    except OSError as error:
+        raise Refused(f"{ACK_FILE} could not be read: {error}") from error
+    return parse_acknowledgements(text)
+
+
+def base_ack_text(repo: Path) -> str | None:
+    """`ACK_FILE` at the merge commit's first parent, the base; None when the base has no such file."""
+
+    def git(*arguments: str) -> str:
+        return subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True, text=True, check=True).stdout
+
+    if not git("ls-tree", "HEAD^1", "--", ACK_FILE).strip():
+        return None
+    return git("show", f"HEAD^1:{ACK_FILE}")
+
+
+def parse_acknowledgements(text: str | None) -> dict[str, dict]:
+    """`ACK_FILE`'s text parsed into entries keyed by target; None (no file) is none. Malformed is refused."""
+    if text is None:
+        return {}
+    try:
+        entries = json.loads(text)
+    except ValueError as error:
+        raise Refused(f"{ACK_FILE} is not JSON: {error}") from error
+    if not isinstance(entries, list):
+        raise Refused(f"{ACK_FILE} must be a JSON list of entries, not {type(entries).__name__}")
+    found: dict[str, dict] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or any(not entry.get(name) for name in ACK_FIELDS):
+            raise Refused(f"{ACK_FILE} entry {entry!r} needs a non-empty {', '.join(ACK_FIELDS)}")
+        reasons = entry["reasons"]
+        typed = isinstance(entry["target"], str) and isinstance(entry["why"], str) and isinstance(reasons, list)
+        if not typed or not all(isinstance(r, str) for r in reasons):
+            raise Refused(f"{ACK_FILE} entry {entry!r}: target and why are strings and reasons a list of strings")
+        if entry["why"] == ACK_WHY_PLACEHOLDER:
+            raise Refused(f"{ACK_FILE} entry for {entry['target']}: replace the placeholder why with what the reviewer checked")
+        if entry["target"] in found:
+            raise Refused(f"{ACK_FILE} names target {entry['target']} twice")
+        found[entry["target"]] = entry
+    return found
+
+
+def unacknowledged(target: str, reasons: list[str], acks: dict[str, dict], base_acks: dict[str, dict]) -> list[str]:
+    """The NEEDS-HUMAN reasons this PR's own `ACK_FILE` entry for `target` does not name, string for string.
+
+    An entry equal to the base's entry for `target` is not this PR's: it names nothing.
+    """
+    entry = acks.get(target)
+    if entry is None or base_acks.get(target) == entry:
+        return list(reasons)
+    return [reason for reason in reasons if reason not in set(entry["reasons"])]
+
+
 def evidence(head_text: str, pin: str, target: str, helms: dict[str, str], net=None) -> dict:
     """E1, E3 and E4 by `pin_bump.check`: both pins rendered with the HEAD `valuesObject`."""
     with tempfile.TemporaryDirectory() as scratch:
@@ -262,9 +393,9 @@ def statuses(repository: str, sha: str) -> list[dict]:
 def e2_problem(found: list[dict], sha: str, base: str) -> str | None:
     """None when EVERY `pin / kind-dryrun` on `sha` is a green bot status for this head and this base; else why not.
 
-    YAAGAAR #420. Any workflow in argocd can post a status as
-    `github-actions[bot]`, so neither the creator nor the newest status can
-    decide alone. Each one must parse as `auto_pin.DESCRIPTION` exactly (no
+    YAAGAAR #420, #422. The creator must be E2_CREATOR, the settled-dispatch App:
+    any argocd workflow's GITHUB_TOKEN posts as `github-actions[bot]`. Still
+    neither the creator nor the newest status decides alone. Each one must parse as `auto_pin.DESCRIPTION` exactly (no
     substring match) with check `e2`, result `green`, `sha` the head, `main`
     the base and a run id. A forged green therefore cannot outvote the bot's
     red; it can only make E2 red. What binds E2 to the dispatch App is the
@@ -307,6 +438,9 @@ def judge(
     statuses_of: Callable[[str], list[dict]],
     helms: dict[str, str],
     changed: list[str],
+    regenerated_of: Callable[[str], list[str]],
+    acks: dict[str, dict] | None = None,
+    base_acks: dict[str, dict] | None = None,
     e2_required: bool = E2_REQUIRED,
 ) -> Outcome:
     """The verdict of `pin-evidence` on one PR (see the module docstring for the order)."""
@@ -346,13 +480,47 @@ def judge(
     if missing:
         outcome.failures.append(f"helm {', '.join(missing)} not installed; E1 renders on exactly {', '.join(HELMS)}")
         return outcome
+    # Pin-only binds all three mechanical files, not `yadgar.yaml` alone: each must be what `pin_bump.write_files`
+    # makes from the base for this target (yaadgaar #424 item 3). FAIL on an automatic head, WARN on a human one.
+    try:
+        differs = regenerated_of(target)
+        problem = (
+            f"not the regenerated pin: {', '.join(differs)} differ(s) from what `pin_bump.write_files` makes from the base for {target}"
+            if differs
+            else None
+        )
+    except (pb.Refused, subprocess.CalledProcessError, OSError) as error:
+        problem = f"the three mechanical files could not be regenerated for {target}: {error}"
+    if problem:
+        (outcome.failures if pr.automatic else outcome.warnings).append(problem)
+    else:
+        outcome.notes.append(f"{', '.join(pb.MECHANICAL_FILES)} are the regenerated ones for {target}, byte for byte")
     found = evidence_of(head_text, pin, target, {version: helms[version] for version in HELMS})
     outcome.evidence = found
     if not found["accept"]:
-        block = outcome.failures if pr.automatic else outcome.warnings
-        block += [f"NEEDS-HUMAN: {reason}" for reason in found["reasons"]]
-        if not pr.automatic:
-            outcome.notes.append("a human pin PR: NEEDS-HUMAN reasons are reported for the human reviewer, not enforced")
+        # An acknowledgement never clears an automatic head: it may change only the three mechanical files anyway.
+        acks, base_acks = acks or {}, base_acks or {}
+        open_reasons = found["reasons"] if pr.automatic else unacknowledged(target, found["reasons"], acks, base_acks)
+        outcome.failures += [f"NEEDS-HUMAN: {reason}" for reason in open_reasons]
+        outcome.warnings += [f"NEEDS-HUMAN (acknowledged in {ACK_FILE}): {r}" for r in found["reasons"] if r not in open_reasons]
+        if open_reasons and not pr.automatic:
+            entry = json.dumps({"target": target, "reasons": found["reasons"], "why": ACK_WHY_PLACEHOLDER})
+            if target not in acks:
+                how = f"commits this entry to {ACK_FILE} in this PR"
+            elif base_acks.get(target) == acks[target]:
+                how = (
+                    f"rewrites {ACK_FILE}'s entry for {target}: the one there is already on the base (it acknowledged an "
+                    f"earlier PR), so it clears nothing here; replace the existing entry in this PR with"
+                )
+            else:
+                how = f"edits {ACK_FILE} in this PR to replace the existing entry for {target}, which misses a reason, with"
+            outcome.failures.append(
+                f"NEEDS-HUMAN-UNACKNOWLEDGED: a human pin PR to {target} merges only after a human reads each NEEDS-HUMAN "
+                f"reason above and {how}: {entry} (a commit in the reviewed diff re-runs this check; a label or an "
+                f"approval does not)"
+            )
+        elif not pr.automatic:
+            outcome.notes.append(f"a human pin PR: every NEEDS-HUMAN reason is acknowledged in {ACK_FILE} for {target}")
 
     try:
         problem = e2_problem(statuses_of(pr.head_sha), pr.head_sha, pr.base_sha)
@@ -460,6 +628,9 @@ def main(argv: list[str] | None = None) -> int:
             statuses_of=lambda sha: statuses(pr.repository, sha),
             helms=pb.discover_helms(),
             changed=changed,
+            regenerated_of=lambda target: regenerated_differences(arguments.repo, target),
+            acks=acknowledgements(arguments.repo / ACK_FILE),
+            base_acks=parse_acknowledgements(base_ack_text(arguments.repo)),
         )
     except (Refused, pb.Refused) as refused:
         print(f"::error::pin-evidence refused: {refused}")

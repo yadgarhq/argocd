@@ -14,9 +14,11 @@ stop a merge, never permit one); two commits → no merge;
 a commit sha different from the status description's sha → no merge; base
 `behind` → no merge, regenerate dispatched, update-branch never called.
 
-AND YAAGAAR #420: a forged `github-actions[bot]` status is refused, because
-the merge reads the argocd-verify run the status names with the dispatch
-App's token and requires that App as its actor.
+AND YAAGAAR #420: a forged status is refused, because the merge reads the
+argocd-verify run the status names with the dispatch App's token and requires
+that App as its actor. YAAGAAR #422: a `github-actions[bot]` status (any
+workflow's GITHUB_TOKEN) is refused outright; the statuses are the settled-
+dispatch App's, `yadgarhq-settled-dispatch[bot]`.
 """
 
 from __future__ import annotations
@@ -103,7 +105,7 @@ def body(sha: str = HEAD, main: str = MAIN, target: str = "0.34.11", e1: str = "
     return ap.marker_line(ap.Marker(sha=sha, main=main, target=target, e1=e1, e2=e2, e2_run=run)) + "\n\n## Summary\n\nthe pin\n"
 
 
-def status(check: str, *, sha: str = HEAD, main: str = MAIN, result: str | None = None, run: int | None = RUN, state: str = "success", creator: str = "github-actions[bot]") -> dict:
+def status(check: str, *, sha: str = HEAD, main: str = MAIN, result: str | None = None, run: int | None = RUN, state: str = "success", creator: str = "yadgarhq-settled-dispatch[bot]") -> dict:
     context = "pin / e1" if check == "e1" else "pin / kind-dryrun"
     word = result or ("accept" if check == "e1" else "green")
     return {
@@ -190,6 +192,26 @@ def test_a_fully_green_pr_merges_squash_at_its_head_sha() -> None:
 def test_a_label_never_permits_a_merge() -> None:
     """The `auto-pin` label alone is no reason to merge: a forged marker or status beside it is still refused."""
     verdict, api = run(world({("GET", STATUSES): [status("e2", creator="maxagahi"), status("e1")]}))
+    assert verdict.action == "refuse", verdict.reason
+    assert not merged(api)
+
+
+@pytest.mark.parametrize("check", ["e1", "e2"])
+def test_a_github_actions_status_is_refused(check: str) -> None:
+    """YAAGAAR #422: auto-pin posts both statuses as yadgarhq-settled-dispatch[bot]. A `github-actions[bot]` one came from
+    some workflow's GITHUB_TOKEN, which any argocd workflow holds: it is refused, even when it reads green."""
+    other = "e1" if check == "e2" else "e2"
+    verdict, api = run(world({("GET", STATUSES): [status(check, creator="github-actions[bot]"), status(other)]}))
+    assert verdict.action == "refuse", verdict.reason
+    assert "github-actions[bot]" in verdict.reason and "yadgarhq-settled-dispatch[bot]" in verdict.reason
+    assert not merged(api)
+
+
+@pytest.mark.parametrize("check", ["e1", "e2"])
+def test_a_status_by_the_pr_authoring_release_app_is_refused(check: str) -> None:
+    """The release App authors the PR (PIN_LOGIN) but never posts its evidence: STATUS_LOGIN is another App."""
+    other = "e1" if check == "e2" else "e2"
+    verdict, api = run(world({("GET", STATUSES): [status(check, creator="yadgarhq-bot[bot]"), status(other)]}))
     assert verdict.action == "refuse", verdict.reason
     assert not merged(api)
 
@@ -395,6 +417,59 @@ def test_main_exits_0_on_a_skip_and_1_on_a_refusal(tmp_path: Path, monkeypatch: 
         monkeypatch.setattr(ap, "_epoch_reader", lambda tree: lambda sha: GREEN)
         assert am.main(["--repo", str(tmp_path)]) == code
         assert not merged(api)
+
+
+# ── two passes: the release App token only after a merge verdict (yaadgaar #424 item 2) ──
+
+
+def two_pass(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, api: Fake) -> tuple[list, Path]:
+    tokens: list = []
+    monkeypatch.setenv("GITHUB_TOKEN", "github-token")
+    monkeypatch.setenv("PIN_TOKEN", "release-app-token")
+    output = tmp_path / "output"
+    output.touch()
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    monkeypatch.setattr(ap, "Api", lambda token: tokens.append(token) or api)
+    monkeypatch.setattr(ap, "checkout_sha", lambda tree: MAIN)
+    monkeypatch.setattr(ap, "current_pin", lambda tree: "0.34.8")
+    monkeypatch.setattr(ap, "_epoch_reader", lambda tree: lambda sha: GREEN)
+    monkeypatch.setattr(am, "_e2_reader", lambda pin: lambda run_id, sha, main: None)
+    return tokens, output
+
+
+def test_the_judge_pass_never_reads_the_release_app_token_and_merges_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    api = Fake(world())
+    tokens, output = two_pass(monkeypatch, tmp_path, api)
+    verdicts = tmp_path / "verdicts.json"
+    assert am.main(["--repo", str(tmp_path), "--verdicts", str(verdicts)]) == 0
+    assert "release-app-token" not in tokens and not merged(api)
+    assert "merge=true" in output.read_text().splitlines()
+    assert [v["number"] for v in json.loads(verdicts.read_text())["merge"]] == [61]
+
+
+def test_the_merge_pass_merges_the_judged_pr_with_the_release_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    api = Fake(world())
+    tokens, _ = two_pass(monkeypatch, tmp_path, api)
+    verdicts = tmp_path / "verdicts.json"
+    assert am.main(["--repo", str(tmp_path), "--verdicts", str(verdicts)]) == 0
+    assert am.main(["--repo", str(tmp_path), "--merge", str(verdicts)]) == 0
+    assert "release-app-token" in tokens and merged(api)
+
+
+def test_no_merge_verdict_says_merge_false(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    api = Fake(world({("GET", f"{R}/pulls/61"): pull(body=body(e1="needs-human"))}))
+    _, output = two_pass(monkeypatch, tmp_path, api)
+    assert am.main(["--repo", str(tmp_path), "--verdicts", str(tmp_path / "v.json")]) == 0
+    assert "merge=false" in output.read_text().splitlines() and "refused=false" in output.read_text().splitlines()
+
+
+def test_a_refusal_in_the_judge_pass_is_reported_not_fatal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A refused PR must not stop another green PR's merge step: the judge pass exits 0 and says `refused=true`; a
+    last workflow step turns the job red."""
+    api = Fake(world({("GET", f"{R}/pulls/61"): pull(body=body(target="0.34.12"))}))
+    _, output = two_pass(monkeypatch, tmp_path, api)
+    assert am.main(["--repo", str(tmp_path), "--verdicts", str(tmp_path / "v.json")]) == 0
+    assert "refused=true" in output.read_text().splitlines()
 
 
 @pytest.mark.parametrize(
@@ -625,6 +700,15 @@ def test_the_merge_workflow_is_gated_runs_mains_code_and_never_updates_a_branch(
     # The ci run's branch is attacker-named data: it reaches the script by env only, never by `${{ }}` in a `run:`.
     assert all("${{" not in str(step.get("run", "")) for step in steps)
     mints = {s["id"]: s["with"] for s in steps if "create-github-app-token" in str(s.get("uses"))}
+    # YAAGAAR #424 item 2: the release App token is minted only after the judge pass found a merge.
+    by_id = {s.get("id"): s for s in steps}
+    order = [s.get("id") for s in steps]
+    assert order.index("judge") < order.index("pin") < order.index("merge") < order.index("refused")
+    assert "PIN_TOKEN" not in by_id["judge"]["env"] and "--verdicts" in by_id["judge"]["run"]
+    assert by_id["pin"]["if"] == "steps.judge.outputs.merge == 'true'"
+    assert by_id["merge"]["if"] == "steps.judge.outputs.merge == 'true'" and "--merge" in by_id["merge"]["run"]
+    assert by_id["merge"]["env"]["PIN_TOKEN"] == "${{ steps.pin.outputs.token }}"
+    assert "steps.judge.outputs.refused == 'true'" in by_id["refused"]["if"] and "exit 1" in by_id["refused"]["run"]
     assert mints["verify"]["repositories"] == "argocd-verify"
     assert mints["verify"]["permission-actions"] == "read" and mints["verify"]["permission-contents"] == "read"
     assert mints["pin"]["repositories"] == "argocd"

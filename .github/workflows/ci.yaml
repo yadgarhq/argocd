@@ -313,8 +313,9 @@ jobs:
   # `timeout-minutes` BOUNDS THE HEAVY RUN. Measured 2026-10-24 off CI for
   # 0.34.8 -> 0.34.11: `judge` took 18-23 s in three runs (helm pulls on two
   # helms, GHCR digests, module tarballs), and one other run hung past 15
-  # minutes with no output. The gates' `helm pull` and `helm template` take no
-  # timeout of their own (yaadgaar #164), so this bound is theirs too.
+  # minutes with no output. The gates' `helm()` wrapper now bounds each call at
+  # 300 s and `pin_bump.run_writer` bounds the K3 writer at 300 s (yaadgaar
+  # #164 item 3), so a hung call fails by name; this bound is the backstop.
   pin-evidence:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
