@@ -282,6 +282,13 @@ def tuples_of(documents) -> set[tuple[str, str, str]]:
     return found
 
 
+# Bound on ONE helm call (yaadgaar #164 item 3). The gate's slowest call, the OCI parent
+# pull, measured 0.7-0.9 s and the parent render 0.15-0.17 s on 2026-10-30 (nice -n 10),
+# and CI's pin-evidence job took 18-23 s end to end for both helms. 300 s is over
+# 300x the measured call and keeps a hung call well inside the CI job limits.
+HELM_TIMEOUT_SECONDS = 300
+
+
 def helm(*arguments: str) -> str:
     """`helm` with its stderr folded into the failure, never swallowed.
 
@@ -304,7 +311,19 @@ def helm(*arguments: str) -> str:
             "HELM_CONFIG_HOME": f"{home}/config",
             "HELM_DATA_HOME": f"{home}/data",
         }
-        finished = subprocess.run(["helm", *arguments], capture_output=True, text=True, check=False, env=env)
+        try:
+            finished = subprocess.run(
+                ["helm", *arguments],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+                timeout=HELM_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            raise AssertionError(
+                f"`helm {' '.join(arguments)}` timed out after {HELM_TIMEOUT_SECONDS} s (a hung pull or template)"
+            ) from None
     if finished.returncode != 0:
         raise AssertionError(
             f"`helm {' '.join(arguments)}` exited {finished.returncode}:\n"
