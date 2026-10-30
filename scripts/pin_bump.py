@@ -105,6 +105,10 @@ APPLICATION = "applications/yadgar.yaml"
 CHART_PIN = "scripts/chart_pin.json"
 TABLE = "scripts/gates/yadgar_render.sha256"
 WRITER = "scripts/gates/test_yadgar_application.py"
+# Bound on one `--write` run (yaadgaar #164 item 3). The writer pulls and renders the
+# parent with helm: measured 2026-10-30 at about 1 s with a warm network, so 300 s is
+# far over it and still far under the CI job limit a hung helm would otherwise reach.
+WRITER_TIMEOUT_SECONDS = 300
 MECHANICAL_FILES = (APPLICATION, CHART_PIN, TABLE)
 
 EXIT_ACCEPT = 0
@@ -1113,9 +1117,21 @@ def write_files(tree: Path, target: str) -> None:
     application.write_text(rewritten)
     (tree / CHART_PIN).write_text(chart_pin)
     with helm_on_path(helm):
+        run_writer(tree / WRITER)
+
+
+def run_writer(writer: Path) -> None:
+    """Run the K3 writer, refusing by name if it outlives `WRITER_TIMEOUT_SECONDS` (yaadgaar #164 item 3)."""
+    try:
         finished = subprocess.run(
-            [sys.executable, str(tree / WRITER), "--write"], capture_output=True, text=True, check=False
+            [sys.executable, str(writer), "--write"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=WRITER_TIMEOUT_SECONDS,
         )
+    except subprocess.TimeoutExpired:
+        raise Refused(f"{WRITER} --write timed out after {WRITER_TIMEOUT_SECONDS} s (a hung helm pull or template)")
     if finished.returncode != 0:
         raise Refused(f"{WRITER} --write exited {finished.returncode}:\n{finished.stderr}")
 
