@@ -19,9 +19,10 @@ And the rules C3 carries:
   and an env read whose key cannot be resolved each fail an automatic pin PR;
 - the job installs exactly helm v3.18.4 and v4.3.0, each pinned by sha256,
   and refuses a tarball whose checksum differs;
-- a NEEDS-HUMAN verdict fails an automatic PR (`auto/pin-<version>`) and
-  warns on a human one: a human pin PR is the human review the verdict asks
-  for (argocd#139, task-db migration 7, reviewed by hand). A downgrade (a
+- a NEEDS-HUMAN verdict fails an automatic PR (`auto/pin-<version>`)
+  always, and fails a human one unless the PR commits an entry in
+  `scripts/pin_needs_human_ack.json` for its target that names every reason
+  (Max, 2026-10-30, after K3 was dropped in argocd#193). A downgrade (a
   revert) is refused on an automatic head and warned on a human one;
 - the E2 status counts only when every `pin / kind-dryrun` on the head sha
   is `success`, created by `github-actions[bot]`, and its description parses
@@ -90,7 +91,7 @@ ACCEPT = {"accept": True, "reasons": [], "helms": sorted(HELMS), "changed": [], 
 
 def judge(
     pr_event: str, head: str, *, evidence=None, statuses=None, required=False, helms=None, base: str = BASE,
-    changed=pb.MECHANICAL_FILES, differs=(),
+    changed=pb.MECHANICAL_FILES, differs=(), acks=None, base_acks=None,
 ):
     calls: list = []
 
@@ -108,6 +109,8 @@ def judge(
         e2_required=required,
         changed=list(changed),
         regenerated_of=lambda target: list(differs),
+        acks={} if acks is None else acks,
+        base_acks={} if base_acks is None else base_acks,
     )
     return outcome, calls
 
@@ -436,6 +439,25 @@ def test_main_sets_the_base_to_the_merge_commits_first_parent(tmp_path: Path, mo
     assert seen == [("c" * 40, True)], "main binds the regenerated files (yaadgaar #424 item 3)"
 
 
+def test_main_reads_the_acknowledgements_from_the_checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ack file is read from the merge checkout (`--repo`), so the PR that commits it is the PR it clears."""
+    seen: list = []
+    monkeypatch.setattr(pe, "texts", lambda repo, sha: (BASE, moved()))
+    monkeypatch.setattr(pe, "changed_files", lambda repo: list(pb.MECHANICAL_FILES))
+    monkeypatch.setattr(pe, "merge_parent", lambda repo: "c" * 40)
+    monkeypatch.setattr(pe, "base_ack_text", lambda repo: json.dumps([ack(why="an older review")[TARGET]]))
+    monkeypatch.setattr(pe, "judge", lambda pr, *a, **k: seen.append((k.get("acks"), k.get("base_acks"))) or pe.Outcome())
+    checkout = tmp_path / "checkout"
+    (checkout / pe.ACK_FILE).parent.mkdir(parents=True)
+    (checkout / pe.ACK_FILE).write_text(json.dumps([ack()[TARGET]]))
+    event_file = tmp_path / "event.json"
+    event_file.write_text(json.dumps(event("event-human.json")))
+    assert pe.main(["judge", "--event", str(event_file), "--repo", str(checkout)]) == 0
+    assert seen == [(ack(), ack(why="an older review"))], "main reads the head ack and the base's copy (HEAD^1)"
+    (checkout / pe.ACK_FILE).write_text("[{}]")
+    assert pe.main(["judge", "--event", str(event_file), "--repo", str(checkout)]) == 1, "a malformed ack file fails the job"
+
+
 # ── the three mechanical files, regenerated (yaadgaar #424 item 3) ──────────
 
 
@@ -529,11 +551,143 @@ def test_a_needs_human_verdict_fails_an_automatic_pin_pr() -> None:
     assert any("migration(s) 7" in f for f in outcome.failures), outcome.failures
 
 
-def test_a_needs_human_verdict_warns_on_a_human_pin_pr() -> None:
-    """argocd#139's shape: a human pin PR whose verdict is NEEDS-HUMAN is the human review itself."""
+def test_an_unacknowledged_needs_human_verdict_fails_a_human_pin_pr() -> None:
+    """Max, 2026-10-30: with K3 gone (argocd#193), a hand pin PR's NEEDS-HUMAN had no hard red. It fails now."""
     outcome, _ = judge("event-human.json", moved(), evidence=NEEDS_HUMAN, statuses=[green_status()])
+    assert not outcome.passed
+    assert any("NEEDS-HUMAN: task-db: migration(s) 7 added" in f for f in outcome.failures), outcome.failures
+    told = "\n".join(outcome.failures)
+    assert pe.ACK_FILE in told and "NEEDS-HUMAN-UNACKNOWLEDGED" in told, told
+    # The failure carries the exact entry to commit: this target, these reasons.
+    entry = json.loads(told[told.index("{"):told.rindex("}") + 1])
+    assert entry["target"] == TARGET and entry["reasons"] == NEEDS_HUMAN["reasons"], entry
+
+
+def ack(target: str = TARGET, reasons=None, why: str = "task-db migration 7 read by hand; additive") -> dict:
+    return {target: {"target": target, "reasons": list(NEEDS_HUMAN["reasons"] if reasons is None else reasons), "why": why}}
+
+
+def test_a_committed_acknowledgement_of_every_reason_clears_a_human_pin_pr() -> None:
+    """argocd#139's shape: a human pin PR that commits the reviewed ack for this target passes; the reasons stay visible."""
+    outcome, _ = judge("event-human.json", moved(), evidence=NEEDS_HUMAN, statuses=[green_status()], acks=ack())
     assert outcome.passed, outcome.failures
     assert any("migration(s) 7" in w for w in outcome.warnings), outcome.warnings
+
+
+@pytest.mark.parametrize(
+    "acks",
+    [
+        pytest.param(ack(target="98.0.0"), id="another-target"),
+        pytest.param(ack(reasons=[]), id="no-reason"),
+        pytest.param(ack(reasons=["task-db: migration(s) 8 added; interim block"]), id="another-reason"),
+    ],
+)
+def test_an_acknowledgement_that_misses_a_reason_or_the_target_fails(acks: dict) -> None:
+    two = {**NEEDS_HUMAN, "reasons": [*NEEDS_HUMAN["reasons"], "gateway: field spec.x changed"]}
+    for evidence in (NEEDS_HUMAN, two):
+        outcome, _ = judge("event-human.json", moved(), evidence=evidence, statuses=[green_status()], acks=acks)
+        assert not outcome.passed, (acks, evidence)
+        assert any("NEEDS-HUMAN-UNACKNOWLEDGED" in f for f in outcome.failures), outcome.failures
+
+
+def test_an_acknowledgement_of_one_reason_of_two_fails_on_the_other() -> None:
+    two = {**NEEDS_HUMAN, "reasons": [*NEEDS_HUMAN["reasons"], "gateway: field spec.x changed"]}
+    outcome, _ = judge("event-human.json", moved(), evidence=two, statuses=[green_status()], acks=ack())
+    assert not outcome.passed
+    unacked = [f for f in outcome.failures if f.startswith("NEEDS-HUMAN: ")]
+    assert unacked == ["NEEDS-HUMAN: gateway: field spec.x changed"], outcome.failures
+
+
+def test_an_acknowledgement_never_clears_an_automatic_pin_pr() -> None:
+    outcome, _ = judge("event-auto.json", moved(), evidence=NEEDS_HUMAN, statuses=[green_status()], acks=ack())
+    assert not outcome.passed
+    assert any("migration(s) 7" in f for f in outcome.failures), outcome.failures
+
+
+def test_an_acknowledgement_already_on_the_base_does_not_clear_a_later_pin_pr() -> None:
+    """Review of argocd#200: an ack keyed by target alone, already on main, would clear a re-pin to the same
+    target (after a revert, or after an ack-only PR merged first). The clearing entry must be new in this PR."""
+    outcome, _ = judge(
+        "event-human.json", moved(), evidence=NEEDS_HUMAN, statuses=[green_status()], acks=ack(), base_acks=ack()
+    )
+    assert not outcome.passed
+    told = "\n".join(outcome.failures)
+    assert "NEEDS-HUMAN-UNACKNOWLEDGED" in told and "already on the base" in told, told
+
+
+def test_an_entry_this_pr_rewrites_from_the_base_clears_it() -> None:
+    outcome, _ = judge(
+        "event-human.json", moved(), evidence=NEEDS_HUMAN, statuses=[green_status()],
+        acks=ack(why="re-read for this re-pin"), base_acks=ack(),
+    )
+    assert outcome.passed, outcome.failures
+
+
+def test_a_partial_entry_for_the_target_says_to_replace_it() -> None:
+    two = {**NEEDS_HUMAN, "reasons": [*NEEDS_HUMAN["reasons"], "gateway: field spec.x changed"]}
+    outcome, _ = judge("event-human.json", moved(), evidence=two, statuses=[green_status()], acks=ack())
+    told = "\n".join(outcome.failures)
+    assert "replace the existing entry" in told, told
+
+
+def test_the_base_copy_of_the_acknowledgement_file_is_read_from_the_first_parent(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list = []
+
+    def run_with(tree: str):
+        def run(command, **kwargs):
+            calls.append(command[3:])
+            out = tree if command[3] == "ls-tree" else "[]\n"
+            return type("Finished", (), {"stdout": out})()
+
+        return run
+
+    monkeypatch.setattr(pe.subprocess, "run", run_with(""))
+    assert pe.base_ack_text(Path("/repo")) is None, "a base without the file has no acknowledgement"
+    assert calls == [["ls-tree", "HEAD^1", "--", pe.ACK_FILE]]
+    calls.clear()
+    monkeypatch.setattr(pe.subprocess, "run", run_with(f"100644 blob {'d' * 40}\t{pe.ACK_FILE}\n"))
+    assert pe.base_ack_text(Path("/repo")) == "[]\n"
+    assert calls == [["ls-tree", "HEAD^1", "--", pe.ACK_FILE], ["show", f"HEAD^1:{pe.ACK_FILE}"]]
+
+
+def test_the_acknowledgement_file_is_read_by_target(tmp_path: Path) -> None:
+    path = tmp_path / "ack.json"
+    assert pe.acknowledgements(path) == {}, "no file is no acknowledgement"
+    entry = ack()[TARGET]
+    path.write_text(json.dumps([entry]))
+    assert pe.acknowledgements(path) == {TARGET: entry}
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        pytest.param("not json", id="not-json"),
+        pytest.param({"target": TARGET}, id="not-a-list"),
+        pytest.param([{**ack()[TARGET], "why": ""}], id="empty-why"),
+        pytest.param([{**ack()[TARGET], "why": pe.ACK_WHY_PLACEHOLDER}], id="placeholder-why"),
+        pytest.param([{**ack()[TARGET], "why": ["not", "text"]}], id="why-not-a-string"),
+        pytest.param([{**ack()[TARGET], "reasons": []}], id="empty-reasons"),
+        pytest.param([{**ack()[TARGET], "reasons": "one"}], id="reasons-not-a-list"),
+        pytest.param([{k: v for k, v in ack()[TARGET].items() if k != "target"}], id="no-target"),
+        pytest.param([ack()[TARGET], ack()[TARGET]], id="duplicate-target"),
+    ],
+)
+def test_a_malformed_acknowledgement_file_is_refused(tmp_path: Path, entries) -> None:
+    path = tmp_path / "ack.json"
+    path.write_text(entries if isinstance(entries, str) else json.dumps(entries))
+    with pytest.raises(pe.Refused):
+        pe.acknowledgements(path)
+
+
+def test_an_unreadable_acknowledgement_file_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "ack.json"
+    path.mkdir()
+    with pytest.raises(pe.Refused):
+        pe.acknowledgements(path)
+
+
+def test_the_committed_acknowledgement_file_parses() -> None:
+    pe.acknowledgements(REPOSITORY / pe.ACK_FILE)
 
 
 def test_an_auto_branch_from_a_fork_is_not_automatic() -> None:
