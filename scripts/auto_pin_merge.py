@@ -51,7 +51,8 @@ regenerate, wait or refuse. It MERGES only when all of these hold:
      None or still running: wait. Concluded otherwise: the sha is spent
      (ADR-0692): REGENERATE. Two or more: refuse.
   8. Every `pin / e1` and every `pin / kind-dryrun` status on the head is
-     `success`, by `github-actions[bot]`, parses as `auto_pin.DESCRIPTION`
+     `success`, by `auto_pin.STATUS_LOGIN` (`yadgarhq-settled-dispatch[bot]`,
+     yaadgaar #422; never `github-actions[bot]`), parses as `auto_pin.DESCRIPTION`
      (accept / green, `sha=` the head, `main=` main), and every E2 names the
      marker's run. A forged green beside the real one cannot win.
   9. YAAGAAR #420, the identity check: the E2 run, read on argocd-verify with
@@ -59,8 +60,10 @@ regenerate, wait or refuse. It MERGES only when all of these hold:
      `workflow_dispatch` started by `yadgarhq-settled-dispatch[bot]`, titled
      `pin-dryrun <head>`, completed success, on argocd-verify's default
      branch, with a `pin-dryrun` artifact whose result is green for this sha,
-     this main and main's pin. Any argocd workflow can post a status as
-     `github-actions[bot]`; only that App can start that run.
+     this main and main's pin. An argocd workflow that names the
+     settled-dispatch App's repository secrets can post a status as that App;
+     the status alone is therefore not enough, and the run it names must be
+     a green `pin-dryrun` for this head.
  10. Main's settled epoch is green (`auto_pin.epoch_state`).
  11. `mergeable_state` is `clean`, polled a bounded number of times while
      GitHub still computes it (`unknown`). `behind`: REGENERATE. Anything
@@ -143,7 +146,7 @@ class MergeReads:
 
 
 def _statuses_problem(statuses: list[dict], *, head: str, main: str, run: int) -> str | None:
-    """Every `pin / e1` and `pin / kind-dryrun` on the head agrees: success, by the Actions bot, this head, this main, the marker's run."""
+    """Every `pin / e1` and `pin / kind-dryrun` on the head agrees: success, by ap.STATUS_LOGIN, this head, this main, the marker's run."""
     expected = {ap.STATUS_E1: ("e1", "accept"), ap.STATUS_E2: ("e2", "green")}
     for context, (check, result) in expected.items():
         mine = [s for s in statuses if s.get("context") == context]

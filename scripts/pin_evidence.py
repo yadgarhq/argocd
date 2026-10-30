@@ -101,13 +101,17 @@ which is what merging the PR makes main.
    migration, or a moved `yadgar-store`, stays mergeable by hand.
 5. E2: the commit status `pin / kind-dryrun` on the PR head sha (never the
    merge commit, which carries no status). It counts only when EVERY status
-   of that context on the sha is `success`, created by `github-actions[bot]`,
+   of that context on the sha is `success`, created by `yadgarhq-settled-dispatch[bot]`,
    and its description parses as `auto_pin.DESCRIPTION` with check `e2`,
    result `green`, `sha=` the head, `main=` the merge commit's first parent
    and a run id (yaadgaar #420: no substring match, and a forged green after
-   a red cannot win). The creator check cannot tell one argocd workflow from
-   another; the dispatch App's identity is checked on the argocd-verify run
-   itself by `auto_pin_merge.py`, which holds the token this job must not.
+   a red cannot win). The creator is the settled-dispatch App, whose token
+   auto-pin mints for argocd with `statuses: write` only (yaadgaar #422): a
+   job's GITHUB_TOKEN posts as `github-actions[bot]`, so such a status is
+   refused. The App's key is an argocd repository secret, so an argocd
+   workflow that names it can still post as the App; the dispatch App's
+   identity is checked on the argocd-verify run itself by
+   `auto_pin_merge.py`, which holds the token this job must not.
    A downgrade is exempt (`pin_dryrun.py` refuses one, so its status can
    never exist).
 
@@ -159,7 +163,8 @@ ACK_FIELDS = ("target", "reasons", "why")
 # The `why` the failure prints. Committed unchanged, it says nobody wrote what was checked: refused.
 ACK_WHY_PLACEHOLDER = "<what the reviewer checked, per reason>"
 E2_CONTEXT = "pin / kind-dryrun"
-E2_CREATOR = "github-actions[bot]"
+# auto-pin posts E2 with a settled-dispatch App token; any argocd workflow's GITHUB_TOKEN posts as github-actions[bot] (yaadgaar #422).
+E2_CREATOR = "yadgarhq-settled-dispatch[bot]"
 
 # Pinned by version AND by the sha256 of get.helm.sh's linux-amd64 tarball,
 # checked on 2026-10-24 against both get.helm.sh's `.sha256sum` and the
@@ -388,9 +393,9 @@ def statuses(repository: str, sha: str) -> list[dict]:
 def e2_problem(found: list[dict], sha: str, base: str) -> str | None:
     """None when EVERY `pin / kind-dryrun` on `sha` is a green bot status for this head and this base; else why not.
 
-    YAAGAAR #420. Any workflow in argocd can post a status as
-    `github-actions[bot]`, so neither the creator nor the newest status can
-    decide alone. Each one must parse as `auto_pin.DESCRIPTION` exactly (no
+    YAAGAAR #420, #422. The creator must be E2_CREATOR, the settled-dispatch App:
+    any argocd workflow's GITHUB_TOKEN posts as `github-actions[bot]`. Still
+    neither the creator nor the newest status decides alone. Each one must parse as `auto_pin.DESCRIPTION` exactly (no
     substring match) with check `e2`, result `green`, `sha` the head, `main`
     the base and a run id. A forged green therefore cannot outvote the bot's
     red; it can only make E2 red. What binds E2 to the dispatch App is the

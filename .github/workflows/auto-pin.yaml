@@ -42,12 +42,22 @@ name: auto-pin
 #     signs the commit), open and label the PR, then close the superseded ones. An App's PR
 #     starts `ci` (a GITHUB_TOKEN one would not): argocd#135, authored by
 #     app/yadgarhq-bot, ran `ci / passed` on a1c4700.
-#   `yadgarhq-settled-dispatch` (R4), argocd-verify only: actions READ for the
+#   `yadgarhq-settled-dispatch` (R4), argocd-verify: actions READ for the
 #     gate (settled verdicts), actions write for the relay (dispatch
 #     `pin-dryrun.yaml`, read its artifact).
-#   this job's GITHUB_TOKEN: read argocd, post the `pin / e1` and
-#     `pin / kind-dryrun` statuses (`statuses: write`, this job only), and
-#     write the `auto-pin-hold` issues (`issues: write`, plan section 7).
+#   `yadgarhq-settled-dispatch` again, argocd only, statuses write and nothing
+#     else (STATUS_TOKEN): post the `pin / e1` and `pin / kind-dryrun`
+#     statuses, so their creator is `yadgarhq-settled-dispatch[bot]`
+#     (yaadgaar #422). The job's GITHUB_TOKEN posts as `github-actions[bot]`,
+#     so pin-evidence and the merge bot refuse that creator. Not the release
+#     App: its key is an org secret that other repositories' workflows read;
+#     this App's key is an argocd repository secret. In `pin` it is minted
+#     right before `push`, under push's condition, so a failed mint leaves no
+#     orphan branch. The push takes seconds and the relay ends inside
+#     RELAY_SECONDS (50 minutes), so the token's 60 minutes cover the E2 post.
+#   this job's GITHUB_TOKEN: read argocd (statuses included, for the
+#     back-off), and write the `auto-pin-hold` issues (`issues: write`, plan
+#     section 7). It never writes a status.
 #
 # THESE LOGS ARE PUBLIC, and the settled-dispatch token can read every
 # argocd-verify artifact: the scripts print results, run ids and shas only.
@@ -103,7 +113,7 @@ jobs:
       contents: read
       issues: write
       pull-requests: read
-      statuses: write
+      statuses: read
     env:
       OUT: ${{ github.workspace }}/../auto-pin
     steps:
@@ -250,6 +260,19 @@ jobs:
           PIN_TOKEN: ${{ steps.pin1.outputs.token }}
         run: python3 scripts/auto_pin.py hold-version --state "$OUT/state.json" --evidence "$OUT/evidence.json"
 
+      # Statuses write on argocd and nothing else (yaadgaar #422): the statuses' creator is
+      # yadgarhq-settled-dispatch[bot]. Before the push, so a failed mint pushes no orphan branch.
+      - name: mint a token for argocd (statuses write), for the evidence statuses
+        id: status
+        if: steps.gate.outputs.action == 'open' && steps.generate.outputs.verdict == 'accept'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.SETTLED_DISPATCH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SETTLED_DISPATCH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: argocd
+          permission-statuses: write
+
       - name: push the pin commit to a new auto/pin-<version>-<sha12>
         id: push
         if: steps.gate.outputs.action == 'open' && steps.generate.outputs.verdict == 'accept'
@@ -280,6 +303,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           VERIFY_TOKEN: ${{ steps.verify2.outputs.token }}
+          STATUS_TOKEN: ${{ steps.status.outputs.token }}
         run: python3 scripts/auto_pin.py dryrun --state "$OUT/state.json" --evidence "$OUT/evidence.json" --out "$OUT/dryrun.json"
 
       # Minted after the relay for both paths below: the relay can spend most of pin1's 60 minutes.
@@ -330,7 +354,6 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-      statuses: write
     steps:
       - name: check out main, read-only
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -352,10 +375,22 @@ jobs:
           permission-actions: write
           permission-contents: read
 
+      # Statuses write on argocd and nothing else (yaadgaar #422): the status's creator is yadgarhq-settled-dispatch[bot].
+      - name: mint a token for argocd (statuses write), for the evidence status
+        id: status
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.SETTLED_DISPATCH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.SETTLED_DISPATCH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: argocd
+          permission-statuses: write
+
       # Standard library only: pin_dryrun.py find imports nothing installed.
       - name: E2 dry run for the PR's head, and its status
         env:
           GITHUB_TOKEN: ${{ github.token }}
           VERIFY_TOKEN: ${{ steps.verify.outputs.token }}
+          STATUS_TOKEN: ${{ steps.status.outputs.token }}
           PR: ${{ inputs.evidence_only }}
         run: python3 scripts/auto_pin.py evidence --repo . --pr "$PR"

@@ -47,7 +47,7 @@ in this order, cheapest first:
      PR gets it closed by `open` with a comment, and its branch is kept
      (`close_superseded` re-reads the head; the plan's C5 red case).
   5. Back-off: an orphan `auto/pin-<target>-*` branch (no open PR) whose head
-     carries a `pin / e1` status by `github-actions[bot]`, on this same main,
+     carries a `pin / e1` status by STATUS_LOGIN (the settled-dispatch App), on this same main,
      younger than BACKOFF_HOURS, is a recent attempt that failed after its push
      (E2 never usable, or the open refused): no PR until it ages out or main
      moves. Without it the cron would re-dispatch the private runner every 15
@@ -96,7 +96,8 @@ API, and `pin-dryrun` needs exactly one merge base with main and a
 is refused. Each attempt gets its own branch, so a regenerate never has to
 move or delete the branch of a PR that is still open. `push` closes nothing.
 
-`dryrun` (VERIFY_TOKEN, plus GITHUB_TOKEN with `statuses: write`). Posts
+`dryrun` (VERIFY_TOKEN; STATUS_TOKEN, a settled-dispatch App token for argocd
+with `statuses: write` only, posts both statuses; GITHUB_TOKEN reads main). Posts
 `pin / e1` (pin_bump's offline verdict), then dispatches
 `yadgarhq/argocd-verify` `pin-dryrun.yaml` for the pushed sha and BINDS to the
 run it started (run-name `pin-dryrun <sha>`, event `workflow_dispatch`, actor
@@ -125,7 +126,7 @@ naming the new one, its branch deleted only when its head is still the sha the
 bot pushed. So no failure path leaves zero automatic PRs open. NOTHING HERE
 MERGES. Merging is C6 (`auto_pin_merge.py`, `auto-pin-merge.yaml`).
 
-`evidence` (VERIFY_TOKEN, GITHUB_TOKEN `statuses: write`): the same E2 relay
+`evidence` (VERIFY_TOKEN, STATUS_TOKEN as in `dryrun`): the same E2 relay
 for a human pin PR, refused unless the PR is open, based on `main`, from this
 repository (no fork) and moves `targetRevision`. It posts `pin / kind-dryrun`
 and opens nothing.
@@ -137,7 +138,9 @@ THE C6 SEAM, what `auto-pin-merge.yaml` and the hold writer read:
   - the PR body marker (`parse_marker`): the sha the bot pushed, the main it
     was built on, the target, E1, E2 and the E2 run.
   - the statuses `pin / e1` and `pin / kind-dryrun` on the head sha, created
-    by `github-actions[bot]`, parsed by `parse_status_description`: C6 merges
+    by STATUS_LOGIN, `yadgarhq-settled-dispatch[bot]` (yaadgaar #422: a job's GITHUB_TOKEN
+    posts as `github-actions[bot]`, which any argocd workflow can), parsed by
+    `parse_status_description`: C6 merges
     only when every one is `success`, its `sha=` is the head and its `main=`
     is main's current head (else it dispatches this workflow with
     `regenerate: <pr>`), and the E2 run it names is the settled-dispatch
@@ -189,7 +192,10 @@ BRANCH_PREFIX = "auto/pin-"
 BRANCH = re.compile(r"^auto/pin-(\d+\.\d+\.\d+)(?:-[0-9a-f]{12})?$")
 PIN_LOGIN = "yadgarhq-bot[bot]"
 DISPATCH_LOGIN = "yadgarhq-settled-dispatch[bot]"
-STATUS_LOGIN = "github-actions[bot]"
+# The statuses are posted with a settled-dispatch App token (STATUS_TOKEN, argocd, `statuses: write` only), never
+# the job's GITHUB_TOKEN, which in every argocd workflow posts as `github-actions[bot]` (yaadgaar #422). Not the
+# release App either: its key is an org secret that other repositories' workflows read. NOT PIN_LOGIN.
+STATUS_LOGIN = DISPATCH_LOGIN
 LABEL_PIN = "auto-pin"
 LABEL_NEEDS_HUMAN = "auto-pin-needs-human"
 LABEL_HOLD = "auto-pin-hold"
@@ -1373,16 +1379,25 @@ def _finder() -> Callable[[str, str, str], dict | None]:
     return find
 
 
+def _status_api() -> Client:
+    """The settled-dispatch App token that posts `pin / e1` and `pin / kind-dryrun` (yaadgaar #422); refused when absent."""
+    token = os.environ.get("STATUS_TOKEN")
+    if not token:
+        raise Refused(f"STATUS_TOKEN is not set: the statuses must be posted as {STATUS_LOGIN}, never with GITHUB_TOKEN")
+    return Api(token)
+
+
 def command_dryrun(args: argparse.Namespace) -> int:
+    poster = _status_api()
     state = load_state(args.state)
     if not state.sha:
         raise Refused("the state file names no pushed sha")
     repo = Api(os.environ.get("GITHUB_TOKEN"))
     evidence = json.loads(args.evidence.read_text())
-    post_e1(repo, state.sha, state.main_sha, bool(evidence.get("accept")))
+    post_e1(poster, state.sha, state.main_sha, bool(evidence.get("accept")))
     verify = Api(os.environ.get("VERIFY_TOKEN"))
     result = relay_dryrun(verify, repo, sha=state.sha, main_sha=state.main_sha, pin=state.pin, find=_finder(), now=_now, sleep=_sleep)
-    post_e2(repo, state.sha, state.main_sha, result)
+    post_e2(poster, state.sha, state.main_sha, result)
     args.out.write_text(json.dumps(asdict(result), indent=2, sort_keys=True) + "\n")
     _output(done="true", result=result.result)
     return EXIT_OK
@@ -1409,6 +1424,7 @@ def command_open(args: argparse.Namespace) -> int:
 
 
 def command_evidence(args: argparse.Namespace) -> int:
+    poster = _status_api()
     repo = Api(os.environ.get("GITHUB_TOKEN"))
     sha = evidence_target(repo, args.pr)
     main_sha = main_head(repo)
@@ -1417,7 +1433,7 @@ def command_evidence(args: argparse.Namespace) -> int:
     pin = current_pin(args.repo)
     verify = Api(os.environ.get("VERIFY_TOKEN"))
     result = relay_dryrun(verify, repo, sha=sha, main_sha=main_sha, pin=pin, find=_finder(), now=_now, sleep=_sleep)
-    post_e2(repo, sha, main_sha, result)
+    post_e2(poster, sha, main_sha, result)
     return EXIT_OK
 
 

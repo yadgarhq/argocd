@@ -25,7 +25,7 @@ And the rules C3 carries:
   (Max, 2026-10-30, after K3 was dropped in argocd#193). A downgrade (a
   revert) is refused on an automatic head and warned on a human one;
 - the E2 status counts only when every `pin / kind-dryrun` on the head sha
-  is `success`, created by `github-actions[bot]`, and its description parses
+  is `success`, created by `yadgarhq-settled-dispatch[bot]` (yaadgaar #422), and its description parses
   exactly as `auto_pin.DESCRIPTION` with check e2, result green, the head sha,
   the base as main and a run id (yaadgaar #420: no substring match, and a
   forged green after the bot's red cannot win).
@@ -80,7 +80,7 @@ def green_status(sha: str = HEAD_SHA, main: str = BASE_SHA) -> dict:
     return {
         "context": "pin / kind-dryrun",
         "state": "success",
-        "creator": {"login": "github-actions[bot]"},
+        "creator": {"login": "yadgarhq-settled-dispatch[bot]"},
         "description": f"e2 green sha={sha} main={main} run=39420396928",
         "target_url": "https://github.com/yadgarhq/argocd-verify/actions/runs/39420396928",
     }
@@ -378,6 +378,10 @@ def test_a_green_pin_with_its_e2_status_passes_when_required() -> None:
         ({"state": "pending"}, "pending"),
         ({"state": "failure"}, "failure"),
         ({"creator": {"login": "m-agahi"}}, "m-agahi"),
+        # YAAGAAR #422: the job GITHUB_TOKEN of ANY argocd workflow posts as github-actions[bot].
+        ({"creator": {"login": "github-actions[bot]"}}, "github-actions[bot], not yadgarhq-settled-dispatch[bot]"),
+        # The release App opens the PR; it never posts E2 (its key is an org secret, readable far beyond argocd).
+        ({"creator": {"login": "yadgarhq-bot[bot]"}}, "yadgarhq-bot[bot], not yadgarhq-settled-dispatch[bot]"),
         ({"description": "green, argocd-verify run 1"}, "not the form"),
         # YAAGAAR #420: the sha only as a substring of a longer text is not the sha judged.
         ({"description": f"green for {HEAD_SHA}, argocd-verify run 39420396928"}, "not the form"),
@@ -391,7 +395,7 @@ def test_a_green_pin_with_its_e2_status_passes_when_required() -> None:
         ({"description": f"e2 green sha={HEAD_SHA} main={BASE_SHA}"}, "no run"),
     ],
     ids=[
-        "pending", "failure", "wrong-creator", "free-text", "sha-substring", "sha-with-suffix", "sha-trailing",
+        "pending", "failure", "wrong-creator", "github-actions-creator", "release-app-creator", "free-text", "sha-substring", "sha-with-suffix", "sha-trailing",
         "other-sha", "wrong-main", "wrong-check", "red-result", "no-run",
     ],
 )
@@ -399,6 +403,13 @@ def test_an_e2_status_that_is_not_a_green_bot_status_for_this_sha_fails_when_req
     outcome, _ = judge("event-auto.json", moved(), statuses=[{**green_status(), **change}], required=True)
     assert not outcome.passed
     assert any(expected in f for f in outcome.failures), outcome.failures
+
+
+def test_the_e2_creator_is_the_settled_dispatch_app_that_posts_it() -> None:
+    """YAAGAAR #422: auto-pin posts E2 with a settled-dispatch App token, so the creator pin-evidence trusts is
+    that App, the same login auto_pin's back-off and auto_pin_merge's predicate read. Not the PR author's App."""
+    assert pe.E2_CREATOR == "yadgarhq-settled-dispatch[bot]" == pe.auto_pin.STATUS_LOGIN == pe.auto_pin.DISPATCH_LOGIN
+    assert pe.E2_CREATOR != pe.auto_pin.PIN_LOGIN
 
 
 def test_a_red_after_a_green_is_red() -> None:
@@ -409,7 +420,7 @@ def test_a_red_after_a_green_is_red() -> None:
 
 
 def test_a_forged_green_after_a_red_is_refused() -> None:
-    """YAAGAAR #420: any workflow in argocd can post a status as `github-actions[bot]`.
+    """YAAGAAR #420: a second status, whatever its creator, cannot outvote a red.
 
     So the newest status cannot decide alone: a green posted after the bot's
     red would turn E2 green. EVERY `pin / kind-dryrun` on the sha must be a
