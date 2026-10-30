@@ -14,9 +14,11 @@ stop a merge, never permit one); two commits → no merge;
 a commit sha different from the status description's sha → no merge; base
 `behind` → no merge, regenerate dispatched, update-branch never called.
 
-AND YAAGAAR #420: a forged `github-actions[bot]` status is refused, because
-the merge reads the argocd-verify run the status names with the dispatch
-App's token and requires that App as its actor.
+AND YAAGAAR #420: a forged status is refused, because the merge reads the
+argocd-verify run the status names with the dispatch App's token and requires
+that App as its actor. YAAGAAR #422: a `github-actions[bot]` status (any
+workflow's GITHUB_TOKEN) is refused outright; the statuses are the settled-
+dispatch App's, `yadgarhq-settled-dispatch[bot]`.
 """
 
 from __future__ import annotations
@@ -103,7 +105,7 @@ def body(sha: str = HEAD, main: str = MAIN, target: str = "0.34.11", e1: str = "
     return ap.marker_line(ap.Marker(sha=sha, main=main, target=target, e1=e1, e2=e2, e2_run=run)) + "\n\n## Summary\n\nthe pin\n"
 
 
-def status(check: str, *, sha: str = HEAD, main: str = MAIN, result: str | None = None, run: int | None = RUN, state: str = "success", creator: str = "github-actions[bot]") -> dict:
+def status(check: str, *, sha: str = HEAD, main: str = MAIN, result: str | None = None, run: int | None = RUN, state: str = "success", creator: str = "yadgarhq-settled-dispatch[bot]") -> dict:
     context = "pin / e1" if check == "e1" else "pin / kind-dryrun"
     word = result or ("accept" if check == "e1" else "green")
     return {
@@ -190,6 +192,26 @@ def test_a_fully_green_pr_merges_squash_at_its_head_sha() -> None:
 def test_a_label_never_permits_a_merge() -> None:
     """The `auto-pin` label alone is no reason to merge: a forged marker or status beside it is still refused."""
     verdict, api = run(world({("GET", STATUSES): [status("e2", creator="maxagahi"), status("e1")]}))
+    assert verdict.action == "refuse", verdict.reason
+    assert not merged(api)
+
+
+@pytest.mark.parametrize("check", ["e1", "e2"])
+def test_a_github_actions_status_is_refused(check: str) -> None:
+    """YAAGAAR #422: auto-pin posts both statuses as yadgarhq-settled-dispatch[bot]. A `github-actions[bot]` one came from
+    some workflow's GITHUB_TOKEN, which any argocd workflow holds: it is refused, even when it reads green."""
+    other = "e1" if check == "e2" else "e2"
+    verdict, api = run(world({("GET", STATUSES): [status(check, creator="github-actions[bot]"), status(other)]}))
+    assert verdict.action == "refuse", verdict.reason
+    assert "github-actions[bot]" in verdict.reason and "yadgarhq-settled-dispatch[bot]" in verdict.reason
+    assert not merged(api)
+
+
+@pytest.mark.parametrize("check", ["e1", "e2"])
+def test_a_status_by_the_pr_authoring_release_app_is_refused(check: str) -> None:
+    """The release App authors the PR (PIN_LOGIN) but never posts its evidence: STATUS_LOGIN is another App."""
+    other = "e1" if check == "e2" else "e2"
+    verdict, api = run(world({("GET", STATUSES): [status(check, creator="yadgarhq-bot[bot]"), status(other)]}))
     assert verdict.action == "refuse", verdict.reason
     assert not merged(api)
 
