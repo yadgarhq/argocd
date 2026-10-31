@@ -220,9 +220,95 @@ def test_an_automatic_pin_pr_must_change_exactly_the_three_pin_files(changed: li
 
 
 def test_a_human_pin_pr_may_change_other_files() -> None:
-    """C3 does not judge non-pin edits on a human head: K3, two-owners and review do."""
+    """C3 does not judge non-pin edits on a human head (two-owners and review do), the seed allowlist aside (ADR-1103)."""
     outcome, _ = judge("event-human.json", moved(), statuses=[green_status()], changed=[*pb.MECHANICAL_FILES, "MIGRATION_NOTES.md"])
     assert outcome.passed, outcome.failures
+
+
+# ── ADR-1103: no pin PR edits the seed allowlist, human or automatic ───────
+
+
+def test_a_human_pin_pr_that_edits_the_seed_allowlist_fails_before_any_render() -> None:
+    """A hard failure, not a NEEDS-HUMAN reason: no acknowledgement clears it, and nothing is rendered."""
+    changed = [*pb.MECHANICAL_FILES, pb.SEED_ALLOWLIST_FILE]
+    outcome, calls = judge("event-human.json", moved(), statuses=[green_status()], changed=changed)
+    assert outcome.failures == [
+        f"a pin PR may not change {pb.SEED_ALLOWLIST_FILE}: allowlist changes land in their own non-pin PR (ADR-1103)"
+    ], outcome.failures
+    assert calls == []
+    acked = {TARGET: {"target": TARGET, "reasons": outcome.failures, "why": "reviewed"}}
+    again, _ = judge("event-human.json", moved(), statuses=[green_status()], changed=changed, acks=acked)
+    assert again.failures == outcome.failures, "an acknowledgement does not clear it"
+
+
+def test_a_human_pin_pr_without_the_seed_allowlist_is_unaffected() -> None:
+    outcome, calls = judge("event-human.json", moved(), statuses=[green_status()], changed=list(pb.MECHANICAL_FILES))
+    assert outcome.passed, outcome.failures
+    assert not any("ADR-1103" in text for text in outcome.failures + outcome.warnings + outcome.notes)
+    assert len(calls) == 1
+
+
+def test_a_non_pin_pr_that_changes_only_the_seed_allowlist_passes() -> None:
+    """The allowlist alone, with no targetRevision move, is the own non-pin PR ADR-1103 wants."""
+    outcome, calls = judge("event-human.json", BASE, helms={}, changed=[pb.SEED_ALLOWLIST_FILE])
+    assert outcome.passed, outcome.failures
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "other",
+    ["MIGRATION_NOTES.md", pb.OPERATOR_APPLICATIONS[0], "scripts/migration_classifier.py", pb.CHART_PIN],
+    ids=["docs", "an-operator-application", "the-classifier", "the-chart-pin"],
+)
+def test_detect_fails_a_non_pin_pr_that_changes_the_seed_allowlist_with_anything_else(
+    other: str, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """ADR-1103: allowlist changes land only in their OWN non-pin PR, so the allowlist alone, never beside a gate
+    edit, a platform move, a chart pin or a note that moves no `targetRevision`."""
+    monkeypatch.setattr(pe, "texts", lambda repo, sha: (BASE, BASE))
+    monkeypatch.setattr(pe, "changed_files", lambda repo: sorted([pb.SEED_ALLOWLIST_FILE, other]))
+    event_file = tmp_path / "event.json"
+    event_file.write_text(json.dumps(event("event-human.json")))
+    output = tmp_path / "output"
+    assert pe.main(["detect", "--event", str(event_file), "--output", str(output)]) == 1
+    assert (
+        f"a PR that changes {pb.SEED_ALLOWLIST_FILE} changes nothing else; it also changes {other} (ADR-1103)"
+        in capsys.readouterr().out
+    )
+    assert not output.exists()
+
+
+def test_judge_fails_a_non_pin_pr_that_changes_the_seed_allowlist_with_anything_else() -> None:
+    """Defence in depth: `judge` applies the same rule, with the other paths listed in sorted order."""
+    changed = [pb.SEED_ALLOWLIST_FILE, "scripts/pin_bump.py", "MIGRATION_NOTES.md"]
+    outcome, calls = judge("event-human.json", BASE, helms={}, changed=changed)
+    assert outcome.failures == [
+        f"a PR that changes {pb.SEED_ALLOWLIST_FILE} changes nothing else; it also changes "
+        "MIGRATION_NOTES.md, scripts/pin_bump.py (ADR-1103)"
+    ], outcome.failures
+    assert calls == []
+
+
+def test_detect_fails_a_human_pin_pr_that_edits_the_seed_allowlist(tmp_path: Path, monkeypatch, capsys) -> None:
+    """In `detect` already, so the job fails before it installs a helm."""
+    monkeypatch.setattr(pe, "texts", lambda repo, sha: (BASE, moved()))
+    monkeypatch.setattr(pe, "changed_files", lambda repo: [*pb.MECHANICAL_FILES, pb.SEED_ALLOWLIST_FILE])
+    event_file = tmp_path / "event.json"
+    event_file.write_text(json.dumps(event("event-human.json")))
+    output = tmp_path / "output"
+    assert pe.main(["detect", "--event", str(event_file), "--output", str(output)]) == 1
+    assert "ADR-1103" in capsys.readouterr().out
+    assert not output.exists()
+
+
+def test_detect_passes_a_non_pin_pr_that_changes_only_the_seed_allowlist(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(pe, "texts", lambda repo, sha: (BASE, BASE))
+    monkeypatch.setattr(pe, "changed_files", lambda repo: [pb.SEED_ALLOWLIST_FILE])
+    event_file = tmp_path / "event.json"
+    event_file.write_text(json.dumps(event("event-human.json")))
+    output = tmp_path / "output"
+    assert pe.main(["detect", "--event", str(event_file), "--output", str(output)]) == 0
+    assert output.read_text().splitlines() == ["moved=false"]
 
 
 def test_detect_fails_an_automatic_pr_that_moves_no_pin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

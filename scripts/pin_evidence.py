@@ -37,6 +37,11 @@ which is what merging the PR makes main.
    `detect` already. C3 does NOT judge non-pin edits on a HUMAN head;
    two-owners and review cover those (K3 is gone, argocd#193). The pin
    move's own NEEDS-HUMAN verdict is enforced on a human head (step 4).
+   ONE EXCEPTION, ON EVERY PR (ADR-1103): a merge commit that changes
+   `scripts/gates/migration_seed_allowlist.json` FAILS, in `detect` already,
+   as a hard failure that no acknowledgement clears, unless it moves no pin
+   and changes no other file. An allowlist change lands only in its own
+   non-pin PR, never beside a gate edit, a platform move or a chart pin.
 1. Pin-only. The head `yadgar.yaml` must be the base one with the one
    `targetRevision:` line rewritten (`pin_bump.rewrite_target_revision`), byte
    for byte. A values change in the same PR is not a pin-only PR: FAIL, before
@@ -298,6 +303,22 @@ def automatic_problem(pr: Pr, move: tuple[str, str] | None, changed: list[str]) 
     return None
 
 
+def seed_allowlist_problem(move: tuple[str, str] | None, changed: list[str]) -> str | None:
+    """Why a PR that changes the seed allowlist may not merge (ADR-1103), or None.
+
+    Allowlist changes land ONLY in their own non-pin PR: a PR that changes the allowlist moves no pin (human or
+    automatic) and changes no other file, not a gate, a platform move, a chart pin or a note. A HARD failure, never
+    a NEEDS-HUMAN reason, so no acknowledgement clears it. A PR that leaves the allowlist alone is not judged here.
+    """
+    if pb.SEED_ALLOWLIST_FILE not in changed:
+        return None
+    if move is not None:
+        return f"a pin PR may not change {pb.SEED_ALLOWLIST_FILE}: allowlist changes land in their own non-pin PR (ADR-1103)"
+    if others := sorted(set(changed) - {pb.SEED_ALLOWLIST_FILE}):
+        return f"a PR that changes {pb.SEED_ALLOWLIST_FILE} changes nothing else; it also changes {', '.join(others)} (ADR-1103)"
+    return None
+
+
 def base_file(repo: Path, path: str) -> bytes:
     """`path` at the merge commit's first parent, the base."""
     return subprocess.run(["git", "-C", str(repo), "show", f"HEAD^1:{path}"], capture_output=True, check=True).stdout
@@ -503,6 +524,10 @@ def judge(
     if problem := automatic_problem(pr, move, changed):
         outcome.failures.append(problem)
         return outcome
+    # Defence in depth: `detect` already refuses this, on every PR (ADR-1103).
+    if problem := seed_allowlist_problem(move, changed):
+        outcome.failures.append(problem)
+        return outcome
     if move is None:
         outcome.notes.append(f"no pin move: targetRevision stays {pb.current_pin(base_text)}")
         return outcome
@@ -673,7 +698,7 @@ def main(argv: list[str] | None = None) -> int:
         changed = changed_files(arguments.repo)
         if arguments.command == "detect":
             move = move_of(base_text, head_text)
-            if problem := automatic_problem(pr, move, changed):
+            if problem := automatic_problem(pr, move, changed) or seed_allowlist_problem(move, changed):
                 raise Refused(problem)
             lines = ["moved=false"] if move is None else ["moved=true", f"pin={move[0]}", f"target={move[1]}"]
             with arguments.output.open("a") as output:
