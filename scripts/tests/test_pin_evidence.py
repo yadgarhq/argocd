@@ -526,6 +526,40 @@ def test_regenerated_differences_seeds_the_base_and_compares_with_the_head(tmp_p
     assert seen["writers"] == sorted(pe.WRITERS)
 
 
+@pytest.mark.parametrize("resolved, differs", [("sha256:" + "1" * 64, []), ("sha256:" + "2" * 64, [pb.CHART_PIN])])
+def test_the_regenerated_chart_pin_records_the_digest_the_tag_resolves_to_now(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, resolved: str, differs: list[str]
+) -> None:
+    """Yaadgaar 250: the real `write_files` re-resolves the target's digest, so a head whose `chart_digest` is not
+    what the tag resolves to at E1 time is not the regenerated pin. Only the K3 writer is stubbed."""
+    base_pin = (REPOSITORY / pb.CHART_PIN).read_text()
+    head = tmp_path / "head"
+    head_files = {
+        pb.APPLICATION: moved(),
+        pb.CHART_PIN: pb.rewrite_chart_pin(base_pin, TARGET, "sha256:" + "1" * 64),
+        pb.TABLE: "table@target\n",
+    }
+    for path, text in head_files.items():
+        (head / path).parent.mkdir(parents=True, exist_ok=True)
+        (head / path).write_text(text)
+    for writer in pe.WRITERS:
+        (head / "scripts" / "gates" / writer).write_text(f"# {writer}")
+
+    class Finished:
+        returncode = 0
+        stderr = ""
+
+    def writer(command, **_):
+        Path(command[1]).parents[2].joinpath(pb.TABLE).write_text("table@target\n")
+        return Finished()
+
+    monkeypatch.setattr(pb, "writer_helm", lambda: "/bin/true")
+    monkeypatch.setattr(pb.subprocess, "run", writer)
+    monkeypatch.setattr(pb, "chart_digest", lambda version: resolved)
+    base = {pb.APPLICATION: BASE, pb.CHART_PIN: base_pin, pb.TABLE: "table@base\n"}
+    assert pe.regenerated_differences(head, TARGET, base_of=lambda path: base[path].encode()) == differs
+
+
 def test_other_contexts_are_not_the_e2_status() -> None:
     other = {**green_status(), "context": "ci / passed"}
     outcome, _ = judge("event-auto.json", moved(), statuses=[other], required=True)

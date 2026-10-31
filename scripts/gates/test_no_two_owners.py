@@ -98,10 +98,12 @@ counterpart, not its replacement.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -493,12 +495,56 @@ def parent_values(tree: Path) -> dict:
     return helm["valuesObject"]
 
 
+CHART_PIN_FILE = Path("scripts") / "chart_pin.json"
+CHART_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def chart_pin_of(tree: Path) -> dict | None:
+    """`tree`'s `scripts/chart_pin.json`, or `None` when the tree carries none."""
+    path = tree / CHART_PIN_FILE
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def parent_pull(source: dict, pin: dict | None) -> tuple[str, ...]:
+    """The `helm pull` reference and version of the parent chart source (yaadgaar 250).
+
+    WITH A PIN, BY ITS RECORDED DIGEST AND ITS TAG:
+    `oci://<repoURL>/<chart>@<chart_digest> --version <targetRevision>`. Helm
+    (v3.18.4 and v4.3.0, measured 2026-10-31) resolves the tag, refuses with
+    "chart reference digest mismatch" naming both digests when they differ, and
+    pulls the recorded manifest. A pin for another tag, or one without a
+    well-formed `chart_digest`, is refused rather than pulled by tag.
+
+    WITHOUT ONE, BY TAG. Only a tree built around a single Application carries
+    no `chart_pin.json` (`pin_bump.render`, `settled_gate`, `pin_dryrun`); this
+    repository's own tree always does, and `scripts/check_chart_pin.py` holds
+    its digest equal to what the tag resolves to.
+    """
+    reference = f"oci://{source['repoURL']}/{source['chart']}"
+    version = source["targetRevision"]
+    if pin is None:
+        return (reference, "--version", version)
+    if pin.get("chart_tag") != f"v{version}":
+        raise AssertionError(
+            f"`{CHART_PIN_FILE}` pins `{pin.get('chart_tag')}`, but the parent source pins `{version}`; "
+            f"the recorded digest is not this chart's"
+        )
+    digest = pin.get("chart_digest")
+    if not isinstance(digest, str) or not CHART_DIGEST.fullmatch(digest):
+        raise AssertionError(
+            f"`{CHART_PIN_FILE}` records chart_digest {digest!r}, not sha256:<64 lowercase hex>; "
+            f"the parent is pulled by the digest the pin recorded, never by its mutable tag alone"
+        )
+    return (f"{reference}@{digest}", "--version", version)
+
+
 def parent_render(tree: Path, overrides: tuple[str, ...] = ()) -> list:
     """The documents of P, for a check that reads more than the tuples.
 
     THE VERSION AND THE VALUES ARE READ OFF `applications/yadgar.yaml` RATHER
     THAN WRITTEN HERE, so a parent bump moves the gate's subject with it and
     never leaves the gate measuring a version the cluster stopped running.
+    The chart is pulled by `chart_pin.json`'s recorded digest (`parent_pull`).
     """
     chart = parent_chart(tree)
     values = parent_values(tree)
@@ -507,9 +553,7 @@ def parent_render(tree: Path, overrides: tuple[str, ...] = ()) -> list:
         values_file.write_text(yaml.safe_dump(values))
         helm(
             "pull",
-            f"oci://{chart['repoURL']}/{chart['chart']}",
-            "--version",
-            chart["targetRevision"],
+            *parent_pull(chart, chart_pin_of(tree)),
             "--untar",
             "--untardir",
             scratch,
@@ -1113,6 +1157,7 @@ def test_the_url_deletion_without_the_bump_reddens(tmp_path: Path) -> None:
     pinned = re.findall(r"^\s*targetRevision: (\d+\.\d+\.\d+)\s*$", text, re.MULTILINE)
     assert len(pinned) == 1, pinned
     application.write_text(text.replace(f"targetRevision: {pinned[0]}", f"targetRevision: {PIN_BEFORE_B5}"))
+    pin_the_tree_at(tree, PIN_BEFORE_B5)
     failures, _ = unresolved_brokers(tree, parent_only=True)
     assert sorted(failures) == [("Deployment/gateway", "nats"), ("Deployment/iam", "nats")], failures
 
@@ -2081,6 +2126,7 @@ def test_the_old_pin_names_both_probe_defects(tmp_path: Path) -> None:
     text = application.read_text()
     pinned = re.findall(r"^\s*targetRevision: (\d+\.\d+\.\d+)\s*$", text, re.MULTILINE)
     application.write_text(text.replace(f"targetRevision: {pinned[0]}", f"targetRevision: {PIN_BEFORE_B9}"))
+    pin_the_tree_at(tree, PIN_BEFORE_B9)
     problems = probe_violations(parent_render(tree))
     assert any("nodePort 30443" in p for p in problems), problems
     assert any(p.startswith("preflight declares") for p in problems), problems
@@ -2172,3 +2218,86 @@ def test_each_helm_call_gets_its_own_cache_config_and_data(tmp_path: Path, monke
     assert len(first) == 3 and not any(path.startswith("/shared") for path in first)
     assert set(first).isdisjoint(second)
     assert len({Path(path).parent for path in first}) == 1
+
+
+# ── THE PARENT IS PULLED BY ITS RECORDED DIGEST (yaadgaar 250) ──────────────
+# `oci://…/yadgar@<chart_digest> --version <targetRevision>`: helm (v3.18.4 and
+# v4.3.0, measured 2026-10-31) resolves the tag, refuses with "chart reference
+# digest mismatch: <tag's> is not <recorded>" when they differ, and pulls the
+# recorded manifest. So the render is of the bytes `chart_pin.json` names.
+
+RECORDED_0_49_27 = "sha256:f989dd433ade520a8987dac3ca39ae933e631b671c1ece46a054c8a74dd57592"
+# 0.25.27's manifest digest, measured 2026-10-31 (`pin_bump.Net().ghcr_digest`
+# and `helm pull` agree): a real digest that is not the 0.49.27 tag's.
+OTHER_RELEASE_DIGEST = "sha256:9785470c73778d958f730b19c6391aa2fc77ae72e752cc88742066f21192cf4f"
+PARENT_SOURCE = {"repoURL": "ghcr.io/yadgarhq/charts", "chart": "yadgar", "targetRevision": "0.49.27"}
+# The red cases that move a copy's pin to an old release record that release's
+# digest too, as a real pin would (measured 2026-10-31, `pin_bump.Net().ghcr_digest`).
+OLD_RELEASE_DIGESTS = {
+    "0.2.38": "sha256:38847bbbdda01657f3a2d259c423e4c1c9e36a3310c8d7698c0b380ac18d3b32",
+    "0.3.7": "sha256:a26bf1dff34f7597b8d17957f2241d84c0bff0e61f736a0a30392a13163471be",
+}
+
+
+def pin_the_tree_at(tree: Path, version: str) -> None:
+    """`tree`'s `chart_pin.json` moved to `version` and its recorded digest, as `pin_bump.py --write` moves it."""
+    pin = chart_pin_of(tree)
+    pin.update(chart_tag=f"v{version}", chart_digest=OLD_RELEASE_DIGESTS[version])
+    (tree / CHART_PIN_FILE).write_text(json.dumps(pin, indent=2) + "\n")
+
+
+def test_the_parent_is_pulled_by_the_recorded_digest_and_its_tag() -> None:
+    pin = {"chart_tag": "v0.49.27", "chart_digest": RECORDED_0_49_27, "platform_version": "0.2.14"}
+    assert parent_pull(PARENT_SOURCE, pin) == (
+        f"oci://ghcr.io/yadgarhq/charts/yadgar@{RECORDED_0_49_27}",
+        "--version",
+        "0.49.27",
+    )
+
+
+def test_a_tree_with_no_chart_pin_pulls_by_tag() -> None:
+    """A one-file tree (`pin_bump.render`, `settled_gate`, `pin_dryrun`) carries no `chart_pin.json` to verify against."""
+    assert parent_pull(PARENT_SOURCE, None) == ("oci://ghcr.io/yadgarhq/charts/yadgar", "--version", "0.49.27")
+
+
+def test_a_chart_pin_without_a_digest_refuses_the_pull() -> None:
+    with pytest.raises(AssertionError, match="chart_digest"):
+        parent_pull(PARENT_SOURCE, {"chart_tag": "v0.49.27", "platform_version": "0.2.14"})
+
+
+@pytest.mark.parametrize("digest", ["", "f989dd43", "sha256:" + "Z" * 64])
+def test_a_malformed_recorded_digest_refuses_the_pull(digest: str) -> None:
+    with pytest.raises(AssertionError, match="chart_digest"):
+        parent_pull(PARENT_SOURCE, {"chart_tag": "v0.49.27", "chart_digest": digest})
+
+
+def test_a_chart_pin_for_another_tag_refuses_the_pull() -> None:
+    with pytest.raises(AssertionError, match=r"v0\.49\.26.*0\.49\.27|0\.49\.27.*v0\.49\.26"):
+        parent_pull(PARENT_SOURCE, {"chart_tag": "v0.49.26", "chart_digest": RECORDED_0_49_27})
+
+
+def test_parent_render_pulls_by_the_trees_recorded_digest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tree = a_copy_of_the_tree(tmp_path)
+    pin = chart_pin_of(tree)
+    pulls: list[tuple[str, ...]] = []
+
+    def fake_helm(*arguments: str) -> str:
+        if arguments[0] == "pull":
+            pulls.append(arguments)
+        return ""
+
+    monkeypatch.setattr(sys.modules[__name__], "helm", fake_helm)
+    parent_render(tree)
+    assert len(pulls) == 1
+    assert pulls[0][1] == f"oci://{PARENT_SOURCE['repoURL']}/yadgar@{pin['chart_digest']}"
+    assert pulls[0][2:4] == ("--version", pin["chart_tag"].removeprefix("v"))
+
+
+def test_a_retagged_parent_reddens_the_render(tmp_path: Path) -> None:
+    """THE LIVE RED CASE. The recorded digest is a real manifest, but not the one the tag resolves to now."""
+    tree = a_copy_of_the_tree(tmp_path)
+    path = tree / CHART_PIN_FILE
+    pin = chart_pin_of(tree)
+    path.write_text(path.read_text().replace(pin["chart_digest"], OTHER_RELEASE_DIGEST))
+    with pytest.raises(AssertionError, match="digest mismatch"):
+        parent_render(tree)

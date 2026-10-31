@@ -151,6 +151,10 @@ EXPECTED_RETRY: dict = {
 #                        (`spec.source.targetRevision`, as the published OCI
 #                        chart version — the same number with a `v` in front is
 #                        the git tag `ref=` takes).
+#   `chart_digest`      the OCI manifest digest `chart_tag`'s chart resolved
+#                        to when the pin was written (yaadgaar 250). The gates
+#                        pull the parent by it, and `scripts/check_chart_pin.py`
+#                        refuses when the tag resolves to anything else now.
 #   `platform_version`  `platform`'s pinned `version` among that tag's
 #                        `chart/Chart.yaml` `dependencies`.
 #
@@ -177,6 +181,7 @@ PLATFORM_VERSION = CHART_PIN["platform_version"]
 # `targetRevision` both write it as (no `v`). `chart_pin_errors` below is the
 # one clause that reads these.
 CHART_TAG_PATTERN = re.compile(r"v\d+\.\d+\.\d+")
+CHART_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 PLATFORM_VERSION_PATTERN = re.compile(r"\d+\.\d+\.\d+")
 
 OPERATOR_KEYS = ("argoCd", "certManager", "envoyGateway", "keda", "mariadbOperator", "prometheus")
@@ -563,11 +568,13 @@ def chart_pin_errors(pin: dict) -> list[str]:
     either pattern to check, and `pin["chart_tag"]` would raise rather than
     fail a clause.
     """
-    if set(pin) != {"chart_tag", "platform_version"}:
+    if set(pin) != {"chart_tag", "chart_digest", "platform_version"}:
         return ["keys"]
     errors = []
     if not CHART_TAG_PATTERN.fullmatch(pin["chart_tag"]):
         errors.append("chart_tag")
+    if not CHART_DIGEST_PATTERN.fullmatch(pin["chart_digest"]):
+        errors.append("chart_digest")
     if not PLATFORM_VERSION_PATTERN.fullmatch(pin["platform_version"]):
         errors.append("platform_version")
     return errors
@@ -623,8 +630,8 @@ def test_every_platform_sourced_application_is_the_d4_shape() -> None:
 
 
 def test_chart_pin_file_is_well_formed() -> None:
-    """LEDGER 1206. `chart_pin.json` carries exactly the two keys this module reads,
-    each in the shape `scripts/check_chart_pin.py`'s requests expect.
+    """LEDGER 1206. `chart_pin.json` carries exactly its three keys, each in the
+    shape `scripts/check_chart_pin.py`'s requests expect.
 
     Whether its `platform_version` and `chart_tag` are still true of
     `yadgarhq/chart` and the running `yadgar` Application is that script's
@@ -651,6 +658,17 @@ def test_a_platform_version_carrying_a_v_prefix_reddens() -> None:
 
 def test_an_extra_chart_pin_key_reddens() -> None:
     assert chart_pin_errors({**CHART_PIN, "extra": "x"}) == ["keys"]
+
+
+def test_a_chart_pin_without_its_digest_reddens() -> None:
+    """Yaadgaar 250: the digest the gates pull by is part of the pin, never optional."""
+    pin = {key: value for key, value in CHART_PIN.items() if key != "chart_digest"}
+    assert chart_pin_errors(pin) == ["keys"]
+
+
+@pytest.mark.parametrize("digest", ["f989dd43", "sha256:F989DD43" + "0" * 56, "sha512:" + "0" * 64, "v0.49.27"])
+def test_a_malformed_chart_digest_reddens(digest: str) -> None:
+    assert chart_pin_errors({**CHART_PIN, "chart_digest": digest}) == ["chart_digest"]
 
 
 def test_a_mismatched_chart_pin_reddens(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -13,7 +13,8 @@ WHAT IS ASSERTED, each with a red case:
      touches a file outside the three pin files (a rename shows both paths), a
      `yadgar.yaml` that differs from main's in anything but the one
      `targetRevision` line (the live red proof's shape: an env entry added to
-     values), a `chart_pin.json` that differs in anything but `chart_tag`, a
+     values), a `chart_pin.json` that differs in anything but `chart_tag` and
+     a well-formed `chart_digest`, a
      target that is not a release, a render table that disagrees with the head
      render, a rendered Secret, and a kind the read table does not name.
   2. Settledness: `yadgar` Synced, Healthy, no operation running, at main's
@@ -40,6 +41,7 @@ from __future__ import annotations
 import copy
 import datetime as dt
 import io
+import hashlib
 import json
 import os
 import subprocess
@@ -87,7 +89,12 @@ spec:
     namespace: yadgar
 """
 
-CHART_PIN = '{{\n  "chart_tag": "v{pin}",\n  "platform_version": "0.2.6"\n}}\n'
+CHART_PIN = '{{\n  "chart_tag": "v{pin}",\n  "chart_digest": "{digest}",\n  "platform_version": "0.2.6"\n}}\n'
+
+
+def chart_pin(pin: str, digest: str | None = None) -> str:
+    """`chart_pin.json` at `pin`; each pin records its own digest, as a real bump moves both (yaadgaar 250)."""
+    return CHART_PIN.format(pin=pin, digest=digest if digest is not None else "sha256:" + hashlib.sha256(pin.encode()).hexdigest())
 
 
 # ── the injected render ─────────────────────────────────────────────────────
@@ -158,7 +165,7 @@ def repo(tmp_path: Path) -> Path:
     root.mkdir()
     git(root, "init", "-q", "-b", "main")
     write(root, "applications/yadgar.yaml", APPLICATION.format(pin=PIN))
-    write(root, "scripts/chart_pin.json", CHART_PIN.format(pin=PIN))
+    write(root, "scripts/chart_pin.json", chart_pin(PIN))
     write(root, "scripts/gates/yadgar_render.sha256", table_for(base_documents(), PIN))
     write(root, ".github/workflows/ci.yaml", "name: ci\n")
     write(root, "README.md", "argocd\n")
@@ -179,7 +186,7 @@ def main_sha(repo: Path) -> str:
 def pin_branch(repo: Path, name: str = "auto/pin-0.25.28", *, target: str = TARGET, table_docs: list | None = None, extra=None) -> str:
     git(repo, "checkout", "-q", "-b", name, "main")
     write(repo, "applications/yadgar.yaml", APPLICATION.format(pin=target))
-    write(repo, "scripts/chart_pin.json", CHART_PIN.format(pin=target))
+    write(repo, "scripts/chart_pin.json", chart_pin(target))
     write(repo, "scripts/gates/yadgar_render.sha256", table_for(table_docs if table_docs is not None else head_documents(), target))
     if extra:
         extra(repo)
@@ -280,7 +287,7 @@ def test_an_env_change_without_a_pin_move_is_refused_too(repo: Path) -> None:
 
 def test_a_chart_pin_change_beyond_chart_tag_is_refused(repo: Path) -> None:
     def platform(r: Path) -> None:
-        write(r, "scripts/chart_pin.json", CHART_PIN.format(pin=TARGET).replace("0.2.6", "0.2.7"))
+        write(r, "scripts/chart_pin.json", chart_pin(TARGET).replace("0.2.6", "0.2.7"))
 
     result = run(repo, pin_branch(repo, extra=platform), kubectl=NoCluster())
     assert result["result"] == "refused"
@@ -763,9 +770,26 @@ def test_a_duplicate_key_in_yadgar_yaml_is_refused_before_any_cluster_read(repo:
     assert any("applications/yadgar.yaml" in p and "duplicate key" in p for p in result["problems"]), result["problems"]
 
 
+@pytest.mark.parametrize("digest", ["", "sha256:abc", "f" * 64, "sha256:" + "G" * 64])
+def test_a_malformed_head_chart_digest_is_refused(repo: Path, digest: str) -> None:
+    """The digest moves with the tag; its value is checked live by CI's `chart-pin` job, its shape here (yaadgaar 250)."""
+    result = run(repo, pin_branch(repo, extra=lambda r: write(r, "scripts/chart_pin.json", chart_pin(TARGET, digest))), kubectl=NoCluster())
+    assert result["result"] == "refused"
+    assert any("scripts/chart_pin.json" in p and "digest" in p for p in result["problems"]), result["problems"]
+
+
+def test_a_head_chart_pin_without_a_digest_is_refused(repo: Path) -> None:
+    def drop(r: Path) -> None:
+        write(r, "scripts/chart_pin.json", '{\n  "chart_tag": "v' + TARGET + '",\n  "platform_version": "0.2.6"\n}\n')
+
+    result = run(repo, pin_branch(repo, extra=drop), kubectl=NoCluster())
+    assert result["result"] == "refused"
+    assert any("scripts/chart_pin.json" in p for p in result["problems"]), result["problems"]
+
+
 def test_a_duplicate_key_in_chart_pin_json_is_refused(repo: Path) -> None:
     def duplicate(r: Path) -> None:
-        write(r, "scripts/chart_pin.json", CHART_PIN.format(pin=TARGET).replace('"platform_version"', '"chart_tag": "v0.0.1",\n  "platform_version"'))
+        write(r, "scripts/chart_pin.json", chart_pin(TARGET).replace('"platform_version"', '"chart_tag": "v0.0.1",\n  "platform_version"'))
 
     result = run(repo, pin_branch(repo, extra=duplicate), kubectl=NoCluster())
     assert result["result"] == "refused"

@@ -51,10 +51,37 @@ REPLAYS = {
     "#109": ("36059be", "0.25.27", "e7403b0"),
 }
 
+# THE THREE HAND PINS PREDATE `chart_digest` (yaadgaar 250), and `write_files`
+# refuses a `chart_pin.json` without one rather than growing it. So the replay
+# gives each base its pin's digest and expects the merged file plus the
+# target's, the line the writer would have moved. The values are the OCI
+# manifest digests of `ghcr.io/yadgarhq/charts/yadgar:<version>`, measured
+# 2026-10-31 (`pin_bump.Net().ghcr_digest` and `helm pull` agree). The writer
+# resolves the target's live, so a retag of any of these tags reddens here.
+BASE_PINS = {"1795558": "0.25.9", "8a2bb79": "0.25.12", "36059be": "0.25.14"}
+CHART_DIGESTS = {
+    "0.25.9": "sha256:70b86205a4a70875d7d32001cd261038bc559cd7f10ea874bac69708b38168d5",
+    "0.25.12": "sha256:80585ec395daeffdd40819f4a8191a7dd6fec703b113448ac82493af2329df55",
+    "0.25.14": "sha256:41dffee600cbeca3f92b03edaeb219ab2eb4ddf9e7940b2b65ee5c280135f5ab",
+    "0.25.27": "sha256:9785470c73778d958f730b19c6391aa2fc77ae72e752cc88742066f21192cf4f",
+}
+
 
 def raw(sha: str, path: str) -> bytes:
     with urllib.request.urlopen(RAW.format(sha=sha, path=path), timeout=30) as response:  # noqa: S310
         return response.read()
+
+
+def with_digest(chart_pin: bytes, version: str) -> bytes:
+    """`chart_pin` with a `chart_digest` line for `version` after its `chart_tag` line, every other byte kept."""
+    lines = chart_pin.decode().splitlines(keepends=True)
+    (index,) = [i for i, line in enumerate(lines) if line.lstrip().startswith('"chart_tag":')]
+    lines.insert(index + 1, f'  "chart_digest": "{CHART_DIGESTS[version]}",\n')
+    return "".join(lines).encode()
+
+
+def seeded(sha: str, path: str) -> bytes:
+    return with_digest(raw(sha, path), BASE_PINS[sha]) if path == pb.CHART_PIN else raw(sha, path)
 
 
 @pytest.mark.parametrize("pull_request", sorted(REPLAYS))
@@ -62,13 +89,16 @@ def test_the_write_reproduces_the_hand_pin(tmp_path: Path, pull_request: str) ->
     base, target, merged = REPLAYS[pull_request]
     for path in pb.MECHANICAL_FILES:
         (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / path).write_bytes(raw(base, path))
+        (tmp_path / path).write_bytes(seeded(base, path))
     for writer in ("test_yadgar_application.py", "test_no_two_owners.py"):
         shutil.copyfile(GATES / writer, tmp_path / "scripts" / "gates" / writer)
 
     pb.write_files(tmp_path, target)
 
-    differing = [path for path in pb.MECHANICAL_FILES if (tmp_path / path).read_bytes() != raw(merged, path)]
+    def expected(path: str) -> bytes:
+        return with_digest(raw(merged, path), target) if path == pb.CHART_PIN else raw(merged, path)
+
+    differing = [path for path in pb.MECHANICAL_FILES if (tmp_path / path).read_bytes() != expected(path)]
     print(f"[replay] {pull_request}: {base} -> {target}, {len(pb.MECHANICAL_FILES)} file(s) compared with {merged}")
     assert differing == []
 
