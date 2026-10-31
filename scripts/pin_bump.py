@@ -1781,8 +1781,9 @@ def classifier():
 #
 # THE BASE'S COPY ONLY. `check` reads it from the tree it checks: auto-pin runs on main's checkout, and
 # `pin_evidence.evidence` writes the base's (HEAD^1) bytes into its copy of the merge checkout, so an entry a PR
-# adds admits nothing in that PR. `pin_dryrun` step 1 refuses a pin PR that touches it; an automatic head may not
-# touch it either (`pin_evidence.automatic_problem`). FAIL CLOSED: a malformed file admits nothing, and every class
+# adds admits nothing in that PR. `pin_dryrun` step 1 refuses a pin PR that touches it; `pin-evidence` fails one
+# too, human or automatic, and any PR that changes it beside another file (`pin_evidence.seed_allowlist_problem`,
+# ADR-1103). FAIL CLOSED: a malformed file admits nothing, and every class
 # D migration is red with the reason; it never raises, so E4 is never skipped.
 
 SEED_ALLOWLIST_FILE = "scripts/gates/migration_seed_allowlist.json"

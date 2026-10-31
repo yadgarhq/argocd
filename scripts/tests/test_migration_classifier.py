@@ -22,7 +22,7 @@ One constructed case per arm:
   outside the allowlist (SERIAL is BIGINT AUTO_INCREMENT UNIQUE) and a spec
   that is not ADD COLUMN red;
 - class D: an INSERT is red with an empty allowlist, green only for an entry of
-  its module and exact table whose columns hold the INSERT's (the subset rule),
+  its module and exact table whose columns are exactly the INSERT's (ADR-1102),
   with one single-quoted ASCII string, number, NULL, TRUE or FALSE per column in
   every row; INSERT ... SELECT, a subquery, ON DUPLICATE, SET, RETURNING, a
   qualified name, a repeated column, a count mismatch and any other value red;
@@ -393,12 +393,39 @@ def test_an_allowlisted_insert_with_literals_is_green_and_names_its_entry() -> N
     assert verdict("CREATE TABLE t (id INT)", (LOCK,)).seed_entry is None, "only class D names an entry"
 
 
-def test_the_insert_columns_may_be_a_subset_of_the_entry_but_not_outside_it() -> None:
-    """The chosen rule (Max has not ruled otherwise): the INSERT's columns are a SUBSET of the entry's columns."""
-    assert green("INSERT INTO iam_org_setting (name, value) VALUES ('a', 1)", (SETTING,)) == "D"
-    assert green("INSERT INTO iam_org_setting (locked, NAME) VALUES (1, 'a')", (SETTING,)) == "D", "column names are case-insensitive"
-    reason = red("INSERT INTO iam_org_setting (name, value, owner) VALUES ('a', 1, 2)", (SETTING,))
-    assert "not on the seed allowlist" in reason, reason
+def test_the_insert_columns_must_equal_the_entry_columns() -> None:
+    """ADR-1102 (supersedes ADR-1101's subset rule): the INSERT names exactly the entry's columns, no fewer, no more."""
+    assert green("INSERT INTO iam_org_setting (name, value, locked) VALUES ('a', 1, 0)", (SETTING,)) == "D"
+    assert green("INSERT INTO iam_org_setting (locked, name, value) VALUES (0, 'a', 1)", (SETTING,)) == "D", "order is free"
+
+
+def test_an_insert_of_a_subset_of_the_entry_columns_is_red_and_names_the_missing_ones() -> None:
+    reason = red("INSERT INTO iam_org_setting (name, value) VALUES ('a', 1)", (SETTING,))
+    assert reason == (
+        "seed INSERT into iam_org_setting (name, value) is not on the seed allowlist for iam-db: "
+        "the iam-db entry for iam_org_setting lists exactly (name, value, locked); missing locked (ADR-1102)"
+    ), reason
+
+
+def test_an_insert_of_a_superset_of_the_entry_columns_is_red_and_names_the_extra_ones() -> None:
+    reason = red("INSERT INTO iam_org_setting (name, value, locked, owner) VALUES ('a', 1, 0, 2)", (SETTING,))
+    assert reason == (
+        "seed INSERT into iam_org_setting (name, value, locked, owner) is not on the seed allowlist for iam-db: "
+        "the iam-db entry for iam_org_setting lists exactly (name, value, locked); extra owner (ADR-1102)"
+    ), reason
+    both = red("INSERT INTO iam_org_setting (name, owner) VALUES ('a', 2)", (SETTING,))
+    assert both.endswith("missing value, locked; extra owner (ADR-1102)"), both
+
+
+def test_an_exact_column_set_in_another_case_is_green() -> None:
+    """Column names compare case-insensitively, as MariaDB's do, after the ASCII check."""
+    assert green("INSERT INTO iam_org_setting (LOCKED, Name, `VALUE`) VALUES (0, 'a', 1)", (SETTING,)) == "D"
+
+
+def test_a_non_ascii_column_is_red_even_when_it_would_fold_into_the_exact_set() -> None:
+    """U+212A KELVIN SIGN lowercases to ASCII `k`: the ASCII check runs first, so the exact set never matches."""
+    reason = red("INSERT INTO iam_x (name, value, `\u212aey`) VALUES ('a', 1, 2)", (KEY_ENTRY,))
+    assert "not an ASCII name" in reason, reason
 
 
 @pytest.mark.parametrize(
@@ -474,7 +501,7 @@ KEY_ENTRY = mc.SeedEntry(module="iam-db", table="iam_x", columns=("name", "value
 def test_a_non_ascii_backticked_insert_column_is_red_before_any_case_fold(column: str) -> None:
     """Security review of argocd#216: Python lowercases U+212A KELVIN SIGN to ASCII `k`, so `Key` matched `key`."""
     assert "ASCII" in red(f"INSERT INTO iam_x (`{column}`) VALUES (1)", (KEY_ENTRY,))
-    assert green("INSERT INTO iam_x (`key`) VALUES (1)", (KEY_ENTRY,)) == "D"
+    assert green("INSERT INTO iam_x (name, value, `key`) VALUES ('a', 1, 2)", (KEY_ENTRY,)) == "D"
 
 
 @pytest.mark.parametrize(

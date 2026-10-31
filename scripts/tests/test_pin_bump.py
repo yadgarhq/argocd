@@ -939,14 +939,14 @@ def entry_json(**overrides) -> dict:
 def test_an_allowlisted_seed_is_green_and_records_the_entry_that_admitted_it() -> None:
     seeds = pb.parse_seed_allowlist(seeds_text(entry_json()))
     assert seeds == pb.SeedAllowlist(entries=(user_seed(),), problem=None)
-    found = pb.migration_evidence("iam-db", tree("e4-old"), with_audit_sql('"INSERT INTO user (id) VALUES (1)".into()'), seeds)
-    checksum = hashlib.sha256(b"INSERT INTO user (id) VALUES (1)").hexdigest()
+    found = pb.migration_evidence("iam-db", tree("e4-old"), with_audit_sql('"INSERT INTO user (id, name) VALUES (1, \'root\')".into()'), seeds)
+    checksum = hashlib.sha256(b"INSERT INTO user (id, name) VALUES (1, 'root')").hexdigest()
     assert found["status"] == "green" and found["reasons"] == [], found["reasons"]
     assert found["admitted"] == [
         {"version": 7, "name": "create_audit", "checksum": checksum, "statement_class": "D", "seed": {"module": "iam-db", "table": "user", "adr": "ADR-1099"}}
     ]
     other = pb.parse_seed_allowlist(seeds_text(entry_json(module="task-db")))
-    assert pb.migration_evidence("iam-db", tree("e4-old"), with_audit_sql('"INSERT INTO user (id) VALUES (1)".into()'), other)["status"] == "red"
+    assert pb.migration_evidence("iam-db", tree("e4-old"), with_audit_sql('"INSERT INTO user (id, name) VALUES (1, \'root\')".into()'), other)["status"] == "red"
 
 
 def test_the_body_names_the_allowlist_entry_that_admitted_a_seed() -> None:

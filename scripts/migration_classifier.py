@@ -27,9 +27,11 @@ Class D (car 3) takes one value per column in every row, each a number, a
 SINGLE-quoted ASCII string (a double-quoted one is an identifier under
 ANSI_QUOTES), NULL, TRUE or FALSE; no repeated column. An allowlist entry of
 the same module and the EXACT table name (MariaDB table names are
-case-sensitive on Linux) admits it when the INSERT's columns are a SUBSET of
-the entry's, compared case-insensitively as MariaDB compares column names.
-The subset rule is the default Max has not ruled otherwise on. `pin_bump`
+case-sensitive on Linux) admits it only when the INSERT names EXACTLY the
+entry's columns, no fewer and no more, compared case-insensitively as MariaDB
+compares column names, after the ASCII check (ADR-1102, which supersedes
+ADR-1101's subset rule; Max, 2026-10-31). The red reason names the missing
+and the extra columns. `pin_bump`
 parses the allowlist from the base; when it is unusable, every INSERT is red
 with that reason and the DDL classes are unaffected.
 
@@ -531,8 +533,9 @@ def _insert_value(cursor: Cursor) -> bool:
 
 def _insert(cursor: Cursor, module: str, allowlist: Sequence[SeedEntry], allowlist_problem: str | None) -> SeedEntry:
     """Class D: `INSERT [IGNORE] INTO t (cols) VALUES (literals)[, (literals)…]`, its table on the allowlist for
-    `module` (exact name: MariaDB table names are case-sensitive on Linux) with the INSERT's columns a SUBSET of the
-    entry's (column names compare case-insensitively, as MariaDB's do). Returns the first matching entry."""
+    `module` (exact name: MariaDB table names are case-sensitive on Linux) with the INSERT's columns EXACTLY the
+    entry's, no fewer and no more (ADR-1102; column names compare case-insensitively, as MariaDB's do). Returns the
+    first matching entry."""
     cursor.accept("IGNORE")
     cursor.expect("INTO", why="unparseable: INSERT without INTO")
     token = cursor.peek()
@@ -566,10 +569,20 @@ def _insert(cursor: Cursor, module: str, allowlist: Sequence[SeedEntry], allowli
         raise Red(f"INSERT … {cursor.take().value} is not admitted (ON DUPLICATE KEY, RETURNING)")
     if allowlist_problem is not None:
         raise Red(f"seed INSERT into {table} ({', '.join(columns)}) is not admitted: the seed allowlist is unusable ({allowlist_problem})")
-    for entry in allowlist:
-        if entry.module == module and entry.table == table and set(columns) <= {c.lower() for c in entry.columns}:
+    listed = [entry for entry in allowlist if entry.module == module and entry.table == table]
+    for entry in listed:
+        if set(columns) == {c.lower() for c in entry.columns}:
             return entry
-    raise Red(f"seed INSERT into {table} ({', '.join(columns)}) is not on the seed allowlist for {module}")
+    reason = f"seed INSERT into {table} ({', '.join(columns)}) is not on the seed allowlist for {module}"
+    if listed:
+        # ADR-1102: an entry admits only its exact column set; name what differs from the first entry for the table.
+        wanted = [c.lower() for c in listed[0].columns]
+        missing, extra = [c for c in wanted if c not in columns], [c for c in columns if c not in wanted]
+        differs = "; ".join(
+            part for part in (missing and f"missing {', '.join(missing)}", extra and f"extra {', '.join(extra)}") if part
+        )
+        reason += f": the {module} entry for {table} lists exactly ({', '.join(listed[0].columns)}); {differs} (ADR-1102)"
+    raise Red(reason)
 
 
 def classify_statement(
