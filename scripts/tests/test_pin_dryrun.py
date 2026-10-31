@@ -329,12 +329,12 @@ def test_an_appended_ack_entry_for_another_target_is_refused(repo: Path) -> None
     assert any(ACK in p and "0.99.0" in p for p in result["problems"]), result["problems"]
 
 
-def test_an_ack_file_that_adds_no_entry_for_the_target_is_refused(repo: Path) -> None:
+def test_an_ack_file_that_drops_an_entry_and_adds_none_is_refused(repo: Path) -> None:
     old = ack_entry("0.25.20")
     with_base_acks(repo, [old, ack_entry("0.25.21")])
     result = run(repo, ack_branch(repo, ack_text([old])), kubectl=NoCluster())
     assert result["result"] == "refused"
-    assert any(ACK in p for p in result["problems"]), result["problems"]
+    assert any(ACK in p and "not an unchanged prefix" in p for p in result["problems"]), result["problems"]
 
 
 def test_a_reformat_of_the_ack_file_that_appends_nothing_is_refused(repo: Path) -> None:
@@ -345,11 +345,29 @@ def test_a_reformat_of_the_ack_file_that_appends_nothing_is_refused(repo: Path) 
     assert any(ACK in p and "no entry appended" in p for p in result["problems"]), result["problems"]
 
 
-@pytest.mark.parametrize("bad", ["{not json", '{"target": "0.25.28"}', '[{"target": "0.25.28"}]', "[1]", '[{"target": "0.25.28", "reasons": [1], "why": "w"}]'])
-def test_a_malformed_ack_file_is_refused(repo: Path, bad: str) -> None:
+@pytest.mark.parametrize(
+    ("bad", "text"),
+    [
+        ("{not json", "not JSON"),
+        ('{"target": "0.25.28"}', "must be a JSON list"),
+        ('[{"target": "0.25.28"}]', "needs a non-empty"),
+        ("[1]", "needs a non-empty"),
+        ('[{"target": "0.25.28", "reasons": [1], "why": "w"}]', "strings and reasons a list of strings"),
+        ('[{"target": "0.25.28", "reasons": ["r"], "why": "w", "why": "other"}]', "duplicate key"),
+    ],
+)
+def test_a_malformed_ack_file_is_refused(repo: Path, bad: str, text: str) -> None:
     result = run(repo, ack_branch(repo, bad + "\n"), kubectl=NoCluster())
     assert result["result"] == "refused"
-    assert any(ACK in p for p in result["problems"]), result["problems"]
+    assert any(ACK in p and text in p for p in result["problems"]), result["problems"]
+
+
+def test_a_duplicate_key_in_the_base_ack_file_is_refused(repo: Path) -> None:
+    write(repo, ACK, '[{"target": "0.25.20", "reasons": ["r"], "why": "w", "why": "other"}]\n')
+    commit(repo, "main with a duplicate key")
+    result = run(repo, ack_branch(repo, ack_text([ack_entry()])), kubectl=NoCluster())
+    assert result["result"] == "refused"
+    assert any(ACK in p and "duplicate key" in p for p in result["problems"]), result["problems"]
 
 
 def test_a_malformed_base_ack_file_is_refused(repo: Path) -> None:
@@ -357,14 +375,33 @@ def test_a_malformed_base_ack_file_is_refused(repo: Path) -> None:
     commit(repo, "main with a broken ack file")
     result = run(repo, ack_branch(repo, ack_text([ack_entry()])), kubectl=NoCluster())
     assert result["result"] == "refused"
-    assert any(ACK in p for p in result["problems"]), result["problems"]
+    assert any(ACK in p and "not JSON" in p for p in result["problems"]), result["problems"]
+
+
+def test_a_base_ack_file_of_valid_json_and_invalid_schema_is_refused(repo: Path) -> None:
+    """Main's own copy goes through the schema validator too: a bare-JSON `[1]` base would otherwise pass as a prefix."""
+    write(repo, ACK, "[1]\n")
+    commit(repo, "main with a schema-invalid ack file")
+    result = run(repo, ack_branch(repo, ack_text([ack_entry()])), kubectl=NoCluster())
+    assert result["result"] == "refused"
+    assert any(ACK in p and "needs a non-empty" in p for p in result["problems"]), result["problems"]
 
 
 def test_a_deleted_ack_file_is_refused(repo: Path) -> None:
     with_base_acks(repo, [ack_entry("0.25.20")])
     result = run(repo, pin_branch(repo, extra=lambda r: (r / ACK).unlink()), kubectl=NoCluster())
     assert result["result"] == "refused"
-    assert any(ACK in p for p in result["problems"]), result["problems"]
+    assert any(ACK in p and "deleted by the sha" in p for p in result["problems"]), result["problems"]
+
+
+def test_the_checker_files_hold_the_pin_evidence_and_auto_pin_code() -> None:
+    """`run` executes both; a checker identity that leaves them out would not notice a stale copy."""
+    assert {"scripts/pin_evidence.py", "scripts/auto_pin.py"} <= set(pin_dryrun.CHECKER_FILES)
+
+
+def test_the_outside_file_refusal_names_the_ack_allowance(repo: Path) -> None:
+    result = run(repo, pin_branch(repo, extra=lambda r: write(r, "README.md", "changed\n")), kubectl=NoCluster())
+    assert any("README.md" in p and ACK in p and "append" in p for p in result["problems"]), result["problems"]
 
 
 def test_an_ack_entry_beside_another_extra_file_still_refuses_the_extra_file(repo: Path) -> None:

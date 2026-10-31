@@ -481,7 +481,8 @@ class PlatformVerdict:
 def operator_inputs(text: str) -> tuple[str, str, list]:
     """`(release name, namespace, value layers)` of an operator Application; refused unless it is the platform shape.
 
-    The layers are Argo CD's order, lowest first: `helm.values` (a string), then `helm.valuesObject`.
+    The layers are `helm.values` (a string) or `helm.valuesObject`, one of them: Argo CD v3.1.8
+    `ApplicationSourceHelm.ValuesYAML()` takes `valuesObject` alone when set, so both is refused (as `chart_documents`).
     `valueFiles`, `parameters`, `releaseName` or a `sources` list would be an input this render does not
     reproduce, so they are refused rather than ignored.
     """
@@ -501,6 +502,8 @@ def operator_inputs(text: str) -> tuple[str, str, list]:
     namespace = (spec.get("destination") or {}).get("namespace")
     if not name or not namespace:
         raise Refused("an operator Application without a name or a destination namespace")
+    if {"values", "valuesObject"} <= set(helm):
+        raise Refused(f"operator Application {name}: helm sets both values and valuesObject; Argo CD renders valuesObject alone, so the two are not layered")
     layers = [helm[key] for key in ("values", "valuesObject") if key in helm]
     return str(name), str(namespace), layers
 
@@ -514,13 +517,38 @@ def operator_template_arguments(name: str, version: str, namespace: str, value_f
     return arguments
 
 
+class HelmInfrastructure(Refused):
+    """A `helm` call that failed on the network or the registry (ghcr.io), not on the chart. Retryable, never green.
+
+    A `Refused` for every E1 caller (they fail closed as before). Only E2 step 9 (`pin_dryrun.operator_renders`)
+    reads the difference: it reports no result, so auto-pin dispatches the dry run again.
+    """
+
+
+# A chart error `helm` names itself. Checked first: its text may quote a number that looks like a status code.
+_TEMPLATE_ERROR = re.compile(r"Error: (?:template:|execution error|YAML parse error|parse error|values don't meet|rendering)", re.I)
+# What a dropped connection, a registry outage or a hung call looks like in `helm`'s stderr or in the gates' timeout text.
+_TRANSIENT = re.compile(
+    r"dial tcp|no such host|temporary failure in name resolution|i/o timeout|handshake timeout|connection (?:reset|refused)"
+    r"|unexpected eof|context deadline exceeded|timed out after|service unavailable|bad gateway|gateway timeout"
+    r"|too many requests|internal server error",
+    re.I,
+)
+
+
 def helm_template(arguments: list[str]) -> str:
-    """Run `helm` through the gates' own runner; a template without `--include-crds` is refused (it hides CRDs)."""
+    """Run `helm` through the gates' own runner; a template without `--include-crds` is refused (it hides CRDs).
+
+    A failure of the network or the registry raises `HelmInfrastructure` (a `Refused`); a chart error, and any
+    failure not recognised as transient, stays a plain `Refused`.
+    """
     if arguments[:1] == ["template"] and INCLUDE_CRDS not in arguments:
         raise Refused(f"`helm {' '.join(arguments[:3])}` without {INCLUDE_CRDS}: Argo CD installs the CRDs, so E1 renders them")
     try:
         return gate("test_no_two_owners").helm(*arguments)
     except AssertionError as error:  # the gates' runner reports a failed helm as an AssertionError
+        if not _TEMPLATE_ERROR.search(str(error)) and _TRANSIENT.search(str(error)):
+            raise HelmInfrastructure(str(error)) from error
         raise Refused(str(error)) from error
 
 

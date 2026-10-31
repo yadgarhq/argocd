@@ -705,6 +705,8 @@ def test_an_acknowledgement_already_on_the_base_does_not_clear_a_later_pin_pr() 
     assert not outcome.passed
     told = "\n".join(outcome.failures)
     assert "NEEDS-HUMAN-UNACKNOWLEDGED" in told and "already on the base" in told, told
+    # ADR-1094: E2 (`pin_dryrun`) refuses that rewrite, so the failure says where the dry run goes.
+    assert "E2 (pin / kind-dryrun) refuses the rewrite" in told and "run the hand dry run" in told, told
 
 
 def test_an_entry_this_pr_rewrites_from_the_base_clears_it() -> None:

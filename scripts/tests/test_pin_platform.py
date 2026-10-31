@@ -34,6 +34,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -631,6 +632,17 @@ def test_every_operator_render_passes_include_crds() -> None:
     assert arguments[:3] == ["template", "keda", pb.PLATFORM_CHART]
 
 
+@pytest.mark.parametrize(("stderr", "kind"), [("dial tcp: lookup ghcr.io: no such host", "infra"), ("Error: template: a.yaml:1: boom", "refused")])
+def test_a_failing_fake_helm_through_render_operator_is_infrastructure_or_refusal(tmp_path: Path, stderr: str, kind: str) -> None:
+    """End to end, no mock of the classifier: a `helm` that exits 1 with `stderr`, through `render_operator`."""
+    fake = tmp_path / "helm"
+    fake.write_text(f"#!/bin/sh\necho '{stderr}' >&2\nexit 1\n")
+    fake.chmod(0o755)
+    with pytest.raises(pb.Refused) as raised:
+        pb.render_operator(OPERATOR_APP.format(version=OLD), "0.2.5", str(fake))
+    assert isinstance(raised.value, pb.HelmInfrastructure) is (kind == "infra")
+
+
 def test_a_render_without_include_crds_is_refused() -> None:
     with pytest.raises(pb.Refused, match="--include-crds"):
         pb.helm_template(["template", "keda", pb.PLATFORM_CHART, "--version", "0.2.5"])
@@ -666,11 +678,66 @@ def test_an_operator_application_of_another_shape_is_refused(edit) -> None:
         pb.operator_inputs(edit(OPERATOR_APP.format(version=OLD)))
 
 
-def test_values_and_values_object_are_both_rendered_values_object_last() -> None:
+def test_an_operator_application_setting_both_values_and_values_object_is_refused() -> None:
+    """Argo CD v3.1.8 `ValuesYAML()` takes `valuesObject` alone when set, so layering both renders what Argo does not."""
     text = OPERATOR_APP.format(version=OLD).replace("      valuesObject:\n", "      values: |\n        a: 1\n      valuesObject:\n")
-    name, namespace, layers = pb.operator_inputs(text)
+    with pytest.raises(pb.Refused, match="both values and valuesObject"):
+        pb.operator_inputs(text)
+
+
+def test_an_operator_application_with_values_object_alone_gives_that_one_layer() -> None:
+    name, namespace, layers = pb.operator_inputs(OPERATOR_APP.format(version=OLD))
     assert (name, namespace) == ("keda", "keda")
-    assert layers == ["a: 1\n", {"operators": {"keda": {"create": True}}}]
+    assert layers == [{"operators": {"keda": {"create": True}}}]
+
+
+def test_an_operator_application_with_values_alone_gives_that_one_layer() -> None:
+    text = re.sub(r"      valuesObject:\n(        .*\n)+", "      values: |\n        a: 1\n", OPERATOR_APP.format(version=OLD))
+    assert pb.operator_inputs(text)[2] == ["a: 1\n"]
+
+
+NETWORK_FAILURES = [
+    "`helm pull oci://ghcr.io/x --version 1` exited 1:\nError: failed to do request: Head \"https://ghcr.io/v2/x\": dial tcp: lookup ghcr.io: no such host",
+    "`helm template keda oci://ghcr.io/x` exited 1:\nError: Get \"https://ghcr.io/v2/\": net/http: TLS handshake timeout",
+    "`helm template keda oci://ghcr.io/x` exited 1:\nError: failed to fetch https://ghcr.io/v2/x/blobs/sha256:1: 503 Service Unavailable",
+    "`helm template keda oci://ghcr.io/x` exited 1:\nError: unexpected status from GET request to https://ghcr.io/v2/x: 502 Bad Gateway",
+    "`helm template keda oci://ghcr.io/x` exited 1:\nError: read tcp 10.0.0.1:1->140.82.1.1:443: connection reset by peer",
+    "`helm template keda oci://ghcr.io/x` timed out after 300 s (a hung pull or template)",
+    "`helm pull oci://ghcr.io/x` exited 1:\nError: Internal Server Error",
+    "`helm pull oci://ghcr.io/x` exited 1:\nError: Too Many Requests",
+]
+
+
+@pytest.mark.parametrize("failure", NETWORK_FAILURES)
+def test_a_helm_network_failure_is_infrastructure_not_a_refusal(monkeypatch: pytest.MonkeyPatch, failure: str) -> None:
+    def helm(*arguments: str) -> str:
+        raise AssertionError(failure)
+
+    monkeypatch.setattr(pb.gate("test_no_two_owners"), "helm", helm)
+    with pytest.raises(pb.HelmInfrastructure):
+        pb.helm_template(["template", "keda", pb.PLATFORM_CHART, "--version", "0.2.5", "--include-crds"])
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "`helm template keda x` exited 1:\nError: template: platform/templates/a.yaml:3:9: executing \"a\" at <.Values.x>: nil pointer",
+        "`helm template keda x` exited 1:\nError: execution error at (platform/templates/a.yaml:1:4): values do not validate",
+        "`helm template keda x` exited 1:\nError: YAML parse error on platform/templates/a.yaml: error converting YAML to JSON",
+        "`helm template keda x` exited 1:\nError: template: platform/templates/a.yaml:2:5: error calling fail: port 503 is reserved",
+        "`helm template keda oci://ghcr.io/x --version 0.2.500 --namespace ns-502` exited 1:\nError: values don't meet the specifications of the schema",
+        "`helm template keda oci://ghcr.io/x --version 0.2.504 --namespace ns-500` exited 1:\nError: unknown field at yaml: line 502",
+        "`helm pull x` exited 1:\nError: chart \"platform\" version \"9.9.9\" not found in oci://ghcr.io/x",
+    ],
+)
+def test_a_helm_template_error_still_refuses(monkeypatch: pytest.MonkeyPatch, failure: str) -> None:
+    def helm(*arguments: str) -> str:
+        raise AssertionError(failure)
+
+    monkeypatch.setattr(pb.gate("test_no_two_owners"), "helm", helm)
+    with pytest.raises(pb.Refused) as raised:
+        pb.helm_template(["template", "keda", pb.PLATFORM_CHART, "--version", "0.2.5", "--include-crds"])
+    assert not isinstance(raised.value, pb.HelmInfrastructure)
 
 
 def test_default_tags_drops_an_empty_tag() -> None:
