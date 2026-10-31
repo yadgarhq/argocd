@@ -208,8 +208,9 @@ def test_an_automatic_pr_that_moves_no_pin_fails() -> None:
         [*pb.MECHANICAL_FILES, ".github/workflows/ci.yaml"],
         list(pb.MECHANICAL_FILES[:2]),
         [pb.APPLICATION, pb.CHART_PIN, "scripts/gates/test_no_two_owners.py"],
+        [*pb.MECHANICAL_FILES, pb.SEED_ALLOWLIST_FILE],
     ],
-    ids=["an-extra-file", "a-missing-file", "a-swapped-file"],
+    ids=["an-extra-file", "a-missing-file", "a-swapped-file", "the-seed-allowlist"],
 )
 def test_an_automatic_pin_pr_must_change_exactly_the_three_pin_files(changed: list) -> None:
     outcome, calls = judge("event-auto.json", moved(), statuses=[green_status()], changed=changed)
@@ -915,8 +916,11 @@ def gateway_render(gateway: str, env: tuple = ("LISTEN", "DB_HOST")) -> list:
     ]
 
 
-def through_check(monkeypatch, sources: dict, head_env: tuple = ("LISTEN", "DB_HOST"), task_db: str = "0.9.8") -> dict:
-    """`pe.evidence` (the default `evidence_of`) over pin_bump.check, renders and network stubbed."""
+def through_check(
+    monkeypatch, sources: dict, head_env: tuple = ("LISTEN", "DB_HOST"), task_db: str = "0.9.8", repo: Path | None = None, base_of=None
+) -> dict:
+    """`pe.evidence` (the default `evidence_of`) over pin_bump.check, renders and network stubbed. The base has no
+    seed allowlist unless `base_of` (the base reader `evidence` takes, by path) says otherwise."""
     charts = {PIN: chart("0.12.10"), TARGET: chart("0.12.11", task_db)}
 
     def render(application_text, version, binary):
@@ -926,7 +930,8 @@ def through_check(monkeypatch, sources: dict, head_env: tuple = ("LISTEN", "DB_H
         return gateway_render("0.12.10") if version == PIN else gateway_render("0.12.11", head_env)
 
     monkeypatch.setattr(pb, "render", render)
-    return pe.evidence(moved(), PIN, TARGET, HELMS, net=FakeNet(sources, charts))
+    base_of = base_of or (lambda path: None)
+    return pe.evidence(moved(), PIN, TARGET, HELMS, net=FakeNet(sources, charts), repo=repo, base_of=base_of)
 
 
 def gateway_sources(old: dict, new: dict) -> dict:
@@ -1004,7 +1009,7 @@ def test_the_evidence_tree_holds_the_whole_estate(monkeypatch) -> None:
         return {}
 
     monkeypatch.setattr(pb, "check", check)
-    pe.evidence(moved(), PIN, TARGET, HELMS, net=object())
+    pe.evidence(moved(), PIN, TARGET, HELMS, net=object(), base_of=lambda path: b"[]\n")
     wanted = {pb.ROOT_APPLICATION, *(p.relative_to(REPOSITORY).as_posix() for p in (REPOSITORY / "applications").glob("*.yaml"))}
     wanted |= {p.relative_to(REPOSITORY).as_posix() for d in ("manifests", "verifier", "install") for p in (REPOSITORY / d).rglob("*") if p.is_file()}
     assert sorted(wanted - seen["files"]) == []
@@ -1048,3 +1053,90 @@ def test_every_pin_move_changes_all_three_mechanical_files() -> None:
     table = (REPOSITORY / pb.TABLE).read_text()
     assert f"targetRevision  {PIN}\n" in table
     assert json.loads((REPOSITORY / pb.CHART_PIN).read_text())["chart_tag"] == f"v{PIN}"
+
+
+# ── the seed allowlist is the base's (ADR-1099, car 3) ──────────────────────
+
+SEED_SQL = '"INSERT INTO user (id) VALUES (1)".into()'
+SEED_ENTRY = {"module": "task-db", "table": "user", "columns": ["id"], "reason": "the first user", "adr": "ADR-1099"}
+
+
+def seed_sources() -> dict:
+    """A task-db release whose one added migration is a seed INSERT that `SEED_ENTRY` admits."""
+    sources = gateway_sources(with_cargo(tree("e3-old"), "v0.2.17"), with_cargo(tree("e3-old"), "v0.2.17"))
+    new = tree("e4-new")
+    new["src/schema.rs"] = new["src/schema.rs"].replace('"CREATE TABLE audit (id BIGINT PRIMARY KEY)".into()', SEED_SQL)
+    assert SEED_SQL in new["src/schema.rs"]
+    sources[("task-db", "0.9.8")] = with_cargo(tree("e4-old"), "v0.2.20", "v0.4.0")
+    sources[("task-db", "0.9.9")] = with_cargo(new, "v0.2.20", "v0.4.0")
+    return sources
+
+
+def head_checkout(tmp_path: Path, allowlist: str | None) -> Path:
+    """The merge checkout: this repository less `.git`, its seed allowlist the HEAD's (`None`: no file)."""
+    import shutil
+
+    root = tmp_path / "checkout"
+    shutil.copytree(REPOSITORY, root, ignore=shutil.ignore_patterns(".git"), symlinks=True)
+    (root / pb.SEED_ALLOWLIST_FILE).unlink(missing_ok=True)
+    if allowlist is not None:
+        (root / pb.SEED_ALLOWLIST_FILE).write_text(allowlist)
+    return root
+
+
+@pytest.mark.parametrize("base", [b"[]\n", None], ids=["base-empty", "base-without-the-file"])
+def test_the_allowlist_is_read_from_the_base_not_the_head(monkeypatch, tmp_path: Path, base) -> None:
+    """A head that adds an entry and a migration that needs it stays red: E4 reads the base (HEAD^1) copy, never the
+    merge checkout's."""
+    asked: list = []
+
+    def base_of(path: str):
+        asked.append(path)
+        return base
+
+    head = head_checkout(tmp_path, json.dumps([SEED_ENTRY]))
+    found = through_check(monkeypatch, seed_sources(), task_db="0.9.9", repo=head, base_of=base_of)
+    task_db = found["migrations"]["task-db"]
+    assert task_db["status"] == "red" and not found["accept"], task_db
+    assert task_db["reasons"] == ["task-db: migration 7 (create_audit) not admitted: seed INSERT into user (id) is not on the seed allowlist for task-db"]
+    assert asked == [pb.SEED_ALLOWLIST_FILE]
+    outcome, _ = judge("event-auto.json", moved(), evidence=found, statuses=[green_status()])
+    assert not outcome.passed
+
+
+def test_a_base_entry_admits_the_seed_whatever_the_head_holds(monkeypatch, tmp_path: Path) -> None:
+    head = head_checkout(tmp_path, "[]\n")
+    base = json.dumps([SEED_ENTRY]).encode()
+    found = through_check(monkeypatch, seed_sources(), task_db="0.9.9", repo=head, base_of=lambda path: base)
+    task_db = found["migrations"]["task-db"]
+    assert task_db["status"] == "green" and found["accept"], found["reasons"]
+    assert task_db["admitted"][0]["seed"] == {"module": "task-db", "table": "user", "adr": "ADR-1099"}
+    outcome, _ = judge("event-auto.json", moved(), evidence=found, statuses=[green_status()])
+    assert outcome.passed, outcome.failures
+
+
+def test_a_malformed_base_allowlist_is_red_with_its_reason_not_an_exception(monkeypatch, tmp_path: Path) -> None:
+    head = head_checkout(tmp_path, json.dumps([SEED_ENTRY]))
+    found = through_check(monkeypatch, seed_sources(), task_db="0.9.9", repo=head, base_of=lambda path: b"[{]")
+    reasons = found["migrations"]["task-db"]["reasons"]
+    assert len(reasons) == 1 and "the seed allowlist is unusable" in reasons[0] and pb.SEED_ALLOWLIST_FILE in reasons[0], reasons
+
+
+def test_the_base_copy_of_the_seed_allowlist_is_read_from_the_first_parent(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list = []
+
+    def run_with(tree: str):
+        def run(command, **kwargs):
+            calls.append(command[3:])
+            out = tree if command[3] == "ls-tree" else b"[]\n"
+            return type("Finished", (), {"stdout": out})()
+
+        return run
+
+    monkeypatch.setattr(pe.subprocess, "run", run_with(b""))
+    assert pe.base_file_if_any(Path("/repo"), pb.SEED_ALLOWLIST_FILE) is None, "a base without the file"
+    assert calls == [["ls-tree", "HEAD^1", "--", pb.SEED_ALLOWLIST_FILE]]
+    calls.clear()
+    monkeypatch.setattr(pe.subprocess, "run", run_with(f"100644 blob {'d' * 40}\t{pb.SEED_ALLOWLIST_FILE}\n".encode()))
+    assert pe.base_file_if_any(Path("/repo"), pb.SEED_ALLOWLIST_FILE) == b"[]\n"
+    assert calls == [["ls-tree", "HEAD^1", "--", pb.SEED_ALLOWLIST_FILE], ["show", f"HEAD^1:{pb.SEED_ALLOWLIST_FILE}"]]

@@ -588,7 +588,7 @@ def test_check_hands_the_yadgar_renders_to_the_platform_evidence(monkeypatch: py
     seen = {}
     monkeypatch.setattr(pb, "render", lambda text, version, binary: [dict(marker, version=version, binary=binary)])
     monkeypatch.setattr(pb, "classify", lambda renders, old, new, digest: pb.Verdict(accept=True, helms=sorted(renders)))
-    monkeypatch.setattr(pb, "audits", lambda head, old, new, net: ({}, {}))
+    monkeypatch.setattr(pb, "audits", lambda head, old, new, net, seeds: ({}, {}))
 
     def evidence(repo, old, new, helms, net, others):
         seen["others"] = others

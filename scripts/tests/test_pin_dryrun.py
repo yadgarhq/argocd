@@ -404,6 +404,22 @@ def test_the_outside_file_refusal_names_the_ack_allowance(repo: Path) -> None:
     assert any("README.md" in p and ACK in p and "append" in p for p in result["problems"]), result["problems"]
 
 
+SEED_ALLOWLIST = "scripts/gates/migration_seed_allowlist.json"
+
+
+@pytest.mark.parametrize("main_has_it", [False, True], ids=["added-by-the-pin", "edited-by-the-pin"])
+def test_pin_dryrun_refuses_a_pin_pr_that_edits_the_seed_allowlist(repo: Path, main_has_it: bool) -> None:
+    """ADR-1099: the seed allowlist is read from main only, and a pin PR that touches it is refused at step 1, before
+    any cluster read: it is none of the pin files, operator Applications or the append-only ack file."""
+    if main_has_it:
+        write(repo, SEED_ALLOWLIST, "[]\n")
+        commit(repo, "main ships the empty seed allowlist")
+    entry = '[{"module": "iam-db", "table": "t", "columns": ["id"], "reason": "r", "adr": "ADR-1099"}]\n'
+    result = run(repo, pin_branch(repo, extra=lambda r: write(r, SEED_ALLOWLIST, entry)), kubectl=NoCluster())
+    assert result["result"] == "refused"
+    assert any(p.startswith(f"{SEED_ALLOWLIST}: changed by main...") for p in result["problems"]), result["problems"]
+
+
 def test_an_ack_entry_beside_another_extra_file_still_refuses_the_extra_file(repo: Path) -> None:
     def both(r: Path) -> None:
         write(r, ACK, ack_text([ack_entry()]))
