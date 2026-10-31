@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """`scripts/chart_pin.json` must still describe a running chart (ledger 1206).
 
-TWO INDEPENDENT CHECKS, because one tag alone cannot prove either half:
+THREE INDEPENDENT CHECKS, because one tag alone cannot prove any of them:
 
   platform-version  `platform_version` equals `platform`'s pin among
                      `yadgarhq/chart@<chart_tag>`'s `chart/Chart.yaml`
@@ -17,6 +17,15 @@ TWO INDEPENDENT CHECKS, because one tag alone cannot prove either half:
                      running pin moves and nobody updates `chart_pin.json`,
                      THIS check reddens even though `platform-version` above
                      still passes against the (now wrong) `chart_tag`.
+  chart-digest       `chart_digest` equals the OCI manifest digest
+                     `ghcr.io/yadgarhq/charts/yadgar:<chart_tag without v>`
+                     resolves to NOW (yaadgaar 250). GHCR tags are mutable: a
+                     re-pushed tag changes what Argo deploys with no diff here.
+                     `pin_bump.py` records the digest when it writes the pin;
+                     this check refuses when the tag has moved since, naming
+                     both digests. It DETECTS a retag at gate time. Argo still
+                     pulls by tag, so a retag between this check and a sync is
+                     not prevented. A pin with no `chart_digest` is refused.
 
 OPTION A LANDED, AND THIS READ FOLLOWED IT. The `yadgar` Application moved out
 of `yadgarhq/deploy` (`infra/yadgar-app.yaml`) and into this repository as
@@ -55,10 +64,21 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import importlib.util
+
 import yaml
 
 REPOSITORY = Path(__file__).resolve().parent.parent
 CHART_PIN = REPOSITORY / "scripts" / "chart_pin.json"
+
+# ONE ANONYMOUS GHCR CLIENT. `pin_bump.Net.ghcr_digest` resolves the module
+# image digests E1 compares; the chart digest is read through the same code.
+# Loaded by path: `scripts/` is not a package.
+_spec = importlib.util.spec_from_file_location("pin_bump", REPOSITORY / "scripts" / "pin_bump.py")
+pin_bump = importlib.util.module_from_spec(_spec)
+sys.modules.setdefault("pin_bump", pin_bump)
+_spec.loader.exec_module(pin_bump)
+CHART_PACKAGE = pin_bump.CHART_PACKAGE
 
 CHART_REPO = "yadgarhq/chart"
 CHART_PATH = "chart/Chart.yaml"
@@ -179,6 +199,36 @@ def check_chart_tag(chart_tag: str, application: Path = APPLICATION) -> str | No
     return None
 
 
+def resolve_chart_digest(version: str) -> str:
+    """The OCI manifest digest `ghcr.io/yadgarhq/charts/yadgar:<version>` resolves to now, anonymously."""
+    return pin_bump.Net().ghcr_digest(CHART_PACKAGE, version)
+
+
+def check_chart_digest(chart_tag: str, recorded: str | None) -> str | None:
+    """`None` when `chart_tag` still resolves to `recorded`, else the error line (yaadgaar 250)."""
+    version = chart_tag.removeprefix("v")
+    reference = f"ghcr.io/yadgarhq/{CHART_PACKAGE}:{version}"
+    try:
+        live = resolve_chart_digest(version)
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, KeyError) as exc:
+        return f"could not resolve `{reference}`'s manifest digest: {type(exc).__name__}."
+    if not recorded:
+        return (
+            f"`{CHART_PIN.name}` records no `chart_digest`. Every pin records the digest its tag resolved "
+            f"to when it was written, so a re-pushed tag is caught. `{reference}` resolves to `{live}` now: "
+            f"add `\"chart_digest\": \"{live}\"` after `chart_tag` once you have checked that is the "
+            f"chart you meant to pin (`pin_bump.py --write` writes it for every new pin)."
+        )
+    if live != recorded:
+        return (
+            f"`{reference}` resolves to `{live}` now, but `{CHART_PIN.name}` records `{recorded}`. "
+            f"The tag was re-pushed after the pin was written, and Argo pulls by tag, so the chart "
+            f"kind-yadgar would sync is not the one this pin was judged on. Find out who re-pushed "
+            f"`{version}` before moving `chart_digest`."
+        )
+    return None
+
+
 def main() -> int:
     pin = committed_pin()
     chart_tag, committed_version = pin.get("chart_tag"), pin.get("platform_version")
@@ -191,7 +241,11 @@ def main() -> int:
 
     errors = [
         error
-        for error in (check_platform_version(chart_tag, committed_version), check_chart_tag(chart_tag))
+        for error in (
+            check_platform_version(chart_tag, committed_version),
+            check_chart_tag(chart_tag),
+            check_chart_digest(chart_tag, pin.get("chart_digest")),
+        )
         if error
     ]
     for error in errors:
@@ -201,8 +255,9 @@ def main() -> int:
 
     print(
         f"{CHART_PIN.name}: platform_version {committed_version} matches {CHART_REPO}@{chart_tag}, "
-        f"and chart_tag matches the running yadgar Application's targetRevision "
-        f"({APPLICATION.relative_to(REPOSITORY)})."
+        f"chart_tag matches the running yadgar Application's targetRevision "
+        f"({APPLICATION.relative_to(REPOSITORY)}), and the tag still resolves to "
+        f"chart_digest {pin['chart_digest']}."
     )
     return 0
 

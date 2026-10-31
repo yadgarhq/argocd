@@ -136,9 +136,40 @@ def test_a_target_revision_matched_nowhere_is_refused() -> None:
         pb.rewrite_target_revision(APPLICATION_TEXT.replace("    targetRevision:", "    revision:"), "9.9.9")
 
 
-def test_the_chart_pin_moves_its_tag_only() -> None:
+OLD_DIGEST = "sha256:" + "1" * 64
+NEW_DIGEST = "sha256:" + "2" * 64
+PIN_TEXT = '{{\n  "chart_tag": "v{tag}",\n  "chart_digest": "{digest}",\n  "platform_version": "0.2.6"\n}}\n'
+
+
+def test_the_chart_pin_moves_its_tag_and_digest_only() -> None:
+    text = PIN_TEXT.format(tag="0.25.14", digest=OLD_DIGEST)
+    assert pb.rewrite_chart_pin(text, "0.25.27", NEW_DIGEST) == PIN_TEXT.format(tag="0.25.27", digest=NEW_DIGEST)
+
+
+def test_a_chart_pin_with_no_digest_line_is_refused_not_grown() -> None:
+    """Yaadgaar 250: the writer moves the recorded digest; a pin without one is refused, never silently extended."""
     text = '{\n  "chart_tag": "v0.25.14",\n  "platform_version": "0.2.6"\n}\n'
-    assert pb.rewrite_chart_pin(text, "0.25.27") == '{\n  "chart_tag": "v0.25.27",\n  "platform_version": "0.2.6"\n}\n'
+    with pytest.raises(pb.Refused, match="chart_digest"):
+        pb.rewrite_chart_pin(text, "0.25.27", NEW_DIGEST)
+
+
+@pytest.mark.parametrize("digest", ["", "2" * 64, "sha256:" + "Z" * 64, "sha256:abc"])
+def test_a_malformed_digest_is_refused(digest: str) -> None:
+    with pytest.raises(pb.Refused, match="digest"):
+        pb.rewrite_chart_pin(PIN_TEXT.format(tag="0.25.14", digest=OLD_DIGEST), "0.25.27", digest)
+
+
+def test_the_chart_digest_is_resolved_through_the_module_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen = []
+
+    class FakeNet:
+        def ghcr_digest(self, module: str, tag: str) -> str:
+            seen.append((module, tag))
+            return NEW_DIGEST
+
+    monkeypatch.setattr(pb, "Net", FakeNet)
+    assert pb.chart_digest("0.25.27") == NEW_DIGEST
+    assert seen == [("charts/yadgar", "0.25.27")]
 
 
 # ── E1: the render classifier ───────────────────────────────────────────────

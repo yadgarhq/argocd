@@ -54,6 +54,7 @@ def tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         return Finished()
 
     monkeypatch.setattr(pb, "writer_helm", lambda: "/bin/true")
+    monkeypatch.setattr(pb, "chart_digest", lambda version: "sha256:" + "f" * 64)
     monkeypatch.setattr(pb.subprocess, "run", writer)
     return tmp_path
 

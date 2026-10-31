@@ -38,7 +38,10 @@ WHAT `run` DOES, in order. Every refusal comes before any cluster read.
      release `X.Y.Z` not lower than main's pin (a downgrade is a human revert).
      Refuse unless the sha's `yadgar.yaml` is main's with that
      one line rewritten (`pin_bump.rewrite_target_revision`), byte for byte,
-     and its `chart_pin.json` is main's with only `chart_tag` moved. So no PR
+     and its `chart_pin.json` is main's with only `chart_tag` and
+     `chart_digest` moved (the digest read from the sha and checked for shape
+     only; CI's `chart-pin` job resolves the tag and compares it, yaadgaar
+     250). So no PR
      value reaches the credential: the head render is main's values at the
      target version. A values change beside the pin is refused, not ignored.
      ONE PARSE ONLY. PyYAML, Go's YAML (Argo CD, Helm, kubectl) and a JSON
@@ -465,10 +468,15 @@ def pin_refusals(repo: Path, base: str, sha: str, runner: Callable) -> tuple[str
         problems.append(f"{CHART_PIN}: absent at main or at the sha")
     else:
         try:
-            if head_pin.decode() != pin_bump.rewrite_chart_pin(main_pin.decode(), target):
-                problems.append(f"{CHART_PIN}: differs from main's in more than chart_tag v{target}")
+            # The head's own digest: its shape is checked by `rewrite_chart_pin`, its value by CI's `chart-pin` job.
+            parsed = json.loads(head_pin)
+            digest = parsed.get("chart_digest") if isinstance(parsed, dict) else None
+            if head_pin.decode() != pin_bump.rewrite_chart_pin(main_pin.decode(), target, digest if isinstance(digest, str) else ""):
+                problems.append(f"{CHART_PIN}: differs from main's in more than chart_tag v{target} and chart_digest")
         except pin_bump.Refused as refused:
             problems.append(f"{CHART_PIN}: {refused}")
+        except ValueError:
+            problems.append(f"{CHART_PIN}: not JSON at the sha")
     return pin, target, expected, problems
 
 

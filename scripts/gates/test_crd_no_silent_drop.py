@@ -187,7 +187,15 @@ from pathlib import Path
 import pytest
 import yaml
 
-from test_no_two_owners import APPLICATIONS, REPOSITORY, api_version_flags, helm, sources_of
+from test_no_two_owners import (
+    APPLICATIONS,
+    REPOSITORY,
+    api_version_flags,
+    chart_pin_of,
+    helm,
+    parent_pull,
+    sources_of,
+)
 
 OWNER_REPO = "yadgarhq/argocd"
 CONTENTS_FILE_API = "https://api.github.com/repos/{repo}/contents/{path}?ref={ref}"
@@ -337,7 +345,15 @@ def self_value_file_content(path: str, side: str, base_ref: str) -> str:
 # ── pulling and rendering, and reading CRDs out of what rendered ───────────
 
 
-def pull_chart(source: dict, scratch: str) -> Path:
+# THE PARENT CHART, the one source whose digest `scripts/chart_pin.json` records (yaadgaar 250).
+PARENT_CHART = ("ghcr.io/yadgarhq/charts", "yadgar")
+
+
+def is_parent_chart(source: dict) -> bool:
+    return (str(source.get("repoURL", "")).rstrip("/"), source.get("chart")) == PARENT_CHART
+
+
+def pull_chart(source: dict, scratch: str, pin: dict | None = None) -> Path:
     """`helm pull --untar` into `scratch`, OCI or classic repo depending on `repoURL`'s scheme.
 
     A scheme-less `repoURL` (`ghcr.io/yadgarhq/charts`, every in-scope
@@ -347,12 +363,17 @@ def pull_chart(source: dict, scratch: str) -> Path:
     pull <chart> --repo <repoURL>` — the earlier version of this gate
     hardcoded the OCI form and would have crashed on this shape (finding 5 of
     the 2026-10-02 review).
+
+    `pin` is the head tree's `chart_pin.json`, passed for the parent chart
+    only: the parent is then pulled by its recorded digest (`parent_pull`).
     """
     repo_url = source["repoURL"]
     chart = source["chart"]
     version = source["targetRevision"]
     if repo_url.startswith("http://") or repo_url.startswith("https://"):
         helm("pull", chart, "--repo", repo_url, "--version", version, "--untar", "--untardir", scratch)
+    elif pin is not None:
+        helm("pull", *parent_pull(source, pin), "--untar", "--untardir", scratch)
     else:
         helm("pull", f"oci://{repo_url}/{chart}", "--version", version, "--untar", "--untardir", scratch)
     return Path(scratch) / chart
@@ -415,6 +436,7 @@ def crds_rendered(
     source: dict,
     namespace: str,
     extra_values_text: str | None = None,
+    pin: dict | None = None,
 ) -> set[str]:
     """Every CRD a real chart source renders — the EMPTY set outright if `skipCrds` is set.
 
@@ -426,7 +448,7 @@ def crds_rendered(
     if (source.get("helm") or {}).get("skipCrds"):
         return set()
     with tempfile.TemporaryDirectory() as scratch:
-        chart_dir = pull_chart(source, scratch)
+        chart_dir = pull_chart(source, scratch, pin)
         return crds_of_chart(
             chart_dir,
             values_of(source),
@@ -485,7 +507,12 @@ def crds_at(side: str, base_ref: str) -> tuple[set[str], dict[str, set[str]]]:
         if self_path is not None:
             extra_values_text = self_value_file_content(self_path, side, base_ref)
 
-        found = crds_rendered(release, source, namespace, extra_values_text)
+        # THE HEAD SIDE'S PARENT IS PULLED BY ITS RECORDED DIGEST (yaadgaar 250). The base side and every
+        # operator chart stay on their tags: no digest is recorded for them, and the base's pin may predate it.
+        pin = chart_pin_of(REPOSITORY) if side == "head" and is_parent_chart(source) else None
+        if side == "head" and is_parent_chart(source) and pin is None:
+            raise AssertionError(f"the head side renders the parent but `{REPOSITORY}` carries no scripts/chart_pin.json")
+        found = crds_rendered(release, source, namespace, extra_values_text, pin)
         per_file[filename] = found  # zero CRDs included: this map also counts Applications examined
         names |= found
     return names, per_file
@@ -918,6 +945,56 @@ def test_pull_chart_uses_the_oci_form_for_a_schemeless_repo_url(
     assert captured["args"][1] == "oci://ghcr.io/yadgarhq/charts/platform"
 
 
+def test_pull_chart_pulls_the_parent_by_its_recorded_digest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Yaadgaar 250: the parent's pull names the digest `chart_pin.json` records, and the tag helm verifies it against."""
+    captured: dict[str, tuple] = {}
+
+    def fake_helm(*args: str) -> str:
+        captured["args"] = args
+        return ""
+
+    monkeypatch.setattr(THIS_MODULE, "helm", fake_helm)
+    digest = "sha256:" + "c" * 64
+    source = {"repoURL": "ghcr.io/yadgarhq/charts", "chart": "yadgar", "targetRevision": "0.49.27"}
+    pull_chart(source, str(tmp_path), {"chart_tag": "v0.49.27", "chart_digest": digest})
+    assert captured["args"][:4] == ("pull", f"oci://ghcr.io/yadgarhq/charts/yadgar@{digest}", "--version", "0.49.27")
+
+
+def test_the_head_parent_is_rendered_by_the_heads_recorded_digest_and_the_base_by_tag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The head side reads this tree's `chart_pin.json`; the base side and every other chart stay on their tags."""
+    apps_dir = tmp_path / "applications"
+    apps_dir.mkdir()
+    parent = fake_application(chart="yadgar", repo_url="ghcr.io/yadgarhq/charts", revision="0.49.27", name="yadgar")
+    other = fake_application(chart="platform", repo_url="ghcr.io/yadgarhq/charts", revision="0.2.14", name="keda")
+    (apps_dir / "yadgar.yaml").write_text(yaml.safe_dump(parent))
+    (apps_dir / "keda.yaml").write_text(yaml.safe_dump(other))
+    pin = {"chart_tag": "v0.49.27", "chart_digest": "sha256:" + "d" * 64, "platform_version": "0.2.14"}
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "chart_pin.json").write_text(json.dumps(pin))
+    seen: list[tuple[str, str, dict | None]] = []
+
+    def fake_crds_rendered(release: str, source: dict, _namespace: str, _extra: str | None = None, pin_: dict | None = None) -> set[str]:
+        seen.append((side["now"], source["chart"], pin_))
+        return set()
+
+    side = {"now": "head"}
+    monkeypatch.setattr(THIS_MODULE, "REPOSITORY", tmp_path)
+    monkeypatch.setattr(THIS_MODULE, "base_application_filenames", lambda ref: {"yadgar.yaml", "keda.yaml"})
+    monkeypatch.setattr(THIS_MODULE, "base_application", lambda filename, ref: parent if filename == "yadgar.yaml" else other)
+    monkeypatch.setattr(THIS_MODULE, "crds_rendered", fake_crds_rendered)
+    crds_at("head", FAKE_BASE_SHA)
+    side["now"] = "base"
+    crds_at("base", FAKE_BASE_SHA)
+    assert sorted(seen, key=lambda row: (row[0], row[1])) == [
+        ("base", "platform", None),
+        ("base", "yadgar", None),
+        ("head", "platform", None),
+        ("head", "yadgar", pin),
+    ]
+
+
 def test_argocd_yaml_is_now_covered() -> None:
     """Finding 6: argocd.yaml's classic-repo + `$self` valueFiles source is modelled, not excluded."""
     document = yaml.safe_load((REPOSITORY / APPLICATIONS / "argocd.yaml").read_text())
@@ -971,7 +1048,7 @@ def test_the_production_path_reddens_when_an_application_drops_a_crd(
     base_document = fake_application(helm_block={"valuesObject": {"enabled": True}})
     (apps_dir / "fake.yaml").write_text(yaml.safe_dump(head_document))
 
-    def fake_crds_rendered(_release: str, source: dict, _namespace: str, _extra: str | None = None) -> set[str]:
+    def fake_crds_rendered(_release: str, source: dict, _namespace: str, _extra: str | None = None, _pin: dict | None = None) -> set[str]:
         enabled = values_of(source).get("enabled")
         return {"widget.fake.io", "gadget.fake.io"} if enabled else {"gadget.fake.io"}
 
@@ -996,7 +1073,7 @@ def test_the_production_path_reddens_when_the_base_side_renders_nothing(
     monkeypatch.setattr(THIS_MODULE, "REPOSITORY", tmp_path)
     monkeypatch.setattr(THIS_MODULE, "base_application_filenames", lambda ref: {"fake.yaml"})
     monkeypatch.setattr(THIS_MODULE, "base_application", lambda filename, ref: document)
-    monkeypatch.setattr(THIS_MODULE, "crds_rendered", lambda release, source, namespace, extra=None: set())
+    monkeypatch.setattr(THIS_MODULE, "crds_rendered", lambda release, source, namespace, extra=None, pin=None: set())
 
     with pytest.raises(AssertionError, match="zero CRDs"):
         gate(FAKE_BASE_SHA)
@@ -1013,7 +1090,7 @@ def test_the_production_path_sees_a_deleted_applications_crds_as_dropped(
     monkeypatch.setattr(THIS_MODULE, "REPOSITORY", tmp_path)
     monkeypatch.setattr(THIS_MODULE, "base_application_filenames", lambda ref: {"fake.yaml"})
     monkeypatch.setattr(THIS_MODULE, "base_application", lambda filename, ref: base_document)
-    monkeypatch.setattr(THIS_MODULE, "crds_rendered", lambda release, source, namespace, extra=None: {"widget.fake.io"})
+    monkeypatch.setattr(THIS_MODULE, "crds_rendered", lambda release, source, namespace, extra=None, pin=None: {"widget.fake.io"})
 
     with pytest.raises(AssertionError, match="widget.fake.io"):
         gate(FAKE_BASE_SHA)
@@ -1035,7 +1112,7 @@ def test_the_production_path_reddens_on_a_stale_acknowledgement(
     monkeypatch.setattr(THIS_MODULE, "base_application_filenames", lambda ref: {"fake.yaml"})
     monkeypatch.setattr(THIS_MODULE, "base_application", lambda filename, ref: document)
     # Present on BOTH sides — never dropped, so `missing` is empty and only the stale check can catch this.
-    monkeypatch.setattr(THIS_MODULE, "crds_rendered", lambda release, source, namespace, extra=None: {"widget.fake.io"})
+    monkeypatch.setattr(THIS_MODULE, "crds_rendered", lambda release, source, namespace, extra=None, pin=None: {"widget.fake.io"})
 
     with pytest.raises(AssertionError, match="widget.fake.io"):
         gate(FAKE_BASE_SHA)
@@ -1059,7 +1136,7 @@ def test_the_gate_prints_its_examined_counts_next_to_the_verdict(
     base_document = fake_application(helm_block={"valuesObject": {"enabled": True}})
     (apps_dir / "fake.yaml").write_text(yaml.safe_dump(head_document))
 
-    def fake_crds_rendered(_release: str, source: dict, _namespace: str, _extra: str | None = None) -> set[str]:
+    def fake_crds_rendered(_release: str, source: dict, _namespace: str, _extra: str | None = None, _pin: dict | None = None) -> set[str]:
         return {"widget.fake.io", "gadget.fake.io"} if values_of(source).get("enabled") else {"gadget.fake.io"}
 
     monkeypatch.setattr(THIS_MODULE, "REPOSITORY", tmp_path)
@@ -1081,7 +1158,7 @@ def test_the_application_count_includes_an_application_rendering_zero_crds(
     for name in ("a", "b"):
         (apps_dir / f"{name}.yaml").write_text(yaml.safe_dump(fake_application(name=name)))
 
-    def fake_crds_rendered(release: str, _source: dict, _namespace: str, _extra: str | None = None) -> set[str]:
+    def fake_crds_rendered(release: str, _source: dict, _namespace: str, _extra: str | None = None, _pin: dict | None = None) -> set[str]:
         return {"widget.fake.io"} if release == "a" else set()
 
     monkeypatch.setattr(THIS_MODULE, "REPOSITORY", tmp_path)
@@ -1115,7 +1192,7 @@ def test_crds_rendered_passes_the_sources_own_values_to_helm(
     the network pull replaced by the local toggled fixture.
     """
     chart = write_toggled_fixture_chart(tmp_path / "chart")
-    monkeypatch.setattr(THIS_MODULE, "pull_chart", lambda source, scratch: chart)
+    monkeypatch.setattr(THIS_MODULE, "pull_chart", lambda source, scratch, pin=None: chart)
     on = fake_application(helm_block={"valuesObject": {"enabled": True}})["spec"]["source"]
     off = fake_application(helm_block={"valuesObject": {"enabled": False}})["spec"]["source"]
     as_string = fake_application(helm_block={"values": "enabled: true\n"})["spec"]["source"]
@@ -1152,7 +1229,7 @@ def test_crds_at_refuses_every_other_value_files_shape(
     (apps_dir / "fake.yaml").write_text(yaml.safe_dump(document))
     monkeypatch.setattr(THIS_MODULE, "REPOSITORY", tmp_path)
     monkeypatch.setattr(THIS_MODULE, "base_application_filenames", lambda ref: set())
-    monkeypatch.setattr(THIS_MODULE, "crds_rendered", lambda release, source, namespace, extra=None: set())
+    monkeypatch.setattr(THIS_MODULE, "crds_rendered", lambda release, source, namespace, extra=None, pin=None: set())
     with pytest.raises(AssertionError, match="valueFiles"):
         crds_at("head", FAKE_BASE_SHA)
 
@@ -1189,7 +1266,7 @@ def self_values_scenario(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reques
 
     monkeypatch.setattr(THIS_MODULE, "REPOSITORY", tree)
     monkeypatch.setattr(THIS_MODULE, "github_request", fake_github_request)
-    monkeypatch.setattr(THIS_MODULE, "pull_chart", lambda source, scratch: chart)
+    monkeypatch.setattr(THIS_MODULE, "pull_chart", lambda source, scratch, pin=None: chart)
 
 
 def test_the_base_side_renders_its_self_values_file_at_the_base_ref(
@@ -1263,7 +1340,7 @@ def two_application_scenario(
     monkeypatch.setattr(THIS_MODULE, "REPOSITORY", tree)
     monkeypatch.setattr(THIS_MODULE, "github_request", fake_github_request)
     monkeypatch.setattr(
-        THIS_MODULE, "crds_rendered", lambda release, source, namespace, extra=None: {f"{release}.fake.io"}
+        THIS_MODULE, "crds_rendered", lambda release, source, namespace, extra=None, pin=None: {f"{release}.fake.io"}
     )
 
 

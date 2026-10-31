@@ -132,14 +132,69 @@ def test_an_unreachable_chart_repository_reddens(script, monkeypatch: pytest.Mon
     assert error is not None and "URLError" in error
 
 
-def test_main_needs_no_request_beyond_the_chart(script, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+def test_main_needs_no_request_beyond_the_chart_and_its_digest(script, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
     calls = []
 
     def fetch(repo: str, path: str, ref: str | None = None) -> str:
         calls.append(repo)
         return chart_yaml(script.committed_pin()["platform_version"])
 
+    def resolve(version: str) -> str:
+        calls.append(f"ghcr.io:{version}")
+        return script.committed_pin()["chart_digest"]
+
     monkeypatch.setattr(script, "fetch_contents", fetch)
+    monkeypatch.setattr(script, "resolve_chart_digest", resolve)
     assert script.main() == 0
-    assert calls == ["yadgarhq/chart"]
+    assert calls == ["yadgarhq/chart", f"ghcr.io:{script.committed_pin()['chart_tag'].removeprefix('v')}"]
     assert "applications/yadgar.yaml" in capsys.readouterr().out
+
+
+# ── the digest half (yaadgaar 250) ─────────────────────────────────────────
+
+RECORDED = "sha256:" + "a" * 64
+RETAGGED = "sha256:" + "b" * 64
+
+
+def test_the_digest_half_is_green_when_the_tag_still_resolves_to_the_recorded_digest(
+    script, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = []
+    monkeypatch.setattr(script, "resolve_chart_digest", lambda version: seen.append(version) or RECORDED)
+    assert script.check_chart_digest("v0.49.27", RECORDED) is None
+    assert seen == ["0.49.27"]
+
+
+def test_a_retagged_chart_reddens_naming_both_digests(script, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(script, "resolve_chart_digest", lambda version: RETAGGED)
+    error = script.check_chart_digest("v0.49.27", RECORDED)
+    assert error is not None and RECORDED in error and RETAGGED in error and "0.49.27" in error
+
+
+def test_a_pin_with_no_recorded_digest_reddens_with_the_migration(script, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(script, "resolve_chart_digest", lambda version: RECORDED)
+    for missing in (None, ""):
+        error = script.check_chart_digest("v0.49.27", missing)
+        assert error is not None and "`chart_digest`" in error and RECORDED in error
+
+
+def test_an_unreachable_registry_reddens(script, monkeypatch: pytest.MonkeyPatch) -> None:
+    def resolve(version: str) -> str:
+        raise urllib.error.URLError("offline")
+
+    monkeypatch.setattr(script, "resolve_chart_digest", resolve)
+    error = script.check_chart_digest("v0.49.27", RECORDED)
+    assert error is not None and "URLError" in error
+
+
+def test_main_refuses_a_retag(script, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    monkeypatch.setattr(script, "fetch_contents", lambda *a, **k: chart_yaml(script.committed_pin()["platform_version"]))
+    monkeypatch.setattr(script, "resolve_chart_digest", lambda version: RETAGGED)
+    assert script.main() == 1
+    assert RETAGGED in capsys.readouterr().out
+
+
+def test_the_resolver_is_pin_bumps_registry_client(script) -> None:
+    """One anonymous GHCR client: `pin_bump.Net.ghcr_digest`, the one that resolves module digests for E1."""
+    assert script.CHART_PACKAGE == "charts/yadgar"
+    assert script.pin_bump.Net.ghcr_digest is not None
