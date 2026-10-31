@@ -110,7 +110,7 @@ spec:
     # `example/operators-application.yaml`.
     repoURL: ghcr.io/yadgarhq/charts
     chart: platform
-    targetRevision: 0.2.14
+    targetRevision: 0.2.17
     helm:
       valuesObject:
         operators:
