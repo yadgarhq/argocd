@@ -978,6 +978,20 @@ def test_a_moved_yadgar_store_tag_is_red(monkeypatch) -> None:
     assert any("yadgar-store" in f for f in outcome.failures), outcome.failures
 
 
+def test_an_admitted_migration_passes_an_automatic_head(monkeypatch) -> None:
+    """ADR-1099: a task-db release that adds one CREATE TABLE in its own fn and list entry is green in E4, so the
+    judge (unchanged) passes an automatic head; the record carries the migration's checksum and forward-only version."""
+    sources = gateway_sources(with_cargo(tree("e3-old"), "v0.2.17"), with_cargo(tree("e3-old"), "v0.2.17"))
+    sources[("task-db", "0.9.8")] = with_cargo(tree("e4-old"), "v0.2.20", "v0.4.0")
+    sources[("task-db", "0.9.9")] = with_cargo(tree("e4-new"), "v0.2.20", "v0.4.0")
+    found = through_check(monkeypatch, sources, task_db="0.9.9")
+    task_db = found["migrations"]["task-db"]
+    assert task_db["status"] == "green" and found["accept"], found["reasons"]
+    assert [m["version"] for m in task_db["admitted"]] == [7] and task_db["forward_only"] == [7]
+    outcome, _ = judge("event-auto.json", moved(), evidence=found, statuses=[green_status()])
+    assert outcome.passed, outcome.failures
+
+
 def test_the_evidence_tree_holds_the_whole_estate(monkeypatch) -> None:
     """ADR-1095: a platform move's E1 reads root and every Application it selects, with the directories they source,
     so `evidence` hands `pin_bump.check` the merge checkout's whole tree, the `yadgar` file alone moved to the base

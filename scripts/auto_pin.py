@@ -540,7 +540,7 @@ def ensure_epoch_hold(api: Client, epoch: EpochState, *, merge_sha: str) -> int 
         f"- **Run:** " + (f"https://github.com/{VERIFY_REPOSITORY}/actions/runs/{epoch.run_id} (run {epoch.run_id})" if epoch.run_id is not None else "no verdict by close"),
         "",
         HOLD_CLEAR,
-        "A rejudge (`settled.yaml` with `rejudge: true`) that turns green, or a revert or forward-fix PR whose epoch is judged green, is a fix.",
+        "A rejudge (`settled.yaml` with `rejudge: true`) that turns green, or a revert (unless the pin crossed a migration) or a forward-fix PR whose epoch is judged green, is a fix.",
     ]
     return ensure_hold(api, kind="epoch", key=epoch.key, title=f"auto-pin hold: epoch {epoch.key[:12]} red", body="\n".join(lines) + "\n")
 
