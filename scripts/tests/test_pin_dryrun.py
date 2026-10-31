@@ -266,6 +266,117 @@ def test_a_rename_shows_the_old_path_and_is_refused(repo: Path) -> None:
     assert any(".github/workflows/ci.yaml" in p for p in result["problems"]), result["problems"]
 
 
+ACK = "scripts/pin_needs_human_ack.json"
+
+
+def ack_entry(target: str = TARGET, why: str = "checked each reason") -> dict:
+    return {"target": target, "reasons": ["gateway: a reason"], "why": why}
+
+
+def ack_text(entries) -> str:
+    return json.dumps(entries, indent=2) + "\n"
+
+
+def with_base_acks(repo: Path, entries: list) -> None:
+    """Main already carries an acknowledgement file (an earlier pin's)."""
+    write(repo, ACK, ack_text(entries))
+    commit(repo, "main with acks")
+
+
+def ack_branch(repo: Path, head_text: str) -> str:
+    return pin_branch(repo, extra=lambda r: write(r, ACK, head_text))
+
+
+def test_pin_files_plus_one_appended_ack_entry_pass_step_one(repo: Path) -> None:
+    old = ack_entry("0.25.20")
+    with_base_acks(repo, [old])
+    result = run(repo, ack_branch(repo, ack_text([old, ack_entry()])))
+    assert result["result"] == "green", result["problems"]
+
+
+def test_the_first_ack_file_added_to_a_base_without_one_passes(repo: Path) -> None:
+    result = run(repo, ack_branch(repo, ack_text([ack_entry()])))
+    assert result["result"] == "green", result["problems"]
+
+
+def test_editing_an_existing_ack_entry_is_refused(repo: Path) -> None:
+    old = ack_entry("0.25.20")
+    with_base_acks(repo, [old])
+    result = run(repo, ack_branch(repo, ack_text([{**old, "why": "rewritten"}, ack_entry()])), kubectl=NoCluster())
+    assert result["result"] == "refused"
+    assert any(ACK in p and "append-only" in p for p in result["problems"]), result["problems"]
+
+
+def test_deleting_an_ack_entry_is_refused(repo: Path) -> None:
+    olds = [ack_entry("0.25.20"), ack_entry("0.25.21")]
+    with_base_acks(repo, olds)
+    result = run(repo, ack_branch(repo, ack_text([olds[0], ack_entry()])), kubectl=NoCluster())
+    assert result["result"] == "refused"
+    assert any(ACK in p and "append-only" in p for p in result["problems"]), result["problems"]
+
+
+def test_reordering_ack_entries_is_refused(repo: Path) -> None:
+    olds = [ack_entry("0.25.20"), ack_entry("0.25.21")]
+    with_base_acks(repo, olds)
+    result = run(repo, ack_branch(repo, ack_text([olds[1], olds[0], ack_entry()])), kubectl=NoCluster())
+    assert result["result"] == "refused"
+    assert any(ACK in p and "append-only" in p for p in result["problems"]), result["problems"]
+
+
+def test_an_appended_ack_entry_for_another_target_is_refused(repo: Path) -> None:
+    result = run(repo, ack_branch(repo, ack_text([ack_entry("0.99.0")])), kubectl=NoCluster())
+    assert result["result"] == "refused"
+    assert any(ACK in p and "0.99.0" in p for p in result["problems"]), result["problems"]
+
+
+def test_an_ack_file_that_adds_no_entry_for_the_target_is_refused(repo: Path) -> None:
+    old = ack_entry("0.25.20")
+    with_base_acks(repo, [old, ack_entry("0.25.21")])
+    result = run(repo, ack_branch(repo, ack_text([old])), kubectl=NoCluster())
+    assert result["result"] == "refused"
+    assert any(ACK in p for p in result["problems"]), result["problems"]
+
+
+def test_a_reformat_of_the_ack_file_that_appends_nothing_is_refused(repo: Path) -> None:
+    old = ack_entry("0.25.20")
+    with_base_acks(repo, [old])
+    result = run(repo, ack_branch(repo, json.dumps([old]) + "\n"), kubectl=NoCluster())
+    assert result["result"] == "refused"
+    assert any(ACK in p and "no entry appended" in p for p in result["problems"]), result["problems"]
+
+
+@pytest.mark.parametrize("bad", ["{not json", '{"target": "0.25.28"}', '[{"target": "0.25.28"}]', "[1]", '[{"target": "0.25.28", "reasons": [1], "why": "w"}]'])
+def test_a_malformed_ack_file_is_refused(repo: Path, bad: str) -> None:
+    result = run(repo, ack_branch(repo, bad + "\n"), kubectl=NoCluster())
+    assert result["result"] == "refused"
+    assert any(ACK in p for p in result["problems"]), result["problems"]
+
+
+def test_a_malformed_base_ack_file_is_refused(repo: Path) -> None:
+    write(repo, ACK, "{not json\n")
+    commit(repo, "main with a broken ack file")
+    result = run(repo, ack_branch(repo, ack_text([ack_entry()])), kubectl=NoCluster())
+    assert result["result"] == "refused"
+    assert any(ACK in p for p in result["problems"]), result["problems"]
+
+
+def test_a_deleted_ack_file_is_refused(repo: Path) -> None:
+    with_base_acks(repo, [ack_entry("0.25.20")])
+    result = run(repo, pin_branch(repo, extra=lambda r: (r / ACK).unlink()), kubectl=NoCluster())
+    assert result["result"] == "refused"
+    assert any(ACK in p for p in result["problems"]), result["problems"]
+
+
+def test_an_ack_entry_beside_another_extra_file_still_refuses_the_extra_file(repo: Path) -> None:
+    def both(r: Path) -> None:
+        write(r, ACK, ack_text([ack_entry()]))
+        write(r, "README.md", "changed\n")
+
+    result = run(repo, pin_branch(repo, extra=both), kubectl=NoCluster())
+    assert result["result"] == "refused"
+    assert any("README.md" in p for p in result["problems"]), result["problems"]
+
+
 def test_a_values_change_beside_the_pin_is_refused_before_any_cluster_read(repo: Path) -> None:
     # THE LIVE RED PROOF'S SHAPE: an env entry added to a module's values.
     def add_env(r: Path) -> None:

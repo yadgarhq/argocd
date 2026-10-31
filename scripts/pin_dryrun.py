@@ -34,7 +34,8 @@ WHAT `run` DOES, in order. Every refusal comes before any cluster read.
      (`--no-renames`, so a rename shows its old path) changes only the three
      pin files: `applications/yadgar.yaml`, `scripts/chart_pin.json`,
      `scripts/gates/yadgar_render.sha256`, plus, on a platform move, the five
-     operator Applications (`OPERATOR_FILES`, car C10). A platform move is
+     operator Applications (`OPERATOR_FILES`, car C10), plus `scripts/pin_needs_human_ack.json`
+     only as an append (`ack_refusals`, ADR-1094). A platform move is
      refused unless each operator file is main's with only its one
      `targetRevision` line moved to the sha's `platform_version`, main's files
      all pinned main's `platform_version`, and the new one is the target
@@ -201,6 +202,8 @@ APPLICATION = "applications/yadgar.yaml"
 CHART_PIN = "scripts/chart_pin.json"
 TABLE = "scripts/gates/yadgar_render.sha256"
 PIN_FILES = frozenset({APPLICATION, CHART_PIN, TABLE})
+# A human pin PR may also append its NEEDS-HUMAN acknowledgement here (ADR-1080, ADR-1094); see `ack_refusals`.
+ACK_FILE = "scripts/pin_needs_human_ack.json"
 # A platform move also changes these five, each by its one `targetRevision` line (car C10), and no more.
 OPERATOR_FILES = tuple(
     f"applications/{name}.yaml" for name in ("cert-manager", "envoy-gateway", "keda", "mariadb-operator", "prometheus")
@@ -229,6 +232,8 @@ FUTURE_SKEW_SECONDS = 300
 CHECKER_FILES = (
     "scripts/pin_dryrun.py",
     "scripts/pin_bump.py",
+    "scripts/pin_evidence.py",
+    "scripts/auto_pin.py",
     "scripts/settled_gate.py",
     "scripts/verify_handover.py",
     "scripts/gates/test_no_two_owners.py",
@@ -444,7 +449,7 @@ def pin_refusals(
         f"{path}: changed by main...{sha[:12]}, outside the three pin files and the five operator Applications "
         f"({', '.join(sorted(PIN_FILES | set(OPERATOR_FILES)))})"
         for path in changed
-        if path not in PIN_FILES and path not in OPERATOR_FILES
+        if path not in PIN_FILES and path not in OPERATOR_FILES and path != ACK_FILE
     ]
     bases = merge_bases(repo, base, sha, runner)
     if len(bases) != 1:
@@ -476,6 +481,8 @@ def pin_refusals(
         return pin, target, None, problems
     if RELEASE.fullmatch(pin) and _version(target) < _version(pin):
         problems.append(f"{APPLICATION}: targetRevision {target} is lower than main's pin {pin}; a downgrade is a human revert")
+    if ACK_FILE in changed:
+        problems += ack_refusals(repo, base, sha, runner, target)
     try:
         expected = pin_bump.rewrite_target_revision(main_application.decode(), target)[0].encode()
     except pin_bump.Refused as refused:
@@ -506,6 +513,34 @@ def pin_refusals(
         problems.append(f"{CHART_PIN}: {refused}")
     problems += operator_refusals(repo, base, sha, runner, changed, platform, moved_to if moved else None, target, platform_of)
     return pin, target, expected, problems
+
+
+def ack_refusals(repo: Path, base: str, sha: str, runner: Callable, target: str) -> list[str]:
+    """ADR-1094: a changed `ACK_FILE` only appends. Main's entries are an unchanged prefix of the sha's list (parsed
+    JSON), and every new entry is well-formed (`pin_evidence`'s own validator) and names `target`."""
+    evidence = _load("pin_evidence")
+    texts = [read_at(repo, commit, ACK_FILE, runner) for commit in (base, sha)]
+    if texts[1] is None:
+        return [f"{ACK_FILE}: deleted by the sha; the file is append-only"]
+    try:
+        # The validator refuses a non-list, a malformed or placeholder entry and a repeated target.
+        evidence.parse_acknowledgements(texts[1].decode())
+        before = [] if texts[0] is None else json.loads(texts[0])
+        after = json.loads(texts[1])
+        if texts[0] is not None:
+            evidence.parse_acknowledgements(texts[0].decode())
+    except (evidence.Refused, ValueError) as error:
+        return [f"{ACK_FILE}: {error}; refused"]
+    if after[: len(before)] != before:
+        return [f"{ACK_FILE}: main's entries are not an unchanged prefix of the sha's; the file is append-only"]
+    added = after[len(before) :]
+    if not added:
+        return [f"{ACK_FILE}: changed with no entry appended; the file is append-only"]
+    return [
+        f"{ACK_FILE}: appended entry targets {entry['target']}, not this pin's {target}"
+        for entry in added
+        if entry["target"] != target
+    ]
 
 
 def operator_refusals(
