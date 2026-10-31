@@ -319,6 +319,13 @@ spec:
           # Pinned offline by `scripts/tests/test_iam_admin_from_team.py` and on the
           # render by `scripts/gates/test_iam_admin_from_team_render.py`.
           adminFromTeam: true
+          # KEY-IDENTITY ADOPTION IS ON (ADR-1085, ADR-1089, ADR-1091). Renders
+          # `KEY_IDENTITY_ADOPT=adopt`: after the proof passes, iam calls
+          # `AdoptKeyIdentity` and records the marker. A failed proof ends the serve on
+          # every pod. The chart ships `observe`. Set only after the iam log showed
+          # `OBSERVE: the adoption proof PASSED`; the evidence is in the pull request
+          # that set this. A revert stops further adoption but does not remove a marker.
+          keyIdentity: { adopt: "adopt" }
           # `seeder` JOINS `gateway` ONCE `teams` IS DECLARED (team access stage 7):
           # the seeder Job sends `SyncTeams` to iam before `SyncProjects` to
           # `project`. This list REPLACES the chart's `[gateway]`; it does not add to
