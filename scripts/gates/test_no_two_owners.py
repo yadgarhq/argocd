@@ -1410,8 +1410,8 @@ def bootstrap_owners(
 
 
 # ── STEP 9, SECOND MERGE: THE PARENT MINTS THE BOOTSTRAP SECRETS ─────────────
-# ADR-0810: this organisation sets `platform.bootstrap.create` true and
-# `platform.bootstrap.iamKeys.create` false, EXPLICITLY. The five names come
+# ADR-0810 / ADR-1086: this organisation sets `platform.bootstrap.create` and
+# `platform.bootstrap.iamKeys.create` true, EXPLICITLY. The five names come
 # back as the parent's hooks, never as tracked objects, so they are asserted
 # here and not in `RETIRED_TUPLES` (see the comment there).
 EXPECTED_BOOTSTRAP_HOOKS = 5
@@ -1419,10 +1419,11 @@ HOOK_PHASES = "pre-install,pre-upgrade"
 HOOK_DELETE_POLICY = "before-hook-creation"
 
 # WHAT EACH HOOK JOB MINTS, read off the `create <name> <<JSON` lines of its
-# script. Measured 2026-09-27 at the pinned 0.3.7. `iam-keys` is absent on
-# purpose: live iam 0.8.45 logs its key identity UNVERIFIED (ledger 1155), so
-# the wrong-key refusal the parent's default `iamKeys.create: true` relies on
-# is not armed here. `iam-keys` stays with `make secrets` and 1Password.
+# script. `iam-keys` is the last mint of `bootstrap-secrets` since ADR-1086
+# (yaadgaar 354): iam logs its key identity VERIFIED live, so the wrong-key
+# refusal the parent's `iamKeys.create: true` relies on is armed. The mint is
+# create-only: on this cluster the existing Secret answers 409 and `make
+# secrets` keeps owning it.
 #
 # THE SEEDER'S JOB (parent 0.25.8, plans/the-d35-seeder.md) MINTS NOTHING
 # EITHER: it reads `seeder-client-tls` and `project-tls` and creates no Secret.
@@ -1432,13 +1433,13 @@ HOOK_DELETE_POLICY = "before-hook-creation"
 # names every Job the render carries, and a probe that started creating a
 # Secret would redden here by name.
 EXPECTED_MINTED = {
-    "bootstrap-secrets": ("valkey-password", "nats-auth", "nats-auth-gateway"),
+    "bootstrap-secrets": ("valkey-password", "nats-auth", "nats-auth-gateway", "iam-keys"),
     "admin-bootstrap-token": ("admin-bootstrap-token",),
     "preflight": (),
     "envoy-gateway-probe": (),
     "seeder": (),
 }
-NEVER_MINTED = "iam-keys"
+IAM_KEYS_SECRET = "iam-keys"
 IAM_KEYS_KEY = "platform.bootstrap.iamKeys.create"
 MINT_LINE = re.compile(r"^\s*create (\S+) <<JSON", re.MULTILINE)
 
@@ -1494,7 +1495,7 @@ def scripts_of(documents: list) -> dict[str, str]:
 
 
 def iam_keys_violations(tree: Path, overrides: tuple[str, ...] = ()) -> list[str]:
-    """Why this tree would mint `iam-keys`, or nothing. Each reason names the key."""
+    """Why this tree would NOT mint `iam-keys`, or nothing. Each reason names the key."""
     values = parent_values(tree)
     stated = ((values.get("platform") or {}).get("bootstrap") or {}).get("iamKeys") or {}
     problems = []
@@ -1502,11 +1503,10 @@ def iam_keys_violations(tree: Path, overrides: tuple[str, ...] = ()) -> list[str
         problems.append(
             f"{IAM_KEYS_KEY} is not stated in applications/yadgar.yaml's valuesObject; the parent default is true"
         )
-    elif stated["create"] is not False:
-        problems.append(f"{IAM_KEYS_KEY} is {stated['create']!r}; ADR-0810 requires false")
-    for job, names in minted(parent_render(tree, overrides)).items():
-        if NEVER_MINTED in names:
-            problems.append(f"Job/{job} mints {NEVER_MINTED} ({IAM_KEYS_KEY})")
+    elif stated["create"] is not True:
+        problems.append(f"{IAM_KEYS_KEY} is {stated['create']!r}; ADR-1086 requires true")
+    if IAM_KEYS_SECRET not in minted(parent_render(tree, overrides)).get("bootstrap-secrets", []):
+        problems.append(f"Job/bootstrap-secrets does not mint {IAM_KEYS_SECRET} ({IAM_KEYS_KEY})")
     return problems
 
 
@@ -1544,31 +1544,46 @@ def test_step_9_adds_the_five_hooks_and_changes_nothing_else(working_tree: Path)
     assert changes == {(*o, "<object added or removed>") for o in added}, sorted(changes)
 
 
-def test_the_hooks_mint_every_bootstrap_secret_but_iam_keys(working_tree: Path) -> None:
-    """Each Job mints exactly its names; `iam-keys` is minted by none."""
+def test_the_hooks_mint_every_bootstrap_secret_including_iam_keys(working_tree: Path) -> None:
+    """Each Job mints exactly its names; `iam-keys` is minted by `bootstrap-secrets` alone."""
     found = minted(parent_render(working_tree))
     print(f"[step 9] minted: {found}")
     assert {job: tuple(names) for job, names in found.items()} == EXPECTED_MINTED, found
     assert not iam_keys_violations(working_tree), iam_keys_violations(working_tree)
 
 
-def test_iam_keys_never_appears_literally_in_either_hook_script(working_tree: Path) -> None:
-    """Stronger than `MINT_LINE` above: `iam-keys` must not appear anywhere in
-    either hook Job's script, not only outside a `create ... <<JSON` line.
-    """
+def test_iam_keys_appears_only_in_the_bootstrap_secrets_hook_script(working_tree: Path) -> None:
+    """`iam-keys` is in `bootstrap-secrets`' script, in no other Job's."""
     scripts = scripts_of(parent_render(working_tree))
-    hit = {job: text for job, text in scripts.items() if job in EXPECTED_MINTED and NEVER_MINTED in text}
-    assert not hit, sorted(hit)
+    hit = sorted(job for job, text in scripts.items() if IAM_KEYS_SECRET in text)
+    assert hit == ["bootstrap-secrets"], hit
 
 
-def test_iam_keys_create_true_mints_iam_keys(working_tree: Path) -> None:
-    """Red case: `iamKeys.create=true` adds `iam-keys` to `bootstrap-secrets`' mint."""
-    found = minted(parent_render(working_tree, ("--set", f"{IAM_KEYS_KEY}=true")))
-    assert found["bootstrap-secrets"] == [*EXPECTED_MINTED["bootstrap-secrets"], NEVER_MINTED], found
+def test_iam_keys_create_false_does_not_mint_iam_keys(working_tree: Path) -> None:
+    """Red case: `iamKeys.create=false` takes `iam-keys` back out of the mint."""
+    found = minted(parent_render(working_tree, ("--set", f"{IAM_KEYS_KEY}=false")))
+    assert found["bootstrap-secrets"] == list(EXPECTED_MINTED["bootstrap-secrets"][:-1]), found
+
+
+def test_iam_keys_mint_is_create_only(working_tree: Path) -> None:
+    """The mint POSTs and answers 409 with "left untouched": no PATCH, PUT or lookup."""
+    script = scripts_of(parent_render(working_tree))["bootstrap-secrets"]
+    assert "create iam-keys <<JSON" in script
+    assert "409) echo" in script and "left untouched" in script
+    for verb in ("PATCH", "PUT", "--request", "-X "):
+        assert verb not in script, verb
+    roles = [
+        d for d in parent_render(working_tree)
+        if isinstance(d, dict) and d.get("kind") == "Role" and d["metadata"]["name"] == "bootstrap-secrets"
+    ]
+    assert roles, "Role/bootstrap-secrets is not rendered"
+    verbs = {v for role in roles for rule in role["rules"] for v in rule["verbs"]}
+    assert verbs == {"create"}, verbs
 
 
 def test_deleting_the_iam_keys_block_reddens_and_names_the_key(tmp_path: Path) -> None:
-    """Red case: the explicit false removed, so the parent default (true) applies.
+    """Red case: the explicit true removed. The parent default is true, so the
+    mint stays, but this organisation states the key (ADR-0810's rule stays).
 
     The WHOLE `iamKeys` block is removed. Removing only its `create` line leaves
     `iamKeys:` null, and a null in values deletes the parent default rather
@@ -1580,8 +1595,7 @@ def test_deleting_the_iam_keys_block_reddens_and_names_the_key(tmp_path: Path) -
     del application["spec"]["source"]["helm"]["valuesObject"]["platform"]["bootstrap"]["iamKeys"]
     path.write_text(yaml.safe_dump(application))
     problems = iam_keys_violations(tree)
-    assert len(problems) == 2 and all(IAM_KEYS_KEY in p for p in problems), problems
-    assert any("Job/bootstrap-secrets mints iam-keys" in p for p in problems), problems
+    assert len(problems) == 1 and IAM_KEYS_KEY in problems[0] and "not stated" in problems[0], problems
 
 
 def admin_token_names(tree: Path, overrides: tuple[str, ...] = ()) -> dict[str, set[str]]:

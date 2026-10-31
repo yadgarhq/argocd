@@ -818,21 +818,22 @@ spec:
           # `admin-bootstrap-token`. They are create-only: an existing Secret answers
           # 409 and is left untouched, so they re-run on every sync and change nothing.
           #
-          # `iamKeys.create` IS FALSE ON PURPOSE, AND IT IS STATED, NOT LEFT TO THE
-          # DEFAULT. The parent defaults it TRUE, safe only where iam refuses a wrong
-          # key (ADR-0753). Live iam logs its key identity UNVERIFIED on this cluster
-          # (ledger 1155), so that refusal is not armed here: a minted `iam-keys` after
-          # a rebuild could leave iam Ready against rows under another key. `iam-keys`
-          # stays in 1Password, applied by `make secrets`. Delete this line and the
-          # parent default mints it; `scripts/tests/test_no_two_owners.py` refuses
-          # that by name. Flip it only after iam logs VERIFIED here AND a separate
-          # ruling settles how the chart mint and the 1Password path coexist.
+          # `iamKeys.create` IS TRUE, AND IT IS STATED, NOT LEFT TO THE DEFAULT
+          # (ADR-1086, which lifts ADR-0810's `false`). The parent's mint is safe only
+          # where iam refuses a wrong key (ADR-0753). Since 2026-10-31 both iam pods
+          # log that the key set they hold is the one iam-db's rows were encrypted
+          # under (ADR-0764), so the refusal is armed here. The mint is create-only:
+          # where `iam-keys` exists the POST answers 409 and the Secret is left
+          # untouched, so `make secrets` keeps owning the live Secret. Only a rebuild
+          # that skips `make secrets` mints a NEW key, and iam then refuses it
+          # (MISMATCH) by design. Delete this line and the parent default still mints
+          # it; `scripts/gates/test_no_two_owners.py` refuses that by name.
           bootstrap:
             create: true
             adminToken:
               secretName: admin-bootstrap-token # = gateway.adminBootstrap.tokenSecret
             iamKeys:
-              create: false # ADR-0810, ledger 1155
+              create: true # ADR-1086, yaadgaar 354
 
           # THE OPERATORS RELEASE IS NOT THIS ORGANISATION'S PATH (ADR-0787). `infra/`
           # installs cert-manager, KEDA, mariadb-operator, Envoy Gateway and Argo CD as
