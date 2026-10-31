@@ -36,7 +36,8 @@ WHAT `run` DOES, in order. Every refusal comes before any cluster read.
      `scripts/gates/yadgar_render.sha256`, plus, on a platform move, the five
      operator Applications (`OPERATOR_FILES`, car C10), plus `scripts/pin_needs_human_ack.json`
      only as an append (`ack_refusals`, ADR-1094; a re-ack of a target already on main
-     rewrites an entry, so it leaves E2 refused: run the hand dry run). A platform move is
+     rewrites an entry, so it leaves E2 refused: run the hand dry run). Any other path is
+     refused, `scripts/gates/migration_seed_allowlist.json` among them (ADR-1099). A platform move is
      refused unless each operator file is main's with only its one
      `targetRevision` line moved to the sha's `platform_version`, main's files
      all pinned main's `platform_version`, and the new one is the target

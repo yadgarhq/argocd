@@ -58,7 +58,10 @@ which is what merging the PR makes main.
    and its reasons carry the fail-closed rules of the C1 review: the two
    helms' per-object digests must agree at both pins, an env read whose key
    cannot be resolved is red, a moved `yadgar-*` crate tag is red, and a moved
-   `yadgar-store` tag on a `-db` module is red.
+   `yadgar-store` tag on a `-db` module is red. E4 admits a seed INSERT only
+   by the BASE's `scripts/gates/migration_seed_allowlist.json` (`evidence`
+   writes the HEAD^1 copy into its tree, ADR-1099): an entry a PR adds admits
+   nothing in that PR.
 
    MEASURED 2026-10-24, NOT ASSUMED: the two helms' raw `helm template`
    output is NOT byte-identical at 0.34.8. Helm v4.3.0 prints one blank line
@@ -300,6 +303,17 @@ def base_file(repo: Path, path: str) -> bytes:
     return subprocess.run(["git", "-C", str(repo), "show", f"HEAD^1:{path}"], capture_output=True, check=True).stdout
 
 
+def base_file_if_any(repo: Path, path: str) -> bytes | None:
+    """`path` at the merge commit's first parent, the base; None when the base has no such file."""
+
+    def git(*arguments: str) -> bytes:
+        return subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True, check=True).stdout
+
+    if not git("ls-tree", "HEAD^1", "--", path).strip():
+        return None
+    return git("show", f"HEAD^1:{path}")
+
+
 def regenerated_differences(
     repo: Path, target: str, *, base_of: Callable[[str], bytes] | None = None, write: Callable[[Path, str], None] | None = None
 ) -> list[str]:
@@ -386,19 +400,35 @@ def unacknowledged(target: str, reasons: list[str], acks: dict[str, dict], base_
     return [reason for reason in reasons if reason not in set(entry["reasons"])]
 
 
-def evidence(head_text: str, pin: str, target: str, helms: dict[str, str], net=None, repo: Path | None = None) -> dict:
+def evidence(
+    head_text: str,
+    pin: str,
+    target: str,
+    helms: dict[str, str],
+    net=None,
+    repo: Path | None = None,
+    base_of: Callable[[str], bytes | None] | None = None,
+) -> dict:
     """E1, E3 and E4 by `pin_bump.check`: both pins rendered with the HEAD `valuesObject`.
 
     The tree is the merge checkout `repo` as it is, less `.git`, with `applications/yadgar.yaml` alone moved to the
-    base pin. A platform move renders each operator Application at both platform versions with its HEAD values (car
-    C10), whatever its own `targetRevision` reads, and reads selectors from root and every Application it selects,
-    with the directories they source (ADR-1095).
+    base pin, and the seed allowlist replaced by the BASE's copy (`base_of`, default `base_file_if_any`; removed when
+    the base has none): an entry this PR adds admits nothing in this PR (ADR-1099). A platform move renders each
+    operator Application at both platform versions with its HEAD values (car C10), whatever its own `targetRevision`
+    reads, and reads selectors from root and every Application it selects, with the directories they source (ADR-1095).
     """
     repo = repo or pb.REPOSITORY
+    base_of = base_of or (lambda path: base_file_if_any(repo, path))
+    seeds = base_of(pb.SEED_ALLOWLIST_FILE)
     with tempfile.TemporaryDirectory() as scratch:
         tree = Path(scratch) / "tree"
         shutil.copytree(repo, tree, ignore=shutil.ignore_patterns(".git"), symlinks=True)
         (tree / pb.APPLICATION).write_text(pb.rewrite_target_revision(head_text, pin)[0])
+        allowlist = tree / pb.SEED_ALLOWLIST_FILE
+        allowlist.unlink(missing_ok=True)
+        if seeds is not None:
+            allowlist.parent.mkdir(parents=True, exist_ok=True)
+            allowlist.write_bytes(seeds)
         return pb.check(tree, target, net or pb.Net(), helms)
 
 

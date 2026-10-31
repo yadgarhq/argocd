@@ -70,8 +70,9 @@ with a reason per failure:
   and `src/schema/**`): every added migration admitted by
   `scripts/migration_classifier.py` (ADR-1099: one statement, a literal `sql:`,
   class A CREATE TABLE, B non-unique CREATE INDEX, C ADD COLUMN nullable or
-  NOT NULL DEFAULT <literal>, D an allowlisted literal INSERT; the allowlist is
-  empty until car 3, so D is red); no added version at or below the old
+  NOT NULL DEFAULT <literal>, D a literal INSERT allowlisted in the BASE's
+  `scripts/gates/migration_seed_allowlist.json`, which ships empty); no added
+  version at or below the old
   maximum (the store runs only versions above the applied high-water mark);
   no removed or changed migration (changed by the exact bytes of a literal
   `sql:`, which the store checksums, else by the block's text); no change
@@ -1766,17 +1767,112 @@ def migration_blocks(source: dict[str, str]) -> dict[int, str]:
     return {v: " ".join(texts[s.path][s.start : s.stop].split()) for v, s in migration_sites(source).items()}
 
 
-# Car 3 (PR B of C10 part 3) reads `scripts/gates/migration_seed_allowlist.json` from the base into this. Until
-# then it is empty, so a seed INSERT (class D) is always NEEDS-HUMAN.
-SEED_ALLOWLIST: tuple = ()
-
-
 def classifier():
     """`scripts/migration_classifier.py`, loaded by path from beside this file (`scripts/` is not a package)."""
     if (module := sys.modules.get("migration_classifier")) is None:
         spec = importlib.util.spec_from_file_location("migration_classifier", Path(__file__).with_name("migration_classifier.py"))
         module = importlib.util.module_from_spec(spec)
         sys.modules["migration_classifier"] = module
+        spec.loader.exec_module(module)
+    return module
+
+
+# ── the seed allowlist (ADR-1099, car 3) ────────────────────────────────────
+#
+# THE BASE'S COPY ONLY. `check` reads it from the tree it checks: auto-pin runs on main's checkout, and
+# `pin_evidence.evidence` writes the base's (HEAD^1) bytes into its copy of the merge checkout, so an entry a PR
+# adds admits nothing in that PR. `pin_dryrun` step 1 refuses a pin PR that touches it; an automatic head may not
+# touch it either (`pin_evidence.automatic_problem`). FAIL CLOSED: a malformed file admits nothing, and every class
+# D migration is red with the reason; it never raises, so E4 is never skipped.
+
+SEED_ALLOWLIST_FILE = "scripts/gates/migration_seed_allowlist.json"
+SEED_FIELDS = ("module", "table", "columns", "reason", "adr")
+# Lowercase ASCII names: the classifier lowercases a bare column, and a bare table name is matched exactly.
+SEED_IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]*", re.ASCII)
+SEED_MODULE = re.compile(r"[a-z][a-z0-9-]*-db", re.ASCII)
+SEED_ADR = re.compile(r"ADR-[0-9]{4}", re.ASCII)
+
+
+@dataclass(frozen=True, kw_only=True)
+class SeedAllowlist:
+    """The parsed allowlist: its entries, or none and `problem` saying why the file is unusable."""
+
+    entries: tuple = ()
+    problem: str | None = None
+
+
+NO_SEEDS = SeedAllowlist()
+
+
+def _seed_entry(entry: object, index: int, seen: set[tuple[str, str]]):
+    """One validated `SeedEntry`; raises ValueError naming what is wrong."""
+    where = f"entry {index}"
+    if not isinstance(entry, dict):
+        raise ValueError(f"{where} is not an object")
+    if sorted(entry) != sorted(SEED_FIELDS):
+        raise ValueError(f"{where} must have exactly the keys {', '.join(SEED_FIELDS)}; it has {', '.join(sorted(map(str, entry))) or 'none'}")
+    for name in ("module", "table", "reason", "adr"):
+        if not isinstance(entry[name], str) or not entry[name].strip():
+            raise ValueError(f"{where}: {name} must be a non-empty string")
+    if not SEED_MODULE.fullmatch(entry["module"]):
+        raise ValueError(f"{where}: module {entry['module']!r} is not a -db module name")
+    if not SEED_IDENTIFIER.fullmatch(entry["table"]):
+        raise ValueError(f"{where}: table {entry['table']!r} is not one unqualified lowercase ASCII identifier")
+    if not SEED_ADR.fullmatch(entry["adr"]):
+        raise ValueError(f"{where}: adr {entry['adr']!r} is not ADR-NNNN")
+    columns = entry["columns"]
+    if not isinstance(columns, list) or not columns:
+        raise ValueError(f"{where}: columns must be a non-empty list")
+    for column in columns:
+        if not isinstance(column, str) or not SEED_IDENTIFIER.fullmatch(column):
+            raise ValueError(f"{where}: column {column!r} is not one lowercase ASCII identifier")
+    if len(set(columns)) != len(columns):
+        raise ValueError(f"{where}: a column is listed twice")
+    key = (entry["module"], entry["table"])
+    if key in seen:
+        raise ValueError(f"{where}: {key[0]} table {key[1]} is listed twice")
+    seen.add(key)
+    return classifier().SeedEntry(
+        module=entry["module"], table=entry["table"], columns=tuple(columns), reason=entry["reason"], adr=entry["adr"]
+    )
+
+
+def parse_seed_allowlist(text: str | bytes | None) -> SeedAllowlist:
+    """`SEED_ALLOWLIST_FILE`'s text parsed and schema-checked; None (no file) is the empty allowlist. Strict JSON:
+    a duplicate key is refused (`pin_dryrun.strict_json`), as is an unknown or missing key. Never raises."""
+    if text is None:
+        return NO_SEEDS
+    try:
+        if isinstance(text, bytes):
+            text = text.decode("utf-8")
+        parsed = _pin_dryrun().strict_json(text)
+        if not isinstance(parsed, list):
+            raise ValueError(f"must be a JSON list of entries, not {type(parsed).__name__}")
+        seen: set[tuple[str, str]] = set()
+        return SeedAllowlist(entries=tuple(_seed_entry(entry, index, seen) for index, entry in enumerate(parsed)))
+    except ValueError as error:  # UnicodeDecodeError, JSONDecodeError and DuplicateKey are ValueErrors
+        return SeedAllowlist(problem=f"{SEED_ALLOWLIST_FILE}: {error}")
+    except (RecursionError, MemoryError) as error:  # `json` recurses once per nesting level
+        return SeedAllowlist(problem=f"{SEED_ALLOWLIST_FILE}: nested too deeply to parse ({type(error).__name__})")
+
+
+def seed_allowlist(repo: Path) -> SeedAllowlist:
+    """`repo`'s `SEED_ALLOWLIST_FILE`, parsed; see the block comment above for why `repo` holds the base's copy."""
+    path = repo / SEED_ALLOWLIST_FILE
+    if not path.exists():
+        return NO_SEEDS
+    try:
+        return parse_seed_allowlist(path.read_bytes())
+    except OSError as error:
+        return SeedAllowlist(problem=f"{SEED_ALLOWLIST_FILE} could not be read: {error}")
+
+
+def _pin_dryrun():
+    """`scripts/pin_dryrun.py` for its `strict_json` (standard library only at import)."""
+    if (module := sys.modules.get("pin_dryrun")) is None:
+        spec = importlib.util.spec_from_file_location("pin_dryrun", Path(__file__).with_name("pin_dryrun.py"))
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["pin_dryrun"] = module
         spec.loader.exec_module(module)
     return module
 
@@ -1932,12 +2028,13 @@ def residual_reasons(module: str, old_source: dict, new_source: dict, added: lis
     ]
 
 
-def migration_evidence(module: str, old_source: dict, new_source: dict, allowlist: tuple = SEED_ALLOWLIST) -> dict:
+def migration_evidence(module: str, old_source: dict, new_source: dict, seeds: SeedAllowlist = NO_SEEDS) -> dict:
     """E4 for one moved -db module: `{status, reasons, admitted, forward_only}` (ADR-1099).
 
     `reasons` names each added migration the classifier does not admit, a removed or changed migration, a schema
     file changed outside the added migrations, an `include_str!`, and a moved `yadgar-store`. `admitted` records each
-    admitted migration's version, name, sha256 of its SQL (the store ledger's checksum) and class; `forward_only` is
+    admitted migration's version, name, sha256 of its SQL (the store ledger's checksum) and class, and for class D
+    the `seed` allowlist entry (module, table, adr) that admitted it; `seeds` is the base's allowlist; `forward_only` is
     every added version, admitted or not: a pin that crosses one cannot be reverted cleanly (DatabaseAhead).
     """
     old, new = migration_blocks(old_source), migration_blocks(new_source)
@@ -1961,9 +2058,12 @@ def migration_evidence(module: str, old_source: dict, new_source: dict, allowlis
             )
             continue
         name = safe_name(name)
-        verdict = classifier().classify(fields["sql"], module=module, allowlist=allowlist)
+        verdict = classifier().classify(fields["sql"], module=module, allowlist=seeds.entries, allowlist_problem=seeds.problem)
         if verdict.admitted:
-            admitted.append({"version": version, "name": name, "checksum": verdict.checksum, "statement_class": verdict.statement_class})
+            record = {"version": version, "name": name, "checksum": verdict.checksum, "statement_class": verdict.statement_class}
+            if (entry := verdict.seed_entry) is not None:
+                record["seed"] = {"module": entry.module, "table": entry.table, "adr": entry.adr}
+            admitted.append(record)
         else:
             reasons.append(f"{module}: migration {version} ({name}) not admitted: {verdict.reason}")
     if removed := sorted(old.keys() - new.keys()):
@@ -2112,8 +2212,9 @@ class Net:
 # ── putting it together ─────────────────────────────────────────────────────
 
 
-def audits(head: list, old_modules: dict, new_modules: dict, net: Net) -> tuple[dict, dict]:
-    """E3 and E4 for every moved module: `(boot audit, migrations)`, each `{module: {status, reasons}}`."""
+def audits(head: list, old_modules: dict, new_modules: dict, net: Net, seeds: SeedAllowlist = NO_SEEDS) -> tuple[dict, dict]:
+    """E3 and E4 for every moved module: `(boot audit, migrations)`, each `{module: {status, reasons}}`; E4 admits a
+    seed INSERT by `seeds`, the base's allowlist."""
     moved = sorted(m for m in new_modules if m != PLATFORM and m in old_modules and old_modules[m] != new_modules[m])
     boot: dict[str, dict] = {}
     migrations: dict[str, dict] = {}
@@ -2128,7 +2229,7 @@ def audits(head: list, old_modules: dict, new_modules: dict, net: Net) -> tuple[
             reasons = boot_audit(module, old, new, env)
             boot[module] = {"status": "red" if reasons else "green", "reasons": reasons}
         if module.endswith("-db"):
-            migrations[module] = migration_evidence(module, old, new)
+            migrations[module] = migration_evidence(module, old, new, seeds)
     return boot, migrations
 
 
@@ -2145,7 +2246,7 @@ def check(repo: Path, target: str, net: Net, helms: dict[str, str]) -> dict:
         for label, binary in sorted(helms.items())
     }
     verdict = classify(renders, old_modules, new_modules, net.ghcr_digest)
-    boot, migrations = audits(renders[verdict.helms[0]][1], old_modules, new_modules, net)
+    boot, migrations = audits(renders[verdict.helms[0]][1], old_modules, new_modules, net, seed_allowlist(repo))
     platform = None
     old_platform, new_platform = old_modules.get(PLATFORM), new_modules.get(PLATFORM)
     if old_platform and new_platform and old_platform != new_platform:
@@ -2281,6 +2382,7 @@ def migration_lines(migrations: dict) -> list[str]:
         lines += [
             f"  - {module}: migration {m['version']} ({m['name']}) admitted, class {m['statement_class']} "
             f"({classes[m['statement_class']]}), sha256 `{m['checksum']}`"
+            + (f", by the seed allowlist entry {m['seed']['module']} / {m['seed']['table']} ({m['seed']['adr']})" if m.get("seed") else "")
             for m in result.get("admitted", [])
         ]
     return lines

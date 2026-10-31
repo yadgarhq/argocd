@@ -23,6 +23,16 @@ A migration is admitted only when ALL of these hold:
 | C | `ALTER TABLE t ADD COLUMN …[, ADD COLUMN …]`: each nullable or `NOT NULL DEFAULT <literal>` |
 | D | `INSERT [IGNORE] INTO t (cols) VALUES (literals)[, …]` whose (module, table, cols) is allowlisted |
 
+Class D (car 3) takes one value per column in every row, each a number, a
+SINGLE-quoted ASCII string (a double-quoted one is an identifier under
+ANSI_QUOTES), NULL, TRUE or FALSE; no repeated column. An allowlist entry of
+the same module and the EXACT table name (MariaDB table names are
+case-sensitive on Linux) admits it when the INSERT's columns are a SUBSET of
+the entry's, compared case-insensitively as MariaDB compares column names.
+The subset rule is the default Max has not ruled otherwise on. `pin_bump`
+parses the allowlist from the base; when it is unusable, every INSERT is red
+with that reason and the DDL classes are unaffected.
+
 Class A is a NEW table, so its own CHECK, FOREIGN KEY and UNIQUE KEY touch no
 existing row and stay green; LIKE is red only as `CREATE TABLE t LIKE s` or
 `(LIKE s)`, never as an operator inside a CHECK; SELECT is red anywhere in the
@@ -54,7 +64,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Sequence
 
 CLASSES = {
@@ -70,7 +80,7 @@ NON_LITERAL = "non-literal sql (not one Rust string literal: format!, concat!, a
 
 @dataclass(frozen=True, kw_only=True)
 class SeedEntry:
-    """One entry of `scripts/gates/migration_seed_allowlist.json` (ADR-1099; read from the base by car 3)."""
+    """One entry of `scripts/gates/migration_seed_allowlist.json` (ADR-1099), parsed from the BASE by `pin_bump`."""
 
     module: str
     table: str
@@ -88,13 +98,15 @@ class StatementVerdict:
 
 @dataclass(frozen=True, kw_only=True)
 class MigrationVerdict:
-    """`reason` is None when admitted; `sql` and `checksum` are None when the literal could not be read."""
+    """`reason` is None when admitted; `sql` and `checksum` are None when the literal could not be read; `seed_entry`
+    is the allowlist entry that admitted a class D INSERT (the first matching one in file order), else None."""
 
     sql: str | None
     checksum: str | None
     statements: tuple[StatementVerdict, ...]
     statement_class: str | None
     reason: str | None
+    seed_entry: SeedEntry | None = None
 
     @property
     def admitted(self) -> bool:
@@ -167,6 +179,7 @@ def rust_literal(expression: str) -> str | None:
 class Token:
     kind: str  # word, ident, string, number, punct
     value: str  # a word upper-cased; an identifier or string unquoted
+    raw: str = field(default="", compare=False)  # the source text, quotes included: a word's case, a string's quote
 
     def is_word(self, *words: str) -> bool:
         return self.kind == "word" and self.value in words
@@ -218,13 +231,14 @@ def tokens(sql: str) -> list[Token]:
                 raise Red("unparseable: unterminated /* comment")
             i = stop + 2
         elif char in "'\"`":
-            value, i = _quoted(sql, i)
-            found.append(Token("ident" if char == "`" else "string", value))
+            value, stop = _quoted(sql, i)
+            found.append(Token("ident" if char == "`" else "string", value, sql[i:stop]))
+            i = stop
         elif match := NUMBER.match(sql, i):
-            found.append(Token("number", match.group()))
+            found.append(Token("number", match.group(), match.group()))
             i = match.end()
         elif match := WORD.match(sql, i):
-            found.append(Token("word", match.group().upper()))
+            found.append(Token("word", match.group().upper(), match.group()))
             i = match.end()
         elif char in PUNCT:
             found.append(Token("punct", char))
@@ -326,9 +340,12 @@ def _split_commas(items: list[Token]) -> list[list[Token]]:
 
 
 def _literal(cursor: Cursor) -> bool:
-    """Consume one SQL literal (string, signed number, NULL, TRUE, FALSE); False, consuming nothing, if none."""
+    """Consume one SQL literal (single-quoted string, signed number, NULL, TRUE, FALSE); False, consuming nothing, if
+    none. A double-quoted text is an identifier under ANSI_QUOTES, so it is no literal (yaadgaar 511)."""
     token = cursor.peek()
     if token is None:
+        return False
+    if token.kind == "string" and not token.raw.startswith("'"):
         return False
     if token.kind in ("string", "number") or token.is_word("NULL", "TRUE", "FALSE"):
         cursor.at += 1
@@ -347,6 +364,8 @@ def _create_table(cursor: Cursor) -> str:
         raise Red("CREATE TABLE without a column list (LIKE, AS SELECT) is not admitted")
     if any(token.is_word("SELECT") for token in cursor.items):
         raise Red("CREATE TABLE with a SELECT is not admitted (it copies existing rows)")
+    if any(token.kind == "string" and not token.raw.startswith("'") for token in cursor.items):
+        raise Red("CREATE TABLE with a double-quoted text is not admitted (an identifier under ANSI_QUOTES, not a string)")
     body = cursor.group()
     if not body or body[0].is_word("LIKE", "VALUES", "TABLE", "WITH") or body[0] == Token("punct", "("):
         raise Red(f"CREATE TABLE ({body[0].value if body else ''} …) is not admitted; only column and key definitions")
@@ -501,34 +520,70 @@ def _alter_table(cursor: Cursor) -> str:
     return "C"
 
 
-def _insert(cursor: Cursor, module: str, allowlist: Sequence[SeedEntry]) -> str:
+def _insert_value(cursor: Cursor) -> bool:
+    """One class D value: a number, a SINGLE-quoted ASCII string, NULL, TRUE or FALSE. A double-quoted text is an
+    identifier under ANSI_QUOTES, so it is no literal here; non-ASCII inside a string is red too (ADR-1099: ASCII)."""
+    token = cursor.peek()
+    if token is not None and token.kind == "string" and not token.value.isascii():
+        return False
+    return _literal(cursor)
+
+
+def _insert(cursor: Cursor, module: str, allowlist: Sequence[SeedEntry], allowlist_problem: str | None) -> SeedEntry:
+    """Class D: `INSERT [IGNORE] INTO t (cols) VALUES (literals)[, (literals)…]`, its table on the allowlist for
+    `module` (exact name: MariaDB table names are case-sensitive on Linux) with the INSERT's columns a SUBSET of the
+    entry's (column names compare case-insensitively, as MariaDB's do). Returns the first matching entry."""
     cursor.accept("IGNORE")
     cursor.expect("INTO", why="unparseable: INSERT without INTO")
-    table = cursor.name("table")
-    columns = []
+    token = cursor.peek()
+    cursor.name("table")
+    table = token.raw if token.kind == "word" else token.value
+    columns: list[str] = []
     for part in _split_commas(cursor.group()):
         if len(part) != 1 or part[0].kind not in ("word", "ident"):
             raise Red("an INSERT column list that is not plain column names is not admitted")
-        columns.append(part[0].value.lower() if part[0].kind == "word" else part[0].value)
+        # BEFORE any case fold: Python lowercases U+212A KELVIN SIGN to ASCII `k` (argocd#216 security review).
+        if not part[0].value.isascii():
+            raise Red(f"INSERT column {part[0].value} is not an ASCII name")
+        column = part[0].value.lower()
+        if column in columns:
+            raise Red(f"INSERT column {column} given twice")
+        columns.append(column)
     cursor.expect("VALUES", why="an INSERT that is not VALUES (literals) is not admitted (INSERT … SELECT, SET)")
     while True:
-        for value in _split_commas(cursor.group()):
+        row = _split_commas(cursor.group())
+        for value in row:
             item = Cursor(value)
-            if not _literal(item) or not item.done():
-                raise Red("an INSERT value that is not a literal is not admitted")
+            if not _insert_value(item) or not item.done():
+                raise Red("an INSERT value that is not a literal (a single-quoted ASCII string, a number, NULL, TRUE, FALSE) is not admitted")
             if len(value) == 0:
                 raise Red("unparseable: an empty INSERT value")
+        if len(row) != len(columns):
+            raise Red(f"an INSERT row of {len(row)} values for {len(columns)} columns is not admitted")
         if not cursor.punct(","):
             break
     if not cursor.done():
         raise Red(f"INSERT … {cursor.take().value} is not admitted (ON DUPLICATE KEY, RETURNING)")
-    if not any(e.module == module and e.table == table and set(columns) <= set(e.columns) for e in allowlist):
-        raise Red(f"seed INSERT into {table} ({', '.join(columns)}) is not on the seed allowlist for {module}")
-    return "D"
+    if allowlist_problem is not None:
+        raise Red(f"seed INSERT into {table} ({', '.join(columns)}) is not admitted: the seed allowlist is unusable ({allowlist_problem})")
+    for entry in allowlist:
+        if entry.module == module and entry.table == table and set(columns) <= {c.lower() for c in entry.columns}:
+            return entry
+    raise Red(f"seed INSERT into {table} ({', '.join(columns)}) is not on the seed allowlist for {module}")
 
 
-def classify_statement(items: list[Token], *, module: str, allowlist: Sequence[SeedEntry]) -> str:
+def classify_statement(
+    items: list[Token], *, module: str, allowlist: Sequence[SeedEntry], allowlist_problem: str | None = None
+) -> str:
     """The class of one statement; raises `Red` with the reason otherwise."""
+    return _classify_statement(items, module=module, allowlist=allowlist, allowlist_problem=allowlist_problem)[0]
+
+
+def _classify_statement(
+    items: list[Token], *, module: str, allowlist: Sequence[SeedEntry], allowlist_problem: str | None
+) -> tuple[str, SeedEntry | None]:
+    """`(class, the admitting seed entry for class D else None)`; raises `Red` with the reason otherwise."""
+    entry = None
     if not items:
         raise Red("unparseable: an empty statement")
     if not _balanced(items):
@@ -541,27 +596,38 @@ def classify_statement(items: list[Token], *, module: str, allowlist: Sequence[S
     elif cursor.accept("ALTER", "TABLE"):
         found = _alter_table(cursor)
     elif cursor.accept("INSERT"):
-        found = _insert(cursor, module, allowlist)
+        entry = _insert(cursor, module, allowlist, allowlist_problem)
+        found = "D"
     else:
         raise Red(f"{items[0].value} is not an admitted statement (ADR-1099 classes A-D)")
     if not cursor.done():
         raise Red(f"unparseable: unexpected {cursor.take().value}")
-    return found
+    return found, entry
+
+
+def shown(text: str) -> str:
+    """`text` fit for a reason, the PR body and stderr (yaadgaar 511): control characters and line breaks become
+    spaces, backticks are escaped, and `::` is broken so no `::error::` workflow command can form. A quoted name or
+    literal in a statement is upstream text."""
+    return re.sub(r"[\x00-\x1f\x7f\u0085\u2028\u2029]", " ", text).replace("`", "\\`").replace("::", ": :")
 
 
 def _text(items: list[Token]) -> str:
-    return " ".join(t.value for t in items)
+    return shown(" ".join(t.value for t in items))
 
 
-def classify(expression: str, *, module: str, allowlist: Sequence[SeedEntry]) -> MigrationVerdict:
-    """The verdict on one added migration, from its Rust `sql:` expression."""
+def classify(
+    expression: str, *, module: str, allowlist: Sequence[SeedEntry], allowlist_problem: str | None = None
+) -> MigrationVerdict:
+    """The verdict on one added migration, from its Rust `sql:` expression. `allowlist_problem` says why the seed
+    allowlist could not be used (malformed); every class D INSERT is then red with that reason, the DDL classes not."""
     sql = rust_literal(expression)
     if sql is None:
         return MigrationVerdict(sql=None, checksum=None, statements=(), statement_class=None, reason=NON_LITERAL)
     checksum = hashlib.sha256(sql.encode("utf-8")).hexdigest()
 
     def red(reason: str, found: tuple[StatementVerdict, ...] = ()) -> MigrationVerdict:
-        return MigrationVerdict(sql=sql, checksum=checksum, statements=found, statement_class=None, reason=reason)
+        return MigrationVerdict(sql=sql, checksum=checksum, statements=found, statement_class=None, reason=shown(reason))
 
     try:
         pieces = statements(sql)
@@ -569,16 +635,20 @@ def classify(expression: str, *, module: str, allowlist: Sequence[SeedEntry]) ->
         return red(str(error))
     if len(pieces) == 1 and not pieces[0]:
         return red("unparseable: no statement")
-    judged = []
+    judged, entries = [], []
     for piece in pieces:
         try:
-            judged.append(StatementVerdict(text=_text(piece), statement_class=(c := classify_statement(piece, module=module, allowlist=allowlist)), reason=CLASSES[c]))
+            c, entry = _classify_statement(piece, module=module, allowlist=allowlist, allowlist_problem=allowlist_problem)
+            judged.append(StatementVerdict(text=_text(piece), statement_class=c, reason=CLASSES[c]))
+            entries.append(entry)
         except Red as error:
-            judged.append(StatementVerdict(text=_text(piece), statement_class=None, reason=str(error)))
+            judged.append(StatementVerdict(text=_text(piece), statement_class=None, reason=shown(str(error))))
     found = tuple(judged)
     if len(found) > 1:
         return red(MULTI_STATEMENT, found)
     only = found[0]
     if only.statement_class is None:
         return red(only.reason, found)
-    return MigrationVerdict(sql=sql, checksum=checksum, statements=found, statement_class=only.statement_class, reason=None)
+    return MigrationVerdict(
+        sql=sql, checksum=checksum, statements=found, statement_class=only.statement_class, reason=None, seed_entry=entries[0]
+    )

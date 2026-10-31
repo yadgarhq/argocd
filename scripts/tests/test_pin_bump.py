@@ -70,6 +70,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib.util
+import json
 import re
 import shutil
 import subprocess
@@ -911,10 +912,118 @@ def test_a_multi_statement_added_migration_is_needs_human() -> None:
 
 
 def test_an_insert_seed_is_needs_human_while_the_allowlist_is_empty() -> None:
-    """PR A reads no allowlist file: `SEED_ALLOWLIST` is empty, so class D (a literal INSERT) is always red."""
-    assert pb.SEED_ALLOWLIST == ()
+    """Rewritten for car 3: no allowlist given is the empty one, so class D (a literal INSERT) is red by default, and
+    the allowlist file ships empty (`[]`), so a seed stays NEEDS-HUMAN until a reviewed entry lands on main."""
+    assert pb.NO_SEEDS == pb.SeedAllowlist(entries=(), problem=None)
+    assert pb.parse_seed_allowlist((REPOSITORY / pb.SEED_ALLOWLIST_FILE).read_bytes()) == pb.NO_SEEDS
+    assert (REPOSITORY / pb.SEED_ALLOWLIST_FILE).read_text() == "[]\n"
     reasons = pb.migration_audit("iam-db", tree("e4-old"), with_audit_sql('"INSERT INTO user (id) VALUES (1)".into()'))
-    assert len(reasons) == 1 and "not on the seed allowlist" in reasons[0], reasons
+    assert reasons == ["iam-db: migration 7 (create_audit) not admitted: seed INSERT into user (id) is not on the seed allowlist for iam-db"], reasons
+
+
+def user_seed():
+    """Built at test time: `test_migration_classifier` reloads the classifier module, and dataclass equality is per class."""
+    return pb.classifier().SeedEntry(module="iam-db", table="user", columns=("id", "name"), reason="the first user", adr="ADR-1099")
+
+
+def seeds_text(*entries: dict) -> str:
+    return json.dumps(list(entries))
+
+
+def entry_json(**overrides) -> dict:
+    found = {"module": "iam-db", "table": "user", "columns": ["id", "name"], "reason": "the first user", "adr": "ADR-1099"}
+    found.update(overrides)
+    return found
+
+
+def test_an_allowlisted_seed_is_green_and_records_the_entry_that_admitted_it() -> None:
+    seeds = pb.parse_seed_allowlist(seeds_text(entry_json()))
+    assert seeds == pb.SeedAllowlist(entries=(user_seed(),), problem=None)
+    found = pb.migration_evidence("iam-db", tree("e4-old"), with_audit_sql('"INSERT INTO user (id) VALUES (1)".into()'), seeds)
+    checksum = hashlib.sha256(b"INSERT INTO user (id) VALUES (1)").hexdigest()
+    assert found["status"] == "green" and found["reasons"] == [], found["reasons"]
+    assert found["admitted"] == [
+        {"version": 7, "name": "create_audit", "checksum": checksum, "statement_class": "D", "seed": {"module": "iam-db", "table": "user", "adr": "ADR-1099"}}
+    ]
+    other = pb.parse_seed_allowlist(seeds_text(entry_json(module="task-db")))
+    assert pb.migration_evidence("iam-db", tree("e4-old"), with_audit_sql('"INSERT INTO user (id) VALUES (1)".into()'), other)["status"] == "red"
+
+
+def test_the_body_names_the_allowlist_entry_that_admitted_a_seed() -> None:
+    seeded = evidence()
+    seeded["migrations"] = {
+        "iam-db": {
+            "status": "green",
+            "reasons": [],
+            "admitted": [{"version": 21, "name": "seed_x", "checksum": "cd" * 32, "statement_class": "D", "seed": {"module": "iam-db", "table": "x", "adr": "ADR-1099"}}],
+            "forward_only": [21],
+        }
+    }
+    verification = pb.pr_body(seeded).split("## Verification\n", 1)[1].split("\n## ", 1)[0]
+    line = "iam-db: migration 21 (seed_x) admitted, class D (allowlisted literal INSERT), sha256 `" + "cd" * 32 + "`"
+    assert line + ", by the seed allowlist entry iam-db / x (ADR-1099)" in verification, verification
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("[", id="not-json"),
+        pytest.param('[{"module": "iam-db", "module": "iam-db", "table": "user", "columns": ["id"], "reason": "r", "adr": "ADR-1099"}]', id="duplicate-key"),
+        pytest.param("{}", id="not-a-list"),
+        pytest.param(seeds_text("x"), id="entry-not-an-object"),
+        pytest.param(seeds_text(entry_json(extra="x")), id="unknown-key"),
+        pytest.param(seeds_text({k: v for k, v in entry_json().items() if k != "reason"}), id="missing-key"),
+        pytest.param(seeds_text(entry_json(reason="")), id="empty-reason"),
+        pytest.param(seeds_text(entry_json(reason=1)), id="reason-not-a-string"),
+        pytest.param(seeds_text(entry_json(columns=[])), id="no-columns"),
+        pytest.param(seeds_text(entry_json(columns="id")), id="columns-not-a-list"),
+        pytest.param(seeds_text(entry_json(columns=["id", "id"])), id="repeated-column"),
+        pytest.param(seeds_text(entry_json(columns=["id", True])), id="column-not-a-string"),
+        pytest.param(seeds_text(entry_json(columns=["id; DROP"])), id="column-not-an-identifier"),
+        pytest.param(seeds_text(entry_json(columns=["Id"])), id="column-not-lowercase"),
+        pytest.param(seeds_text(entry_json(table="db.user")), id="qualified-table"),
+        pytest.param(seeds_text(entry_json(table="User")), id="table-not-lowercase"),
+        pytest.param(seeds_text(entry_json(table="us\u00e9r")), id="table-not-ascii"),
+        pytest.param(seeds_text(entry_json(adr="ADR-99")), id="adr-short"),
+        pytest.param(seeds_text(entry_json(adr="ADR-\uff11\uff10\uff19\uff19")), id="adr-unicode-digits"),
+        pytest.param(seeds_text(entry_json(adr="ADR-1099\n")), id="adr-trailing-newline"),
+        pytest.param(seeds_text(entry_json(module="gateway")), id="module-not-db"),
+        pytest.param(seeds_text(entry_json(), entry_json(columns=["id"])), id="table-listed-twice"),
+        pytest.param("\ufeff[]", id="byte-order-mark"),
+        pytest.param(b"[\xff]", id="not-utf8"),
+    ],
+)
+def test_a_malformed_allowlist_admits_nothing_and_says_why(text) -> None:
+    seeds = pb.parse_seed_allowlist(text)
+    assert seeds.entries == () and seeds.problem and pb.SEED_ALLOWLIST_FILE in seeds.problem, seeds
+
+
+@pytest.mark.parametrize("depth", [100_000, 2_000_000], ids=["recursion", "deep"])
+def test_a_deeply_nested_allowlist_is_a_problem_not_an_exception(depth: int) -> None:
+    """Security review of argocd#216: `json` recurses per nesting level and raises RecursionError."""
+    seeds = pb.parse_seed_allowlist("[" * depth + "]" * depth)
+    assert seeds.entries == () and seeds.problem and pb.SEED_ALLOWLIST_FILE in seeds.problem, seeds
+
+
+def test_a_malformed_allowlist_makes_a_seed_red_with_its_reason_and_never_raises() -> None:
+    seeds = pb.parse_seed_allowlist('[{"module": "iam-db", "module": "x"}]')
+    found = pb.migration_evidence("iam-db", tree("e4-old"), with_audit_sql('"INSERT INTO user (id) VALUES (1)".into()'), seeds)
+    assert found["status"] == "red" and len(found["reasons"]) == 1, found["reasons"]
+    assert "the seed allowlist is unusable" in found["reasons"][0] and "duplicate key 'module'" in found["reasons"][0], found["reasons"]
+    ddl = pb.migration_evidence("iam-db", tree("e4-old"), tree("e4-new"), seeds)
+    assert ddl["status"] == "green" and ddl["reasons"] == [], "a malformed allowlist touches class D only"
+
+
+def test_the_allowlist_is_read_from_the_tree_pin_bump_checks(tmp_path: Path) -> None:
+    """`check` reads `repo`'s copy: main's checkout in auto-pin, the base copy `pin_evidence.evidence` writes there."""
+    assert pb.seed_allowlist(tmp_path) == pb.NO_SEEDS, "no file is the empty allowlist"
+    (tmp_path / pb.SEED_ALLOWLIST_FILE).parent.mkdir(parents=True)
+    (tmp_path / pb.SEED_ALLOWLIST_FILE).write_text(seeds_text(entry_json()))
+    assert pb.seed_allowlist(tmp_path).entries == (user_seed(),)
+    (tmp_path / pb.SEED_ALLOWLIST_FILE).unlink()
+    (tmp_path / pb.SEED_ALLOWLIST_FILE).mkdir()
+    unreadable = pb.seed_allowlist(tmp_path)
+    assert unreadable.entries == () and "could not be read" in unreadable.problem, unreadable
 
 
 AUDIT_LITERAL = """    Migration {
