@@ -14,8 +14,8 @@ One constructed case per arm:
   never touches the comments that name the field;
 - the classifier (E1) accepts only the image-only shape and names every other
   shape: an env entry added, an object added, a digest mismatch, a repository
-  changed under a matching digest, a helm disagreement, a single helm, a
-  platform move, and a module image changed with no module version moved;
+  changed under a matching digest, a helm disagreement, a single helm, and a
+  module image changed with no module version moved;
 - E3: a new `env_required` key the render lacks is NEEDS-HUMAN, and the same
   key rendered is green; a new `env::var` / `var_os` / lookup-closure read and a
   new const passed to `env_required` are NEEDS-HUMAN; a new error-code literal
@@ -24,7 +24,8 @@ One constructed case per arm:
   `required`) and a path-qualified const are followed; a new call site whose
   key cannot be resolved (`format!`) and a moved `yadgar-*` crate pin are
   NEEDS-HUMAN; a DaemonSet, an initContainer and a swap inside the registry are
-  NEEDS-HUMAN; platform moves and migrations carry the ADR-0948 R5 interim text;
+  NEEDS-HUMAN; migrations carry the ADR-0948 R5 interim text, and a platform move
+  is left to the operator evidence (car C10, `test_pin_platform.py`);
 - E3 fail-closed tripwires (re-review at aad2e9d): a new shared-crate env entry
   point, every unknown reader shape (use-as, bare use, module alias, dotenvy,
   vars scan, generic and boxed `Fn(&str)`, clap `env =`), a new key through a fn
@@ -143,20 +144,20 @@ PIN_TEXT = '{{\n  "chart_tag": "v{tag}",\n  "chart_digest": "{digest}",\n  "plat
 
 def test_the_chart_pin_moves_its_tag_and_digest_only() -> None:
     text = PIN_TEXT.format(tag="0.25.14", digest=OLD_DIGEST)
-    assert pb.rewrite_chart_pin(text, "0.25.27", NEW_DIGEST) == PIN_TEXT.format(tag="0.25.27", digest=NEW_DIGEST)
+    assert pb.rewrite_chart_pin(text, "0.25.27", digest=NEW_DIGEST) == PIN_TEXT.format(tag="0.25.27", digest=NEW_DIGEST)
 
 
 def test_a_chart_pin_with_no_digest_line_is_refused_not_grown() -> None:
     """Yaadgaar 250: the writer moves the recorded digest; a pin without one is refused, never silently extended."""
     text = '{\n  "chart_tag": "v0.25.14",\n  "platform_version": "0.2.6"\n}\n'
     with pytest.raises(pb.Refused, match="chart_digest"):
-        pb.rewrite_chart_pin(text, "0.25.27", NEW_DIGEST)
+        pb.rewrite_chart_pin(text, "0.25.27", digest=NEW_DIGEST)
 
 
 @pytest.mark.parametrize("digest", ["", "2" * 64, "sha256:" + "Z" * 64, "sha256:abc"])
 def test_a_malformed_digest_is_refused(digest: str) -> None:
     with pytest.raises(pb.Refused, match="digest"):
-        pb.rewrite_chart_pin(PIN_TEXT.format(tag="0.25.14", digest=OLD_DIGEST), "0.25.27", digest)
+        pb.rewrite_chart_pin(PIN_TEXT.format(tag="0.25.14", digest=OLD_DIGEST), "0.25.27", digest=digest)
 
 
 def test_the_chart_digest_is_resolved_through_the_module_client(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -281,13 +282,14 @@ def test_a_single_helm_is_needs_human() -> None:
     assert any("one helm" in r for r in verdict.reasons), verdict.reasons
 
 
-def test_a_platform_move_is_needs_human() -> None:
-    """The #103 shape: platform 0.2.4 -> 0.2.5 moves the operator Applications."""
+def test_a_platform_move_is_left_to_the_operator_evidence() -> None:
+    """The #103 shape: platform 0.2.4 -> 0.2.5 moves the operator Applications. Car C10 (ruled 2026-10-31): the
+    `yadgar` classifier no longer blocks it by category; `classify_platform` judges the five operator Applications
+    (`test_pin_platform.py`)."""
     old = {**OLD_MODULES, "platform": "0.2.4"}
     new = {**NEW_MODULES, "platform": "0.2.5"}
     verdict = classify(two_helms(render_at("0.12.10"), render_at("0.12.11")), new_modules=new, old_modules=old)
-    assert not verdict.accept
-    assert any("platform moved" in r and "0.2.4" in r and "0.2.5" in r for r in verdict.reasons), verdict.reasons
+    assert verdict.accept, verdict.reasons
 
 
 def test_a_module_image_changed_without_its_version_moving_is_needs_human() -> None:
@@ -306,12 +308,12 @@ def test_a_changed_config_map_is_needs_human() -> None:
 
 
 
-def test_a_platform_move_is_an_interim_block() -> None:
-    """ADR-0948 R5 (Max, 2026-10-18): platform moves auto-merge when green, once car C10 lands."""
+def test_a_platform_move_carries_no_interim_block() -> None:
+    """ADR-0948 R5 (Max, 2026-10-18): platform moves auto-merge when green; car C10 lifted the interim block."""
     old = {**OLD_MODULES, "platform": "0.2.4"}
     new = {**NEW_MODULES, "platform": "0.2.5"}
     verdict = classify(two_helms(render_at("0.12.10"), render_at("0.12.11")), new_modules=new, old_modules=old)
-    assert any("platform moved" in r and R5 in r for r in verdict.reasons), verdict.reasons
+    assert not any(R5 in r for r in verdict.reasons), verdict.reasons
 
 
 def workload(kind: str, name: str, image: str, container_list: str = "containers") -> dict:

@@ -227,9 +227,11 @@ class NoCluster:
         raise AssertionError(f"the cluster was read before the refusal: {cmd}")
 
 
-def run(repo: Path, sha: str, *, kubectl=None, render: Render | None = None, base: str | None = None) -> dict:
+def run(repo: Path, sha: str, *, kubectl=None, render: Render | None = None, base: str | None = None, platform_of=None) -> dict:
+    """The dry run; the target chart's `platform` is the pinned one unless `platform_of` says otherwise (car C10)."""
     cluster = verify_handover.Cluster(CONTEXT, runner=kubectl if kubectl is not None else Kubectl())
-    return pin_dryrun.dry_run(repo, base or main_sha(repo), sha, cluster, render=render or Render())
+    platform_of = platform_of or (lambda target: "0.2.6")
+    return pin_dryrun.dry_run(repo, base or main_sha(repo), sha, cluster, render=render or Render(), platform_of=platform_of)
 
 
 def items(live: dict, key: str) -> list:
@@ -1119,3 +1121,133 @@ def test_the_module_imports_without_pyyaml() -> None:
     finished = subprocess.run([sys.executable, "-c", code, str(SCRIPTS)], capture_output=True, text=True, check=False)
     assert finished.returncode == 0, finished.stderr
     assert finished.stdout.strip() == "ok"
+
+
+# ── 8. a platform move (car C10): a pure version move of the five operator files ──
+
+OPERATORS = ("cert-manager", "envoy-gateway", "keda", "mariadb-operator", "prometheus")
+PLATFORM, NEW_PLATFORM = "0.2.6", "0.2.7"
+OPERATOR = """\
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {name}
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: ghcr.io/yadgarhq/charts
+    chart: platform
+    # moves with platform_version
+    targetRevision: {version}
+    helm:
+      valuesObject:
+        operators:
+          create: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: {name}
+"""
+
+
+def operator_file(name: str) -> str:
+    return f"applications/{name}.yaml"
+
+
+@pytest.fixture
+def platform_repo(repo: Path) -> Path:
+    for name in OPERATORS:
+        write(repo, operator_file(name), OPERATOR.format(name=name, version=PLATFORM))
+    commit(repo, "the operator Applications")
+    return repo
+
+
+def platform_branch(repo: Path, *, versions: dict | None = None, chart_platform: str = NEW_PLATFORM, extra=None) -> str:
+    """A pin that also moves the platform: chart_pin.json's platform_version and the five operator files."""
+    def move(r: Path) -> None:
+        write(r, "scripts/chart_pin.json", chart_pin(TARGET).replace(PLATFORM, chart_platform))
+        for name in OPERATORS:
+            version = (versions or {}).get(name, NEW_PLATFORM)
+            write(r, operator_file(name), OPERATOR.format(name=name, version=version))
+        if extra:
+            extra(r)
+
+    return pin_branch(repo, extra=move)
+
+
+def run_platform(repo: Path, sha: str, *, platform_of=None, kubectl=None) -> dict:
+    cluster = verify_handover.Cluster(CONTEXT, runner=kubectl if kubectl is not None else NoCluster())
+    return pin_dryrun.dry_run(
+        repo, main_sha(repo), sha, cluster, render=Render(), platform_of=platform_of or (lambda target: NEW_PLATFORM)
+    )
+
+
+def test_a_pure_platform_move_is_held_red_until_the_operator_comparator_exists(platform_repo: Path) -> None:
+    """The five files are allowed and pure, so nothing is refused; but no live operator comparison exists yet, so
+    E2 is red, without a cluster read (C10's E2-interim over the operators is the next part)."""
+    result = run_platform(platform_repo, platform_branch(platform_repo))
+    assert result["result"] == "red"
+    assert any("operator comparator" in p for p in result["problems"]), result["problems"]
+    assert not any("outside" in p for p in result["problems"]), result["problems"]
+
+
+def test_an_operator_file_with_a_values_change_is_refused(platform_repo: Path) -> None:
+    def values(r: Path) -> None:
+        text = OPERATOR.format(name="keda", version=NEW_PLATFORM).replace("create: false", "create: true")
+        write(r, operator_file("keda"), text)
+
+    result = run_platform(platform_repo, platform_branch(platform_repo, extra=values))
+    assert result["result"] == "refused"
+    assert any("applications/keda.yaml" in p and "targetRevision" in p for p in result["problems"]), result["problems"]
+
+
+def test_five_operator_files_that_disagree_are_refused(platform_repo: Path) -> None:
+    result = run_platform(platform_repo, platform_branch(platform_repo, versions={"keda": "0.2.8"}))
+    assert result["result"] == "refused"
+    assert any("applications/keda.yaml" in p for p in result["problems"]), result["problems"]
+
+
+def test_operator_files_that_disagree_with_platform_version_are_refused(platform_repo: Path) -> None:
+    sha = platform_branch(platform_repo, versions=dict.fromkeys(OPERATORS, "0.2.8"))
+    result = run_platform(platform_repo, sha)
+    assert result["result"] == "refused"
+    assert any("platform_version" in p for p in result["problems"]), result["problems"]
+
+
+def test_a_platform_version_that_is_not_the_target_charts_platform_is_refused(platform_repo: Path) -> None:
+    result = run_platform(platform_repo, platform_branch(platform_repo), platform_of=lambda target: "0.2.9")
+    assert result["result"] == "refused"
+    assert any("0.2.9" in p for p in result["problems"]), result["problems"]
+
+
+def test_an_operator_file_moved_without_platform_version_is_refused(platform_repo: Path) -> None:
+    def one(r: Path) -> None:
+        write(r, operator_file("keda"), OPERATOR.format(name="keda", version=NEW_PLATFORM))
+
+    result = run_platform(platform_repo, pin_branch(platform_repo, extra=one))
+    assert result["result"] == "refused"
+    assert any("applications/keda.yaml" in p for p in result["problems"]), result["problems"]
+
+
+def test_a_platform_move_that_leaves_an_operator_file_behind_is_refused(platform_repo: Path) -> None:
+    sha = platform_branch(platform_repo, versions={"prometheus": PLATFORM})
+    result = run_platform(platform_repo, sha)
+    assert result["result"] == "refused"
+    assert any("applications/prometheus.yaml" in p for p in result["problems"]), result["problems"]
+
+
+def test_a_target_whose_chart_moved_platform_is_refused_when_the_operator_files_stay(repo: Path) -> None:
+    """Carry-forward gap: a three-file pin to a target whose chart's `platform` is not the pinned `platform_version`
+    leaves the operator Applications behind; refused before any cluster read."""
+    result = run(repo, pin_branch(repo), kubectl=NoCluster(), platform_of=lambda target: "0.2.9")
+    assert result["result"] == "refused"
+    assert any("0.2.9" in p and "platform_version" in p for p in result["problems"]), result["problems"]
+
+
+def test_an_unreadable_target_platform_refuses_a_three_file_pin(repo: Path) -> None:
+    def unreadable(target: str) -> str:
+        raise OSError("raw.githubusercontent.com unreachable")
+
+    result = run(repo, pin_branch(repo), kubectl=NoCluster(), platform_of=unreadable)
+    assert result["result"] == "refused"
+    assert any("could not be read" in p for p in result["problems"]), result["problems"]

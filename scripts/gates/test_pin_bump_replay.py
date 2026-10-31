@@ -87,7 +87,9 @@ def seeded(sha: str, path: str) -> bytes:
 @pytest.mark.parametrize("pull_request", sorted(REPLAYS))
 def test_the_write_reproduces_the_hand_pin(tmp_path: Path, pull_request: str) -> None:
     base, target, merged = REPLAYS[pull_request]
-    for path in pb.MECHANICAL_FILES:
+    # All eight pin files (car C10): no hand pin moved `platform`, so the five operator files must come out unchanged.
+    paths = pb.pin_files(platform_moved=True)
+    for path in paths:
         (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / path).write_bytes(seeded(base, path))
     for writer in ("test_yadgar_application.py", "test_no_two_owners.py"):
@@ -98,8 +100,8 @@ def test_the_write_reproduces_the_hand_pin(tmp_path: Path, pull_request: str) ->
     def expected(path: str) -> bytes:
         return with_digest(raw(merged, path), target) if path == pb.CHART_PIN else raw(merged, path)
 
-    differing = [path for path in pb.MECHANICAL_FILES if (tmp_path / path).read_bytes() != expected(path)]
-    print(f"[replay] {pull_request}: {base} -> {target}, {len(pb.MECHANICAL_FILES)} file(s) compared with {merged}")
+    differing = [path for path in paths if (tmp_path / path).read_bytes() != expected(path)]
+    print(f"[replay] {pull_request}: {base} -> {target}, {len(paths)} file(s) compared with {merged}")
     assert differing == []
 
 
