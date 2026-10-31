@@ -21,10 +21,11 @@ constructed case per arm of the plan's C10 red list
 - the consumers take three files, or eight when the platform moves, and
   nothing between: `pin_evidence`, `auto_pin.push`, `auto_pin_merge` and
   `pin_dryrun`'s pure-move refusal;
-- ADR-1093: a derived label on an object's OWN metadata (a Service, a CRD, a
-  Deployment's own labels, not only a pod template) whose key any selector in
-  any of the six Applications reads (the five operator renders at both pins,
-  and the `yadgar` render) blocks; the same move with no selector reading it
+- ADR-1095 (superseding ADR-1093): a derived label on an object's OWN metadata
+  (a Service, a CRD, a Deployment's own labels, not only a pod template) whose
+  key any selector in any Application of the estate reads (here: the operator
+  renders at both pins and the `yadgar` render; the rest of the estate in
+  `test_pin_estate_selectors.py`) blocks; the same move with no selector reading it
   passes; a green platform move carries no hold reason.
 """
 
@@ -33,6 +34,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -372,7 +374,7 @@ def test_a_pod_label_another_objects_selector_reads_blocks(name: str) -> None:
     assert any("keda-operator" in r and "inside a selector" in r and key in r for r in reasons), reasons
 
 
-# ── ADR-1093: an object's OWN derived label that any selector in any of the six Applications reads ──
+# ── ADR-1095: an object's OWN derived label that any selector in any Application of the estate reads ──
 
 
 def reads_chart_label(kind: str = "ServiceMonitor") -> dict:
@@ -398,7 +400,7 @@ def apps(**renders: tuple[list, list]) -> dict:
 
 def test_an_own_label_a_servicemonitor_in_another_application_reads_blocks() -> None:
     """The Service's OWN `helm.sh/chart` label moves with keda; a ServiceMonitor in the `prometheus` Application reads
-    that key. Under ADR-1093 that is inside a selector: NEEDS-HUMAN, though the Service has no pod template."""
+    that key. Under ADR-1095 that is inside a selector: NEEDS-HUMAN, though the Service has no pod template."""
     selecting = [reads_chart_label()]
     reasons = judge(apps(keda=(tag_render(KEDA_OLD), tag_render(KEDA_NEW)), prometheus=(selecting, selecting)))
     assert any(
@@ -540,10 +542,11 @@ def test_a_platform_move_with_no_operator_render_blocks() -> None:
 
 def test_a_green_platform_move_carries_no_hold_reason(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Rewritten from C10 part 1's "stays needs-human until the operator comparator exists": part 2 builds that
-    comparator in `pin_dryrun.py`, so a ruled-set diff with no selector read clears E1 with no reason at all."""
-    for name in pb.OPERATOR_APPLICATIONS:
-        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / name).write_bytes((REPOSITORY / name).read_bytes())
+    comparator in `pin_dryrun.py`, so a ruled-set diff with no selector read clears E1 with no reason at all. The
+    tree carries every Application and root (ADR-1095); the chart Applications outside the operators render nothing."""
+    for directory in ("applications", "manifests", "verifier", "install", "projects"):
+        shutil.copytree(REPOSITORY / directory, tmp_path / directory)
+    monkeypatch.setattr(pb, "render_chart_source", lambda name, namespace, source, value_files, binary: [])
     monkeypatch.setattr(pb, "render_operator", lambda text, version, binary: tag_render(KEDA_OLD if version == OLD else KEDA_NEW))
     monkeypatch.setattr(pb, "platform_facts", lambda version, binary: facts(KEDA_OLD if version == OLD else KEDA_NEW))
     found = pb.platform_evidence(tmp_path, OLD, NEW, {"v3.18.4": "/h3", "v4.3.0": "/h4"}, pb.Net(), [])
@@ -552,7 +555,7 @@ def test_a_green_platform_move_carries_no_hold_reason(monkeypatch: pytest.Monkey
 
 
 def test_platform_evidence_counts_the_yadgar_renders_selectors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """ADR-1093: the `yadgar` Application is one of the six; a selector in its render that reads a derived label key
+    """ADR-1095: the `yadgar` Application is in the estate; a selector in its render that reads a derived label key
     holds a move of that label on an operator object's own metadata."""
     for name in pb.OPERATOR_APPLICATIONS:
         (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)

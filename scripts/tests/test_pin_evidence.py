@@ -976,6 +976,26 @@ def test_a_moved_yadgar_store_tag_is_red(monkeypatch) -> None:
     assert any("yadgar-store" in f for f in outcome.failures), outcome.failures
 
 
+def test_the_evidence_tree_holds_the_whole_estate(monkeypatch) -> None:
+    """ADR-1095: a platform move's E1 reads root and every Application it selects, with the directories they source,
+    so `evidence` hands `pin_bump.check` the merge checkout's whole tree, the `yadgar` file alone moved to the base
+    pin. A tree of the pin files only would make every platform move NEEDS-HUMAN ("`projects/root.yaml` is absent")."""
+    seen = {}
+
+    def check(tree: Path, target: str, net, helms) -> dict:
+        seen["files"] = {p.relative_to(tree).as_posix() for p in tree.rglob("*") if p.is_file()}
+        seen["yadgar"] = (tree / pb.APPLICATION).read_text()
+        return {}
+
+    monkeypatch.setattr(pb, "check", check)
+    pe.evidence(moved(), PIN, TARGET, HELMS, net=object())
+    wanted = {pb.ROOT_APPLICATION, *(p.relative_to(REPOSITORY).as_posix() for p in (REPOSITORY / "applications").glob("*.yaml"))}
+    wanted |= {p.relative_to(REPOSITORY).as_posix() for d in ("manifests", "verifier", "install") for p in (REPOSITORY / d).rglob("*") if p.is_file()}
+    assert sorted(wanted - seen["files"]) == []
+    assert not any(f.startswith(".git/") or f == ".git" for f in seen["files"])
+    assert seen["yadgar"] == moved(target=PIN)
+
+
 # ── the workflow ────────────────────────────────────────────────────────────
 
 WORKFLOW = yaml.safe_load((REPOSITORY / ".github" / "workflows" / "ci.yaml").read_text())

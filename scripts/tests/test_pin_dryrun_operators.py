@@ -16,20 +16,28 @@ WHAT IS ASSERTED, each with a red case:
      `OPERATOR_READS`, a rendered Secret, an object rendered twice.
   3. The shape: a container image of the same repository, a derived label
      (`helm.sh/chart`, `app.kubernetes.io/version`) whose key NO selector in
-     the six Applications reads (ADR-1093: own metadata counts, a webhook
-     `objectSelector` in another Application counts, the `yadgar` render
-     counts), or a CRD's `spec.versions` (E1 judges its schema allowlist).
+     any Application of the estate reads (ADR-1095: own metadata counts, a
+     webhook `objectSelector` in another Application counts, the `yadgar`
+     render counts, every live selector object in every namespace counts),
+     or a CRD's `spec.versions` (E1 judges its schema allowlist).
   4. Settledness, the baseline and ownership, per operator Application.
   5. The two omitempty zero values measured on platform 0.2.17 match an
      absent live field, and nothing wider: `automountServiceAccountToken:
      false` still differs.
   6. The read table is read by the verifier's ClusterRole.
+  7. ADR-1095: every `SELECTOR_READS` kind is read across all namespaces on a
+     platform move only; a live selector in a non-operator Application, or in
+     an object no Application tracks, that reads a moved derived key is red;
+     a kind the verifier cannot list refuses; a CRD-backed kind is read only
+     when its CRD is served; `status` and `managedFields` are no selector;
+     every selector kind is granted to the verifier's ClusterRole.
 """
 
 from __future__ import annotations
 
 import copy
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -50,7 +58,7 @@ from test_pin_dryrun import (  # noqa: E402,F401  (`repo` and `platform_repo` ar
     OPERATORS,
     PLATFORM,
     TARGET,
-    Kubectl,
+    Kubectl as BaseKubectl,
     NoCluster,
     Render,
     live_objects,
@@ -64,6 +72,28 @@ from test_pin_dryrun import (  # noqa: E402,F401  (`repo` and `platform_repo` ar
 
 KEDA_OLD, KEDA_NEW = "2.20.1", "2.20.2"
 CHART, VERSION = "helm.sh/chart", "app.kubernetes.io/version"
+
+
+class Kubectl(BaseKubectl):
+    """The fake kubectl, plus ADR-1095's cluster-wide reads: `get <resource> -A` answers every item the fake holds
+    under `<resource>` or `<resource> -n <namespace>`, unless the test set that key itself, or names the resource in
+    `forbidden` (the API server's Forbidden)."""
+
+    def __init__(self, live: dict | None = None, *, forbidden: tuple[str, ...] = ()) -> None:
+        super().__init__(live)
+        self.forbidden = forbidden
+
+    def __call__(self, cmd, capture_output, text, check):
+        args = cmd[3:]
+        if len(args) == 5 and args[2] == "-A":
+            resource = args[1]
+            if resource in self.forbidden:
+                self.calls.append(list(cmd))
+                return subprocess.CompletedProcess(cmd, 1, "", f'Error from server (Forbidden): {resource} is forbidden')
+            if f"{resource} -A" not in self.live:
+                items = [i for key, value in self.live.items() if key == resource or key.startswith(f"{resource} -n ") for i in value.get("items") or []]
+                self.live = {**self.live, f"{resource} -A": {"items": items}}
+        return super().__call__(cmd, capture_output, text, check)
 
 
 # ── the injected operator render ────────────────────────────────────────────
@@ -211,7 +241,9 @@ def find_live(live: dict, key: str, name: str) -> dict:
 
 def run(repo: Path, sha: str, *, render: OperatorRender | None = None, kubectl=None) -> dict:
     render = render or OperatorRender()
-    cluster = verify_handover.Cluster(CONTEXT, runner=kubectl if kubectl is not None else Kubectl(operator_live(render)))
+    # The module `pin_dryrun` loads at run time: `test_verify_handover` re-executes `verify_handover` under the same
+    # name at collection, and a KubectlError of the other copy would escape the selector read's refusal.
+    cluster = pin_dryrun._load("verify_handover").Cluster(CONTEXT, runner=kubectl if kubectl is not None else Kubectl(operator_live(render)))
     return pin_dryrun.dry_run(
         repo, main_sha(repo), sha, cluster, render=Render(), platform_of=lambda target: NEW_PLATFORM, render_operator=render
     )
@@ -327,7 +359,7 @@ def webhook(key: str) -> dict:
 
 
 def test_an_own_label_a_webhook_in_another_application_reads_is_red(platform_repo: Path) -> None:
-    """ADR-1093 in E2: the keda Service's OWN `helm.sh/chart` label moves, and a webhook `objectSelector` in the
+    """ADR-1095 in E2: the keda Service's OWN `helm.sh/chart` label moves, and a webhook `objectSelector` in the
     cert-manager Application reads that key."""
     render = OperatorRender()
     for version in (PLATFORM, NEW_PLATFORM):
@@ -360,7 +392,7 @@ def test_a_pod_template_label_a_selector_reads_is_still_red(platform_repo: Path)
 
 
 def test_a_selector_in_the_yadgar_render_counts(platform_repo: Path) -> None:
-    """The `yadgar` Application is one of the six: its Service reads `helm.sh/chart` in this case."""
+    """The `yadgar` Application is in the estate: its Service reads `helm.sh/chart` in this case."""
     yadgar = Render()
     for documents in yadgar.versions.values():
         service = next(d for d in documents if d["kind"] == "Service")
@@ -595,3 +627,143 @@ def test_the_operator_read_table_names_no_secret_and_resources_match_their_group
 def test_the_result_holds_no_value(platform_repo: Path) -> None:
     result = run(platform_repo, platform_branch(platform_repo))
     assert KEDA_NEW not in json.dumps(result["objects"]) and "keda-2.20" not in json.dumps(result)
+
+
+# ── 7. ADR-1095: the live selectors of every Application, all namespaces ────
+
+
+def tracked_service(application_name: str, namespace: str, selector: dict, name: str = "reads-version") -> dict:
+    return {
+        "apiVersion": "v1", "kind": "Service",
+        "metadata": {
+            "name": name, "namespace": namespace,
+            "annotations": {pin_dryrun.TRACKING_ID: f"{application_name}:/Service:{namespace}/{name}"},
+        },
+        "spec": {"selector": selector, "ports": [{"port": 80}]},
+    }
+
+
+def with_live(*items: tuple[str, dict]) -> dict:
+    live = operator_live()
+    for key, item in items:
+        live.setdefault(key, {"items": []})["items"].append(item)
+    return live
+
+
+@pytest.mark.parametrize("application_name", ["tls", "estate-front"])
+def test_a_live_version_selector_in_a_non_operator_application_is_red(platform_repo: Path, application_name: str) -> None:
+    """A Service tracked by a non-operator Application selects on `app.kubernetes.io/version`; keda's moves."""
+    namespace = "yadgar" if application_name == "tls" else "estate-front"
+    live = with_live((f"services -n {namespace}", tracked_service(application_name, namespace, {VERSION: "x"})))
+    result = run(platform_repo, platform_branch(platform_repo), kubectl=Kubectl(live))
+    assert result["result"] == "red"
+    assert any("keda-operator" in p and f"labels.{VERSION}" in p and "inside a selector" in p for p in result["problems"]), result["problems"]
+    assert VERSION in result["selectors"]["live"][application_name]
+
+
+def test_an_untracked_live_selector_counts(platform_repo: Path) -> None:
+    """An object no Application tracks (kube-system's) is read too, under `untracked`: all namespaces, no filter."""
+    item = tracked_service("x", "kube-system", {}, name="dns")
+    del item["metadata"]["annotations"]
+    item["spec"]["selector"] = {"matchExpressions": [{"key": CHART, "operator": "Exists"}]}
+    item["kind"] = "NetworkPolicy"
+    item["spec"] = {"podSelector": item["spec"]["selector"]}
+    result = run(platform_repo, platform_branch(platform_repo), kubectl=Kubectl(with_live(("networkpolicies.networking.k8s.io -n kube-system", item))))
+    assert result["result"] == "red"
+    assert CHART in result["selectors"]["live"]["untracked"]
+    assert any(f"labels.{CHART}" in p and "inside a selector" in p for p in result["problems"]), result["problems"]
+
+
+def test_a_live_selector_with_no_derived_key_stays_green(platform_repo: Path) -> None:
+    live = with_live(("services -n yadgar", tracked_service("tls", "yadgar", {"app": "x"})))
+    result = run(platform_repo, platform_branch(platform_repo), kubectl=Kubectl(live))
+    assert result["result"] == "green", result["problems"]
+    assert result["selectors"]["live"]["tls"] == ["app"]
+
+
+@pytest.mark.parametrize("resource", sorted({r for r in pin_dryrun.SELECTOR_READS.values()}))
+def test_a_selector_kind_the_verifier_cannot_list_is_refused(platform_repo: Path, resource: str) -> None:
+    """Forbidden on any selector kind refuses the run, naming the kind and the grant; it never passes."""
+    result = run(platform_repo, platform_branch(platform_repo), kubectl=Kubectl(operator_live(), forbidden=(resource,)))
+    assert result["result"] == "refused"
+    assert any(resource in p and "across all namespaces" in p and "grant" in p for p in result["problems"]), result["problems"]
+
+
+def test_every_selector_kind_is_read_across_all_namespaces(platform_repo: Path) -> None:
+    kubectl = Kubectl(operator_live())
+    run(platform_repo, platform_branch(platform_repo), kubectl=kubectl)
+    read = {c[4] for c in kubectl.calls if c[5:6] == ["-A"]}
+    assert read == set(pin_dryrun.SELECTOR_READS.values())
+
+
+def test_a_monitor_kind_whose_crd_is_absent_is_not_read(platform_repo: Path) -> None:
+    """No ServiceMonitor CRD on the cluster (kind-yadgar, 2026-10-31): no instance can exist, so nothing to read."""
+    kubectl = Kubectl(operator_live())
+    result = run(platform_repo, platform_branch(platform_repo), kubectl=kubectl)
+    assert result["result"] == "green", result["problems"]
+    assert not {a for c in kubectl.calls for a in c} & set(pin_dryrun.SELECTOR_CRD_READS.values())
+    assert result["selectors"]["absent"] == sorted(pin_dryrun.SELECTOR_CRD_READS.values())
+
+
+def crd_named(name: str) -> dict:
+    return {"apiVersion": "apiextensions.k8s.io/v1", "kind": "CustomResourceDefinition", "metadata": {"name": name}, "spec": {}}
+
+
+def test_a_monitor_kind_whose_crd_is_served_is_read(platform_repo: Path) -> None:
+    live = operator_live()
+    live["customresourcedefinitions.apiextensions.k8s.io"]["items"].append(crd_named("servicemonitors.monitoring.coreos.com"))
+    monitor = {
+        "apiVersion": "monitoring.coreos.com/v1", "kind": "ServiceMonitor",
+        "metadata": {"name": "m", "namespace": "observability"},
+        "spec": {"selector": {"matchLabels": {VERSION: "x"}}},
+    }
+    live["servicemonitors.monitoring.coreos.com -A"] = {"items": [monitor]}
+    result = run(platform_repo, platform_branch(platform_repo), kubectl=Kubectl(live))
+    assert result["result"] == "red"
+    assert VERSION in result["selectors"]["live"]["untracked"]
+
+
+def test_a_monitor_kind_whose_crd_is_served_but_unreadable_is_refused(platform_repo: Path) -> None:
+    live = operator_live()
+    live["customresourcedefinitions.apiextensions.k8s.io"]["items"].append(crd_named("podmonitors.monitoring.coreos.com"))
+    result = run(platform_repo, platform_branch(platform_repo), kubectl=Kubectl(live, forbidden=("podmonitors.monitoring.coreos.com",)))
+    assert result["result"] == "refused"
+    assert any(p.startswith("selectors: cannot list podmonitors.monitoring.coreos.com ") and "grant" in p for p in result["problems"]), result["problems"]
+
+
+def test_status_and_managed_fields_are_not_selectors(platform_repo: Path) -> None:
+    """Only what the object declares selects: its `status` and `metadata.managedFields` are not read."""
+    item = tracked_service("tls", "yadgar", {"app": "x"})
+    item["status"] = {"selector": {VERSION: "x"}}
+    item["metadata"]["managedFields"] = [{"manager": "m", "fieldsV1": {"podSelector": {VERSION: "x"}}}]
+    result = run(platform_repo, platform_branch(platform_repo), kubectl=Kubectl(with_live(("services -n yadgar", item))))
+    assert result["result"] == "green", result["problems"]
+
+
+def test_an_ordinary_pin_reads_nothing_cluster_wide(repo: Path) -> None:
+    """The cluster-wide reads belong to a platform move; an image-only pin's dry run never makes them."""
+    from test_pin_dryrun import pin_branch, run as plain_run
+
+    kubectl = Kubectl()
+    result = plain_run(repo, pin_branch(repo), kubectl=kubectl)
+    assert result["result"] == "green", result["problems"]
+    assert not any("-A" in c for c in kubectl.calls)
+    assert "selectors" not in result
+
+
+def test_every_selector_read_is_granted_to_the_verifier() -> None:
+    """Each kind ADR-1095's live read lists is granted (get, list) to the verifier's ClusterRole, so a platform move is
+    judged rather than refused; none is a Secret."""
+    role = yaml.safe_load((SCRIPTS.parent / "verifier" / "manifests" / "clusterrole.yaml").read_text())
+    granted = {
+        (group, resource)
+        for rule in role["rules"]
+        if {"get", "list"} <= set(rule["verbs"])
+        for group in rule["apiGroups"]
+        for resource in rule["resources"]
+    }
+    reads = {**pin_dryrun.SELECTOR_READS, **pin_dryrun.SELECTOR_CRD_READS}
+    wanted = {(group, resource.split(".", 1)[0]) for (group, _kind), resource in reads.items()}
+    assert sorted(wanted - granted) == []
+    for (group, kind), resource in reads.items():
+        assert kind != "Secret" and resource == resource.split(".", 1)[0] + (f".{group}" if group else "")

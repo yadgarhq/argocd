@@ -387,16 +387,16 @@ def unacknowledged(target: str, reasons: list[str], acks: dict[str, dict], base_
 def evidence(head_text: str, pin: str, target: str, helms: dict[str, str], net=None, repo: Path | None = None) -> dict:
     """E1, E3 and E4 by `pin_bump.check`: both pins rendered with the HEAD `valuesObject`.
 
-    The five operator Applications come from the merge checkout `repo` as they are: a platform move renders each
-    at both platform versions with its HEAD values (car C10), whatever its own `targetRevision` reads.
+    The tree is the merge checkout `repo` as it is, less `.git`, with `applications/yadgar.yaml` alone moved to the
+    base pin. A platform move renders each operator Application at both platform versions with its HEAD values (car
+    C10), whatever its own `targetRevision` reads, and reads selectors from root and every Application it selects,
+    with the directories they source (ADR-1095).
     """
     repo = repo or pb.REPOSITORY
     with tempfile.TemporaryDirectory() as scratch:
-        tree = Path(scratch)
-        (tree / "applications").mkdir()
+        tree = Path(scratch) / "tree"
+        shutil.copytree(repo, tree, ignore=shutil.ignore_patterns(".git"), symlinks=True)
         (tree / pb.APPLICATION).write_text(pb.rewrite_target_revision(head_text, pin)[0])
-        for path in pb.OPERATOR_APPLICATIONS:
-            shutil.copyfile(repo / path, tree / path)
         return pb.check(tree, target, net or pb.Net(), helms)
 
 

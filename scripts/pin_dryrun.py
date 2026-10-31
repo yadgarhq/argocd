@@ -108,9 +108,12 @@ WHAT `run` DOES, in order. Every refusal comes before any cluster read.
      in the PLATFORM-MOVE SHAPE: a container image of a workload whose
      repository does not move; a derived label (`helm.sh/chart`,
      `app.kubernetes.io/version`) on the object's own or its pod template's
-     labels whose key no selector in the six Applications reads (the five
-     operator renders at both pins and the `yadgar` render, ADR-1093); or a
-     CRD's `spec.versions`. The object set and every hook status stay the same.
+     labels whose key no selector in any Application of the estate reads
+     (ADR-1095: the five operator renders at both pins, the `yadgar` render,
+     and every live object of `SELECTOR_READS` in every namespace, tracked by
+     any Application or by none; a CRD-backed kind of `SELECTOR_CRD_READS` is
+     read when its CRD is served); or a CRD's `spec.versions`. A selector kind
+     the verifier cannot list refuses the run, naming the grant it needs. The object set and every hook status stay the same.
      THE SHAPE IS NOT E1. The values (a tag at its subchart's `appVersion`, a
      digest at the registry's, a CRD version change inside the allowlist) are
      judged by E1, `pin_bump.classify_platform`, on two helms, in the required
@@ -149,7 +152,9 @@ THE RESULT holds object keys and field paths, never a value: `sha`,
 `not_run`, `problems`, `baseline`, `objects` (the head diff), `hooks_left_out`,
 `compared`, `admission`. On a platform move, `objects`, `baseline`,
 `hooks_left_out` and `compared` carry the operator Applications' too, each
-operator head diff entry naming its `application`. `pin-dryrun.yaml` uploads it
+operator head diff entry naming its `application`, and `selectors` holds the
+live selector keys per tracking Application (`untracked` for none) and the
+CRD-backed selector kinds not served (keys only, never a value). `pin-dryrun.yaml` uploads it
 as artifact `pin-dryrun` (`result.json`).
 
 `find` is the reader, and the evidence is only as good as its filters.
@@ -334,6 +339,36 @@ OPERATOR_READS: dict[tuple[str, str], tuple[str, bool]] = {
     ("rbac.authorization.k8s.io", "RoleBinding"): ("rolebindings.rbac.authorization.k8s.io", True),
 }
 OPERATOR_WORKLOAD_KINDS = frozenset({"Deployment", "StatefulSet", "DaemonSet", "Job"})
+# THE SELECTOR READS (ADR-1095): on a platform move, every object of these kinds
+# in every namespace, read-only, `get <resource> -A`, so a selector in ANY
+# Application (or none: kube-system's count too) is in the set. The kinds that
+# carry a label selector or a pod template (topologySpread, affinity), and the
+# admission objects with an `objectSelector`. Each is granted to the verifier's
+# ClusterRole (`verifier/manifests/clusterrole.yaml`, held by
+# `scripts/tests/test_pin_dryrun_operators.py`); a Forbidden read refuses the
+# run, never passes it. No Secret, ever.
+SELECTOR_READS: dict[tuple[str, str], str] = {
+    ("", "Pod"): "pods",
+    ("", "Service"): "services",
+    ("admissionregistration.k8s.io", "MutatingWebhookConfiguration"): "mutatingwebhookconfigurations.admissionregistration.k8s.io",
+    ("admissionregistration.k8s.io", "ValidatingAdmissionPolicy"): "validatingadmissionpolicies.admissionregistration.k8s.io",
+    ("admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding"): "validatingadmissionpolicybindings.admissionregistration.k8s.io",
+    ("admissionregistration.k8s.io", "ValidatingWebhookConfiguration"): "validatingwebhookconfigurations.admissionregistration.k8s.io",
+    ("apps", "DaemonSet"): "daemonsets.apps",
+    ("apps", "Deployment"): "deployments.apps",
+    ("apps", "ReplicaSet"): "replicasets.apps",
+    ("apps", "StatefulSet"): "statefulsets.apps",
+    ("batch", "CronJob"): "cronjobs.batch",
+    ("batch", "Job"): "jobs.batch",
+    ("networking.k8s.io", "NetworkPolicy"): "networkpolicies.networking.k8s.io",
+    ("policy", "PodDisruptionBudget"): "poddisruptionbudgets.policy",
+}
+# CRD-backed selector kinds: read when their CRD is served, else no instance can
+# exist. kind-yadgar serves neither on 2026-10-31 (no prometheus-operator CRDs).
+SELECTOR_CRD_READS: dict[tuple[str, str], str] = {
+    ("monitoring.coreos.com", "PodMonitor"): "podmonitors.monitoring.coreos.com",
+    ("monitoring.coreos.com", "ServiceMonitor"): "servicemonitors.monitoring.coreos.com",
+}
 CRD_KIND = "CustomResourceDefinition"
 ADMISSION = {
     "mutating": "mutatingwebhookconfigurations.admissionregistration.k8s.io",
@@ -995,6 +1030,35 @@ def operator_owner_problem(name: str, operator: dict, application: dict, key: st
     return None
 
 
+def live_selectors(cluster) -> tuple[dict[str, set[str]], list[str], list[str]]:
+    """`({Application or "untracked": selector keys}, refusals, absent CRD-backed kinds)`, every namespace (ADR-1095).
+
+    An object is keyed by the Application its tracking-id names. Its `status` and `metadata.managedFields` are no
+    selector and are not read. A kind the verifier cannot list is a refusal naming the grant it needs.
+    """
+    verify_handover = _load("verify_handover")
+    render_selector_keys = _load("pin_bump").render_selector_keys
+    served = {(i.get("metadata") or {}).get("name") for i in cluster.json("get", OPERATOR_READS[("apiextensions.k8s.io", CRD_KIND)][0]).get("items") or []}
+    keys: dict[str, set[str]] = {}
+    refusals: list[str] = []
+    absent = sorted(resource for resource in SELECTOR_CRD_READS.values() if resource not in served)
+    for resource in sorted({*SELECTOR_READS.values(), *SELECTOR_CRD_READS.values()} - set(absent)):
+        try:
+            items = cluster.json("get", resource, "-A").get("items") or []
+        except verify_handover.KubectlError as error:
+            refusals.append(
+                f"selectors: cannot list {resource} across all namespaces ({error}); grant get and list on it to the "
+                f"verifier's ClusterRole, ADR-1095 leaves no selector out"
+            )
+            continue
+        for item in items:
+            metadata = {k: v for k, v in (item.get("metadata") or {}).items() if k != "managedFields"}
+            declared = {**{k: v for k, v in item.items() if k != "status"}, "metadata": metadata}
+            owner = str((metadata.get("annotations") or {}).get(TRACKING_ID) or "").split(":", 1)[0] or "untracked"
+            keys.setdefault(owner, set()).update(render_selector_keys([declared]))
+    return keys, refusals, absent
+
+
 def shape_problem(name: str, key: str, document: dict, path: str, before, after, selected: set[str]) -> str | None:
     """One changed path of an operator object against the platform-move shape (step 9). None when inside it."""
     pin_bump = _load("pin_bump")
@@ -1136,8 +1200,11 @@ def dry_run(
         live = live_objects(cluster, {**base_steady, **head_steady})
         operator_applications, operators_live = operator_live(cluster, operators) if operators else ({}, {})
         seen_admission = admission(cluster)
+        estate, refusals, absent = live_selectors(cluster) if operators else ({}, [], [])
     except (verify_handover.KubectlError, verify_handover.UsageError, ValueError) as error:
         raise InfrastructureError(f"a cluster read failed: {error}") from error
+    if refusals:
+        return {**result, "problems": refusals}
 
     problems += settled_problems(application, pin)
     baseline: list[str] = []
@@ -1163,11 +1230,14 @@ def dry_run(
             if kind not in WORKLOAD_KINDS or not IMAGE_PATH.fullmatch(path)
         ]
     compared = len(base_steady)
+    selectors = {}
     if operators:
-        # ADR-1093: one selector set over the six Applications, both pins.
+        # ADR-1095: one selector set, the renders at both pins and every live object of every Application.
         selected = _load("pin_bump").render_selector_keys(
             [*base_documents, *head_documents, *(d for o in operators.values() for side in ("base", "head") for d in o[side].values())]
         )
+        selected |= {key for found in estate.values() for key in found}
+        selectors = {"selectors": {"live": {name: sorted(found) for name, found in sorted(estate.items())}, "absent": absent}}
         found, found_baseline, found_objects, found_compared, found_hooks = operator_judgment(
             operators, operator_applications, operators_live, platform, selected
         )
@@ -1186,6 +1256,7 @@ def dry_run(
         "hooks_left_out": hooks,
         "compared": compared,
         "admission": seen_admission,
+        **selectors,
     }
 
 
