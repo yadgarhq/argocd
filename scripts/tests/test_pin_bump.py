@@ -24,8 +24,8 @@ One constructed case per arm:
   `required`) and a path-qualified const are followed; a new call site whose
   key cannot be resolved (`format!`) and a moved `yadgar-*` crate pin are
   NEEDS-HUMAN; a DaemonSet, an initContainer and a swap inside the registry are
-  NEEDS-HUMAN; migrations carry the ADR-0948 R5 interim text, and a platform move
-  is left to the operator evidence (car C10, `test_pin_platform.py`);
+  NEEDS-HUMAN; a platform move is left to the operator evidence (car C10,
+  `test_pin_platform.py`);
 - E3 fail-closed tripwires (re-review at aad2e9d): a new shared-crate env entry
   point, every unknown reader shape (use-as, bare use, module alias, dotenvy,
   vars scan, generic and boxed `Fn(&str)`, clap `env =`), a new key through a fn
@@ -41,16 +41,34 @@ One constructed case per arm:
   block, a real `std::env::var` / `env::var` read beside it, and a new key
   through a closure value that escapes (passed to a fn, returned) stay
   NEEDS-HUMAN;
-- E4: a moved `yadgar-store` pin on a -db module, a schema change outside the
-  blocks and an `include_str!` are NEEDS-HUMAN;
-- E4: an added migration version is NEEDS-HUMAN; an unchanged schema is green;
+- E4: a moved `yadgar-store` pin on a -db module (beside an admitted
+  migration too), a schema change outside the blocks and an `include_str!` are
+  NEEDS-HUMAN;
+- E4 (car C10 part 3, ADR-1099; the classes are `test_migration_classifier.py`):
+  an added migration the classifier admits is green and recorded with its
+  sha256 and as forward-only; one it does not admit (an UPDATE, a non-literal
+  `sql:`, two statements, a seed INSERT while the allowlist is empty) is
+  NEEDS-HUMAN by version; the added fn with its doc lines and its list entry
+  (one per line or appended as `, x()]`), and a new child file of migration fns
+  with its `mod` line, leave no residual diff, while any other change beside
+  them (an old block, a const, a renamed fn, a dropped or doubled entry, a fn
+  body beyond the literal, an attribute, a helper in the child file, a bare
+  `mod` line) is NEEDS-HUMAN; an unchanged schema is green; a whitespace-only
+  edit inside an old migration's literal (the store checksums exact bytes) and
+  an added version at or below the old maximum (`pending_after`) are
+  NEEDS-HUMAN; a Migration literal other than exactly `version: <int>`,
+  `name: <literal>`, `sql: <literal>` (a cfg attribute, `..base`, another
+  field, a block expression) is NEEDS-HUMAN, and a name is sanitised;
 - the body carries the template's five headings and one Conventional Commits
-  bullet, a rollback with `argocd app terminate-op`, and no MIGRATION_NOTES.
+  bullet, a rollback with `argocd app terminate-op`, and no MIGRATION_NOTES; a
+  pin that crossed a migration names it as forward-only (DatabaseAhead) with
+  each admitted migration's sha256.
 """
 
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 import re
 import shutil
@@ -784,9 +802,18 @@ def test_a_key_rendered_on_one_container_only_is_needs_human() -> None:
 # ── E4: the migration diff ──────────────────────────────────────────────────
 
 
+def with_audit_sql(sql: str) -> dict:
+    """e4-new with migration 7's `sql:` expression replaced by `sql` (Rust source text)."""
+    new = tree("e4-new")
+    new["src/schema.rs"] = new["src/schema.rs"].replace('"CREATE TABLE audit (id BIGINT PRIMARY KEY)".into()', sql)
+    assert sql in new["src/schema.rs"]
+    return new
+
+
 def test_an_added_migration_version_is_needs_human() -> None:
-    reasons = pb.migration_audit("iam-db", tree("e4-old"), tree("e4-new"))
-    assert reasons and any("iam-db" in r and "7" in r for r in reasons), reasons
+    """Rewritten for car C10 part 3: an added migration outside the ADR-1099 classes stays NEEDS-HUMAN, by version."""
+    reasons = pb.migration_audit("iam-db", tree("e4-old"), with_audit_sql('"UPDATE user SET id = 1".into()'))
+    assert reasons == ["iam-db: migration 7 (create_audit) not admitted: UPDATE is not an admitted statement (ADR-1099 classes A-D)"], reasons
 
 
 def test_an_unchanged_schema_is_green() -> None:
@@ -800,14 +827,321 @@ def test_a_changed_migration_is_needs_human() -> None:
     assert reasons and any("2" in r and "changed" in r for r in reasons), reasons
 
 
+def test_a_whitespace_only_edit_inside_an_old_migrations_sql_is_needs_human() -> None:
+    """The store checksums the exact bytes of `sql` (`Migration::checksum`), so a whitespace edit inside an old
+    migration's literal fails boot with ChecksumMismatch; whitespace-collapsed text would call it unchanged."""
+    new = tree("e4-old")
+    new["src/schema/policy.rs"] = new["src/schema/policy.rs"].replace("(name VARCHAR(64) PRIMARY KEY)", "(name  VARCHAR(64) PRIMARY KEY)")
+    assert new["src/schema/policy.rs"] != tree("e4-old")["src/schema/policy.rs"]
+    reasons = pb.migration_audit("iam-db", tree("e4-old"), new)
+    assert "iam-db: migration 2 changed" in reasons, reasons
+
+
+def test_a_whitespace_edit_outside_an_old_literal_is_not_a_changed_migration() -> None:
+    new = tree("e4-old")
+    new["src/schema/policy.rs"] = new["src/schema/policy.rs"].replace("        version: 2,", "        version:   2,")
+    assert pb.migration_audit("iam-db", tree("e4-old"), new) == []
+
+
+def test_a_changed_non_literal_old_migration_is_compared_as_text() -> None:
+    old, new = tree("e4-old"), tree("e4-old")
+    for source, column in ((old, "name"), (new, "label")):
+        source["src/schema/policy.rs"] = source["src/schema/policy.rs"].replace(
+            '"CREATE TABLE setting (name VARCHAR(64) PRIMARY KEY)".into()', f'format!("CREATE TABLE setting ({column} INT)")'
+        )
+    assert pb.migration_audit("iam-db", old, old) == []
+    assert "iam-db: migration 2 changed" in pb.migration_audit("iam-db", old, new)
+
+
+def test_an_added_version_at_or_below_the_old_maximum_is_needs_human() -> None:
+    """yadgar-store runs only `pending_after(applied)`, versions above the applied high-water mark, so an added
+    version at or below the old maximum never runs on an existing database."""
+    old = tree("e4-new")
+    new = tree("e4-new")
+    new["src/schema.rs"] = new["src/schema.rs"].replace("vec![user(), policy::setting(), audit()]", "vec![user(), policy::setting(), audit(), early()]") + (
+        '\nfn early() -> Migration {\n    Migration {\n        version: 5,\n        name: "create_early".into(),\n'
+        '        sql: "CREATE TABLE early (id INT)".into(),\n    }\n}\n'
+    )
+    found = pb.migration_evidence("iam-db", old, new)
+    assert (
+        "iam-db: migration 5 sits at or below the applied high-water mark 7; the store never runs it on an existing database (pending_after)"
+        in found["reasons"]
+    ), found["reasons"]
+    assert found["status"] == "red"
+    # Above the maximum it stays admitted: the same fn at version 8 is green.
+    new["src/schema.rs"] = new["src/schema.rs"].replace("version: 5,", "version: 8,")
+    assert pb.migration_audit("iam-db", old, new) == []
+
+
 def test_the_migration_versions_read_both_files_and_skip_tests() -> None:
     assert set(pb.migration_blocks(tree("e4-new"))) == {1, 2, 7}
 
 
 
-def test_an_added_migration_is_an_interim_block() -> None:
-    reasons = pb.migration_audit("iam-db", tree("e4-old"), tree("e4-new"))
-    assert any(R5 in r for r in reasons), reasons
+def test_an_added_migration_is_judged_by_the_classifier_not_an_interim_block() -> None:
+    """Rewritten from `test_an_added_migration_is_an_interim_block`: car C10 part 3 (ADR-1099) lifts the ADR-0948 R5
+    interim block. A CREATE TABLE added in its own fn and list entry is admitted; no reason carries the interim text."""
+    found = pb.migration_evidence("iam-db", tree("e4-old"), tree("e4-new"))
+    assert found["reasons"] == [] and found["status"] == "green", found["reasons"]
+    assert not any(R5 in r for r in found["reasons"])
+
+
+def test_an_admitted_migration_is_green_and_recorded_with_its_checksum() -> None:
+    found = pb.migration_evidence("iam-db", tree("e4-old"), tree("e4-new"))
+    checksum = hashlib.sha256(b"CREATE TABLE audit (id BIGINT PRIMARY KEY)").hexdigest()
+    assert found["admitted"] == [{"version": 7, "name": "create_audit", "checksum": checksum, "statement_class": "A"}]
+    assert found["forward_only"] == [7]
+
+
+def test_an_unchanged_schema_records_no_admitted_and_no_forward_only_migration() -> None:
+    found = pb.migration_evidence("iam-db", tree("e4-old"), tree("e4-old"))
+    assert found == {"status": "green", "reasons": [], "admitted": [], "forward_only": []}
+
+
+def test_a_non_literal_added_migration_is_needs_human_and_still_forward_only() -> None:
+    found = pb.migration_evidence("iam-db", tree("e4-old"), with_audit_sql('format!("CREATE TABLE {T} (id INT)")'))
+    assert found["status"] == "red" and found["admitted"] == [] and found["forward_only"] == [7]
+    assert any(r.startswith("iam-db: migration 7 (create_audit) not admitted: non-literal sql") for r in found["reasons"]), found
+
+
+def test_a_multi_statement_added_migration_is_needs_human() -> None:
+    new = with_audit_sql('"CREATE TABLE audit (id INT);\n INSERT IGNORE INTO audit (id) VALUES (1)".into()')
+    reasons = pb.migration_audit("iam-db", tree("e4-old"), new)
+    assert reasons == ["iam-db: migration 7 (create_audit) not admitted: multi-statement migration; ruled red (ADR-1099)"], reasons
+
+
+def test_an_insert_seed_is_needs_human_while_the_allowlist_is_empty() -> None:
+    """PR A reads no allowlist file: `SEED_ALLOWLIST` is empty, so class D (a literal INSERT) is always red."""
+    assert pb.SEED_ALLOWLIST == ()
+    reasons = pb.migration_audit("iam-db", tree("e4-old"), with_audit_sql('"INSERT INTO user (id) VALUES (1)".into()'))
+    assert len(reasons) == 1 and "not on the seed allowlist" in reasons[0], reasons
+
+
+AUDIT_LITERAL = """    Migration {
+        version: 7,
+        name: "create_audit".into(),
+        sql: "CREATE TABLE audit (id BIGINT PRIMARY KEY)".into(),
+    }"""
+
+
+def with_audit_literal(literal: str) -> dict:
+    """e4-new with migration 7's whole struct literal replaced by `literal` (Rust source text)."""
+    new = tree("e4-new")
+    assert AUDIT_LITERAL in new["src/schema.rs"]
+    new["src/schema.rs"] = new["src/schema.rs"].replace(AUDIT_LITERAL, literal)
+    return new
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        pytest.param(
+            '    Migration {\n        version: 7,\n        name: "create_audit".into(),\n'
+            '        #[cfg(test)]\n        sql: "CREATE TABLE audit (id INT)".into(),\n'
+            '        #[cfg(not(test))]\n        sql: "DROP TABLE user".into(),\n    }',
+            id="cfg-sql-twice",
+        ),
+        pytest.param(
+            '    Migration {\n        version: 7,\n        name: "create_audit".into(),\n'
+            '        sql: "DROP TABLE user".into(),\n        sql: "CREATE TABLE audit (id INT)".into(),\n    }',
+            id="sql-twice",
+        ),
+        pytest.param(
+            '    Migration {\n        #[cfg(test)]\n        version: 7,\n        #[cfg(not(test))]\n        version: 8,\n'
+            '        name: "create_audit".into(),\n        sql: "CREATE TABLE audit (id INT)".into(),\n    }',
+            id="cfg-version-twice",
+        ),
+        pytest.param(
+            '    Migration {\n        version: 7,\n        name: { side_effect(); "create_audit" }.into(),\n'
+            '        sql: "CREATE TABLE audit (id INT)".into(),\n    }',
+            id="name-block-expression",
+        ),
+        pytest.param(
+            '    Migration {\n        version: 7,\n        sql: "CREATE TABLE audit (id INT)".into(),\n        ..base()\n    }',
+            id="struct-update",
+        ),
+        pytest.param(
+            '    Migration {\n        version: 7,\n        name: "create_audit".into(),\n'
+            '        sql: "CREATE TABLE audit (id INT)".into(),\n        extra: 1,\n    }',
+            id="other-field",
+        ),
+        pytest.param(
+            '    Migration {\n        version: SEVEN + 7,\n        name: "create_audit".into(),\n'
+            '        sql: "CREATE TABLE audit (id INT)".into(),\n    }',
+            id="version-expression",
+        ),
+        pytest.param(
+            '    Migration {\n        version: g(version: 7,),\n        name: "create_audit".into(),\n'
+            '        sql: "CREATE TABLE audit (id INT)".into(),\n    }',
+            id="version-digits-only-inside-an-expression",
+        ),
+        pytest.param(
+            '    Migration {\n        version: 7,\n        sql: "CREATE TABLE audit (id INT)".into(),\n    }',
+            id="no-name",
+        ),
+    ],
+)
+def test_a_migration_literal_other_than_exactly_version_name_sql_is_red(literal: str) -> None:
+    """Security review of argocd#214: the struct literal has a positive grammar too. Exactly `version: <int>`,
+    `name: <string literal>` and `sql: <string literal>`, each once; an attribute, `..`, another field or an
+    expression is red, whatever `sql:` the first match would have read."""
+    found = pb.migration_evidence("iam-db", tree("e4-old"), with_audit_literal(literal))
+    assert found["status"] == "red" and found["admitted"] == [], found
+    # `version: SEVEN + 7` is no migration site at all, so its fn is a residual change instead; red either way.
+    wanted = ("not exactly the fields version, name and sql", "changed outside the added migration(s)")
+    assert any(w in r for r in found["reasons"] for w in wanted), found["reasons"]
+
+
+def test_a_comment_inside_the_migration_literal_is_still_green() -> None:
+    literal = AUDIT_LITERAL.replace("        sql:", "        // Why, as iam-db writes it.\n        sql:").replace(
+        ".into(),\n    }", ".into(), // trailing\n    }"
+    )
+    assert pb.migration_audit("iam-db", tree("e4-old"), with_audit_literal(literal)) == []
+
+
+def test_a_raw_string_sql_inside_the_migration_literal_is_green() -> None:
+    literal = AUDIT_LITERAL.replace('"CREATE TABLE audit (id BIGINT PRIMARY KEY)".into()', 'r#"CREATE TABLE audit (id BIGINT PRIMARY KEY)"#.into()')
+    found = pb.migration_evidence("iam-db", tree("e4-old"), with_audit_literal(literal))
+    assert found["reasons"] == [] and found["admitted"][0]["checksum"] == hashlib.sha256(b"CREATE TABLE audit (id BIGINT PRIMARY KEY)").hexdigest()
+
+
+def test_the_migration_name_is_sanitised_in_reasons_and_the_record() -> None:
+    bad = with_audit_literal(AUDIT_LITERAL.replace('"create_audit"', '"a\\nb`c"').replace("CREATE TABLE audit (id BIGINT PRIMARY KEY)", "DROP TABLE x"))
+    reasons = pb.migration_audit("iam-db", tree("e4-old"), bad)
+    assert reasons and reasons[0].startswith("iam-db: migration 7 (a b\\`c) not admitted"), reasons
+    good = with_audit_literal(AUDIT_LITERAL.replace('"create_audit"', '"a\\nb`c"'))
+    assert pb.migration_evidence("iam-db", tree("e4-old"), good)["admitted"][0]["name"] == "a b\\`c"
+
+
+DOCUMENTED_FN = """
+/// Why the table exists, as every real -db module writes it.
+/// A second doc line.
+// and a plain comment
+fn audit() -> Migration {
+    Migration {
+        version: 7,
+        name: "create_audit".into(),
+        // A comment inside the literal stays with it.
+        sql: "CREATE TABLE audit (
+                  id BIGINT PRIMARY KEY
+              ) ENGINE=InnoDB"
+            .into(),
+    }
+}
+"""
+
+
+def multi_line(source: dict, entries: list[str], tail: str = "") -> dict:
+    """`source` with its list rewritten one entry per line, with trailing commas, as the real modules write it."""
+    text = source["src/schema.rs"]
+    start = text.index("vec![")
+    stop = text.index("]", start) + 1
+    body = "".join(f"        {e},\n" for e in entries)
+    return {**source, "src/schema.rs": text[:start] + "vec![\n" + body + "    ]" + text[stop:] + tail}
+
+
+def test_an_added_migration_leaves_no_residual_file_diff() -> None:
+    """The fn (with its `///` and `//` lines) and its list entry are removed; the rest is the old file, so no reason."""
+    old = multi_line(tree("e4-old"), ["user()", "policy::setting()"])
+    new = multi_line(tree("e4-old"), ["user()", "policy::setting()", "audit()"], DOCUMENTED_FN)
+    found = pb.migration_evidence("iam-db", old, new)
+    assert found["reasons"] == [] and [m["version"] for m in found["admitted"]] == [7], found
+    # Also with the e4-new shape: the entry appended without a trailing comma, `, audit()]`.
+    assert pb.migration_audit("iam-db", tree("e4-old"), tree("e4-new")) == []
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        pytest.param(lambda t: t.replace("CREATE TABLE user (id BIGINT PRIMARY KEY)", "CREATE TABLE user (id INT)"), id="old-block"),
+        pytest.param(lambda t: t + "\nconst EXTRA: &str = \"x\";\n", id="new-const"),
+        pytest.param(lambda t: t.replace("pub fn migrations()", "pub fn migrations_renamed()"), id="renamed-fn"),
+        pytest.param(lambda t: t.replace("vec![user(), policy::setting(), audit()]", "vec![user(), audit()]"), id="dropped-entry"),
+        pytest.param(lambda t: t.replace("audit()]", "audit(), audit()]"), id="listed-twice"),
+        pytest.param(
+            lambda t: t.replace("fn audit() -> Migration {\n    Migration {", "fn audit() -> Migration {\n    let _x = 1;\n    Migration {"),
+            id="fn-body-is-not-only-the-literal",
+        ),
+        pytest.param(lambda t: t.replace("fn audit() -> Migration {", "#[cfg(feature = \"x\")]\nfn audit() -> Migration {"), id="attribute"),
+    ],
+)
+def test_a_residual_change_beside_an_added_migration_is_red(edit) -> None:
+    """The schema file outside the added migration fns and their list entries must be the old one (ADR-1099)."""
+    new = tree("e4-new")
+    new["src/schema.rs"] = edit(new["src/schema.rs"])
+    reasons = pb.migration_audit("iam-db", tree("e4-old"), new)
+    assert "iam-db: schema source src/schema.rs changed outside the added migration(s)" in reasons, reasons
+
+
+TEAM_RS = """//! Migrations 7 and 8, for teams.
+
+use yadgar_store::migrate::Migration;
+
+pub(super) fn team() -> Migration {
+    Migration {
+        version: 7,
+        name: "create_team".into(),
+        sql: "CREATE TABLE team (id INT PRIMARY KEY)".into(),
+    }
+}
+
+/// Doc for the index.
+pub(super) fn team_index() -> Migration {
+    Migration {
+        version: 8,
+        name: "team_index".into(),
+        sql: "CREATE INDEX ix_team ON team (id)".into(),
+    }
+}
+"""
+
+
+def with_child(team_rs: str = TEAM_RS) -> dict:
+    new = tree("e4-old")
+    new["src/schema.rs"] = new["src/schema.rs"].replace(
+        "mod policy;\n", "mod policy;\n/// Migrations 7 and 8, for teams.\nmod team;\n"
+    ).replace("vec![user(), policy::setting()]", "vec![user(), policy::setting(), team::team(), team::team_index()]")
+    new["src/schema/team.rs"] = team_rs
+    return new
+
+
+def test_a_new_child_schema_file_with_only_migration_fns_is_green() -> None:
+    found = pb.migration_evidence("iam-db", tree("e4-old"), with_child())
+    assert found["reasons"] == [], found["reasons"]
+    assert [(m["version"], m["statement_class"]) for m in found["admitted"]] == [(7, "A"), (8, "B")]
+    assert found["forward_only"] == [7, 8]
+
+
+@pytest.mark.parametrize(
+    "team_rs",
+    [
+        pytest.param(TEAM_RS + "\nconst T: &str = \"team\";\n", id="const"),
+        pytest.param(TEAM_RS + "\npub fn helper() -> u8 {\n    1\n}\n", id="helper-fn"),
+    ],
+)
+def test_a_new_child_schema_file_with_more_than_migration_fns_is_red(team_rs: str) -> None:
+    reasons = pb.migration_audit("iam-db", tree("e4-old"), with_child(team_rs))
+    assert "iam-db: schema source src/schema/team.rs changed outside the added migration(s)" in reasons, reasons
+
+
+def test_a_mod_line_without_a_new_child_file_is_red() -> None:
+    new = tree("e4-new")
+    new["src/schema.rs"] = new["src/schema.rs"].replace("mod policy;\n", "mod policy;\nmod other;\n")
+    reasons = pb.migration_audit("iam-db", tree("e4-old"), new)
+    assert "iam-db: schema source src/schema.rs changed outside the added migration(s)" in reasons, reasons
+
+
+def test_a_moved_yadgar_store_tag_stays_red_after_c10() -> None:
+    """ADR-1092 / ADR-1099: even beside an admitted migration, a moved store tag is NEEDS-HUMAN, its reason unchanged
+    byte for byte (acknowledgements match reason strings)."""
+    old, new = with_cargo(tree("e4-old"), "v0.2.20", "v0.4.0"), with_cargo(tree("e4-new"), "v0.2.20", "v0.4.1")
+    found = pb.migration_evidence("iam-db", old, new)
+    store = [r for r in found["reasons"] if "yadgar-store" in r]
+    assert store == [
+        f"{r}; store's migrate.rs owns the ledger DDL; it stays NEEDS-HUMAN after car C10 (plan E4)"
+        for r in pb.crate_moves("iam-db", old, new, only="yadgar-store")
+    ] and store, found["reasons"]
+    assert found["status"] == "red" and [m["version"] for m in found["admitted"]] == [7]
 
 
 def test_a_moved_yadgar_store_tag_on_a_db_module_is_needs_human() -> None:
@@ -884,6 +1218,30 @@ def test_the_body_carries_the_commit_table_the_digest_and_the_rollback() -> None
     assert "abc1234" in body and DIGEST[("gateway", "0.12.11")] in body
     assert "argocd app terminate-op yadgar" in body
     assert "MIGRATION_NOTES" not in body
+
+
+def test_the_body_names_forward_only_for_a_crossed_migration() -> None:
+    """ADR-1099: an admitted migration is recorded with its checksum, and the rollback says a revert is not clean."""
+    crossed = evidence()
+    checksum = "ab" * 32
+    crossed["migrations"] = {
+        "iam-db": {
+            "status": "green",
+            "reasons": [],
+            "admitted": [{"version": 22, "name": "create_x", "checksum": checksum, "statement_class": "A"}],
+            "forward_only": [22],
+        }
+    }
+    body = pb.pr_body(crossed)
+    verification = body.split("## Verification\n", 1)[1].split("\n## ", 1)[0]
+    assert "iam-db: migration 22 (create_x) admitted, class A (CREATE TABLE), sha256 `" + checksum + "`" in verification
+    risk = body.split("## Risk\n", 1)[1]
+    assert "crossed migration(s) iam-db 22" in risk and "NOT clean" in risk and "DatabaseAhead" in risk, risk
+    assert "forward-fix pin" in risk and "interim block" not in risk, risk
+    assert "Revert this PR's commit" not in risk and "Do not revert this PR" in risk, risk
+    plain = pb.pr_body(evidence()).split("## Risk\n", 1)[1]
+    assert "crosses no migration" in plain and "DatabaseAhead" not in plain and "interim block" not in plain, plain
+    assert "2. Revert this PR's commit by PR." in plain, plain
 
 
 def test_a_needs_human_body_names_every_reason() -> None:

@@ -66,15 +66,26 @@ with a reason per failure:
   tripwire, and no moved, unpinnable or overridden `yadgar-*` crate in
   Cargo.toml or Cargo.lock; each container running the module is audited on
   its own env;
-- E4, the migration diff, finds no added, removed or changed migration in any
-  moved `-db` module (`src/schema.rs` and `src/schema/**`), no other change to
-  those files, no `include_str!` in them, and no moved `yadgar-store` pin (its
-  migrate.rs owns the ledger DDL).
+- E4, the migration diff, finds in each moved `-db` module (`src/schema.rs`
+  and `src/schema/**`): every added migration admitted by
+  `scripts/migration_classifier.py` (ADR-1099: one statement, a literal `sql:`,
+  class A CREATE TABLE, B non-unique CREATE INDEX, C ADD COLUMN nullable or
+  NOT NULL DEFAULT <literal>, D an allowlisted literal INSERT; the allowlist is
+  empty until car 3, so D is red); no added version at or below the old
+  maximum (the store runs only versions above the applied high-water mark);
+  no removed or changed migration (changed by the exact bytes of a literal
+  `sql:`, which the store checksums, else by the block's text); no change
+  to those files beyond each added migration fn (with its comment lines) and
+  its list entry, or a new child file of `use` lines, comments and migration
+  fns with its `mod` line (the residual diff); no `include_str!` in them; and
+  no moved `yadgar-store` pin (its migrate.rs owns the ledger DDL, ADR-1092).
+  Each admitted migration is recorded with the sha256 of its SQL, the store
+  ledger's checksum, and every added version as `forward_only`: such a pin
+  cannot be reverted cleanly (DatabaseAhead), and the body's rollback says so.
 
-The migration block is interim: ADR-0948 R5 (Max, 2026-10-18) lets an
-additive migration auto-merge when green, and the second part of car C10 (the
-migration classifier) lifts it. The `yadgar-store` and shared-crate blocks are
-not interim: C10 keeps them (plan E3, E4).
+Car C10 part 3 lifted the ADR-0948 R5 interim block on every added migration.
+The `yadgar-store` and shared-crate blocks are not interim: C10 keeps them
+(plan E3, E4).
 
 A tag that moved after it was published gives a false red (its digest no
 longer matches), never a false green.
@@ -97,6 +108,7 @@ import copy
 import fnmatch
 import hashlib
 import importlib
+import importlib.util
 import io
 import json
 import os
@@ -1725,52 +1737,274 @@ def schema_sources(source: dict[str, str]) -> dict[str, str]:
     return {p: t for p, t in production_sources(source).items() if p == "src/schema.rs" or p.startswith("src/schema/")}
 
 
-def migration_blocks(source: dict[str, str]) -> dict[int, str]:
-    """`{version: the struct literal that declares it}` across `src/schema.rs` and `src/schema/**`."""
-    blocks: dict[int, str] = {}
+@dataclass(frozen=True, kw_only=True)
+class MigrationSite:
+    """Where one migration's struct literal sits: `text[start:stop]` is `{ version: …, name: …, sql: … }`."""
+
+    path: str
+    start: int
+    stop: int
+
+
+def migration_sites(source: dict[str, str]) -> dict[int, MigrationSite]:
+    """`{version: its site}` across `src/schema.rs` and `src/schema/**` (test modules removed)."""
+    sites: dict[int, MigrationSite] = {}
     for path, text in schema_sources(source).items():
         mask = code_mask(text)
         for match in MIGRATION_VERSION.finditer(mask):
             opening = mask.rfind("{", 0, match.start())
             version = int(match.group(1))
-            if version in blocks:
+            if version in sites:
                 raise Refused(f"migration {version} declared twice ({path})")
-            blocks[version] = " ".join(text[opening : matching_brace(mask, opening)].split())
-    return blocks
+            sites[version] = MigrationSite(path=path, start=opening, stop=matching_brace(mask, opening))
+    return sites
 
 
-def migration_audit(module: str, old_source: dict, new_source: dict) -> list[str]:
-    """E4 for one moved -db module: any added, removed or changed migration."""
+def migration_blocks(source: dict[str, str]) -> dict[int, str]:
+    """`{version: the struct literal that declares it}` across `src/schema.rs` and `src/schema/**`."""
+    texts = schema_sources(source)
+    return {v: " ".join(texts[s.path][s.start : s.stop].split()) for v, s in migration_sites(source).items()}
+
+
+# Car 3 (PR B of C10 part 3) reads `scripts/gates/migration_seed_allowlist.json` from the base into this. Until
+# then it is empty, so a seed INSERT (class D) is always NEEDS-HUMAN.
+SEED_ALLOWLIST: tuple = ()
+
+
+def classifier():
+    """`scripts/migration_classifier.py`, loaded by path from beside this file (`scripts/` is not a package)."""
+    if (module := sys.modules.get("migration_classifier")) is None:
+        spec = importlib.util.spec_from_file_location("migration_classifier", Path(__file__).with_name("migration_classifier.py"))
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["migration_classifier"] = module
+        spec.loader.exec_module(module)
+    return module
+
+
+def struct_field(text: str, site: MigrationSite, name: str) -> str | None:
+    """The source text of field `name`'s expression in the struct literal at `site`, or None when it has none."""
+    mask = code_mask(text)
+    depth = 0
+    for index in range(site.start + 1, site.stop - 1):
+        char = mask[index]
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif depth == 0 and (match := re.compile(rf"\b{name}\s*:(?!:)").match(mask, index)) and not mask[index - 1].isalnum():
+            end, inner = match.end(), 0
+            while end < site.stop - 1 and not (inner == 0 and mask[end] == ","):
+                inner += 1 if mask[end] in "([{" else -1 if mask[end] in ")]}" else 0
+                end += 1
+            return text[match.end() : end]
+    return None
+
+
+STRUCT_FIELD = re.compile(r"\s*(?P<name>[A-Za-z_]\w*)\s*:(?!:)", re.ASCII)
+
+
+def struct_fields(text: str, site: MigrationSite) -> dict[str, str] | None:
+    """`{version, name, sql}` -> each field's expression source when the literal at `site` is EXACTLY those three
+    fields, each once, with nothing else: no attribute (`#[cfg]`), no `..base`, no other field. Else None.
+
+    A positive grammar, because rustc reads what the first `sql:` does not: two cfg'd `sql:` fields, or a `name:`
+    block that runs code, would otherwise pass beside a harmless first match (security review of argocd#214).
+    """
+    mask = code_mask(text)
+    body = mask[site.start + 1 : site.stop - 1]
+    if re.search(r"#\s*!?\s*\[", body) or ".." in body:
+        return None
+    parts, depth, start = [], 0, 0
+    for index, char in enumerate(body):
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append((start, index))
+            start = index + 1
+    if body[start:].strip():
+        parts.append((start, len(body)))
+    fields: dict[str, str] = {}
+    for begin, end in parts:
+        match = STRUCT_FIELD.match(body, begin, end)
+        if not match or match.group("name") in fields:
+            return None
+        offset = site.start + 1
+        fields[match.group("name")] = text[offset + match.end() : offset + end]
+    if set(fields) != {"version", "name", "sql"} or not re.fullmatch(r"\s*[0-9]+\s*", fields["version"], re.ASCII):
+        return None
+    return fields
+
+
+def safe_name(name: str) -> str:
+    """A migration name fit for a reason string and the PR body: no control characters or line breaks, backticks
+    escaped."""
+    return re.sub(r"[\x00-\x1f\x7f\u0085\u2028\u2029]", " ", name).replace("`", "\\`")
+
+
+MIGRATION_FN = re.compile(r"(?m)^[ \t]*(?:pub(?:\s*\([^)]*\))?\s+)?fn\s+(\w+)\s*\(\s*\)\s*->\s*(?:\w+\s*::\s*)*Migration\s*\{")
+
+
+def with_comments_above(text: str, start: int) -> int:
+    """`start` moved up over the `///` and `//` lines directly above it (never `//!`, never across a blank line)."""
+    while start > 0:
+        above = text.rfind("\n", 0, start - 1) + 1
+        line = text[above : start - 1].strip()
+        if not line.startswith("//") or line.startswith("//!"):
+            break
+        start = above
+    return start
+
+
+def migration_fn(text: str, site: MigrationSite) -> tuple[str, int, int] | None:
+    """`(name, start, stop)` of the `fn name() -> Migration { Migration { … } }` that is exactly the literal at
+    `site`, with the comment lines above it and its newline; None when the literal sits anywhere else."""
+    mask = code_mask(text)
+    for match in MIGRATION_FN.finditer(mask):
+        body = match.end() - 1
+        stop = matching_brace(mask, body)
+        if not body < site.start < site.stop <= stop:
+            continue
+        only_the_literal = re.fullmatch(r"\s*(?:\w+\s*::\s*)*Migration\s*", mask[body + 1 : site.start]) and not mask[site.stop : stop - 1].strip()
+        if not only_the_literal:
+            return None
+        return match.group(1), with_comments_above(text, match.start()), stop + (text[stop : stop + 1] == "\n")
+    return None
+
+
+def schema_module(path: str) -> str:
+    """The Rust module path a list entry names a fn of `path` by: "" for `src/schema.rs`, `x` for `src/schema/x.rs`."""
+    return "" if path in ("src/schema.rs", "src/schema/mod.rs") else Path(path).stem
+
+
+def cut_first(files: dict[str, str], pattern: re.Pattern, whole_line: bool = False) -> bool:
+    """Remove the first match of `pattern` (read on the code mask) across `files`, `src/schema.rs` first."""
+    for path in sorted(files, key=lambda p: (p != "src/schema.rs", p)):
+        text = files[path]
+        if not (match := pattern.search(code_mask(text))):
+            continue
+        start, stop = match.start(), match.end()
+        if whole_line:
+            start = with_comments_above(text, start)
+        elif re.match(r"\s*,", text[stop:]):
+            stop += len(re.match(r"\s*,", text[stop:]).group())
+        elif comma := re.search(r",\s*$", text[:start]):
+            start = comma.start()
+        files[path] = text[:start] + text[stop:]
+        return True
+    return False
+
+
+def residual_reasons(module: str, old_source: dict, new_source: dict, added: list[int]) -> list[str]:
+    """ADR-1099: the schema files at the new tag, less each added migration fn and its list entry (and a new child
+    file of only `use` lines, comments and migration fns, with its `mod` line), must be the old files."""
+    old_files, new_files = schema_sources(old_source), dict(schema_sources(new_source))
+    sites = migration_sites(new_source)
+    cuts: dict[str, list[tuple[str, int, int]]] = {}
+    for version in added:
+        site = sites[version]
+        if found := migration_fn(new_files[site.path], site):
+            cuts.setdefault(site.path, []).append(found)
+    for path, spans in cuts.items():
+        text = new_files[path]
+        for _, start, stop in sorted(set(spans), key=lambda span: -span[1]):
+            text = text[:start] + text[stop:]
+        new_files[path] = text
+    for path, spans in sorted(cuts.items()):
+        qualifier = schema_module(path)
+        prefix = rf"{qualifier}\s*::\s*" if qualifier else ""
+        for name in sorted({name for name, _, _ in spans}):
+            cut_first(new_files, re.compile(rf"(?<![\w:.])(?:(?:self|super|crate)\s*::\s*)*{prefix}{name}\s*\(\s*\)"))
+    children = []
+    for path in sorted(new_files.keys() - old_files.keys()):
+        if not path.startswith("src/schema/") or re.sub(r"\buse\s[^;]*;", "", code_mask(new_files[path])).strip():
+            continue
+        parents = {p: t for p, t in new_files.items() if p != path}
+        mod_line = re.compile(rf"(?m)^[ \t]*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+{Path(path).stem}\s*;[ \t]*\n?")
+        if cut_first(parents, mod_line, whole_line=True):
+            new_files.update(parents)
+            children.append(path)
+    return [
+        f"{module}: schema source {path} changed outside the added migration(s)"
+        for path in sorted(old_files.keys() | new_files.keys())
+        if path not in children and " ".join(old_files.get(path, "").split()) != " ".join(new_files.get(path, "").split())
+    ]
+
+
+def migration_evidence(module: str, old_source: dict, new_source: dict, allowlist: tuple = SEED_ALLOWLIST) -> dict:
+    """E4 for one moved -db module: `{status, reasons, admitted, forward_only}` (ADR-1099).
+
+    `reasons` names each added migration the classifier does not admit, a removed or changed migration, a schema
+    file changed outside the added migrations, an `include_str!`, and a moved `yadgar-store`. `admitted` records each
+    admitted migration's version, name, sha256 of its SQL (the store ledger's checksum) and class; `forward_only` is
+    every added version, admitted or not: a pin that crosses one cannot be reverted cleanly (DatabaseAhead).
+    """
     old, new = migration_blocks(old_source), migration_blocks(new_source)
     if not new:
-        return [f"{module}: no migration found in src/schema.rs or src/schema/ at the new tag"]
-    reasons = []
-    if added := sorted(new.keys() - old.keys()):
-        reasons.append(
-            f"{module}: migration(s) {', '.join(map(str, added))} added; a revert does not undo a migration; interim block; lifted by car C10 per ADR-0948 R5"
-        )
+        reasons = [f"{module}: no migration found in src/schema.rs or src/schema/ at the new tag"]
+        return {"status": "red", "reasons": reasons, "admitted": [], "forward_only": []}
+    reasons, admitted = [], []
+    added = sorted(new.keys() - old.keys())
+    texts, sites = schema_sources(new_source), migration_sites(new_source)
+    for version in added:
+        site = sites[version]
+        text = texts[site.path]
+        fields = struct_fields(text, site)
+        found = migration_fn(text, site)
+        name = classifier().rust_literal(fields["name"]) if fields else None
+        if name is None:
+            label = found[0] if found else "unnamed"
+            reasons.append(
+                f"{module}: migration {version} ({safe_name(label)}) not admitted: its Migration literal is not exactly the fields "
+                "version, name and sql, each once, with literal values (no attribute, `..`, other field or expression)"
+            )
+            continue
+        name = safe_name(name)
+        verdict = classifier().classify(fields["sql"], module=module, allowlist=allowlist)
+        if verdict.admitted:
+            admitted.append({"version": version, "name": name, "checksum": verdict.checksum, "statement_class": verdict.statement_class})
+        else:
+            reasons.append(f"{module}: migration {version} ({name}) not admitted: {verdict.reason}")
     if removed := sorted(old.keys() - new.keys()):
         reasons.append(f"{module}: migration(s) {', '.join(map(str, removed))} removed")
-    reasons += [f"{module}: migration {v} changed" for v in sorted(old.keys() & new.keys()) if old[v] != new[v]]
-    # COARSE: any change to a schema file outside the blocks (SQL from a const, a migration dropped from the
-    # set) and any file the schema includes are not readable here.
-    old_files, new_files = schema_sources(old_source), schema_sources(new_source)
-    reasons += [
-        f"{module}: schema source {path} changed"
-        for path in sorted(old_files.keys() | new_files.keys())
-        if " ".join(old_files.get(path, "").split()) != " ".join(new_files.get(path, "").split())
-    ]
+    # An added version at or below the old maximum never runs on a database already past it: the store applies only
+    # `pending_after(applied)`, the versions above the applied high-water mark.
+    if old:
+        reasons += [
+            f"{module}: migration {v} sits at or below the applied high-water mark {max(old)}; the store never runs it on an existing database (pending_after)"
+            for v in added
+            if v <= max(old)
+        ]
+    # CHANGED BY EXACT BYTES where both literals decode: the store checksums `sql`'s exact bytes, so a whitespace edit
+    # inside an old literal fails boot (ChecksumMismatch) while the whitespace-collapsed block text reads unchanged.
+    old_texts, old_sites = schema_sources(old_source), migration_sites(old_source)
+
+    def sql_of(files: dict[str, str], where: dict[int, MigrationSite], version: int) -> str | None:
+        site = where[version]
+        return classifier().rust_literal(struct_field(files[site.path], site, "sql") or "")
+
+    for v in sorted(old.keys() & new.keys()):
+        old_sql, new_sql = sql_of(old_texts, old_sites, v), sql_of(texts, sites, v)
+        if old[v] != new[v] or (old_sql is not None and new_sql is not None and old_sql != new_sql):
+            reasons.append(f"{module}: migration {v} changed")
+    reasons += residual_reasons(module, old_source, new_source, added)
     reasons += [
         f"{module}: schema source {path} uses include_str!/include_bytes!, which E4 cannot read"
-        for path, text in sorted(new_files.items())
+        for path, text in sorted(texts.items())
         if re.search(r"\binclude_(?:str|bytes)!", code_mask(text))
     ]
-    # yadgar-store's migrate.rs owns the migration ledger's own DDL, so its move is a schema change too.
+    # yadgar-store's migrate.rs owns the migration ledger's own DDL, so its move is a schema change too (ADR-1092).
     reasons += [
         f"{r}; store's migrate.rs owns the ledger DDL; it stays NEEDS-HUMAN after car C10 (plan E4)"
         for r in crate_moves(module, old_source, new_source, only="yadgar-store")
     ]
-    return reasons
+    return {"status": "red" if reasons else "green", "reasons": reasons, "admitted": admitted, "forward_only": added}
+
+
+def migration_audit(module: str, old_source: dict, new_source: dict) -> list[str]:
+    """E4's reasons for one moved -db module (`migration_evidence` without the record)."""
+    return migration_evidence(module, old_source, new_source)["reasons"]
 
 
 # ── the network (public reads only) ─────────────────────────────────────────
@@ -1894,8 +2128,7 @@ def audits(head: list, old_modules: dict, new_modules: dict, net: Net) -> tuple[
             reasons = boot_audit(module, old, new, env)
             boot[module] = {"status": "red" if reasons else "green", "reasons": reasons}
         if module.endswith("-db"):
-            reasons = migration_audit(module, old, new)
-            migrations[module] = {"status": "red" if reasons else "green", "reasons": reasons}
+            migrations[module] = migration_evidence(module, old, new)
     return boot, migrations
 
 
@@ -2040,6 +2273,19 @@ def audit_lines(title: str, results: dict, none: str) -> list[str]:
     return lines
 
 
+def migration_lines(migrations: dict) -> list[str]:
+    """E4's lines: each module's status and reasons, then each admitted migration with its class and sha256."""
+    lines = audit_lines("E4 migration diff", migrations, "No `-db` module moved.")
+    classes = classifier().CLASSES if any(r.get("admitted") for r in migrations.values()) else {}
+    for module, result in sorted(migrations.items()):
+        lines += [
+            f"  - {module}: migration {m['version']} ({m['name']}) admitted, class {m['statement_class']} "
+            f"({classes[m['statement_class']]}), sha256 `{m['checksum']}`"
+            for m in result.get("admitted", [])
+        ]
+    return lines
+
+
 def platform_lines(platform: dict | None) -> list[str]:
     if not platform:
         return ["- **E1 platform move.** `platform` did not move; the operator Applications are untouched."]
@@ -2101,7 +2347,7 @@ def pr_body(evidence: dict) -> str:
             for c in changed
         ],
         *audit_lines("E3 boot audit", evidence["boot_audit"], "No module moved."),
-        *audit_lines("E4 migration diff", evidence["migrations"], "No `-db` module moved."),
+        *migration_lines(evidence["migrations"]),
         *platform_lines(platform),
         "- **Not covered here:** E2, the kind-yadgar dry run, is a separate check.",
     ]
@@ -2109,6 +2355,7 @@ def pr_body(evidence: dict) -> str:
         verification += ["", "**NEEDS-HUMAN.** Each reason below blocks the automatic merge:", ""]
         verification += [f"- {reason}" for reason in evidence["reasons"]]
     rolled = sorted({c["object"] for c in changed})
+    crossed = [f"{module} {v}" for module, result in sorted(evidence["migrations"].items()) for v in result.get("forward_only", [])]
     risk = [
         "## Risk",
         "",
@@ -2119,9 +2366,15 @@ def pr_body(evidence: dict) -> str:
         "",
         "1. If `yadgar`'s operation is Running or retrying, first run (NEEDS-MAX) `argocd app terminate-op yadgar`. "
         "Argo CD v3.1.8 has no `retry.refresh`, so a retrying operation keeps applying the bad revision.",
-        "2. Revert this PR's commit by PR.",
-        "3. A revert is clean only for a pin with no migration, which is why E4 blocks every migration "
-        "(interim block; lifted by car C10 per ADR-0948 R5).",
+        *(
+            [
+                "2. Do not revert this PR: it crossed migration(s) " + ", ".join(crossed) + ".",
+                "3. A revert is NOT clean. yadgar-store refuses to boot an older binary against a database ahead of it "
+                "(DatabaseAhead), so recover by a forward-fix pin (ADR-1099).",
+            ]
+            if crossed
+            else ["2. Revert this PR's commit by PR.", "3. A revert is clean: this pin crosses no migration (E4)."]
+        ),
     ]
     return "\n".join(what + [""] + why + [""] + changelog + [""] + verification + [""] + risk) + "\n"
 

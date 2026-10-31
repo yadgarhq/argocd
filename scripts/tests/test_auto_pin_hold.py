@@ -163,6 +163,15 @@ def test_a_red_or_past_close_epoch_ensures_one_hold_issue(kind: str) -> None:
     assert ("run 77" in body["body"]) if kind == "red" else ("no verdict by close" in body["body"])
 
 
+def test_the_epoch_hold_fix_text_excludes_a_revert_across_a_migration() -> None:
+    """ADR-1099: a pin that crossed a migration cannot be reverted cleanly (DatabaseAhead), so the hold names a revert
+    as a fix only for a pin that crossed none."""
+    api = Fake(Issues().routes())
+    ap.ensure_epoch_hold(api, red_epoch(), merge_sha=MAIN)
+    body = [w for w in api.writes() if w[0] == "POST"][0][2]["body"]
+    assert "a revert (unless the pin crossed a migration) or a forward-fix PR whose epoch is judged green" in body, body
+
+
 def test_the_same_epoch_run_twice_is_still_one_issue() -> None:
     issues = Issues()
     api = Fake(issues.routes())
