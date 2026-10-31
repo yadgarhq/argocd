@@ -58,10 +58,13 @@ FIXTURE = Path(__file__).resolve().parent / "fixtures" / "verify_handover" / "cl
 CONTEXT = "kind-test"
 
 # `scripts/` is not a package, so the module is loaded by path.
-_spec = importlib.util.spec_from_file_location("verify_handover", REPOSITORY / "scripts" / "verify_handover.py")
-vh = importlib.util.module_from_spec(_spec)
-sys.modules["verify_handover"] = vh
-_spec.loader.exec_module(vh)
+# Loaded once: a second copy under the same name would give other test modules a different KubectlError (yaadgaar 504).
+if "verify_handover" not in sys.modules:
+    _spec = importlib.util.spec_from_file_location("verify_handover", REPOSITORY / "scripts" / "verify_handover.py")
+    _module = importlib.util.module_from_spec(_spec)
+    sys.modules["verify_handover"] = _module
+    _spec.loader.exec_module(_module)
+vh = sys.modules["verify_handover"]
 
 
 class FakeRunner:

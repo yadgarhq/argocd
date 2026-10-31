@@ -50,7 +50,10 @@ with a reason per failure:
 - no dependency was added or removed; a `platform` move is E1 over the five
   operator Applications (`classify_platform`, car C10): each rendered at both
   platforms on both helms with `--include-crds`, and the diff held to the
-  platform-move set Max ruled on 2026-10-31 (see that section);
+  platform-move set Max ruled on 2026-10-31 (see that section), a derived
+  label inside a selector read from EVERY Application of the estate (root and
+  all it selects, ADR-1095); an Application whose source cannot be read for
+  selectors is NEEDS-HUMAN;
 - E3, the boot audit, is green for every moved module: no required key
   (`env_required*`, `env_parsed`, `parse_bucket_env`) new at the new source tag
   that the render does not set, and no env name read at an env-read call site
@@ -91,6 +94,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+import fnmatch
 import hashlib
 import importlib
 import io
@@ -453,8 +457,9 @@ def judge_image(key, path, old_image, new_image, old_modules, new_modules, diges
 # - the labels `helm.sh/chart` and `app.kubernetes.io/version`, derived from the
 #   subchart's version and `appVersion`, never inside a selector: a moved label,
 #   on a pod template or on any object's own `metadata.labels` (a CRD's too),
-#   blocks when its key is read by any selector in any of the six Applications,
-#   the five operator renders at both pins and the `yadgar` render (ADR-1093);
+#   blocks when its key is read by any selector in any Application of the
+#   estate, the five operator renders at both pins, the `yadgar` render, and
+#   root with every other Application it selects (ADR-1095, `estate_selectors`);
 # - on a CRD: a new optional property with no default, and a new served version
 #   with the storage version and conversion unchanged.
 
@@ -657,8 +662,8 @@ def judge_label(
 ) -> list[str]:
     """A changed `helm.sh/chart` or `app.kubernetes.io/version` label; anything else here blocks.
 
-    `selected` is every label key a selector in any of the six Applications reads (`render_selector_keys` over
-    them all, ADR-1093). A label whose key is in it blocks wherever it sits, on a pod template or on the object's
+    `selected` is every label key a selector in any Application of the estate reads (`render_selector_keys` over
+    them all, ADR-1095). A label whose key is in it blocks wherever it sits, on a pod template or on the object's
     own `metadata.labels`; a pod template label the object's own selector reads blocks too. The match is by key:
     a selector that reads the key on any object counts, which may hold more than it must, never less.
     """
@@ -789,9 +794,10 @@ def crd_problems(
 def classify_platform(renders: dict, old_facts: dict, new_facts: dict, registry_digest, *, others: list = ()) -> PlatformVerdict:
     """E1 of a platform move. `renders` is `{helm version: {Application: (base documents, head documents)}}`.
 
-    `others` is the render of the estate's other Application, `yadgar`. Its selectors and those of every operator
-    Application at both pins are collected ONCE, before any object is judged (ADR-1093): a ServiceMonitor in one
-    Application may select another's Service.
+    `others` is the render of every other Application of the estate: `yadgar` at both pins, root and what it
+    selects (`estate_selectors`). Their selectors and those of every operator Application at both pins are
+    collected ONCE, before any object is judged (ADR-1095): a ServiceMonitor in one Application may select
+    another's Service.
     """
     digests = gate("test_yadgar_application").digests
     verdict = PlatformVerdict()
@@ -857,8 +863,10 @@ def classify_platform(renders: dict, old_facts: dict, new_facts: dict, registry_
 def platform_evidence(repo: Path, old: str, new: str, helms: dict[str, str], net: Net, others: list) -> dict:
     """The platform move's E1: the five operator Applications of `repo` rendered at `old` and `new` on every helm.
 
-    `others` is every `yadgar` render `check` made; its selectors count with the operators' (ADR-1093). The live
-    operators and CRDs are compared by `pin_dryrun.py` (E2-interim, car C10 part 2), not here.
+    `others` is every `yadgar` render `check` made. Its selectors, the operators' at both pins and those of every
+    other Application of the estate (`estate_selectors`, ADR-1095) are one set. An Application whose source cannot
+    be read for selectors is a reason, never a skip. The live operators and CRDs are compared by `pin_dryrun.py`
+    (E2-interim, car C10 part 2), not here.
     """
     texts = {}
     for path in OPERATOR_APPLICATIONS:
@@ -868,11 +876,248 @@ def platform_evidence(repo: Path, old: str, new: str, helms: dict[str, str], net
         label: {name: (render_operator(text, old, binary), render_operator(text, new, binary)) for name, text in texts.items()}
         for label, binary in sorted(helms.items())
     }
+    estate, documents, unread = estate_selectors(repo, helms, in_hand=(APPLICATION, *OPERATOR_APPLICATIONS))
     binary = helms[sorted(helms)[0]]
     verdict = classify_platform(
-        renders, platform_facts(old, binary), platform_facts(new, binary), net.registry_digest, others=others
+        renders, platform_facts(old, binary), platform_facts(new, binary), net.registry_digest, others=[*others, *documents]
     )
-    return {"from": old, "to": new, "objects": verdict.objects, "changed": verdict.changed, "reasons": verdict.reasons}
+    keys = {name: sorted(found) for name, found in estate.items()}
+    keys[Path(APPLICATION).stem] = sorted(render_selector_keys(others))
+    for name in texts:
+        keys[name] = sorted(render_selector_keys([d for r in renders.values() for d in (*r[name][0], *r[name][1])]))
+    return {
+        "from": old,
+        "to": new,
+        "objects": verdict.objects,
+        "changed": verdict.changed,
+        "applications": sorted(keys),
+        "selector_keys": dict(sorted(keys.items())),
+        "reasons": unread + verdict.reasons,
+    }
+
+
+# ── ADR-1095: the selector keys of EVERY Application of the estate ──────────
+#
+# A derived label counts as inside a selector when any label selector in any
+# Argo CD Application of the estate reads its key. The estate is root
+# (`projects/root.yaml`) and every Application root's directory source selects,
+# found by reading that source, never from a list: a new Application file is in
+# scope with no code change. `yadgar` and the five operator Applications are
+# rendered by `check` and `platform_evidence` at both pins already; every other
+# one is read here once, at this tree, on every helm (the keys are unioned).
+#
+# Only what this reader reproduces exactly is read; anything else is a reason
+# (NEEDS-HUMAN), never a skip. A directory source of THIS repository at
+# `main`/`HEAD` (plain manifests: `.yaml`, `.yml`, `.json`; `recurse` and a
+# plain `include` glob only, matched as Argo CD does with `*` crossing `/`; no
+# kustomization, `Chart.yaml` or jsonnet in it; no `kind: List`);
+# a `ref:` source of this repository (renders nothing); a helm chart at one
+# exact version, OCI when its `repoURL` has no scheme, with `values` or
+# `valuesObject` (not both: Argo CD drops `values` then), `releaseName` and
+# `valueFiles` that name a `ref:` source. An in-hand Application is skipped
+# only when root lists it exactly as its file reads. An
+# ApplicationSet, or an Application inside another Application's render, would
+# bring in Applications this reader cannot see, so both are reasons too.
+
+ROOT_APPLICATION = "projects/root.yaml"
+THIS_REPOSITORY = "https://github.com/yadgarhq/argocd"
+TREE_REVISIONS = frozenset({"main", "HEAD"})
+MANIFEST_SUFFIXES = (".yaml", ".yml", ".json")
+NOT_PLAIN = frozenset({"kustomization.yaml", "kustomization.yml", "Kustomization", "Chart.yaml"})
+CHART_VERSION = re.compile(r"^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$")
+
+
+def this_repository(url) -> bool:
+    return str(url).rstrip("/").removesuffix(".git") == THIS_REPOSITORY
+
+
+def sources_of(application: dict) -> list:
+    """`spec.source`, then each `spec.sources` entry; refused when there is neither."""
+    spec = application.get("spec") or {}
+    found = [spec["source"]] if isinstance(spec.get("source"), dict) else []
+    if isinstance(spec.get("sources"), list):
+        found += [s for s in spec["sources"] if isinstance(s, dict)]
+    if not found:
+        raise Refused("no `spec.source` or `spec.sources`")
+    return found
+
+
+def glob_matches(pattern: str, relative: str) -> bool:
+    """Argo CD v3.1.8's `directory.include` match: gobwas `glob.Match` with no separators, so `*` crosses `/`
+    (`reposerver/repository/repository.go`). `applications/*.yaml` matches `applications/sub/x.yaml`."""
+    return fnmatch.fnmatchcase(relative, pattern)
+
+
+def directory_documents(repo: Path, source: dict) -> list:
+    """Every document a plain-manifest directory source of this repository renders."""
+    if set(source) - {"repoURL", "targetRevision", "path", "directory"}:
+        raise Refused(f"source keys {sorted(source)}; only a plain directory is read")
+    if not this_repository(source.get("repoURL")):
+        raise Refused(f"path `{source.get('path')}` is on {source.get('repoURL')}, not this repository")
+    if source.get("targetRevision") not in TREE_REVISIONS:
+        raise Refused(f"path `{source.get('path')}` at revision {source.get('targetRevision')!r}; this tree is main")
+    directory = source.get("directory") or {}
+    include = str(directory.get("include") or "")
+    if set(directory) - {"recurse", "include"} or any(c in include for c in "{}[]\\"):
+        raise Refused(f"directory options {directory}; only `recurse` and a plain `include` glob are read")
+    top = (repo / str(source["path"])).resolve()
+    if not top.is_dir() or not top.is_relative_to(repo.resolve()):
+        raise Refused(f"path `{source['path']}` is no directory of this tree")
+    # Argo CD picks kustomize or helm from the files at the path itself; a directory renders jsonnet it includes.
+    if built := sorted(NOT_PLAIN & {p.name for p in top.iterdir()}):
+        raise Refused(f"`{source['path']}` holds {', '.join(built)}: Argo CD would build it as kustomize or helm")
+    files = []
+    for folder, subfolders, names in os.walk(top):
+        subfolders[:] = sorted(s for s in subfolders if s != ".git") if directory.get("recurse") else []
+        for name in sorted(names):
+            relative = (Path(folder) / name).relative_to(top).as_posix()
+            if include and not glob_matches(include, relative):
+                continue
+            if name.endswith((".jsonnet", ".libsonnet")):
+                raise Refused(f"`{source['path']}/{relative}`: Argo CD would evaluate this jsonnet")
+            if name.endswith(MANIFEST_SUFFIXES):
+                files.append(Path(folder) / name)
+    return [d for path in files for d in yaml.safe_load_all(path.read_text()) if isinstance(d, dict)]
+
+
+def chart_source_arguments(name: str, namespace: str, source: dict, value_files: list[str]) -> list[str]:
+    """`helm template` of a chart source as Argo CD renders it: release = `releaseName` or the Application's name."""
+    release = str((source.get("helm") or {}).get("releaseName") or name)
+    url = str(source["repoURL"])
+    if "://" in url:
+        arguments = ["template", release, str(source["chart"]), "--repo", url]
+    else:
+        arguments = ["template", release, f"oci://{url.rstrip('/')}/{source['chart']}"]
+    arguments += ["--version", str(source["targetRevision"]), "--namespace", namespace, INCLUDE_CRDS]
+    arguments += gate("test_no_two_owners").api_version_flags()
+    for value_file in value_files:
+        arguments += ["--values", value_file]
+    return arguments
+
+
+def render_chart_source(name: str, namespace: str, source: dict, value_files: list[str], binary: str) -> list:
+    """One chart source rendered on `binary`."""
+    with helm_on_path(binary):
+        rendered = helm_template(chart_source_arguments(name, namespace, source, value_files))
+    return [d for d in yaml.safe_load_all(rendered) if isinstance(d, dict)]
+
+
+def chart_documents(repo: Path, name: str, namespace: str, source: dict, refs: dict, binary: str) -> list:
+    """A helm chart source, its value layers in Argo CD's order: `valueFiles`, then `values` or `valuesObject`."""
+    if set(source) - {"repoURL", "chart", "targetRevision", "helm"}:
+        raise Refused(f"chart source keys {sorted(source)}")
+    if not CHART_VERSION.match(str(source.get("targetRevision", ""))):
+        raise Refused(f"chart {source.get('chart')} at {source.get('targetRevision')!r}, not one exact version")
+    helm = source.get("helm") or {}
+    if set(helm) - {"values", "valuesObject", "valueFiles", "releaseName"}:
+        raise Refused(f"helm keys {sorted(helm)}; only values, valuesObject, valueFiles and releaseName are rendered")
+    if {"values", "valuesObject"} <= set(helm):
+        # Argo CD v3.1.8 `ApplicationSourceHelm.ValuesYAML()` takes `valuesObject` alone when set and drops `values`.
+        raise Refused("helm sets both values and valuesObject; Argo CD renders valuesObject alone, so the two are not layered")
+    layers = []
+    for value_file in helm.get("valueFiles") or []:
+        ref, _, rest = str(value_file).partition("/")
+        if not ref.startswith("$") or ref[1:] not in refs or not rest:
+            raise Refused(f"valueFile {value_file!r} names no `ref:` source of this repository")
+        path = (repo / rest).resolve()
+        if not path.is_file() or not path.is_relative_to(repo.resolve()):
+            raise Refused(f"valueFile {value_file!r}: `{rest}` is no file of this tree")
+        layers.append(path.read_text())
+    layers += [helm[key] if isinstance(helm[key], str) else yaml.safe_dump(helm[key]) for key in ("values", "valuesObject") if key in helm]
+    with tempfile.TemporaryDirectory() as scratch:
+        files = []
+        for index, layer in enumerate(layers):
+            files.append(str(Path(scratch) / f"values-{index}.yaml"))
+            Path(files[-1]).write_text(layer)
+        return render_chart_source(name, namespace, source, files, binary)
+
+
+def application_documents(repo: Path, application: dict, binary: str) -> list:
+    """Every document one Application renders from this tree on `binary`; Refused for anything not reproduced."""
+    name = str((application.get("metadata") or {}).get("name") or "")
+    namespace = ((application.get("spec") or {}).get("destination") or {}).get("namespace")
+    sources = sources_of(application)
+    refs = {}
+    for source in sources:
+        if "ref" in source:
+            if set(source) - {"repoURL", "targetRevision", "ref"} or not this_repository(source.get("repoURL")):
+                raise Refused(f"`ref: {source['ref']}` source {sorted(source)} on {source.get('repoURL')}; only this repository is read")
+            if source.get("targetRevision") not in TREE_REVISIONS:
+                raise Refused(f"`ref: {source['ref']}` at revision {source.get('targetRevision')!r}; this tree is main")
+            refs[str(source["ref"])] = source
+    documents = []
+    for source in sources:
+        if "ref" in source:
+            continue
+        if "chart" in source:
+            if not namespace:
+                raise Refused("a chart source with no destination namespace")
+            documents += chart_documents(repo, name, str(namespace), source, refs, binary)
+        elif "path" in source:
+            documents += directory_documents(repo, source)
+        else:
+            raise Refused(f"source keys {sorted(source)}: neither a chart, a path nor a ref")
+    return documents
+
+
+def list_documents(documents: list) -> list[str]:
+    """The kinds of every List document (a kind ending in `List` with `items`): Argo CD applies each item."""
+    return sorted({str(d.get("kind")) for d in documents if str(d.get("kind", "")).endswith("List") and "items" in d})
+
+
+def estate_selectors(repo: Path, helms: dict[str, str], *, in_hand: tuple = ()) -> tuple[dict[str, set[str]], list, list[str]]:
+    """`({Application: selector keys}, documents, reasons)` over root and every Application root selects.
+
+    `in_hand` names the Application files whose renders the caller holds: root lists them, they are not rendered
+    again here. A chart source is rendered on every helm in `helms`, a directory read once. Each reason reads
+    `selectors: Application <name>: cannot be read for selectors (...)`.
+    """
+    keys: dict[str, set[str]] = {}
+    documents: list = []
+    reasons: list[str] = []
+
+    def unread(name: str, why) -> None:
+        reasons.append(f"selectors: Application {name}: cannot be read for selectors ({why}); ADR-1095 leaves no Application out")
+
+    if not (repo / ROOT_APPLICATION).is_file():
+        unread("root", f"`{ROOT_APPLICATION}` is absent")
+        return keys, documents, reasons
+    try:
+        listed = application_documents(repo, yaml.safe_load((repo / ROOT_APPLICATION).read_text()) or {}, "")
+    except Refused as refused:
+        unread("root", refused)
+        return keys, documents, reasons
+    if lists := list_documents(listed):
+        unread("root", f"it lists {', '.join(lists)}; Argo CD expands a List, and an Application inside one is not followed")
+        return keys, documents, reasons
+    keys["root"] = render_selector_keys(listed)
+    documents += listed
+    for document in listed:
+        if document.get("kind") == "ApplicationSet":
+            unread("root", f"ApplicationSet {(document.get('metadata') or {}).get('name')} generates Applications this reader cannot see")
+    # Skipped only when equal to the parsed in-hand file: another file reusing its name is read like any other.
+    hand = [yaml.safe_load((repo / path).read_text()) for path in in_hand if (repo / path).is_file()]
+    for application in (d for d in listed if d.get("kind") == "Application"):
+        name = str((application.get("metadata") or {}).get("name") or "<unnamed>")
+        if application in hand:
+            continue
+        found: list = []
+        try:
+            charted = any("chart" in source for source in sources_of(application))
+            for binary in [helms[label] for label in sorted(helms)] if charted else [""]:
+                rendered = application_documents(repo, application, binary)
+                nested = sorted({str(d["kind"]) for d in rendered if d.get("kind") in ("Application", "ApplicationSet")})
+                if nested:
+                    raise Refused(f"it renders {', '.join(nested)}; a nested Application is not followed")
+                if lists := list_documents(rendered):
+                    raise Refused(f"it renders {', '.join(lists)}; Argo CD expands a List, and its items are not read")
+                found += rendered
+        except Refused as refused:
+            unread(name, refused)
+            continue
+        keys[name] = render_selector_keys(found)
+        documents += found
+    return keys, documents, reasons
 
 
 # ── reading Rust source ─────────────────────────────────────────────────────

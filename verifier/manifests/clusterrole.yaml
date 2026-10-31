@@ -38,8 +38,10 @@ rules:
       - services
       - serviceaccounts
     verbs: [get, list, watch]
+  # replicasets and (in batch) cronjobs: `scripts/pin_dryrun.py`'s cluster-wide
+  # selector read on a platform move (ADR-1095, `SELECTOR_READS`).
   - apiGroups: [apps]
-    resources: [deployments, statefulsets, daemonsets]
+    resources: [deployments, statefulsets, daemonsets, replicasets]
     verbs: [get, list, watch]
   - apiGroups: [apiextensions.k8s.io]
     resources: [customresourcedefinitions]
@@ -67,7 +69,7 @@ rules:
     resources: [poddisruptionbudgets]
     verbs: [get, list, watch]
   - apiGroups: [batch]
-    resources: [jobs]
+    resources: [jobs, cronjobs]
     verbs: [get, list, watch]
   # Custom resources: one rule per group, every plural named.
   # All four ARC plurals. Applications track the AutoscalingRunnerSet
@@ -123,6 +125,11 @@ rules:
     verbs: [get, list, watch]
   - apiGroups: [gateway.networking.x-k8s.io]
     resources: [xbackends, xbackendtrafficpolicies, xmeshes]
+    verbs: [get, list, watch]
+  # ServiceMonitors and PodMonitors: the same selector read, once their CRD is
+  # served (none on kind-yadgar on 2026-10-31; a grant for an absent type is inert).
+  - apiGroups: [monitoring.coreos.com]
+    resources: [podmonitors, servicemonitors]
     verbs: [get, list, watch]
   - apiGroups: [k8s.mariadb.com]
     resources:
