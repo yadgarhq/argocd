@@ -1293,13 +1293,23 @@ def run_platform(repo: Path, sha: str, *, platform_of=None, kubectl=None) -> dic
     )
 
 
-def test_a_pure_platform_move_is_held_red_until_the_operator_comparator_exists(platform_repo: Path) -> None:
-    """The five files are allowed and pure, so nothing is refused; but no live operator comparison exists yet, so
-    E2 is red, without a cluster read (C10's E2-interim over the operators is the next part)."""
-    result = run_platform(platform_repo, platform_branch(platform_repo))
-    assert result["result"] == "red"
-    assert any("operator comparator" in p for p in result["problems"]), result["problems"]
-    assert not any("outside" in p for p in result["problems"]), result["problems"]
+def test_a_pure_platform_move_goes_on_to_the_operator_comparison(platform_repo: Path) -> None:
+    """Rewritten from C10 part 1's "held red until the operator comparator exists": the five files are allowed and
+    pure, so nothing is refused, and step 9 renders every operator Application (from main's file) before any cluster
+    read. `test_pin_dryrun_operators.py` holds the comparison itself."""
+    rendered = []
+
+    def render_operator(text: str, version: str) -> list:
+        rendered.append((yaml.safe_load(text)["metadata"]["name"], version))
+        raise pin_dryrun._load("pin_bump").Refused("stop here")
+
+    cluster = verify_handover.Cluster(CONTEXT, runner=NoCluster())
+    result = pin_dryrun.dry_run(
+        platform_repo, main_sha(platform_repo), platform_branch(platform_repo), cluster, render=Render(),
+        platform_of=lambda target: NEW_PLATFORM, render_operator=render_operator,
+    )
+    assert sorted(rendered) == sorted((name, PLATFORM) for name in OPERATORS)
+    assert not any("operator comparator" in p or "outside" in p for p in result["problems"]), result["problems"]
 
 
 def test_an_operator_file_with_a_values_change_is_refused(platform_repo: Path) -> None:

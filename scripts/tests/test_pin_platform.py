@@ -20,8 +20,12 @@ constructed case per arm of the plan's C10 red list
   and the #103 shape (platform 0.2.4 -> 0.2.5, image only) pass;
 - the consumers take three files, or eight when the platform moves, and
   nothing between: `pin_evidence`, `auto_pin.push`, `auto_pin_merge` and
-  `pin_dryrun`'s pure-move refusal; `pin_dryrun` holds a platform move red
-  until its operator comparator exists, without reading the cluster.
+  `pin_dryrun`'s pure-move refusal;
+- ADR-1093: a derived label on an object's OWN metadata (a Service, a CRD, a
+  Deployment's own labels, not only a pod template) whose key any selector in
+  any of the six Applications reads (the five operator renders at both pins,
+  and the `yadgar` render) blocks; the same move with no selector reading it
+  passes; a green platform move carries no hold reason.
 """
 
 from __future__ import annotations
@@ -368,6 +372,106 @@ def test_a_pod_label_another_objects_selector_reads_blocks(name: str) -> None:
     assert any("keda-operator" in r and "inside a selector" in r and key in r for r in reasons), reasons
 
 
+# ── ADR-1093: an object's OWN derived label that any selector in any of the six Applications reads ──
+
+
+def reads_chart_label(kind: str = "ServiceMonitor") -> dict:
+    """An object that selects on `helm.sh/chart` and is identical at both pins."""
+    if kind == "ServiceMonitor":
+        return {
+            "apiVersion": "monitoring.coreos.com/v1", "kind": "ServiceMonitor", "metadata": {"name": "keda", "namespace": "observability"},
+            "spec": {"selector": {"matchExpressions": [{"key": "helm.sh/chart", "operator": "Exists"}]}, "endpoints": [{"port": "metrics"}]},
+        }
+    return {
+        "apiVersion": "admissionregistration.k8s.io/v1", "kind": "ValidatingWebhookConfiguration", "metadata": {"name": "guard"},
+        "webhooks": [{"name": "guard.example.org", "objectSelector": {"matchExpressions": [{"key": "app.kubernetes.io/version", "operator": "Exists"}]}}],
+    }
+
+
+def apps(**renders: tuple[list, list]) -> dict:
+    """Several Applications on two helms."""
+    return {
+        helm: {name: (copy.deepcopy(base), copy.deepcopy(head)) for name, (base, head) in renders.items()}
+        for helm in ("v3.18.4", "v4.3.0")
+    }
+
+
+def test_an_own_label_a_servicemonitor_in_another_application_reads_blocks() -> None:
+    """The Service's OWN `helm.sh/chart` label moves with keda; a ServiceMonitor in the `prometheus` Application reads
+    that key. Under ADR-1093 that is inside a selector: NEEDS-HUMAN, though the Service has no pod template."""
+    selecting = [reads_chart_label()]
+    reasons = judge(apps(keda=(tag_render(KEDA_OLD), tag_render(KEDA_NEW)), prometheus=(selecting, selecting)))
+    assert any(
+        r.startswith("keda: ") and "Service/keda/keda-operator" in r and "metadata.labels.helm.sh/chart" in r and "inside a selector" in r
+        for r in reasons
+    ), reasons
+
+
+def test_an_own_label_no_selector_reads_is_allowed() -> None:
+    """The same move with a ServiceMonitor in another Application that reads only `app`: still green."""
+    selecting = [reads_chart_label()]
+    selecting[0]["spec"]["selector"] = {"matchLabels": {"app": "keda-operator"}}
+    assert judge(apps(keda=(tag_render(KEDA_OLD), tag_render(KEDA_NEW)), prometheus=(selecting, selecting))) == []
+
+
+def test_an_own_label_a_webhook_object_selector_in_another_application_reads_blocks() -> None:
+    """A webhook `objectSelector` in another Application reads `app.kubernetes.io/version`; the keda Deployment's own
+    metadata label of that key moves."""
+    selecting = [reads_chart_label("webhook")]
+    reasons = judge(apps(keda=(tag_render(KEDA_OLD), tag_render(KEDA_NEW)), cert_manager=(selecting, selecting)))
+    assert any(
+        "Deployment/keda/keda-operator" in r and "metadata.labels.app.kubernetes.io/version" in r and "inside a selector" in r
+        and not r.split("metadata.labels")[0].endswith("template.")
+        for r in reasons
+    ), reasons
+
+
+def test_an_own_label_a_selector_in_the_yadgar_render_reads_blocks() -> None:
+    """`others` carries the `yadgar` Application's render: its selectors count too."""
+    reasons = pb.classify_platform(
+        two_helms(tag_render(KEDA_OLD), tag_render(KEDA_NEW)), facts(KEDA_OLD), facts(KEDA_NEW), no_registry,
+        others=[reads_chart_label()],
+    ).reasons
+    assert any("Service/keda/keda-operator" in r and "inside a selector" in r for r in reasons), reasons
+
+
+def test_a_crd_own_label_a_selector_reads_blocks() -> None:
+    """A CRD's own `helm.sh/chart` label, read by a selector elsewhere: a webhook objectSelector can match a CRD."""
+    selecting = [reads_chart_label()]
+    reasons = judge(apps(keda=(tag_render(KEDA_OLD), tag_render(KEDA_NEW)), prometheus=(selecting, selecting)))
+    assert any("CustomResourceDefinition" in r and "inside a selector" in r for r in reasons), reasons
+
+
+def test_the_selector_keys_are_collected_once_across_applications() -> None:
+    """The collector reads every Application at both pins: a selector present only in the BASE of another Application
+    still counts (it selects the live objects until the move lands)."""
+    selecting = [reads_chart_label()]
+    reasons = judge(apps(keda=(tag_render(KEDA_OLD), tag_render(KEDA_NEW)), prometheus=(selecting, [])))
+    assert any("Service/keda/keda-operator" in r and "inside a selector" in r for r in reasons), reasons
+
+
+@pytest.mark.parametrize("field", ["matchLabelKeys", "mismatchLabelKeys"])
+@pytest.mark.parametrize("where", ["topologySpreadConstraints", "podAntiAffinity"])
+def test_a_pod_label_a_label_keys_list_reads_blocks(field: str, where: str) -> None:
+    """ADR-0645 review: `matchLabelKeys`/`mismatchLabelKeys` name pod label keys the scheduler reads from the pod's own
+    labels; a moved derived label so named is inside a selector."""
+    def render(keda: str) -> list:
+        documents = tag_render(keda)
+        pod = documents[0]["spec"]["template"]["spec"]
+        if where == "topologySpreadConstraints":
+            pod[where] = [{"maxSkew": 1, "topologyKey": "kubernetes.io/hostname", "whenUnsatisfiable": "ScheduleAnyway",
+                           "labelSelector": {"matchLabels": {"app": "keda-operator"}}, field: ["app.kubernetes.io/version"]}]
+        else:
+            pod["affinity"] = {where: {"requiredDuringSchedulingIgnoredDuringExecution": [
+                {"topologyKey": "kubernetes.io/hostname", "labelSelector": {"matchLabels": {"app": "keda-operator"}},
+                 field: ["app.kubernetes.io/version"]}]}}
+        return documents
+
+    assert "app.kubernetes.io/version" in pb.render_selector_keys(render(KEDA_OLD))
+    reasons = judge(two_helms(render(KEDA_OLD), render(KEDA_NEW)))
+    assert any("app.kubernetes.io/version" in r and "inside a selector" in r for r in reasons), reasons
+
+
 def test_a_chart_label_that_is_not_the_subchart_version_blocks() -> None:
     head = tag_render(KEDA_NEW)
     head[2]["metadata"]["labels"]["helm.sh/chart"] = "keda-9.9.9"
@@ -434,17 +538,63 @@ def test_a_platform_move_with_no_operator_render_blocks() -> None:
     assert any("no operator Application" in r for r in reasons), reasons
 
 
-def test_a_platform_move_stays_needs_human_until_the_operator_comparator_exists(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """A green ruled-set diff alone does not clear a platform move until C10 part 2: E1 carries one hold reason, so a
-    human pin still commits an acknowledgement and auto-pin opens no PR it could never merge."""
+def test_a_green_platform_move_carries_no_hold_reason(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Rewritten from C10 part 1's "stays needs-human until the operator comparator exists": part 2 builds that
+    comparator in `pin_dryrun.py`, so a ruled-set diff with no selector read clears E1 with no reason at all."""
     for name in pb.OPERATOR_APPLICATIONS:
         (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / name).write_bytes((REPOSITORY / name).read_bytes())
-    monkeypatch.setattr(pb, "render_operator", lambda text, version, binary: tag_render(KEDA_OLD))
-    monkeypatch.setattr(pb, "platform_facts", lambda version, binary: facts(KEDA_OLD))
-    found = pb.platform_evidence(tmp_path, OLD, NEW, {"v3.18.4": "/h3", "v4.3.0": "/h4"}, pb.Net())
-    assert found["reasons"] == [pb.PLATFORM_HOLD]
-    assert "car C10 part 2" in pb.PLATFORM_HOLD
+    monkeypatch.setattr(pb, "render_operator", lambda text, version, binary: tag_render(KEDA_OLD if version == OLD else KEDA_NEW))
+    monkeypatch.setattr(pb, "platform_facts", lambda version, binary: facts(KEDA_OLD if version == OLD else KEDA_NEW))
+    found = pb.platform_evidence(tmp_path, OLD, NEW, {"v3.18.4": "/h3", "v4.3.0": "/h4"}, pb.Net(), [])
+    assert found["reasons"] == []
+    assert not hasattr(pb, "PLATFORM_HOLD")
+
+
+def test_platform_evidence_counts_the_yadgar_renders_selectors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """ADR-1093: the `yadgar` Application is one of the six; a selector in its render that reads a derived label key
+    holds a move of that label on an operator object's own metadata."""
+    for name in pb.OPERATOR_APPLICATIONS:
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_bytes((REPOSITORY / name).read_bytes())
+    monkeypatch.setattr(pb, "render_operator", lambda text, version, binary: tag_render(KEDA_OLD if version == OLD else KEDA_NEW))
+    monkeypatch.setattr(pb, "platform_facts", lambda version, binary: facts(KEDA_OLD if version == OLD else KEDA_NEW))
+    found = pb.platform_evidence(tmp_path, OLD, NEW, {"v3.18.4": "/h3", "v4.3.0": "/h4"}, pb.Net(), [reads_chart_label()])
+    assert any("Service/keda/keda-operator" in r and "inside a selector" in r for r in found["reasons"]), found["reasons"]
+
+
+def test_check_hands_the_yadgar_renders_to_the_platform_evidence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """`check` passes every `yadgar` render it made (both pins, every helm) to `platform_evidence`."""
+    (tmp_path / "applications").mkdir()
+    (tmp_path / pb.APPLICATION).write_bytes((REPOSITORY / pb.APPLICATION).read_bytes())
+    pin = pb.current_pin((tmp_path / pb.APPLICATION).read_text())
+    marker = {"kind": "Service", "metadata": {"name": "marker"}, "spec": {"selector": {"x": "y"}}}
+
+    class FakeNet:
+        def chart_yaml(self, version: str) -> str:
+            platform = OLD if version == pin else NEW
+            return f"dependencies:\n  - name: platform\n    version: {platform}\n"
+
+        def commits(self, old: str, new: str) -> list:
+            return []
+
+        def ghcr_digest(self, module: str, tag: str) -> str:
+            raise AssertionError("classify is stubbed")
+
+    seen = {}
+    monkeypatch.setattr(pb, "render", lambda text, version, binary: [dict(marker, version=version, binary=binary)])
+    monkeypatch.setattr(pb, "classify", lambda renders, old, new, digest: pb.Verdict(accept=True, helms=sorted(renders)))
+    monkeypatch.setattr(pb, "audits", lambda head, old, new, net: ({}, {}))
+
+    def evidence(repo, old, new, helms, net, others):
+        seen["others"] = others
+        return {"from": old, "to": new, "objects": {}, "changed": [], "reasons": []}
+
+    monkeypatch.setattr(pb, "platform_evidence", evidence)
+    pb.check(tmp_path, "999.0.0", FakeNet(), {"v3.18.4": "/h3", "v4.3.0": "/h4"})
+    assert sorted((d["version"], d["binary"]) for d in seen["others"]) == sorted(
+        (v, b) for v in (pin, "999.0.0") for b in ("/h3", "/h4")
+    )
 
 
 # ── renders: --include-crds, and the operator Application's shape ───────────

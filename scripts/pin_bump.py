@@ -451,8 +451,10 @@ def judge_image(key, path, old_image, new_image, old_modules, new_modules, diges
 # - a digest-pinned image whose repository and registry are unchanged and whose
 #   digest is the top-level manifest digest of its declared tag, anonymously;
 # - the labels `helm.sh/chart` and `app.kubernetes.io/version`, derived from the
-#   subchart's version and `appVersion`, never inside a selector (a pod template
-#   label whose key any selector in the Application's render reads blocks);
+#   subchart's version and `appVersion`, never inside a selector: a moved label,
+#   on a pod template or on any object's own `metadata.labels` (a CRD's too),
+#   blocks when its key is read by any selector in any of the six Applications,
+#   the five operator renders at both pins and the `yadgar` render (ADR-1093);
 # - on a CRD: a new optional property with no default, and a new served version
 #   with the storage version and conversion unchanged.
 
@@ -463,11 +465,6 @@ OPERATOR_WORKLOAD_KINDS = frozenset({"Deployment", "StatefulSet", "DaemonSet", "
 CHART_LABEL, VERSION_LABEL = "helm.sh/chart", "app.kubernetes.io/version"
 DERIVED_LABELS = frozenset({CHART_LABEL, VERSION_LABEL})
 CRD_KIND = "CustomResourceDefinition"
-PLATFORM_HOLD = (
-    "platform move: the E2-interim operator comparator (live operators and CRDs) is not built yet (car C10 part 2); "
-    "a platform move waits for a human"
-)
-
 
 @dataclass
 class PlatformVerdict:
@@ -604,9 +601,11 @@ def split_reference(reference: str) -> tuple[str, str, str]:
 
 
 def render_selector_keys(documents) -> set[str]:
-    """Every label key any selector in an Application's render reads, on any object but a CRD.
+    """Every label key any selector in `documents` reads, on any object but a CRD.
 
-    `matchLabels` keys and `matchExpressions[].key` anywhere (a workload, PodDisruptionBudget, NetworkPolicy
+    `matchLabels` keys, `matchExpressions[].key` and the keys a `matchLabelKeys`/`mismatchLabelKeys` list names
+    (topologySpreadConstraints, pod affinity terms: the scheduler reads them from the pod's own labels) anywhere
+    (a workload, PodDisruptionBudget, NetworkPolicy
     `podSelector`/`namespaceSelector`, ServiceMonitor/PodMonitor `selector`, webhook `objectSelector`, ...), and the
     keys of a plain-map selector under any key ending in `selector` (a Service's `spec.selector`). Over-collecting
     blocks more; under-collecting would let a moved pod label leave a selector's set.
@@ -619,6 +618,9 @@ def render_selector_keys(documents) -> set[str]:
                 found.update(str(k) for k in node["matchLabels"])
             if isinstance(node.get("matchExpressions"), list):
                 found.update(str(e.get("key")) for e in node["matchExpressions"] if isinstance(e, dict))
+            for keys in ("matchLabelKeys", "mismatchLabelKeys"):  # topologySpreadConstraints, pod (anti-)affinity
+                if isinstance(node.get(keys), list):
+                    found.update(k for k in node[keys] if isinstance(k, str))
             plain = not ({"matchLabels", "matchExpressions"} & set(node))
             if plain and str(name).lower().endswith("selector") and all(not isinstance(v, (dict, list)) for v in node.values()):
                 found.update(str(k) for k in node)
@@ -655,12 +657,15 @@ def judge_label(
 ) -> list[str]:
     """A changed `helm.sh/chart` or `app.kubernetes.io/version` label; anything else here blocks.
 
-    `selected` is every label key a selector anywhere in the Application's render reads (`render_selector_keys`);
-    a pod template label whose key is in it, or in the object's own selector, blocks.
+    `selected` is every label key a selector in any of the six Applications reads (`render_selector_keys` over
+    them all, ADR-1093). A label whose key is in it blocks wherever it sits, on a pod template or on the object's
+    own `metadata.labels`; a pod template label the object's own selector reads blocks too. The match is by key:
+    a selector that reads the key on any object counts, which may hold more than it must, never less.
     """
     label = path[-1]
     where = dotted(path)
-    if path[:3] == ("spec", "template", "metadata") and label in selector_labels(new) | selector_labels(old) | set(selected):
+    own_selector = selector_labels(new) | selector_labels(old) if path[:3] == ("spec", "template", "metadata") else set()
+    if label in own_selector | set(selected):
         return [f"{key}: label {where} changed inside a selector"]
     labels_new, labels_old = at_tuple(new, path[:-1]), at_tuple(old, path[:-1])
     value = labels_new.get(label) if isinstance(labels_new, dict) else None
@@ -751,16 +756,18 @@ def default_anywhere(schema) -> bool:
     return False
 
 
-def crd_problems(key: str, old: dict, new: dict, old_facts: dict, new_facts: dict) -> list[str]:
+def crd_problems(
+    key: str, old: dict, new: dict, old_facts: dict, new_facts: dict, *, selected: frozenset | set = frozenset()
+) -> list[str]:
     """The CRD allowlist: (a) a new optional property with no default, (b) a new served version with the storage
-    version and conversion unchanged, plus the derived chart labels. Everything else blocks."""
+    version and conversion unchanged, plus the derived chart labels outside any selector. Everything else blocks."""
     problems = []
     rest_old, rest_new = copy.deepcopy(old), copy.deepcopy(new)
     versions_old = (rest_old.get("spec") or {}).pop("versions", None) or []
     versions_new = (rest_new.get("spec") or {}).pop("versions", None) or []
     for path in tuple_paths(rest_old, rest_new):
         if path[:2] == ("metadata", "labels") and len(path) == 3 and path[2] in DERIVED_LABELS:
-            problems += judge_label(key, path, old, new, old_facts, new_facts)
+            problems += judge_label(key, path, old, new, old_facts, new_facts, selected=selected)
         else:
             problems.append(f"{key}: field {dotted(path)} changed; a CRD may only add an optional property or a served version")
     by_old = {str(v.get("name")): v for v in versions_old}
@@ -779,8 +786,13 @@ def crd_problems(key: str, old: dict, new: dict, old_facts: dict, new_facts: dic
     return problems
 
 
-def classify_platform(renders: dict, old_facts: dict, new_facts: dict, registry_digest) -> PlatformVerdict:
-    """E1 of a platform move. `renders` is `{helm version: {Application: (base documents, head documents)}}`."""
+def classify_platform(renders: dict, old_facts: dict, new_facts: dict, registry_digest, *, others: list = ()) -> PlatformVerdict:
+    """E1 of a platform move. `renders` is `{helm version: {Application: (base documents, head documents)}}`.
+
+    `others` is the render of the estate's other Application, `yadgar`. Its selectors and those of every operator
+    Application at both pins are collected ONCE, before any object is judged (ADR-1093): a ServiceMonitor in one
+    Application may select another's Service.
+    """
     digests = gate("test_yadgar_application").digests
     verdict = PlatformVerdict()
     helms = sorted(renders)
@@ -790,6 +802,9 @@ def classify_platform(renders: dict, old_facts: dict, new_facts: dict, registry_
         verdict.reasons.append("platform moved but no operator Application was rendered")
         return verdict
     first = helms[0]
+    selected = render_selector_keys(
+        [*others, *(d for base, head in renders[first].values() for d in (*base, *head))]
+    )
     for application in sorted(renders[first]):
         for other in helms[1:]:
             for side, index in (("base", 0), ("head", 1)):
@@ -799,7 +814,6 @@ def classify_platform(renders: dict, old_facts: dict, new_facts: dict, registry_
                     differing = sorted(k for k in a.keys() | b.keys() if a.get(k) != b.get(k))
                     verdict.reasons.append(f"{application}: helm {first} and helm {other} disagree at the {side} platform: {', '.join(differing)}")
         base, head = (objects_of(documents) for documents in renders[first][application])
-        selected = render_selector_keys([*base.values(), *head.values()])
         verdict.objects[application] = len(head)
         for side, objects in (("base", base), ("head", head)):
             if not objects:
@@ -811,7 +825,9 @@ def classify_platform(renders: dict, old_facts: dict, new_facts: dict, registry_
             if old == new:
                 continue
             if new.get("kind") == CRD_KIND or old.get("kind") == CRD_KIND:
-                verdict.reasons += [f"{application}: {p}" for p in crd_problems(key, old, new, old_facts, new_facts)]
+                verdict.reasons += [
+                    f"{application}: {p}" for p in crd_problems(key, old, new, old_facts, new_facts, selected=selected)
+                ]
                 continue
             for path in tuple_paths(old, new):
                 kind = new.get("kind")
@@ -838,8 +854,12 @@ def classify_platform(renders: dict, old_facts: dict, new_facts: dict, registry_
     return verdict
 
 
-def platform_evidence(repo: Path, old: str, new: str, helms: dict[str, str], net: Net) -> dict:
-    """The platform move's E1: the five operator Applications of `repo` rendered at `old` and `new` on every helm."""
+def platform_evidence(repo: Path, old: str, new: str, helms: dict[str, str], net: Net, others: list) -> dict:
+    """The platform move's E1: the five operator Applications of `repo` rendered at `old` and `new` on every helm.
+
+    `others` is every `yadgar` render `check` made; its selectors count with the operators' (ADR-1093). The live
+    operators and CRDs are compared by `pin_dryrun.py` (E2-interim, car C10 part 2), not here.
+    """
     texts = {}
     for path in OPERATOR_APPLICATIONS:
         name = Path(path).stem
@@ -849,11 +869,10 @@ def platform_evidence(repo: Path, old: str, new: str, helms: dict[str, str], net
         for label, binary in sorted(helms.items())
     }
     binary = helms[sorted(helms)[0]]
-    verdict = classify_platform(renders, platform_facts(old, binary), platform_facts(new, binary), net.registry_digest)
-    # Until car C10 part 2 compares the live operators and CRDs (E2-interim), E1 alone cannot clear a platform
-    # move: it stays NEEDS-HUMAN, so a human pin still commits an acknowledgement and auto-pin opens no PR for it.
-    reasons = [*verdict.reasons, PLATFORM_HOLD]
-    return {"from": old, "to": new, "objects": verdict.objects, "changed": verdict.changed, "reasons": reasons}
+    verdict = classify_platform(
+        renders, platform_facts(old, binary), platform_facts(new, binary), net.registry_digest, others=others
+    )
+    return {"from": old, "to": new, "objects": verdict.objects, "changed": verdict.changed, "reasons": verdict.reasons}
 
 
 # ── reading Rust source ─────────────────────────────────────────────────────
@@ -1624,7 +1643,8 @@ def check(repo: Path, target: str, net: Net, helms: dict[str, str]) -> dict:
     platform = None
     old_platform, new_platform = old_modules.get(PLATFORM), new_modules.get(PLATFORM)
     if old_platform and new_platform and old_platform != new_platform:
-        platform = platform_evidence(repo, old_platform, new_platform, helms, net)
+        yadgar = [d for base, head in renders.values() for d in (*base, *head)]
+        platform = platform_evidence(repo, old_platform, new_platform, helms, net, yadgar)
     reasons = verdict.reasons + [r for b in boot.values() for r in b["reasons"]]
     reasons += [r for m in migrations.values() for r in m["reasons"]]
     reasons += platform["reasons"] if platform else []

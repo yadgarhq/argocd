@@ -43,8 +43,7 @@ WHAT `run` DOES, in order. Every refusal comes before any cluster read.
      refused, and so is a pin that keeps `platform_version` while the target
      chart's `platform` differs from it (the operators would stay behind). So
      every run reads the target chart's `Chart.yaml`; an unreadable one is a
-     refusal. A pure platform move is then RED, before any cluster read, until
-     car C10's second part compares the live operators and CRDs.
+     refusal. A pure platform move then goes on to step 9 as well.
   2. Read ONE value from the sha's data: `spec.source.targetRevision`, a bare
      release `X.Y.Z` not lower than main's pin (a downgrade is a human revert).
      Refuse unless the sha's `yadgar.yaml` is main's with that
@@ -92,6 +91,31 @@ WHAT `run` DOES, in order. Every refusal comes before any cluster read.
      initContainer image is red, as in `pin_bump.py`'s classifier.
   8. The live head diff: the fields where the head render differs from live,
      steady objects only, held to the same image rule.
+  9. On a platform move only (car C10 part 2), the same over the five operator
+     Applications, ALL OF THEM ONE JUDGMENT. Each is rendered from MAIN's file
+     (the sha's differs only in `targetRevision`, step 1) at main's and at the
+     sha's `platform_version`, on the workflow's one helm, CRDs included
+     (`pin_bump.render_operator`). Before any cluster read: refused when a
+     render fails, holds an object twice, holds a Secret, or holds a steady
+     kind outside `OPERATOR_READS`. Then, per operator Application: settled
+     as in step 5, at main's `platform_version`; the baseline as in step 6,
+     each object read in its rendered namespace or else the Application's
+     destination, owned by a tracking-id naming the Application (a
+     cluster-scoped object's names the destination namespace, as Argo writes
+     it), or, for a CRD, which carries no tracking-id on kind-yadgar
+     (measured 2026-10-31), a row in the Application's `status.resources`;
+     and every render-diff path (hooks included) and every live head-diff path
+     in the PLATFORM-MOVE SHAPE: a container image of a workload whose
+     repository does not move; a derived label (`helm.sh/chart`,
+     `app.kubernetes.io/version`) on the object's own or its pod template's
+     labels whose key no selector in the six Applications reads (the five
+     operator renders at both pins and the `yadgar` render, ADR-1093); or a
+     CRD's `spec.versions`. The object set and every hook status stay the same.
+     THE SHAPE IS NOT E1. The values (a tag at its subchart's `appVersion`, a
+     digest at the registry's, a CRD version change inside the allowlist) are
+     judged by E1, `pin_bump.classify_platform`, on two helms, in the required
+     `pin-evidence` job; this workflow has one helm. An automatic head needs
+     both E1 accept and this green.
 
 THE COMPARATOR. Rendered fields only, so `managedFields`, `resourceVersion`,
 `generation`, `status`, uids, server defaults and extra live annotations never
@@ -123,8 +147,10 @@ any other object.
 THE RESULT holds object keys and field paths, never a value: `sha`,
 `main_sha`, `pin`, `target`, `result` (green, red or refused), `interim`,
 `not_run`, `problems`, `baseline`, `objects` (the head diff), `hooks_left_out`,
-`compared`, `admission`. `pin-dryrun.yaml` uploads it as artifact `pin-dryrun`
-(`result.json`).
+`compared`, `admission`. On a platform move, `objects`, `baseline`,
+`hooks_left_out` and `compared` carry the operator Applications' too, each
+operator head diff entry naming its `application`. `pin-dryrun.yaml` uploads it
+as artifact `pin-dryrun` (`result.json`).
 
 `find` is the reader, and the evidence is only as good as its filters.
 
@@ -186,6 +212,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import urllib.error
@@ -280,6 +307,34 @@ READS: dict[tuple[str, str], tuple[str, bool]] = {
     ("networking.k8s.io", "NetworkPolicy"): ("networkpolicies.networking.k8s.io", True),
     ("policy", "PodDisruptionBudget"): ("poddisruptionbudgets.policy", True),
 }
+# THE OPERATOR READ TABLE (car C10 part 2): the steady kinds of the five
+# operator Applications at platform 0.2.17 (158 objects with CRDs, 147 steady),
+# each read by the verifier's ClusterRole (`verifier/manifests/clusterrole.yaml`,
+# held by `scripts/tests/test_pin_dryrun_operators.py`). Kept exact by
+# `scripts/gates/test_pin_dryrun_kinds.py`. No Secret, ever.
+OPERATOR_READS: dict[tuple[str, str], tuple[str, bool]] = {
+    ("", "ConfigMap"): ("configmaps", True),
+    ("", "PersistentVolumeClaim"): ("persistentvolumeclaims", True),
+    ("", "Service"): ("services", True),
+    ("", "ServiceAccount"): ("serviceaccounts", True),
+    ("admissionregistration.k8s.io", "MutatingWebhookConfiguration"): ("mutatingwebhookconfigurations.admissionregistration.k8s.io", False),
+    ("admissionregistration.k8s.io", "ValidatingAdmissionPolicy"): ("validatingadmissionpolicies.admissionregistration.k8s.io", False),
+    ("admissionregistration.k8s.io", "ValidatingAdmissionPolicyBinding"): (
+        "validatingadmissionpolicybindings.admissionregistration.k8s.io", False,
+    ),
+    ("admissionregistration.k8s.io", "ValidatingWebhookConfiguration"): (
+        "validatingwebhookconfigurations.admissionregistration.k8s.io", False,
+    ),
+    ("apiextensions.k8s.io", "CustomResourceDefinition"): ("customresourcedefinitions.apiextensions.k8s.io", False),
+    ("apiregistration.k8s.io", "APIService"): ("apiservices.apiregistration.k8s.io", False),
+    ("apps", "Deployment"): ("deployments.apps", True),
+    ("rbac.authorization.k8s.io", "ClusterRole"): ("clusterroles.rbac.authorization.k8s.io", False),
+    ("rbac.authorization.k8s.io", "ClusterRoleBinding"): ("clusterrolebindings.rbac.authorization.k8s.io", False),
+    ("rbac.authorization.k8s.io", "Role"): ("roles.rbac.authorization.k8s.io", True),
+    ("rbac.authorization.k8s.io", "RoleBinding"): ("rolebindings.rbac.authorization.k8s.io", True),
+}
+OPERATOR_WORKLOAD_KINDS = frozenset({"Deployment", "StatefulSet", "DaemonSet", "Job"})
+CRD_KIND = "CustomResourceDefinition"
 ADMISSION = {
     "mutating": "mutatingwebhookconfigurations.admissionregistration.k8s.io",
     "validating": "validatingwebhookconfigurations.admissionregistration.k8s.io",
@@ -654,6 +709,12 @@ SEGMENT = re.compile(r"[^.\[\]]+|\[\d+\]")
 # path. A rendered `false` or `0` is NOT matched to an absent field: on a
 # pointer field (`automountServiceAccountToken`) absent means the default.
 ENV_VALUE = re.compile(r"(?:^|\.)(?:containers|initContainers)\[\d+\]\.env\[\d+\]\.value$")
+# Two more omitempty zero values, measured in the operator renders at platform
+# 0.2.17 against kind-yadgar on 2026-10-31: keda's and mariadb-operator's
+# `hostNetwork: false` (PodSpec.HostNetwork, a plain bool), and prometheus's
+# `subPath: ""` (VolumeMount.SubPath, a plain string). Only these paths.
+HOST_NETWORK = re.compile(r"spec\.template\.spec\.hostNetwork")
+SUB_PATH = re.compile(r"(?:^|\.)(?:containers|initContainers)\[\d+\]\.volumeMounts\[\d+\]\.subPath$")
 
 
 def quantity(value) -> Decimal | None:
@@ -696,7 +757,9 @@ def differences(rendered, live, path: str = "") -> list[str]:
         if not isinstance(live, list) or len(live) != len(rendered):
             return [path or "<root>"]
         return [found for i, (a, b) in enumerate(zip(rendered, live, strict=True)) for found in differences(a, b, f"{path}[{i}]")]
-    if rendered == "" and live is None and ENV_VALUE.search(path):
+    if rendered == "" and live is None and (ENV_VALUE.search(path) or SUB_PATH.search(path)):
+        return []
+    if rendered is False and live is None and HOST_NETWORK.fullmatch(path):
         return []
     if isinstance(rendered, bool) != isinstance(live, bool):
         return [path]
@@ -773,26 +836,26 @@ def tracking_problem(key: str, document: dict, live: dict) -> str | None:
 # ── step 4-5: the reads and settledness ─────────────────────────────────────
 
 
-def settled_problems(application: dict, pin: str) -> list[str]:
+def settled_problems(application: dict, pin: str, name: str = APPLICATION_NAME) -> list[str]:
     status = application.get("status") or {}
     problems = []
     sync = (status.get("sync") or {}).get("status")
     health = (status.get("health") or {}).get("status")
     phase = (status.get("operationState") or {}).get("phase")
     if sync != "Synced":
-        problems.append(f"not settled: {APPLICATION_NAME} sync status {sync}")
+        problems.append(f"not settled: {name} sync status {sync}")
     if health != "Healthy":
-        problems.append(f"not settled: {APPLICATION_NAME} health {health}")
+        problems.append(f"not settled: {name} health {health}")
     if phase in {"Running", "Terminating"}:
-        problems.append(f"not settled: {APPLICATION_NAME} operation {phase}")
+        problems.append(f"not settled: {name} operation {phase}")
     if application.get("operation"):
-        problems.append(f"not settled: {APPLICATION_NAME} has an operation pending")
+        problems.append(f"not settled: {name} has an operation pending")
     spec_revision = ((application.get("spec") or {}).get("source") or {}).get("targetRevision")
     if str(spec_revision) != pin:
-        problems.append(f"not settled: {APPLICATION_NAME} spec.source.targetRevision {spec_revision}, main pins {pin}")
+        problems.append(f"not settled: {name} spec.source.targetRevision {spec_revision}, main pins {pin}")
     synced_revision = (status.get("sync") or {}).get("revision")
     if str(synced_revision) != pin:
-        problems.append(f"not settled: {APPLICATION_NAME} status.sync.revision {synced_revision}, main pins {pin}")
+        problems.append(f"not settled: {name} status.sync.revision {synced_revision}, main pins {pin}")
     return problems
 
 
@@ -836,12 +899,179 @@ def live_objects(cluster, documents: dict[str, dict]) -> dict[str, dict]:
     return found
 
 
+# ── step 9: the operator Applications on a platform move (car C10 part 2) ──
+
+
+def default_operator_render(text: str, version: str) -> list:
+    """One operator Application at platform `version` on the `helm` on PATH (the workflow's v3.18.4)."""
+    helm = shutil.which("helm")
+    if helm is None:
+        raise InfrastructureError("no helm on PATH to render the operator Applications")
+    return _load("pin_bump").render_operator(text, version, helm)
+
+
+def platform_versions(repo: Path, base: str, sha: str, runner: Callable) -> tuple[str, str]:
+    """`(main's platform_version, the sha's)`, both already checked by step 1."""
+    main_pin, head_pin = (strict_json(read_at(repo, commit, CHART_PIN, runner) or b"{}") for commit in (base, sha))
+    return str(main_pin.get("platform_version")), str(head_pin.get("platform_version"))
+
+
+def operator_renders(
+    repo: Path, base: str, runner: Callable, old: str, new: str, render_operator: Callable[[str, str], list]
+) -> tuple[dict[str, dict], list[str]]:
+    """`({Application: {namespace, base, head}}, refusals)` from MAIN's five operator files; no cluster read."""
+    pin_bump = _load("pin_bump")
+    operators: dict[str, dict] = {}
+    problems: list[str] = []
+    for path in OPERATOR_FILES:
+        text = (read_at(repo, base, path, runner) or b"").decode()
+        try:
+            name, namespace, _ = pin_bump.operator_inputs(text)
+            sides = {side: render_operator(text, version) for side, version in (("base", old), ("head", new))}
+        except pin_bump.Refused as refused:
+            problems.append(f"{path}: the operator render failed: {refused}")
+            continue
+        for side, documents in sides.items():
+            problems += [f"{name}: {key} rendered twice at the {side} platform; refused" for key in rendered_twice(documents)]
+        operators[name] = {"namespace": namespace, **{side: objects_of(documents) for side, documents in sides.items()}}
+        for key, document in sorted({**operators[name]["base"], **operators[name]["head"]}.items()):
+            if is_hook(document):
+                continue
+            if document.get("kind") == "Secret":
+                problems.append(f"{name}: {key}: the render holds a Secret, which this check never reads")
+            elif group_kind(document) not in OPERATOR_READS:
+                problems.append(f"{name}: {key}: kind not in pin_dryrun.OPERATOR_READS; extend the table (and the runner's ClusterRole) first")
+    return operators, problems
+
+
+def live_namespace(document: dict, destination: str) -> str:
+    """Where Argo applies a namespaced object: its rendered namespace, else the Application's destination."""
+    return str((document.get("metadata") or {}).get("namespace") or destination)
+
+
+def operator_live(cluster, operators: dict[str, dict]) -> tuple[dict[str, dict], dict[tuple[str, str], dict]]:
+    """`({Application: its live Application}, {(Application, key): live object})`, one list per kind and namespace."""
+    applications = {name: cluster.json("get", "applications.argoproj.io", name, "-n", ARGOCD_NAMESPACE) for name in sorted(operators)}
+    wanted: dict[tuple[str, str], dict[str, tuple[str, str]]] = {}
+    for name, operator in sorted(operators.items()):
+        for key, document in {**operator["base"], **operator["head"]}.items():
+            if is_hook(document):
+                continue
+            resource, namespaced = OPERATOR_READS[group_kind(document)]
+            namespace = live_namespace(document, operator["namespace"]) if namespaced else ""
+            wanted.setdefault((resource, namespace), {})[str((document.get("metadata") or {}).get("name"))] = (name, key)
+    found: dict[tuple[str, str], dict] = {}
+    for (resource, namespace), names in sorted(wanted.items()):
+        args = ["get", resource, "-n", namespace] if namespace else ["get", resource]
+        for item in cluster.json(*args).get("items") or []:
+            name = (item.get("metadata") or {}).get("name")
+            if name in names:
+                found[names[name]] = item
+    return applications, found
+
+
+def operator_owner_problem(name: str, operator: dict, application: dict, key: str, document: dict, live: dict) -> str | None:
+    """The live object belongs to Application `name`: its tracking-id, or, for a CRD, `status.resources`."""
+    group, kind = group_kind(document)
+    object_name = (document.get("metadata") or {}).get("name")
+    if kind == CRD_KIND:
+        listed = {
+            (r.get("group"), r.get("kind"), r.get("name"))
+            for r in (application.get("status") or {}).get("resources") or []
+            if isinstance(r, dict)
+        }
+        if (group, kind, object_name) not in listed:
+            return f"baseline not empty: {name}: {key} is not in {name}'s status.resources (a CRD carries no tracking-id)"
+        return None
+    namespaced = OPERATOR_READS[(group, kind)][1]
+    destination = operator["namespace"]
+    namespace = live_namespace(document, destination) if namespaced else destination
+    wanted = {f"{name}:{group}/{kind}:{namespace}/{object_name}"}
+    if not namespaced:
+        wanted.add(f"{name}:{group}/{kind}:/{object_name}")
+    found = ((live.get("metadata") or {}).get("annotations") or {}).get(TRACKING_ID)
+    if found not in wanted:
+        return f"baseline not empty: {name}: {key} tracking-id does not name {name}'s {group}/{kind} {object_name}"
+    return None
+
+
+def shape_problem(name: str, key: str, document: dict, path: str, before, after, selected: set[str]) -> str | None:
+    """One changed path of an operator object against the platform-move shape (step 9). None when inside it."""
+    pin_bump = _load("pin_bump")
+    kind = document.get("kind")
+    if kind in OPERATOR_WORKLOAD_KINDS and IMAGE_PATH.fullmatch(path):
+        if not isinstance(before, str) or not isinstance(after, str) or image_repository(before) != image_repository(after):
+            return f"{name}: {key} {path} image repository moved"
+        return None
+    for label in sorted(pin_bump.DERIVED_LABELS):
+        if path in (f"metadata.labels.{label}", f"spec.template.metadata.labels.{label}"):
+            return f"{name}: {key} {path} changed inside a selector" if label in selected else None
+    if kind == CRD_KIND and (path == "spec.versions" or path.startswith(("spec.versions.", "spec.versions["))):
+        return None
+    return f"{name}: {key} {path} changed; outside the platform-move shape"
+
+
+def _value(document, path: str):
+    try:
+        return _at(document, path)
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
+def operator_judgment(
+    operators: dict[str, dict], applications: dict[str, dict], live: dict[tuple[str, str], dict], platform: str, selected: set[str]
+) -> tuple[list[str], list[str], list[dict], int, list[str]]:
+    """`(problems, baseline, head diff objects, compared, hooks left out)` over every operator Application."""
+    problems: list[str] = []
+    baseline: list[str] = []
+    objects: list[dict] = []
+    hooks: list[str] = []
+    compared = 0
+    for name, operator in sorted(operators.items()):
+        base, head = operator["base"], operator["head"]
+        problems += settled_problems(applications[name], platform, name)
+        problems += [f"{name}: {key}: added at head (the object set moved)" for key in sorted(head.keys() - base.keys())]
+        problems += [f"{name}: {key}: removed at head (the object set moved)" for key in sorted(base.keys() - head.keys())]
+        for key in sorted(base.keys() & head.keys()):
+            old, new = base[key], head[key]
+            if is_hook(old) != is_hook(new):
+                problems.append(f"{name}: render diff: {key} hook status changed ({HOOK} {'added' if is_hook(new) else 'removed'} at head)")
+            for path in render_paths(old, new):
+                if (problem := shape_problem(name, key, new, path, _value(old, path), _value(new, path), selected)) is not None:
+                    problems.append(f"render diff: {problem}")
+        hooks += sorted(k for k, d in {**base, **head}.items() if is_hook(d))
+        for key, document in sorted(base.items()):
+            if is_hook(document):
+                continue
+            compared += 1
+            found = live.get((name, key))
+            if found is None:
+                baseline.append(f"baseline not empty: {name}: {key} not live")
+                continue
+            if (problem := operator_owner_problem(name, operator, applications[name], key, document, found)) is not None:
+                baseline.append(problem)
+            baseline += [f"baseline not empty: {name}: {key} {path}" for path in differences(document, found)]
+        for key, document in sorted(head.items()):
+            found = live.get((name, key))
+            if is_hook(document) or found is None:
+                continue
+            paths = differences(document, found)
+            if not paths:
+                continue
+            objects.append({"application": name, "key": key, "paths": paths})
+            for path in paths:
+                if (problem := shape_problem(name, key, document, path, _value(found, path), _value(document, path), selected)) is not None:
+                    problems.append(f"head diff: {problem}")
+    return problems, baseline, objects, compared, hooks
+
+
 # ── run ─────────────────────────────────────────────────────────────────────
 
 
 def dry_run(
     repo: Path, base: str, sha: str, cluster, *, render: Callable[[bytes], list] | None = None,
     runner: Callable = subprocess.run, platform_of: Callable[[str], str] | None = None,
+    render_operator: Callable[[str, str], list] | None = None,
 ) -> dict:
     """The E2-interim result for `sha` judged by main at `base`. Raises InfrastructureError for a failure of the run."""
     result = {
@@ -864,13 +1094,8 @@ def dry_run(
     result.update(pin=pin, target=target)
     if problems or head_application is None:
         return {**result, "problems": problems}
-    if any(read_at(repo, base, path, runner) != read_at(repo, sha, path, runner) for path in OPERATOR_FILES):
-        # Car C10 part 2 builds the E2-interim comparator over the live operators and CRDs. Until then a pure
-        # platform move is judged RED here, never green and never by the `yadgar` comparison alone.
-        return {**result, "result": "red", "problems": [
-            "platform move: the E2-interim operator comparator (live operators and CRDs) is not built yet; "
-            "a platform move waits for a human"
-        ]}
+    # Step 1 has proved the operator files untouched, or a pure version move of all five: then step 9 runs too.
+    platform_moved = any(read_at(repo, base, path, runner) != read_at(repo, sha, path, runner) for path in OPERATOR_FILES)
 
     settled_gate = _load("settled_gate")
     render = render or settled_gate.default_render
@@ -898,10 +1123,18 @@ def dry_run(
     base_steady = {k: d for k, d in base_objects.items() if not is_hook(d)}
     head_steady = {k: d for k, d in head_objects.items() if not is_hook(d)}
 
+    operators: dict[str, dict] = {}
+    if platform_moved:
+        platform, moved_to = platform_versions(repo, base, sha, runner)
+        operators, refusals = operator_renders(repo, base, runner, platform, moved_to, render_operator or default_operator_render)
+        if refusals:
+            return {**result, "problems": refusals}
+
     verify_handover = _load("verify_handover")
     try:
         application = cluster.json("get", "applications.argoproj.io", APPLICATION_NAME, "-n", ARGOCD_NAMESPACE)
         live = live_objects(cluster, {**base_steady, **head_steady})
+        operator_applications, operators_live = operator_live(cluster, operators) if operators else ({}, {})
         seen_admission = admission(cluster)
     except (verify_handover.KubectlError, verify_handover.UsageError, ValueError) as error:
         raise InfrastructureError(f"a cluster read failed: {error}") from error
@@ -929,6 +1162,20 @@ def dry_run(
             for path in paths
             if kind not in WORKLOAD_KINDS or not IMAGE_PATH.fullmatch(path)
         ]
+    compared = len(base_steady)
+    if operators:
+        # ADR-1093: one selector set over the six Applications, both pins.
+        selected = _load("pin_bump").render_selector_keys(
+            [*base_documents, *head_documents, *(d for o in operators.values() for side in ("base", "head") for d in o[side].values())]
+        )
+        found, found_baseline, found_objects, found_compared, found_hooks = operator_judgment(
+            operators, operator_applications, operators_live, platform, selected
+        )
+        problems += found
+        baseline += found_baseline
+        objects += found_objects
+        compared += found_compared
+        hooks = sorted({*hooks, *found_hooks})
     problems += baseline
     return {
         **result,
@@ -937,7 +1184,7 @@ def dry_run(
         "baseline": baseline,
         "objects": objects,
         "hooks_left_out": hooks,
-        "compared": len(base_steady),
+        "compared": compared,
         "admission": seen_admission,
     }
 

@@ -169,3 +169,32 @@ def test_the_109_range_classifies_as_its_hand_evidence(tmp_path: Path) -> None:
         assert evidence["reasons"] == [] and evidence["accept"] is True
     else:
         assert [r[: len(ONE_HELM)] for r in evidence["reasons"]] == [ONE_HELM] and evidence["accept"] is False
+
+
+# ── the platform move, live: 0.2.14 -> 0.2.17 (car C10 part 2, ADR-1093) ────
+
+# argocd#207 pinned this move by hand (yadgar 0.49.27 -> 0.50.0) with the only
+# platform reason being the part-1 hold. Rendered again here with the selector
+# keys collected across all six Applications (the five operator renders at both
+# platforms and main's `yadgar` render), it carries no reason: no selector in
+# the estate reads `helm.sh/chart` or `app.kubernetes.io/version`.
+LIVE_PLATFORM_MOVE = ("0.2.14", "0.2.17")
+OPERATOR_OBJECTS = {"cert-manager": 50, "envoy-gateway": 40, "keda": 29, "mariadb-operator": 32, "prometheus": 7}
+
+
+def test_the_live_0_2_14_to_0_2_17_move_carries_no_hold(tmp_path: Path) -> None:
+    gate = pb.gate("test_no_two_owners")
+    for path in pb.OPERATOR_APPLICATIONS:
+        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(REPOSITORY / path, tmp_path / path)
+    helms = pb.discover_helms()
+    yadgar = [d for d in gate.parent_render(REPOSITORY) if isinstance(d, dict)]
+
+    found = pb.platform_evidence(tmp_path, *LIVE_PLATFORM_MOVE, helms, pb.Net(), yadgar)
+
+    print(f"[platform] {' -> '.join(LIVE_PLATFORM_MOVE)} on helm {', '.join(sorted(helms))}: reasons {found['reasons']}")
+    assert found["objects"] == OPERATOR_OBJECTS and found["changed"] == []
+    if len(helms) > 1:
+        assert found["reasons"] == []
+    else:
+        assert [r[: len("platform: " + ONE_HELM)] for r in found["reasons"]] == ["platform: " + ONE_HELM]
