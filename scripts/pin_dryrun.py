@@ -33,13 +33,24 @@ WHAT `run` DOES, in order. Every refusal comes before any cluster read.
      criss-cross history makes `main...sha` ambiguous), and `main...sha`
      (`--no-renames`, so a rename shows its old path) changes only the three
      pin files: `applications/yadgar.yaml`, `scripts/chart_pin.json`,
-     `scripts/gates/yadgar_render.sha256`.
+     `scripts/gates/yadgar_render.sha256`, plus, on a platform move, the five
+     operator Applications (`OPERATOR_FILES`, car C10). A platform move is
+     refused unless each operator file is main's with only its one
+     `targetRevision` line moved to the sha's `platform_version`, main's files
+     all pinned main's `platform_version`, and the new one is the target
+     chart's `platform`; an operator file changed with no platform move is
+     refused, and so is a pin that keeps `platform_version` while the target
+     chart's `platform` differs from it (the operators would stay behind). So
+     every run reads the target chart's `Chart.yaml`; an unreadable one is a
+     refusal. A pure platform move is then RED, before any cluster read, until
+     car C10's second part compares the live operators and CRDs.
   2. Read ONE value from the sha's data: `spec.source.targetRevision`, a bare
      release `X.Y.Z` not lower than main's pin (a downgrade is a human revert).
      Refuse unless the sha's `yadgar.yaml` is main's with that
      one line rewritten (`pin_bump.rewrite_target_revision`), byte for byte,
      and its `chart_pin.json` is main's with only `chart_tag` and
-     `chart_digest` moved (the digest read from the sha and checked for shape
+     `chart_digest` moved, plus `platform_version` on a platform move, all in
+     one comparison (the digest read from the sha and checked for shape
      only; CI's `chart-pin` job resolves the tag and compares it, yaadgaar
      250). So no PR
      value reaches the credential: the head render is main's values at the
@@ -190,6 +201,10 @@ APPLICATION = "applications/yadgar.yaml"
 CHART_PIN = "scripts/chart_pin.json"
 TABLE = "scripts/gates/yadgar_render.sha256"
 PIN_FILES = frozenset({APPLICATION, CHART_PIN, TABLE})
+# A platform move also changes these five, each by its one `targetRevision` line (car C10), and no more.
+OPERATOR_FILES = tuple(
+    f"applications/{name}.yaml" for name in ("cert-manager", "envoy-gateway", "keda", "mariadb-operator", "prometheus")
+)
 
 APPLICATION_NAME = "yadgar"
 ARGOCD_NAMESPACE = "argocd"
@@ -418,13 +433,18 @@ def checker_identity(repo: Path, base: str, runner: Callable) -> dict:
 # ── step 1-3: refusals, before any cluster read ─────────────────────────────
 
 
-def pin_refusals(repo: Path, base: str, sha: str, runner: Callable) -> tuple[str | None, str | None, bytes | None, list[str]]:
-    """`(pin, target, head application, problems)`. Git and text only; no render, no cluster."""
+def pin_refusals(
+    repo: Path, base: str, sha: str, runner: Callable, platform_of: Callable[[str], str] | None = None
+) -> tuple[str | None, str | None, bytes | None, list[str]]:
+    """`(pin, target, head application, problems)`. Git and text only, plus the target chart's `platform` version
+    (`platform_of`) on a platform move; no render, no cluster."""
     pin_bump = _load("pin_bump")
+    changed = changed_paths(repo, base, sha, runner)
     problems = [
-        f"{path}: changed by main...{sha[:12]}, outside the three pin files ({', '.join(sorted(PIN_FILES))})"
-        for path in changed_paths(repo, base, sha, runner)
-        if path not in PIN_FILES
+        f"{path}: changed by main...{sha[:12]}, outside the three pin files and the five operator Applications "
+        f"({', '.join(sorted(PIN_FILES | set(OPERATOR_FILES)))})"
+        for path in changed
+        if path not in PIN_FILES and path not in OPERATOR_FILES
     ]
     bases = merge_bases(repo, base, sha, runner)
     if len(bases) != 1:
@@ -466,18 +486,77 @@ def pin_refusals(repo: Path, base: str, sha: str, runner: Callable) -> tuple[str
     head_pin = read_at(repo, sha, CHART_PIN, runner)
     if main_pin is None or head_pin is None:
         problems.append(f"{CHART_PIN}: absent at main or at the sha")
-    else:
-        try:
-            # The head's own digest: its shape is checked by `rewrite_chart_pin`, its value by CI's `chart-pin` job.
-            parsed = json.loads(head_pin)
-            digest = parsed.get("chart_digest") if isinstance(parsed, dict) else None
-            if head_pin.decode() != pin_bump.rewrite_chart_pin(main_pin.decode(), target, digest if isinstance(digest, str) else ""):
-                problems.append(f"{CHART_PIN}: differs from main's in more than chart_tag v{target} and chart_digest")
-        except pin_bump.Refused as refused:
-            problems.append(f"{CHART_PIN}: {refused}")
-        except ValueError:
-            problems.append(f"{CHART_PIN}: not JSON at the sha")
+        return pin, target, expected, problems
+    try:
+        main_parsed, head_parsed = strict_json(main_pin), strict_json(head_pin)
+        platform, moved_to = main_parsed.get("platform_version"), head_parsed.get("platform_version")
+        # The head's own digest: its shape is checked by `rewrite_chart_pin`, its value by CI's `chart-pin` job.
+        digest = head_parsed.get("chart_digest")
+    except (ValueError, AttributeError):  # already named above as not JSON; nothing more can be read from it
+        return pin, target, expected, problems or [f"{CHART_PIN}: not a JSON object"]
+    moved = moved_to != platform
+    try:
+        rewritten = pin_bump.rewrite_chart_pin(
+            main_pin.decode(), target, digest=digest if isinstance(digest, str) else "", platform=moved_to if moved else None
+        )
+        if head_pin.decode() != rewritten:
+            what = f"chart_tag v{target}, chart_digest" + (f" and platform_version {moved_to}" if moved else "")
+            problems.append(f"{CHART_PIN}: differs from main's in more than {what}")
+    except pin_bump.Refused as refused:
+        problems.append(f"{CHART_PIN}: {refused}")
+    problems += operator_refusals(repo, base, sha, runner, changed, platform, moved_to if moved else None, target, platform_of)
     return pin, target, expected, problems
+
+
+def operator_refusals(
+    repo: Path, base: str, sha: str, runner: Callable, changed: list[str], platform: str, moved_to: str | None,
+    target: str, platform_of: Callable[[str], str] | None,
+) -> list[str]:
+    """Car C10: the five operator files are untouched, or, on a platform move, a pure version move to `moved_to`.
+
+    For each file the head is main's with only `spec.source.targetRevision` rewritten, byte for byte; main's pinned
+    `platform_version` and the head pins `moved_to`, which must be the target chart's `platform`. A values change,
+    files that disagree with each other or with `platform_version`, and a file left behind are all refused.
+    """
+    pin_bump = _load("pin_bump")
+    if moved_to is None:
+        problems = [f"{path}: changed by main...{sha[:12]} while platform_version stays {platform}" for path in OPERATOR_FILES if path in changed]
+        # A target whose chart moved `platform` is a platform move: three files would leave the operators behind.
+        try:
+            wanted = (platform_of or pin_bump.target_platform)(target)
+        except Exception as error:  # noqa: BLE001  (an unreadable chart is a refusal, never a pass)
+            return [*problems, f"the target chart {target}'s platform version could not be read: {error}"]
+        if wanted != platform:
+            problems.append(
+                f"{CHART_PIN}: platform_version stays {platform}, but the target chart {target}'s platform is {wanted}; "
+                "a platform move moves platform_version and all five operator Applications"
+            )
+        return problems
+    problems = []
+    for path in OPERATOR_FILES:
+        main_text, head_text = read_at(repo, base, path, runner), read_at(repo, sha, path, runner)
+        if main_text is None or head_text is None:
+            problems.append(f"{path}: absent at main or at the sha; a platform move moves all five operator Applications")
+            continue
+        for side, text in (("main", main_text), ("the sha", head_text)):
+            problems += [f"{path} at {side}: {p}; refused, two readers may read it apart" for p in yaml_ambiguities(text.decode())]
+        try:
+            expected, old = pin_bump.rewrite_target_revision(main_text.decode(), moved_to, path)
+        except pin_bump.Refused as refused:
+            problems.append(f"{path}: {refused}")
+            continue
+        if old != platform:
+            problems.append(f"{path}: main pins platform {old}, not main's platform_version {platform}")
+        if head_text.decode() != expected:
+            problems.append(f"{path}: differs from main's in more than the one targetRevision line moved to platform_version {moved_to}")
+    try:
+        wanted = (platform_of or pin_bump.target_platform)(target)
+    except Exception as error:  # noqa: BLE001  (an unreadable chart is a refusal, never a pass)
+        problems.append(f"the target chart {target}'s platform version could not be read: {error}")
+    else:
+        if wanted != moved_to:
+            problems.append(f"{CHART_PIN}: platform_version {moved_to} is not the target chart {target}'s platform {wanted}")
+    return problems
 
 
 def objects_of(documents: list) -> dict[str, dict]:
@@ -725,7 +804,10 @@ def live_objects(cluster, documents: dict[str, dict]) -> dict[str, dict]:
 # ── run ─────────────────────────────────────────────────────────────────────
 
 
-def dry_run(repo: Path, base: str, sha: str, cluster, *, render: Callable[[bytes], list] | None = None, runner: Callable = subprocess.run) -> dict:
+def dry_run(
+    repo: Path, base: str, sha: str, cluster, *, render: Callable[[bytes], list] | None = None,
+    runner: Callable = subprocess.run, platform_of: Callable[[str], str] | None = None,
+) -> dict:
     """The E2-interim result for `sha` judged by main at `base`. Raises InfrastructureError for a failure of the run."""
     result = {
         "sha": sha,
@@ -743,10 +825,17 @@ def dry_run(repo: Path, base: str, sha: str, cluster, *, render: Callable[[bytes
         "admission": {},
         "checker": checker_identity(repo, base, runner),
     }
-    pin, target, head_application, problems = pin_refusals(repo, base, sha, runner)
+    pin, target, head_application, problems = pin_refusals(repo, base, sha, runner, platform_of)
     result.update(pin=pin, target=target)
     if problems or head_application is None:
         return {**result, "problems": problems}
+    if any(read_at(repo, base, path, runner) != read_at(repo, sha, path, runner) for path in OPERATOR_FILES):
+        # Car C10 part 2 builds the E2-interim comparator over the live operators and CRDs. Until then a pure
+        # platform move is judged RED here, never green and never by the `yadgar` comparison alone.
+        return {**result, "result": "red", "problems": [
+            "platform move: the E2-interim operator comparator (live operators and CRDs) is not built yet; "
+            "a platform move waits for a human"
+        ]}
 
     settled_gate = _load("settled_gate")
     render = render or settled_gate.default_render

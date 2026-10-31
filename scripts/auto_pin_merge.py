@@ -39,7 +39,9 @@ regenerate, wait or refuse. It MERGES only when all of these hold:
   4. Exactly one commit: the head, authored by the release App, verified
      (GitHub signs an App's API commit), whose only parent is the marker's main.
   5. The changed files equal `pin_bump.MECHANICAL_FILES` as MAIN's checkout
-     defines it (`--repo`), never anything the PR carries, and each one is a
+     defines it (`--repo`), or those and all five of its
+     `pin_bump.OPERATOR_APPLICATIONS` (a platform move, car C10; CI's
+     `pin-evidence` binds their content), never anything the PR carries, and each one is a
      plain `modified` entry: a rename onto a mechanical path deletes a file
      outside the set under a matching name, and a removal or an addition is
      no pin.
@@ -143,6 +145,16 @@ class MergeReads:
     e2_run: Callable[[int, str, str], str | None]
     mechanical: tuple[str, ...]
     sleep: Callable[[float], None]
+    # main's `pin_bump.OPERATOR_APPLICATIONS`: a platform move changes these five as well, all or none (car C10).
+    operators: tuple[str, ...] = ()
+
+
+def files_allowed(files: list[str], reads: MergeReads) -> bool:
+    """The PR's changed files are main's three mechanical files, or those and main's five operator Applications."""
+    allowed = [sorted(reads.mechanical)]
+    if reads.operators:
+        allowed.append(sorted((*reads.mechanical, *reads.operators)))
+    return sorted(files) in allowed
 
 
 def _statuses_problem(statuses: list[dict], *, head: str, main: str, run: int) -> str | None:
@@ -241,8 +253,12 @@ def judge_pr(api: ap.Client, number: int, reads: MergeReads, *, run_head: str | 
 
     entries = api.paginate(f"{R}/pulls/{number}/files")
     files = sorted(str(f.get("filename")) for f in entries)
-    if files != sorted(reads.mechanical):
-        return verdict("refuse", f"#{number} changes files {files}, not main's MECHANICAL_FILES {sorted(reads.mechanical)}")
+    if not files_allowed(files, reads):
+        return verdict(
+            "refuse",
+            f"#{number} changes files {files}, not main's MECHANICAL_FILES {sorted(reads.mechanical)}"
+            + (f" (with or without all of OPERATOR_APPLICATIONS {sorted(reads.operators)})" if reads.operators else ""),
+        )
     odd = [f"{f.get('filename')} ({f.get('status')}{', from ' + str(f['previous_filename']) if f.get('previous_filename') else ''})" for f in entries if f.get("status") != "modified" or f.get("previous_filename")]
     if odd:
         return verdict("refuse", f"#{number} does not only modify its mechanical files in place: {', '.join(odd)}")
@@ -381,7 +397,7 @@ def _e2_reader(pin: str) -> Callable[[int, str, str], str | None]:
 def judge_pass(reader: ap.Client, args: argparse.Namespace) -> tuple[int, list[Verdict]]:
     """Judge every open automatic PR with GITHUB_TOKEN alone, regenerate where due, and return the merge verdicts."""
     pb = ap._import("pin_bump")
-    reads = MergeReads(epoch=ap._epoch_reader(args.repo), e2_run=_e2_reader(ap.current_pin(args.repo)), mechanical=tuple(pb.MECHANICAL_FILES), sleep=time.sleep)
+    reads = MergeReads(epoch=ap._epoch_reader(args.repo), e2_run=_e2_reader(ap.current_pin(args.repo)), mechanical=tuple(pb.MECHANICAL_FILES), operators=tuple(pb.OPERATOR_APPLICATIONS), sleep=time.sleep)
     code = ap.EXIT_OK
     merges: list[Verdict] = []
     candidates = [p for p in ap.pin_prs(reader) if p.state == "open"]

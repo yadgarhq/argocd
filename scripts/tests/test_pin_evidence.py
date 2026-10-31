@@ -510,6 +510,9 @@ def test_regenerated_differences_seeds_the_base_and_compares_with_the_head(tmp_p
     for path, text in ((pb.APPLICATION, "app@target"), (pb.CHART_PIN, "pin@target"), (pb.TABLE, "hand-edited table")):
         (head / path).parent.mkdir(parents=True, exist_ok=True)
         (head / path).write_text(text)
+    # No platform move: the five operator Applications are the base's at the head too (car C10 compares them).
+    for path in pb.OPERATOR_APPLICATIONS:
+        (head / path).write_text(f"base {path}")
     for writer in pe.WRITERS:
         (head / "scripts" / "gates" / writer).write_text(f"# {writer}")
     seen: dict = {}
@@ -536,8 +539,10 @@ def test_the_regenerated_chart_pin_records_the_digest_the_tag_resolves_to_now(
     head = tmp_path / "head"
     head_files = {
         pb.APPLICATION: moved(),
-        pb.CHART_PIN: pb.rewrite_chart_pin(base_pin, TARGET, "sha256:" + "1" * 64),
+        pb.CHART_PIN: pb.rewrite_chart_pin(base_pin, TARGET, digest="sha256:" + "1" * 64),
         pb.TABLE: "table@target\n",
+        # No platform move: the five operator Applications are the base's at the head too (car C10 compares them).
+        **{path: (REPOSITORY / path).read_text() for path in pb.OPERATOR_APPLICATIONS},
     }
     for path, text in head_files.items():
         (head / path).parent.mkdir(parents=True, exist_ok=True)
@@ -556,8 +561,50 @@ def test_the_regenerated_chart_pin_records_the_digest_the_tag_resolves_to_now(
     monkeypatch.setattr(pb, "writer_helm", lambda: "/bin/true")
     monkeypatch.setattr(pb.subprocess, "run", writer)
     monkeypatch.setattr(pb, "chart_digest", lambda version: resolved)
+    monkeypatch.setattr(pb, "target_platform", lambda version: json.loads(base_pin)["platform_version"])
     base = {pb.APPLICATION: BASE, pb.CHART_PIN: base_pin, pb.TABLE: "table@base\n"}
+    base |= {path: (REPOSITORY / path).read_text() for path in pb.OPERATOR_APPLICATIONS}
     assert pe.regenerated_differences(head, TARGET, base_of=lambda path: base[path].encode()) == differs
+
+
+@pytest.mark.parametrize("behind", [None, *pb.OPERATOR_APPLICATIONS])
+def test_the_regenerated_platform_move_binds_the_digest_and_all_eight_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, behind: str | None
+) -> None:
+    """Car C10 on top of yaadgaar 250: a platform move regenerates `chart_tag`, `chart_digest` and `platform_version`
+    together and the five operator files; a head that left one operator file behind is named. Only the K3 writer,
+    the registry and the target's platform are stubbed."""
+    base_pin = (REPOSITORY / pb.CHART_PIN).read_text()
+    old_platform, new_platform, digest = json.loads(base_pin)["platform_version"], "9.9.9", "sha256:" + "1" * 64
+    operators = {path: (REPOSITORY / path).read_text() for path in pb.OPERATOR_APPLICATIONS}
+    head_files = {
+        pb.APPLICATION: moved(),
+        pb.CHART_PIN: pb.rewrite_chart_pin(base_pin, TARGET, digest=digest, platform=new_platform),
+        pb.TABLE: "table@target\n",
+    }
+    for path, text in operators.items():
+        moved_text = text.replace(f"targetRevision: {old_platform}\n", f"targetRevision: {new_platform}\n")
+        head_files[path] = text if path == behind else moved_text
+    for path, text in head_files.items():
+        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / path).write_text(text)
+    for writer in pe.WRITERS:
+        (tmp_path / "scripts" / "gates" / writer).write_text(f"# {writer}")
+
+    class Finished:
+        returncode = 0
+        stderr = ""
+
+    def writer(command, **_):
+        Path(command[1]).parents[2].joinpath(pb.TABLE).write_text("table@target\n")
+        return Finished()
+
+    monkeypatch.setattr(pb, "writer_helm", lambda: "/bin/true")
+    monkeypatch.setattr(pb.subprocess, "run", writer)
+    monkeypatch.setattr(pb, "chart_digest", lambda version: digest)
+    monkeypatch.setattr(pb, "target_platform", lambda version: new_platform)
+    base = {pb.APPLICATION: BASE, pb.CHART_PIN: base_pin, pb.TABLE: "table@base\n", **operators}
+    assert pe.regenerated_differences(tmp_path, TARGET, base_of=lambda path: base[path].encode()) == ([behind] if behind else [])
 
 
 def test_other_contexts_are_not_the_e2_status() -> None:

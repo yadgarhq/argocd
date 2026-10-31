@@ -56,6 +56,9 @@ def tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(pb, "writer_helm", lambda: "/bin/true")
     monkeypatch.setattr(pb, "chart_digest", lambda version: "sha256:" + "f" * 64)
     monkeypatch.setattr(pb.subprocess, "run", writer)
+    # No platform move: the fixture target keeps this checkout's platform, so the three files alone move.
+    platform = __import__("json").loads((REPOSITORY / pb.CHART_PIN).read_text())["platform_version"]
+    monkeypatch.setattr(pb, "target_platform", lambda target: platform)
     return tmp_path
 
 

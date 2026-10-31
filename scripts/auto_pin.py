@@ -187,6 +187,10 @@ GITHUB_API = "https://api.github.com"
 
 APPLICATION = "applications/yadgar.yaml"
 PIN_FILES = ("applications/yadgar.yaml", "scripts/chart_pin.json", "scripts/gates/yadgar_render.sha256")
+# `pin_bump.OPERATOR_APPLICATIONS`: a platform move changes all five beside the three, or none (car C10).
+OPERATOR_APPLICATIONS = tuple(
+    f"applications/{name}.yaml" for name in ("cert-manager", "envoy-gateway", "keda", "mariadb-operator", "prometheus")
+)
 
 BRANCH_PREFIX = "auto/pin-"
 BRANCH = re.compile(r"^auto/pin-(\d+\.\d+\.\d+)(?:-[0-9a-f]{12})?$")
@@ -852,14 +856,24 @@ def bot_owned(api: Client, sha: str) -> bool:
     return (commit.get("author") or {}).get("login") == PIN_LOGIN and verified and len(commit.get("parents") or []) == 1
 
 
-def push(api: Client, tree: Path, state: State, *, changed: list[str], open_heads: frozenset[str]) -> str:
-    """Make the pin commit on main through the Git Data API and point a new `auto/pin-<v>-<sha12>` at it. Closes nothing."""
-    outside = sorted(set(changed) - set(PIN_FILES))
+def push_problem(changed: list[str]) -> str | None:
+    """Why pin_bump's change set is no pin, or None: the three pin files, plus all five operator files or none."""
+    outside = sorted(set(changed) - set(PIN_FILES) - set(OPERATOR_APPLICATIONS))
     if outside:
-        raise Refused(f"pin_bump changed files outside the three pin files: {', '.join(outside)}")
+        return f"pin_bump changed files outside the pin files: {', '.join(outside)}"
+    operators = set(changed) & set(OPERATOR_APPLICATIONS)
+    if operators and operators != set(OPERATOR_APPLICATIONS):
+        return f"pin_bump changed {sorted(operators)}; a platform move changes all five operator Applications or none"
     # C3's rule: a non-empty subset of the three pin files that includes the Application.
     if APPLICATION not in changed:
-        raise Refused(f"pin_bump's change set {sorted(changed)} does not include {APPLICATION}: not a pin")
+        return f"pin_bump's change set {sorted(changed)} does not include {APPLICATION}: not a pin"
+    return None
+
+
+def push(api: Client, tree: Path, state: State, *, changed: list[str], open_heads: frozenset[str]) -> str:
+    """Make the pin commit on main through the Git Data API and point a new `auto/pin-<v>-<sha12>` at it. Closes nothing."""
+    if problem := push_problem(changed):
+        raise Refused(problem)
     if main_head(api) != state.main_sha:
         raise MainMoved(f"main moved since the gate read {state.main_sha}")
     for ref, sha in target_refs(api, state.target):
@@ -872,7 +886,7 @@ def push(api: Client, tree: Path, state: State, *, changed: list[str], open_head
             print(f"kept {ref}: its head {sha} is not provably the bot's commit")
     base_tree = ((api.get(f"/repos/{REPOSITORY}/git/commits/{state.main_sha}") or {}).get("tree") or {}).get("sha")
     entries = []
-    for path in PIN_FILES:
+    for path in (*PIN_FILES, *(p for p in OPERATOR_APPLICATIONS if p in changed)):
         blob = api.post(f"/repos/{REPOSITORY}/git/blobs", {"content": (tree / path).read_text(), "encoding": "utf-8"})
         entries.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
     made_tree = api.post(f"/repos/{REPOSITORY}/git/trees", {"base_tree": base_tree, "tree": entries})

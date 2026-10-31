@@ -671,6 +671,36 @@ def test_a_malformed_chart_digest_reddens(digest: str) -> None:
     assert chart_pin_errors({**CHART_PIN, "chart_digest": digest}) == ["chart_digest"]
 
 
+def test_a_platform_move_written_by_pin_bump_keeps_all_eight_files_well_formed(
+    copy: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Car C10 with yaadgaar 250: `pin_bump.write_files` on a platform move writes a `chart_pin.json` of exactly its
+    three keys, digest included, and five operator files every clause here still accepts at the new
+    `platform_version`. Offline: the registry digest and the K3 writer are stubbed."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("pin_bump_operator_applications", REPOSITORY / "scripts" / "pin_bump.py")
+    pin_bump = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, pin_bump)
+    spec.loader.exec_module(pin_bump)
+    for path in (pin_bump.CHART_PIN, pin_bump.APPLICATION, pin_bump.TABLE):
+        (copy / path).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(REPOSITORY / path, copy / path)
+    digest = "sha256:" + "3" * 64
+    monkeypatch.setattr(pin_bump, "chart_digest", lambda version: digest)
+    monkeypatch.setattr(pin_bump, "writer_helm", lambda: "/bin/true")
+    monkeypatch.setattr(pin_bump, "run_writer", lambda writer: None)
+
+    written = pin_bump.write_files(copy, "99.0.0", platform="9.9.9")
+
+    pin = json.loads((copy / pin_bump.CHART_PIN).read_text())
+    assert sorted(written) == sorted(pin_bump.pin_files(platform_moved=True))
+    assert chart_pin_errors(pin) == []
+    assert pin == {"chart_tag": "v99.0.0", "chart_digest": digest, "platform_version": "9.9.9"}
+    monkeypatch.setattr(sys.modules[__name__], "PLATFORM_VERSION", pin["platform_version"])
+    assert platform_clause_errors(copy) == []
+
+
 def test_a_mismatched_chart_pin_reddens(monkeypatch: pytest.MonkeyPatch) -> None:
     """LEDGER 1206's gate: every platform-sourced Application's pin equals `PLATFORM_VERSION`.
 

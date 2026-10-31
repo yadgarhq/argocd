@@ -284,8 +284,12 @@ def automatic_problem(pr: Pr, move: tuple[str, str] | None, changed: list[str]) 
         return None
     if move is None:
         return f"an automatic pin PR ({pr.head_ref}) must move targetRevision, and this one does not"
-    if sorted(changed) != sorted(pb.MECHANICAL_FILES):
-        return f"an automatic pin PR must change exactly {', '.join(pb.MECHANICAL_FILES)}; it changes {', '.join(changed) or 'nothing'}"
+    three, eight = pb.pin_files(platform_moved=False), pb.pin_files(platform_moved=True)
+    if sorted(changed) not in (sorted(three), sorted(eight)):
+        return (
+            f"an automatic pin PR must change exactly {', '.join(three)}, or those and all of "
+            f"{', '.join(pb.OPERATOR_APPLICATIONS)} on a platform move; it changes {', '.join(changed) or 'nothing'}"
+        )
     return None
 
 
@@ -297,22 +301,28 @@ def base_file(repo: Path, path: str) -> bytes:
 def regenerated_differences(
     repo: Path, target: str, *, base_of: Callable[[str], bytes] | None = None, write: Callable[[Path, str], None] | None = None
 ) -> list[str]:
-    """The mechanical files of the checkout `repo` that differ from what `pin_bump.write_files` makes for `target`.
+    """The pin files of the checkout `repo` that differ from what `pin_bump.write_files` makes for `target`.
 
-    The tree holds the BASE's three files and the checkout's two writers, nothing else, exactly as
-    `test_pin_bump_replay` builds it; `write_files` then moves it to `target` (helm v3.18.4 from `PIN_BUMP_HELMS`).
+    The tree holds the BASE's eight pin files (the three and the five operator Applications) and the checkout's
+    two writers, nothing else, as `test_pin_bump_replay` builds it; `write_files` then moves it to `target` (helm
+    v3.18.4 from `PIN_BUMP_HELMS`), the operator files only on a platform move (car C10). All eight are compared.
     """
     base_of = base_of or (lambda path: base_file(repo, path))
     write = write or pb.write_files
+    paths = pb.pin_files(platform_moved=True)
     with tempfile.TemporaryDirectory() as scratch:
         tree = Path(scratch)
-        for path in pb.MECHANICAL_FILES:
+        for path in paths:
             (tree / path).parent.mkdir(parents=True, exist_ok=True)
             (tree / path).write_bytes(base_of(path))
         for writer in WRITERS:
             shutil.copyfile(repo / "scripts" / "gates" / writer, tree / "scripts" / "gates" / writer)
         write(tree, target)
-        return [path for path in pb.MECHANICAL_FILES if (tree / path).read_bytes() != (repo / path).read_bytes()]
+
+        def read(root: Path, path: str) -> bytes | None:
+            return (root / path).read_bytes() if (root / path).exists() else None
+
+        return [path for path in paths if read(tree, path) != read(repo, path)]
 
 
 def acknowledgements(path: Path) -> dict[str, dict]:
@@ -374,12 +384,19 @@ def unacknowledged(target: str, reasons: list[str], acks: dict[str, dict], base_
     return [reason for reason in reasons if reason not in set(entry["reasons"])]
 
 
-def evidence(head_text: str, pin: str, target: str, helms: dict[str, str], net=None) -> dict:
-    """E1, E3 and E4 by `pin_bump.check`: both pins rendered with the HEAD `valuesObject`."""
+def evidence(head_text: str, pin: str, target: str, helms: dict[str, str], net=None, repo: Path | None = None) -> dict:
+    """E1, E3 and E4 by `pin_bump.check`: both pins rendered with the HEAD `valuesObject`.
+
+    The five operator Applications come from the merge checkout `repo` as they are: a platform move renders each
+    at both platform versions with its HEAD values (car C10), whatever its own `targetRevision` reads.
+    """
+    repo = repo or pb.REPOSITORY
     with tempfile.TemporaryDirectory() as scratch:
         tree = Path(scratch)
         (tree / "applications").mkdir()
         (tree / pb.APPLICATION).write_text(pb.rewrite_target_revision(head_text, pin)[0])
+        for path in pb.OPERATOR_APPLICATIONS:
+            shutil.copyfile(repo / path, tree / path)
         return pb.check(tree, target, net or pb.Net(), helms)
 
 
@@ -497,6 +514,15 @@ def judge(
         outcome.notes.append(f"{', '.join(pb.MECHANICAL_FILES)} are the regenerated ones for {target}, byte for byte")
     found = evidence_of(head_text, pin, target, {version: helms[version] for version in HELMS})
     outcome.evidence = found
+    # Car C10: a target whose chart moved `platform` moves all five operator Applications with the pin, on any head.
+    # A FAILURE, not a NEEDS-HUMAN reason: no acknowledgement may leave an operator on the old platform.
+    if platform := found.get("platform"):
+        behind = [path for path in pb.OPERATOR_APPLICATIONS if path not in changed]
+        if behind:
+            outcome.failures.append(
+                f"platform move {platform['from']} -> {platform['to']}: {', '.join(behind)} left behind on the old platform; "
+                f"a platform move changes all eight pin files ({', '.join(pb.pin_files(platform_moved=True))})"
+            )
     if not found["accept"]:
         # An acknowledgement never clears an automatic head: it may change only the three mechanical files anyway.
         acks, base_acks = acks or {}, base_acks or {}
@@ -624,7 +650,7 @@ def main(argv: list[str] | None = None) -> int:
             pr,
             base_text,
             head_text,
-            evidence_of=evidence,
+            evidence_of=lambda head_text, pin, target, found: evidence(head_text, pin, target, found, repo=arguments.repo),
             statuses_of=lambda sha: statuses(pr.repository, sha),
             helms=pb.discover_helms(),
             changed=changed,
