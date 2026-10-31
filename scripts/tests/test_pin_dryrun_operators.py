@@ -320,6 +320,19 @@ def test_a_failed_operator_render_is_refused(platform_repo: Path) -> None:
     assert any("helm pull failed" in p for p in result["problems"]), result["problems"]
 
 
+def test_an_infrastructure_failure_of_the_operator_render_is_no_result_not_a_refusal(platform_repo: Path) -> None:
+    """A transient ghcr.io or `helm pull` failure is exit 3 with no result, so auto-pin dispatches again; never green."""
+    def flaky(text: str, version: str) -> list:
+        raise pin_dryrun._load("pin_bump").HelmInfrastructure("helm pull: dial tcp: i/o timeout")
+
+    cluster = verify_handover.Cluster(CONTEXT, runner=NoCluster())
+    with pytest.raises(pin_dryrun.InfrastructureError, match="i/o timeout"):
+        pin_dryrun.dry_run(
+            platform_repo, main_sha(platform_repo), platform_branch(platform_repo), cluster,
+            render=Render(), platform_of=lambda target: NEW_PLATFORM, render_operator=flaky,
+        )
+
+
 # ── 3. the platform-move shape ──────────────────────────────────────────────
 
 

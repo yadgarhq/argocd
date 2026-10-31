@@ -91,7 +91,9 @@ which is what merging the PR makes main.
    Otherwise an ack merged earlier for the same target, by a revert and a
    re-pin or by an ack-only PR merged first, would clear a later PR nobody
    acknowledged. To re-acknowledge, the PR rewrites the existing entry (a
-   new `why` at least). A malformed file on either side FAILS
+   new `why` at least). That passes this job, but `pin_dryrun` step 1 (ADR-1094)
+   takes the file as an append only, so E2 (`pin / kind-dryrun`) stays refused
+   for a re-ack of a target already on main: run the hand dry run. A malformed file on either side FAILS
    (`acknowledgements`): a half-filled acknowledgement reads as reviewed when
    it was not (the `crd_removals_ack.json` rule).
 
@@ -536,7 +538,9 @@ def judge(
             elif base_acks.get(target) == acks[target]:
                 how = (
                     f"rewrites {ACK_FILE}'s entry for {target}: the one there is already on the base (it acknowledged an "
-                    f"earlier PR), so it clears nothing here; replace the existing entry in this PR with"
+                    f"earlier PR), so it clears nothing here; replace the existing entry in this PR "
+                    f"(E2 (pin / kind-dryrun) refuses the rewrite, as {ACK_FILE} is append-only there (ADR-1094): run the "
+                    f"hand dry run) with"
                 )
             else:
                 how = f"edits {ACK_FILE} in this PR to replace the existing entry for {target}, which misses a reason, with"

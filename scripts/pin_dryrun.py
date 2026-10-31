@@ -35,7 +35,8 @@ WHAT `run` DOES, in order. Every refusal comes before any cluster read.
      pin files: `applications/yadgar.yaml`, `scripts/chart_pin.json`,
      `scripts/gates/yadgar_render.sha256`, plus, on a platform move, the five
      operator Applications (`OPERATOR_FILES`, car C10), plus `scripts/pin_needs_human_ack.json`
-     only as an append (`ack_refusals`, ADR-1094). A platform move is
+     only as an append (`ack_refusals`, ADR-1094; a re-ack of a target already on main
+     rewrites an entry, so it leaves E2 refused: run the hand dry run). A platform move is
      refused unless each operator file is main's with only its one
      `targetRevision` line moved to the sha's `platform_version`, main's files
      all pinned main's `platform_version`, and the new one is the target
@@ -537,7 +538,7 @@ def pin_refusals(
     changed = changed_paths(repo, base, sha, runner)
     problems = [
         f"{path}: changed by main...{sha[:12]}, outside the three pin files and the five operator Applications "
-        f"({', '.join(sorted(PIN_FILES | set(OPERATOR_FILES)))})"
+        f"({', '.join(sorted(PIN_FILES | set(OPERATOR_FILES)))}) and the append-only {ACK_FILE}"
         for path in changed
         if path not in PIN_FILES and path not in OPERATOR_FILES and path != ACK_FILE
     ]
@@ -612,6 +613,14 @@ def ack_refusals(repo: Path, base: str, sha: str, runner: Callable, target: str)
     texts = [read_at(repo, commit, ACK_FILE, runner) for commit in (base, sha)]
     if texts[1] is None:
         return [f"{ACK_FILE}: deleted by the sha; the file is append-only"]
+    for side, text in (("main", texts[0]), ("the sha", texts[1])):
+        try:  # one parse only: a duplicate key is refused, as in CHART_PIN
+            if text is not None:
+                strict_json(text)
+        except DuplicateKey as error:
+            return [f"{ACK_FILE} at {side}: {error}; refused, two readers may read it apart"]
+        except ValueError:
+            return [f"{ACK_FILE} at {side}: not JSON; refused"]
     try:
         # The validator refuses a non-list, a malformed or placeholder entry and a repeated target.
         evidence.parse_acknowledgements(texts[1].decode())
@@ -963,6 +972,9 @@ def operator_renders(
         try:
             name, namespace, _ = pin_bump.operator_inputs(text)
             sides = {side: render_operator(text, version) for side, version in (("base", old), ("head", new))}
+        except pin_bump.HelmInfrastructure as error:
+            # A registry or network failure judges nothing: no result (exit 3), so auto-pin dispatches again.
+            raise InfrastructureError(f"{path}: the operator render hit an infrastructure failure: {error}") from error
         except pin_bump.Refused as refused:
             problems.append(f"{path}: the operator render failed: {refused}")
             continue
