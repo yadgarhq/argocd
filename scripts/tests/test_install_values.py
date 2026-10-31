@@ -108,7 +108,7 @@ MEASURED_MARGIN = 3
 # to 0.2.1, and the four hook Jobs again render byte-identically.
 #
 # Rendered with `applications/yadgar.yaml`'s `valuesObject` (`iamKeys.create:
-# false` in this org), every attempt runs four hook Jobs from the platform
+# true` in this org since ADR-1086), every attempt runs four hook Jobs from the platform
 # subchart.
 #
 #   preflight (PreSync, hook-weight -7). #24 bounds the Job itself:
@@ -134,13 +134,14 @@ PROBE_SECONDS = PROBE_DEADLINE + PROBE_GRACE
 #     run IN PARALLEL). #24 gives each its own `activeDeadlineSeconds`: the Job
 #     controller's own pod backoff (10 + 20 + 40 + 80 = 150 s, `backoffLimit: 4`)
 #     plus 5 attempts of (a 30 s scheduling/start allowance + its requests x a
-#     10 s `--max-time` each). bootstrap-secrets makes 3 requests with
-#     `iamKeys.create: false` (valkey-password, nats-auth, nats-auth-gateway),
-#     so its attempt is 30 + 3*10 = 60 s and its deadline 150 + 5*60 = 450 s;
+#     10 s `--max-time` each). bootstrap-secrets makes 4 requests with
+#     `iamKeys.create: true` (valkey-password, nats-auth, nats-auth-gateway,
+#     iam-keys; ADR-1086), so its attempt is 30 + 4*10 = 70 s and its deadline
+#     150 + 5*70 = 500 s (450 s while iamKeys was off, ADR-0810);
 #     admin-bootstrap-token makes 1 and is smaller. The two Jobs share the
 #     larger deadline. Neither sets `terminationGracePeriodSeconds`, so
 #     Kubernetes' pod default, 30 s, applies.
-BOOTSTRAP_DEADLINE = (10 + 20 + 40 + 80) + 5 * (30 + 3 * 10)
+BOOTSTRAP_DEADLINE = (10 + 20 + 40 + 80) + 5 * (30 + 4 * 10)
 BOOTSTRAP_GRACE = 30
 BOOTSTRAP_JOB_SECONDS = BOOTSTRAP_DEADLINE + BOOTSTRAP_GRACE
 #   SYNC-PHASE HEALTH. yadgar's sync is multi-step (it has Pre- and PostSync
@@ -169,7 +170,7 @@ ATTEMPT_ALLOWANCE = {
     "yadgar": (
         YADGAR_ATTEMPT_SECONDS,
         "bounded: activeDeadlineSeconds + grace, platform#24 (forward-looking): "
-        "preflight 1260+60, probe 1200+45, bootstrap deadline 450+30 (iamKeys off "
+        "preflight 1260+60, probe 1200+45, bootstrap deadline 500+30 (iamKeys on "
         "in this org); "
         "measured, not bounded: Sync-phase health, 90 s",
     ),
@@ -332,14 +333,14 @@ def test_the_retry_waits_are_the_measured_sequence() -> None:
 def test_yadgar_per_attempt_is_the_documented_bounds() -> None:
     assert (PREFLIGHT_DEADLINE, PREFLIGHT_GRACE) == (1260, 60)
     assert (PROBE_DEADLINE, PROBE_GRACE) == (1200, 45)
-    assert (BOOTSTRAP_DEADLINE, BOOTSTRAP_GRACE) == (450, 30)
-    assert (PREFLIGHT_SECONDS, PROBE_SECONDS, BOOTSTRAP_JOB_SECONDS, SYNC_HEALTH_SECONDS) == (1320, 1245, 480, 270)
-    assert YADGAR_ATTEMPT_SECONDS == 3315
+    assert (BOOTSTRAP_DEADLINE, BOOTSTRAP_GRACE) == (500, 30)
+    assert (PREFLIGHT_SECONDS, PROBE_SECONDS, BOOTSTRAP_JOB_SECONDS, SYNC_HEALTH_SECONDS) == (1320, 1245, 530, 270)
+    assert YADGAR_ATTEMPT_SECONDS == 3365
 
 
 def test_the_floor_is_yadgars_chain() -> None:
-    # 1050 s of backoff plus 7 attempts of 3315 s.
-    assert sync_timeout_floor() == 1050 + 7 * 3315 == 24255
+    # 1050 s of backoff plus 7 attempts of 3365 s.
+    assert sync_timeout_floor() == 1050 + 7 * 3365 == 24605
 
 
 def test_every_automated_application_is_read() -> None:
@@ -401,7 +402,7 @@ def test_a_new_manual_application_needs_no_row(copy: Path) -> None:
             }
         )
     )
-    assert sync_timeout_floor(copy) == 24255
+    assert sync_timeout_floor(copy) == 24605
 
 
 @pytest.mark.parametrize("limit", [0, -1], ids=["zero", "forever"])
@@ -419,8 +420,8 @@ def test_a_dropped_retry_block_falls_back_to_the_implicit_one(copy: Path) -> Non
     document = yaml.safe_load(path.read_text())
     del document["spec"]["syncPolicy"]["retry"]
     path.write_text(yaml.safe_dump(document))
-    # 310 s of implicit backoff plus 6 attempts of 3315 s.
-    assert sync_timeout_floor(copy) == 310 + 6 * 3315
+    # 310 s of implicit backoff plus 6 attempts of 3365 s.
+    assert sync_timeout_floor(copy) == 310 + 6 * 3365
 
 
 @pytest.mark.parametrize(
