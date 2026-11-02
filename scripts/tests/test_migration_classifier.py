@@ -533,12 +533,30 @@ def test_a_reason_carries_no_line_break_workflow_command_or_raw_backtick(sql: st
         pytest.param('ALTER TABLE t ADD COLUMN c VARCHAR(8) NOT NULL DEFAULT "x"', id="class-c-default"),
         pytest.param('CREATE TABLE t (c VARCHAR(8) NOT NULL DEFAULT "x")', id="class-a-default"),
         pytest.param('CREATE TABLE t (c INT) COMMENT "x"', id="class-a-comment"),
+        pytest.param('ALTER TABLE t ADD COLUMN c INT NULL COMMENT "x"', id="class-c-column-comment"),
+        pytest.param('CREATE INDEX i ON t (c) COMMENT "x"', id="class-b-index-comment"),
     ],
 )
 def test_a_double_quoted_default_is_an_identifier_under_ansi_quotes_and_red(sql: str) -> None:
-    """yaadgaar 511: under ANSI_QUOTES `"x"` is an identifier, not a string; single quotes stay green."""
+    """yaadgaar 511: under ANSI_QUOTES `"x"` is an identifier, not a string; single quotes stay green.
+
+    yaadgaar 512 item 3: a double-quoted COMMENT was red in class A only; B and C now refuse it the same way."""
     red(sql)
-    assert green(sql.replace('"', "'")) in ("A", "C")
+    assert green(sql.replace('"', "'")) in ("A", "B", "C")
+
+
+def test_shown_breaks_every_pair_of_colons() -> None:
+    """`str.replace` does not overlap, so `:::` kept a `::` (yaadgaar 512 item 1)."""
+    for text in ("::", ":::", "::::", "a:::error:::b"):
+        assert "::" not in mc.shown(text), (text, mc.shown(text))
+
+
+def test_a_red_statement_reason_is_sanitised_once_not_twice() -> None:
+    """`red(only.reason)` re-ran `shown` on a reason already shown: a backtick came out escaped twice (512 item 2)."""
+    found = verdict("ALTER TABLE t ADD COLUMN `c``x` INT NOT NULL")
+    assert not found.admitted
+    assert found.reason == found.statements[0].reason
+    assert "\\\\`" not in found.reason and "\\`" in found.reason, found.reason
 
 
 def test_an_unusable_allowlist_makes_every_insert_red_with_its_reason_and_leaves_ddl_alone() -> None:

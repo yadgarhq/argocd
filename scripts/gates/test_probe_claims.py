@@ -15,7 +15,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
-import yaml
+from test_no_two_owners import strict_load
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 
@@ -26,7 +26,7 @@ _spec.loader.exec_module(pp)
 
 
 def registry() -> dict:
-    doc = yaml.safe_load((REPOSITORY / "applications" / "yadgar.yaml").read_text())
+    doc = strict_load((REPOSITORY / "applications" / "yadgar.yaml").read_text())
     return doc["spec"]["source"]["helm"]["valuesObject"]["seeder"]["registry"]
 
 

@@ -195,6 +195,8 @@ from test_no_two_owners import (
     helm,
     parent_pull,
     sources_of,
+    strict_load,
+    strict_load_all,
 )
 
 OWNER_REPO = "yadgarhq/argocd"
@@ -287,11 +289,21 @@ def values_of(source: dict) -> dict:
     if "valuesObject" in helm_block:
         return helm_block["valuesObject"] or {}
     if "values" in helm_block:
-        return yaml.safe_load(helm_block["values"]) or {}
+        return strict_load(helm_block["values"]) or {}
     return {}
 
 
 # ── the GitHub contents API, for the base side of a depth-1 checkout ───────
+
+
+def base_ref_from_environment() -> str:
+    """`PR_BASE_SHA`, refused by name when unset (yaadgaar 170): a bare `KeyError` said nothing about what to set."""
+    base_ref = os.environ.get("PR_BASE_SHA")
+    assert base_ref is not None, (
+        "PR_BASE_SHA is not set. CI sets it to the pull request's base sha; locally, run with "
+        "`PR_BASE_SHA=$(git rev-parse origin/main)`. Refusing rather than comparing against nothing."
+    )
+    return base_ref
 
 
 def github_request(url: str):
@@ -300,8 +312,18 @@ def github_request(url: str):
     token = os.environ.get("GITHUB_TOKEN", "")
     if token:
         request.add_header("Authorization", f"Bearer {token}")
-    with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
-        return json.loads(response.read())
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
+            return json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        # A rate-limited read is still a failure (yaadgaar 157); it says what to set rather than a bare 403.
+        if exc.code in (403, 429):
+            raise AssertionError(
+                f"the GitHub contents API answered {exc.code} for {url} — the anonymous rate limit, most "
+                f"likely ({'a' if token else 'no'} GITHUB_TOKEN was set). CI sets GITHUB_TOKEN; locally, run "
+                "with `GITHUB_TOKEN=$(gh auth token)`."
+            ) from exc
+        raise
 
 
 def base_application_filenames(ref: str) -> set[str]:
@@ -326,7 +348,7 @@ def base_application(filename: str, ref: str) -> dict | None:
         if exc.code == 404:
             return None
         raise
-    return yaml.safe_load(base64.b64decode(payload["content"]).decode())
+    return strict_load(base64.b64decode(payload["content"]).decode())
 
 
 def self_value_file_content(path: str, side: str, base_ref: str) -> str:
@@ -428,7 +450,7 @@ def crds_of_chart(
             "--include-crds",
             *extra_flags,
         )
-    return crd_names(yaml.safe_load_all(rendered))
+    return crd_names(strict_load_all(rendered))
 
 
 def crds_rendered(
@@ -480,7 +502,7 @@ def crds_at(side: str, base_ref: str) -> tuple[set[str], dict[str, set[str]]]:
     for filename in sorted(filenames):
         if side == "head":
             path = REPOSITORY / APPLICATIONS / filename
-            document = yaml.safe_load(path.read_text()) if path.exists() else None
+            document = strict_load(path.read_text()) if path.exists() else None
         else:
             document = base_application(filename, base_ref)
 
@@ -997,7 +1019,7 @@ def test_the_head_parent_is_rendered_by_the_heads_recorded_digest_and_the_base_b
 
 def test_argocd_yaml_is_now_covered() -> None:
     """Finding 6: argocd.yaml's classic-repo + `$self` valueFiles source is modelled, not excluded."""
-    document = yaml.safe_load((REPOSITORY / APPLICATIONS / "argocd.yaml").read_text())
+    document = strict_load((REPOSITORY / APPLICATIONS / "argocd.yaml").read_text())
     source = chart_source(document)
     assert source is not None
     assert unmodelled_helm_keys(source) == set()
@@ -1027,7 +1049,7 @@ def test_a_second_chart_source_fails_red() -> None:
 
 
 def test_a_path_only_application_has_no_chart_source() -> None:
-    document = yaml.safe_load((REPOSITORY / APPLICATIONS / "tls.yaml").read_text())
+    document = strict_load((REPOSITORY / APPLICATIONS / "tls.yaml").read_text())
     assert chart_source(document) is None
 
 
@@ -1373,11 +1395,88 @@ def test_a_500_on_the_base_directory_listing_fails_the_gate(
 # ── TDD, round 2 (g): an empty or malformed base ref fails loudly ──────────
 
 
-@pytest.mark.parametrize("base_ref", ["", "main", "0123abc", "g" * 40], ids=["empty", "branch", "short", "non-hex"])
-def test_gate_refuses_a_base_ref_that_is_not_a_full_commit_sha(base_ref: str) -> None:
-    """An empty `PR_BASE_SHA` became `?ref=` — GitHub's DEFAULT BRANCH — and the gate passed. Measured."""
+@pytest.mark.parametrize(
+    "base_ref",
+    [
+        "", "main", "0123abc", "g" * 40, FAKE_BASE_SHA + "x", "x" + FAKE_BASE_SHA, FAKE_BASE_SHA[:-1],
+        FAKE_BASE_SHA.upper(), " " + FAKE_BASE_SHA, FAKE_BASE_SHA + "\n",
+    ],
+    ids=["empty", "branch", "short", "non-hex", "sha-then-x", "x-then-sha", "39-hex", "upper", "leading-space", "newline"],
+)  # fmt: skip
+def test_gate_refuses_a_base_ref_that_is_not_a_full_commit_sha(base_ref: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty `PR_BASE_SHA` became `?ref=` — GitHub's DEFAULT BRANCH — and the gate passed. Measured.
+
+    `<sha>x` kills `.match` in place of `.fullmatch` (and `.search`); `x<sha>` kills `.search` only, as `.match`
+    anchors at the start and refuses it anyway (yaadgaar 156). `crds_at`
+    fails loudly if reached, so the refusal is proved to come before any read.
+    """
+
+    def reached(*_args: object) -> None:
+        raise RuntimeError("crds_at reached with a ref that is not a full sha")
+
+    monkeypatch.setattr(THIS_MODULE, "crds_at", reached)
     with pytest.raises(AssertionError, match="PR_BASE_SHA"):
         gate(base_ref)
+
+
+def test_the_application_count_includes_an_application_present_only_at_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Kills Z' (`len(head_by_file)` in place of the base/head union, yaadgaar 156).
+
+    `a.yaml` is at both sides; `b.yaml` is at base only (deleted at head). `b`'s CRD is acknowledged,
+    so the gate passes and the count is the only thing that differs: 2, not 1.
+    """
+    apps_dir = tmp_path / "applications"
+    apps_dir.mkdir()
+    (apps_dir / "a.yaml").write_text(yaml.safe_dump(fake_application(name="a")))
+    ack_file = tmp_path / "ack.json"
+    ack_file.write_text(json.dumps([{"name": "gadget.fake.io", "reason": "r", "cleanup": "kubectl ... delete crd ..."}]))
+
+    def fake_crds_rendered(release: str, _source: dict, _namespace: str, _extra: str | None = None, _pin: dict | None = None) -> set[str]:
+        return {"widget.fake.io"} if release == "a" else {"gadget.fake.io"}
+
+    monkeypatch.setattr(THIS_MODULE, "REPOSITORY", tmp_path)
+    monkeypatch.setattr(THIS_MODULE, "ACK_FILE", ack_file)
+    monkeypatch.setattr(THIS_MODULE, "base_application_filenames", lambda ref: {"a.yaml", "b.yaml"})
+    monkeypatch.setattr(
+        THIS_MODULE, "base_application", lambda filename, ref: fake_application(name=filename.removesuffix(".yaml"))
+    )
+    monkeypatch.setattr(THIS_MODULE, "crds_rendered", fake_crds_rendered)
+
+    gate(FAKE_BASE_SHA)
+    assert "crd-gate: base=2 head=1 CRDs over 2 Applications" in capsys.readouterr().out
+
+
+def test_an_unset_pr_base_sha_is_refused_by_name_not_a_key_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Locally, an unset `PR_BASE_SHA` was a bare `KeyError` (yaadgaar 170). It stays a failure, with a message."""
+    monkeypatch.delenv("PR_BASE_SHA", raising=False)
+    with pytest.raises(AssertionError, match="PR_BASE_SHA is not set"):
+        base_ref_from_environment()
+
+
+@pytest.mark.parametrize("code", [403, 429])
+def test_a_rate_limited_read_fails_and_names_github_token(code: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Anonymous runs hit GitHub's rate limit as a bare 403 (yaadgaar 157). It stays a failure, and says what to set."""
+
+    def limited(request: object, timeout: int = 0) -> None:
+        raise urllib.error.HTTPError("https://api.github.com/x", code, "rate limit exceeded", {}, None)  # type: ignore[arg-type]
+
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setattr(urllib.request, "urlopen", limited)
+    with pytest.raises(AssertionError, match="GITHUB_TOKEN"):
+        github_request("https://api.github.com/x")
+
+
+def test_a_404_still_reaches_the_caller_as_an_http_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`base_application_filenames` reads a 404 as "no applications/ at base"; the 403 path must not swallow it."""
+
+    def missing(request: object, timeout: int = 0) -> None:
+        raise urllib.error.HTTPError("https://api.github.com/x", 404, "not found", {}, None)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(urllib.request, "urlopen", missing)
+    with pytest.raises(urllib.error.HTTPError):
+        github_request("https://api.github.com/x")
 
 
 # ── the live gate: this organisation's real Applications, base vs head ─────
@@ -1385,4 +1484,4 @@ def test_gate_refuses_a_base_ref_that_is_not_a_full_commit_sha(base_ref: str) ->
 
 def test_a_chart_bump_or_values_change_does_not_silently_drop_a_crd() -> None:
     """LEDGER 1217, THE PRODUCTION GATE. See the module docstring for the shape."""
-    gate(os.environ["PR_BASE_SHA"])
+    gate(base_ref_from_environment())

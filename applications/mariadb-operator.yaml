@@ -3,11 +3,11 @@
 # Application by name, keeping its uid.
 #
 # WHAT D7.3 CHANGED, AND ONLY THIS: `source`. It was the operator's own chart,
-# `mariadb-operator` 26.6.0 from helm.mariadb.com. It is now `platform` at the
-# version `yadgarhq/chart@v0.3.15` embeds, with
+# `mariadb-operator` 26.6.0 from helm.mariadb.com. It became `platform` at the
+# version `yadgarhq/chart@v0.3.15` embedded, with
 # `operators.mariadbOperator.create` true and every other operator explicitly
-# false. `platform` 0.1.21 carries the same `mariadb-operator` 26.6.0 as a
-# subchart, so the image tags and the chart label do not move.
+# false. At that handover `platform` 0.1.21 carried the same `mariadb-operator`
+# 26.6.0 as a subchart, so the image tags and the chart label did not move.
 #
 # THE 12 CRDs NOW RIDE WITH THE OPERATOR. They used to come from a second
 # Application, `mariadb-operator-crds` (chart `mariadb-operator-crds` 26.6.0).

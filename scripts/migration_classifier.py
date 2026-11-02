@@ -341,6 +341,11 @@ def _split_commas(items: list[Token]) -> list[list[Token]]:
     return parts
 
 
+def _single_quoted(token: Token | None) -> bool:
+    """A SINGLE-quoted string token. A double-quoted text is an identifier under ANSI_QUOTES (yaadgaar 511, 512)."""
+    return token is not None and token.kind == "string" and token.raw.startswith("'")
+
+
 def _literal(cursor: Cursor) -> bool:
     """Consume one SQL literal (single-quoted string, signed number, NULL, TRUE, FALSE); False, consuming nothing, if
     none. A double-quoted text is an identifier under ANSI_QUOTES, so it is no literal (yaadgaar 511)."""
@@ -432,8 +437,8 @@ def _create_index(cursor: Cursor) -> str:
             if not (cursor.accept("BTREE") or cursor.accept("HASH")):
                 raise Red("unparseable: USING without BTREE or HASH")
         elif cursor.accept("COMMENT"):
-            if cursor.take().kind != "string":
-                raise Red("unparseable: COMMENT without a string")
+            if not _single_quoted(cursor.take()):
+                raise Red("unparseable: COMMENT without a single-quoted string (a double-quoted one is an identifier under ANSI_QUOTES)")
         else:
             raise Red(f"index option {cursor.take().value} is not admitted")
     return "B"
@@ -495,8 +500,8 @@ def _add_column(spec: list[Token]) -> None:
             cursor.name("collation")
         elif cursor.accept("COMMENT"):
             once("COMMENT")
-            if cursor.take().kind != "string":
-                raise Red(f"column {column}: COMMENT without a string")
+            if not _single_quoted(cursor.take()):
+                raise Red(f"column {column}: COMMENT without a single-quoted string (a double-quoted one is an identifier under ANSI_QUOTES)")
         elif cursor.accept("AFTER"):
             once("AFTER / FIRST")
             cursor.name("column")
@@ -622,7 +627,7 @@ def shown(text: str) -> str:
     """`text` fit for a reason, the PR body and stderr (yaadgaar 511): control characters and line breaks become
     spaces, backticks are escaped, and `::` is broken so no `::error::` workflow command can form. A quoted name or
     literal in a statement is upstream text."""
-    return re.sub(r"[\x00-\x1f\x7f\u0085\u2028\u2029]", " ", text).replace("`", "\\`").replace("::", ": :")
+    return re.sub(r":(?=:)", ": ", re.sub(r"[\x00-\x1f\x7f\u0085\u2028\u2029]", " ", text).replace("`", "\\`"))
 
 
 def _text(items: list[Token]) -> str:
@@ -639,8 +644,10 @@ def classify(
         return MigrationVerdict(sql=None, checksum=None, statements=(), statement_class=None, reason=NON_LITERAL)
     checksum = hashlib.sha256(sql.encode("utf-8")).hexdigest()
 
-    def red(reason: str, found: tuple[StatementVerdict, ...] = ()) -> MigrationVerdict:
-        return MigrationVerdict(sql=sql, checksum=checksum, statements=found, statement_class=None, reason=shown(reason))
+    def red(reason: str, found: tuple[StatementVerdict, ...] = (), *, already_shown: bool = False) -> MigrationVerdict:
+        return MigrationVerdict(
+            sql=sql, checksum=checksum, statements=found, statement_class=None, reason=reason if already_shown else shown(reason)
+        )
 
     try:
         pieces = statements(sql)
@@ -660,8 +667,8 @@ def classify(
     if len(found) > 1:
         return red(MULTI_STATEMENT, found)
     only = found[0]
-    if only.statement_class is None:
-        return red(only.reason, found)
+    if only.statement_class is None:  # `only.reason` is `shown(str(error))` above: shown once (yaadgaar 512 item 2)
+        return red(only.reason, found, already_shown=True)
     return MigrationVerdict(
         sql=sql, checksum=checksum, statements=found, statement_class=only.statement_class, reason=None, seed_entry=entries[0]
     )

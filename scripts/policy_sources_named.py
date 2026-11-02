@@ -54,6 +54,15 @@ import yaml
 
 REPOSITORY = Path(__file__).resolve().parent.parent
 
+# ONE READING OF EACH DOCUMENT (yaadgaar 219). A duplicate key reads as the last
+# value here and may read as the first in another reader; a policy judged in one
+# reading could deploy as the other. The gates' `strict_load_all` refuses a
+# duplicate key and a merge key; it is imported, not copied, so there is one
+# loader. That module imports pytest at module level, as `pin_bump` already
+# accepts, so the hook carries `pytest` beside `pyyaml`.
+sys.path.insert(0, str(REPOSITORY / "scripts" / "gates"))
+from test_no_two_owners import strict_load_all  # noqa: E402
+
 # ── THE PORTS ADMITTED FROM EVERY SOURCE, WRITTEN DOWN ───────────────────────
 # Keyed by policy name and asserted as an EQUALITY. Every NetworkPolicy this
 # repository declares appears here, including the ones that admit nothing from
@@ -71,10 +80,8 @@ REPOSITORY = Path(__file__).resolve().parent.parent
 # `ingress` key — a deny-all for ingress — and four `egress` rules. So
 # `ingress_rules` returns nothing for it and its `set()` here passes without
 # examining anything. It is listed so that renaming or deleting it reddens the
-# floor below, NOT because its egress is checked: this gate asks only "does
-# every INGRESS rule name a source". The mirror question for egress — a `to`-less
-# rule, which admits every destination the same way — is a separate gate that
-# nothing in this repository asks yet.
+# floor below. Its EGRESS is not checked by this dict: it is held by
+# `EXPECTED_EGRESS` and `check_egress` below (yaadgaar 156, ledger 1064).
 #
 # `valkey-ingress` LEFT THIS DICT WITH THE POLICY ITSELF, at step 3 of
 # `plans/retiring-the-deploy-copies.md`. The parent chart renders it now, behind
@@ -116,6 +123,43 @@ EXPECTED_ALLOW_ALL_PORTS: dict[str, set[int]] = {
 # policies at all is a broken walk rather than a clean repository.
 MINIMUM_POLICIES = len(EXPECTED_ALLOW_ALL_PORTS)
 
+# THE EGRESS CENSUS (yaadgaar 156, ledger 1064). An EQUALITY over every
+# `(destination, protocol, port)` a policy's egress rules admit, not a
+# ceiling: an added destination reddens as surely as a removed one. A rule whose
+# `to` is absent or empty admits EVERY destination, and one whose `ports` is
+# absent or empty admits EVERY port (ADR-0664, by symmetry with `from`); both
+# are refused in every policy the tree declares, census or not. So is a port
+# entry with no `port`, which admits every port of its protocol (yaadgaar 328).
+#
+# THE PORT TEXT CARRIES `endPort` (`443-65535`), and any other key of the port
+# entry verbatim, as `peer_key` does for a peer: a range or an unmodelled key
+# widening a written-down rule then changes the tuple and reddens the census.
+#
+# `post-merge-verifier-egress` is NOT listed here: its egress shape and peers are
+# held by `scripts/tests/test_project_probe.py`
+# (`test_every_egress_rule_names_a_destination_and_a_port` and the peer-equality
+# tests), and a second written-down copy would be a second owner. It still
+# meets the to-less/port-less refusal below.
+EXPECTED_EGRESS: dict[str, set[tuple[str, str, str]]] = {
+    "estate-front-egress": {
+        # DNS: kube-dns, both protocols.
+        ("ns={kubernetes.io/metadata.name=kube-system},pods={k8s-app=kube-dns}", "UDP", "53"),
+        ("ns={kubernetes.io/metadata.name=kube-system},pods={k8s-app=kube-dns}", "TCP", "53"),
+        # The `edge` envoy pods, post-DNAT: the in-cluster MCP smoke reaches the gateway here.
+        (
+            "ns={kubernetes.io/metadata.name=envoy-gateway-system},pods={app.kubernetes.io/name=envoy,"
+            "gateway.envoyproxy.io/owning-gateway-name=edge,gateway.envoyproxy.io/owning-gateway-namespace=yadgar}",
+            "TCP",
+            "10443",
+        ),
+        # The `yadgar-edge` clusterIP, pre-DNAT (manifests/estate-front/edge-service.yaml).
+        ("cidr=10.96.0.100/32,except=[]", "TCP", "443"),
+        # GitHub's API and registry over 443; no FQDN rule is possible on kindnet, so the
+        # cluster's pod, service and node ranges are cut out instead.
+        ("cidr=0.0.0.0/0,except=[10.244.0.0/16,10.89.4.0/24,10.96.0.0/16]", "TCP", "443"),
+    },
+}
+
 
 def documents():
     """Every YAML document in the repository, with the file it came from.
@@ -129,7 +173,7 @@ def documents():
         if ".git" in path.parts:
             continue
         try:
-            loaded = list(yaml.safe_load_all(path.read_text()))
+            loaded = list(strict_load_all(path.read_text()))
         except yaml.YAMLError as failure:
             yield path, failure
             continue
@@ -158,6 +202,106 @@ def ingress_rules(policy: dict) -> list[dict]:
     that manifest, which is how a check stops covering things.
     """
     return policy["spec"].get("ingress") or []
+
+
+def egress_rules(policy: dict) -> list[dict]:
+    """The policy's egress rules, or none (an Ingress-only policy has no `egress` key)."""
+    return policy["spec"].get("egress") or []
+
+
+EVERY_DESTINATION = "<every destination>"
+EVERY_PORT = "<every port>"
+
+
+def labels(selector: object) -> str:
+    """`{k=v,...}` of a selector's `matchLabels`; any other key is kept verbatim so it cannot pass unseen."""
+    if not isinstance(selector, dict):
+        return repr(selector)
+    shown = ",".join(f"{k}={v}" for k, v in sorted((selector.get("matchLabels") or {}).items()))
+    rest = {k: v for k, v in selector.items() if k != "matchLabels"}
+    return "{" + shown + "}" + (f"+{rest!r}" if rest else "")
+
+
+def peer_key(peer: dict) -> str:
+    """One egress peer as text: `ns=..,pods=..` or `cidr=..,except=[..]`; an unmodelled key stays visible."""
+    parts = []
+    if "ipBlock" in peer:
+        block = peer["ipBlock"] or {}
+        parts.append(f"cidr={block.get('cidr')},except=[{','.join(sorted(block.get('except') or []))}]")
+    if "namespaceSelector" in peer:
+        parts.append(f"ns={labels(peer['namespaceSelector'])}")
+    if "podSelector" in peer:
+        parts.append(f"pods={labels(peer['podSelector'])}")
+    rest = {k: v for k, v in peer.items() if k not in ("ipBlock", "namespaceSelector", "podSelector")}
+    if rest:
+        parts.append(repr(rest))
+    return ",".join(parts)
+
+
+MODELLED_PORT_KEYS = ("protocol", "port", "endPort")
+
+
+def port_key(port: object) -> tuple[str, str]:
+    """`(protocol, port text)` of one port entry. A missing `protocol` is TCP, as the API server reads it.
+
+    The text is `port`, `port-endPort` for a range, and any unmodelled key appended verbatim so it cannot
+    pass unseen (yaadgaar 328). A missing `port` is EVERY_PORT, which `check_egress` refuses.
+    """
+    if not isinstance(port, dict):
+        return "*", repr(port)
+    text = str(port["port"]) if port.get("port") is not None else EVERY_PORT
+    if "endPort" in port:
+        text += f"-{port['endPort']}"
+    rest = {k: v for k, v in port.items() if k not in MODELLED_PORT_KEYS}
+    if rest:
+        text += f"+{rest!r}"
+    return str(port.get("protocol", "TCP")), text
+
+
+def egress_tuples(rules: list[dict]) -> set[tuple[str, str, str]]:
+    """Every `(destination, protocol, port)` the rules admit."""
+    admitted = set()
+    for rule in rules:
+        peers = [peer_key(peer) for peer in rule.get("to") or []] or [EVERY_DESTINATION]
+        ports = [port_key(port) for port in rule.get("ports") or []]
+        for peer in peers:
+            for protocol, port in ports or [("*", EVERY_PORT)]:
+                admitted.add((peer, protocol, port))
+    return admitted
+
+
+def check_egress(found: dict[str, tuple[Path, dict]]) -> list[str]:
+    """No egress rule in any policy is open on destination or port; each listed policy admits exactly its census."""
+    problems = []
+    for name, (path, policy) in sorted(found.items()):
+        for index, rule in enumerate(egress_rules(policy)):
+            if not rule.get("to"):
+                problems.append(
+                    f"{path}: {name} egress rule {index} has no `to` (absent or empty): it admits EVERY "
+                    f"destination (ADR-0664). Write the destination it needs."
+                )
+            if not rule.get("ports"):
+                problems.append(
+                    f"{path}: {name} egress rule {index} has no `ports` (absent or empty): it admits EVERY "
+                    f"port. Write the ports it needs."
+                )
+            for entry, port in enumerate(rule.get("ports") or []):
+                if not isinstance(port, dict) or port.get("port") is None:
+                    problems.append(
+                        f"{path}: {name} egress rule {index} port {entry} has no `port`: it admits EVERY "
+                        f"port of its protocol. Write the port it needs."
+                    )
+    for name, expected in EXPECTED_EGRESS.items():
+        if name not in found:
+            problems.append(f"{name} is named in EXPECTED_EGRESS and not found in the tree.")
+            continue
+        path, policy = found[name]
+        admitted = egress_tuples(egress_rules(policy))
+        for extra in sorted(admitted - expected):
+            problems.append(f"{path}: {name} admits {extra}, which EXPECTED_EGRESS does not write down.")
+        for gone in sorted(expected - admitted):
+            problems.append(f"{path}: {name} no longer admits {gone}; EXPECTED_EGRESS still writes it down.")
+    return problems
 
 
 # ── THE MATCHERS, COPIED FROM yadgarhq/platform (ADR-0679) ───────────────────
@@ -249,7 +393,7 @@ def main() -> int:
         )
         return 1
 
-    problems = check_allow_all(found)
+    problems = check_allow_all(found) + check_egress(found)
     if problems:
         print("", file=sys.stderr)
         for problem in problems:
@@ -257,7 +401,9 @@ def main() -> int:
         return 1
 
     print(
-        f"[policy gate] every ingress rule of {len(found)} policies names a source."
+        f"[policy gate] every ingress rule of {len(found)} policies names a source; every egress rule "
+        f"names a destination and a port; {len(EXPECTED_EGRESS)} egress census(es) match "
+        f"({sum(len(v) for v in EXPECTED_EGRESS.values())} destinations)."
     )
     return 0
 

@@ -107,7 +107,7 @@ jobs:
   # LEDGER 1206. `scripts/chart_pin.json`'s `platform_version` is read by
   # `scripts/tests/test_operator_applications.py` with no network, so that gate
   # alone cannot tell "committed value is still true" from "committed value went
-  # stale while nobody told it". This job makes the two requests that can —
+  # stale while nobody told it". This job makes the three requests that can —
   # `scripts/check_chart_pin.py`'s own module docstring has the full argument,
   # this is the short form:
   #
@@ -126,6 +126,10 @@ jobs:
   #                      ADR-0828); now it is a local read, and
   #                      `scripts/tests/test_check_chart_pin.py` covers it
   #                      offline in the `operator-applications` hook.
+  #   chart-digest       resolves `ghcr.io/yadgarhq/charts/yadgar:<chart_tag>`
+  #                      to its OCI manifest digest and fails if it is not the
+  #                      committed `chart_digest`: a re-pushed tag (argocd#205,
+  #                      ADR-1090).
   #
   # NOT A PRE-COMMIT HOOK, UNLIKE `operator-applications`. That hook's whole
   # point (the `repo: local` block comment in `.pre-commit-config.yaml` makes

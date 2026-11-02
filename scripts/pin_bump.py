@@ -140,6 +140,8 @@ WRITER = "scripts/gates/test_yadgar_application.py"
 # parent with helm: measured 2026-10-30 at about 1 s with a warm network, so 300 s is
 # far over it and still far under the CI job limit a hung helm would otherwise reach.
 WRITER_TIMEOUT_SECONDS = 300
+# Bound on one `helm version --short` (yaadgaar 474 item 1): a local call with no network, so 30 s is generous.
+HELM_VERSION_TIMEOUT_SECONDS = 30
 MECHANICAL_FILES = (APPLICATION, CHART_PIN, TABLE)
 # THE FIVE PLATFORM-SOURCED APPLICATIONS (car C10). They move with `platform_version`, together, and only then.
 OPERATOR_APPLICATIONS = tuple(
@@ -294,7 +296,12 @@ def gate(name: str):
 
 
 def helm_version(binary: str) -> str:
-    finished = subprocess.run([binary, "version", "--short"], capture_output=True, text=True, check=True)
+    try:
+        finished = subprocess.run(
+            [binary, "version", "--short"], capture_output=True, text=True, check=True, timeout=HELM_VERSION_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired:
+        raise Refused(f"{binary} version --short timed out after {HELM_VERSION_TIMEOUT_SECONDS} s") from None
     return finished.stdout.strip().split("+")[0]
 
 
@@ -1515,6 +1522,82 @@ def enclosing_fn(path: str, text: str, mask: str, position: int) -> tuple[str, s
     return name, hashlib.sha256(" ".join(text[start:stop].split()).encode()).hexdigest()
 
 
+SELF_PARAMETER = re.compile(r"^&?\s*(?:'[a-z_]+\s+)?(?:mut\s+)?self\b")
+
+
+def innermost_fn_parameters(mask: str, position: int) -> tuple[str, str] | None:
+    """`(name, parameter text)` of the innermost fn whose body contains `position`, as `enclosing_fn` finds it."""
+    best: tuple[int, str, str] | None = None
+    for function in FN_DEFINITION.finditer(mask, 0, position):
+        brace = fn_body_brace(mask, function.end() - 1)
+        if brace < 0:
+            continue
+        if brace < position < matching_brace(mask, brace) and (best is None or function.start() > best[0]):
+            best = (function.start(), function.group(1), mask[function.end() : matching_paren(mask, function.end() - 1) - 1])
+    return None if best is None else (best[1], best[2])
+
+
+def takes_parameters(parameters: str) -> bool:
+    """A fn takes an argument other than `self` (a caller can then choose what it reads)."""
+    return any(part.strip() and not SELF_PARAMETER.match(part.strip()) for part in parameters.split(","))
+
+
+LITERAL_ARGUMENTS = re.compile(r'\s*"[^"\\]*"\s*(?:,\s*"[^"\\]*"\s*)*')
+
+
+def wrapper_call_sites(
+    files: dict[str, str], masks: dict[str, str], unresolved: Counter, readers: set[str]
+) -> tuple[Counter, dict]:
+    """Every call into a fn holding an unresolved env site and taking a parameter, keyed as an unresolved site is.
+
+    yaadgaar 471, option (a). `fn rd(p: &str) { std::env::var(&format!("{p}_X")) }`: the site inside `rd` is
+    keyed once, so a NEW `rd("SECRET")`, or an `rd("APP")` changed to `rd("SECRET")`, changed nothing E3 keyed.
+    A fn that holds such a site and takes a parameter is a wrapper, whatever the site's expression names (a `let`
+    can rebind the parameter); each call into it is keyed by (caller fn, `via <wrapper>: <call text>`, caller body
+    hash). A caller that takes a parameter other than `self` and makes a call whose arguments are not all string
+    literals is a wrapper too, to a fixpoint. FAIL-CLOSED: the parameter's name need not appear in the call, since
+    a `let` rebind (`let p = k; rd(p)`), a closure (`let g = |p| rd(p); g(k)`) or a name of any case can carry it.
+    Fail-closed: a fn of the same name elsewhere is a wrapper too, and a method call `.rd(` counts.
+
+    A call whose arguments are string literals only is keyed WITHOUT the caller's body hash: the call text is
+    then the whole binding, and an unrelated edit to the caller is no new read. Any other argument (a variable,
+    a `format!`) keeps the hash, as an unresolved site does. A fn `readers_of` already models (`env_required`,
+    `fn get(k) { std::env::var(k) }`) is no wrapper here: its callers' keys are resolved, or unresolved, already.
+    """
+    definitions: dict[str, list[str]] = {}
+    for mask in masks.values():
+        for function in FN_DEFINITION.finditer(mask):
+            definitions.setdefault(function.group(1), []).append(mask[function.end() : matching_paren(mask, function.end() - 1) - 1])
+    wrappers = {
+        name
+        for (name, _site, _body) in unresolved
+        if name not in readers and any(takes_parameters(parameters) for parameters in definitions.get(name, ()))
+    }
+    sites: Counter = Counter()
+    paths: dict[tuple, set[str]] = {}
+    done: set[str] = set()
+    while wrappers - done:
+        name = sorted(wrappers - done)[0]
+        done.add(name)
+        call = re.compile(rf"\b{re.escape(name)}\s*\(")
+        for path, text in files.items():
+            mask = masks[path]
+            for match in call.finditer(mask):
+                if re.search(r"\bfn\s*$", mask[max(0, match.start() - 8) : match.start()]):
+                    continue  # the wrapper's own definition
+                stop = matching_paren(mask, match.end() - 1)
+                site = " ".join(text[match.start() : stop].split())
+                caller, body = enclosing_fn(path, text, mask, match.start())
+                literal = LITERAL_ARGUMENTS.fullmatch(text[match.end() : stop - 1]) and caller != "<top>"
+                key = (caller, f"via {name}: {site}", "" if literal else body)
+                sites[key] += 1
+                paths.setdefault(key, set()).add(path)
+                found = innermost_fn_parameters(mask, match.start())
+                if found and found[0] not in wrappers and not literal and takes_parameters(found[1]):
+                    wrappers.add(found[0])
+    return sites, paths
+
+
 def env_sites(source: dict[str, str]) -> tuple[set[str], set[str], Counter]:
     """`(required keys, every key read, unresolved call sites)` of the non-test source.
 
@@ -1557,6 +1640,10 @@ def env_sites(source: dict[str, str]) -> tuple[set[str], set[str], Counter]:
             reads.update(keys)
             if match.group("required"):
                 required.update(keys)
+    calls, call_paths = wrapper_call_sites(files, masks, unresolved, required_names | read_names)
+    for key, count in calls.items():
+        unresolved[key] += count
+        locations.setdefault(key, set()).update(call_paths[key])
     return required, reads, unresolved, {key: sorted(paths) for key, paths in locations.items()}
 
 
@@ -2329,8 +2416,12 @@ def run_writer(writer: Path) -> None:
             check=False,
             timeout=WRITER_TIMEOUT_SECONDS,
         )
-    except subprocess.TimeoutExpired:
-        raise Refused(f"{WRITER} --write timed out after {WRITER_TIMEOUT_SECONDS} s (a hung helm pull or template)")
+    except subprocess.TimeoutExpired as expired:
+        stderr = expired.stderr.decode(errors="replace") if isinstance(expired.stderr, bytes) else expired.stderr or ""
+        raise Refused(
+            f"{WRITER} --write timed out after {WRITER_TIMEOUT_SECONDS} s (a hung helm pull or template)"
+            + (f":\n{stderr}" if stderr else "")
+        ) from None
     if finished.returncode != 0:
         raise Refused(f"{WRITER} --write exited {finished.returncode}:\n{finished.stderr}")
 
@@ -2407,11 +2498,15 @@ def pr_body(evidence: dict) -> str:
     pin, target = evidence["pin"], evidence["target"]
     changed = evidence["changed"]
     platform = evidence.get("platform")
+    pin_file = (
+        f"moves `scripts/chart_pin.json`'s `chart_tag` to `v{target}` and its `chart_digest` to the digest that tag "
+        "resolved to when this PR was written"
+    )
     moves = (
-        f"moves `scripts/chart_pin.json` to `v{target}` and `platform_version` {platform['to']}, and moves the five "
+        f"{pin_file}, sets `platform_version` {platform['to']}, and moves the five "
         f"operator Applications from platform {platform['from']} to **{platform['to']}**"
         if platform
-        else f"moves `scripts/chart_pin.json` to `v{target}`"
+        else pin_file
     )
     what = [
         "## What",
@@ -2514,6 +2609,9 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_NO_OP
     except Refused as refused:
         print(f"refused: {refused}", file=sys.stderr)
+        return EXIT_ERROR
+    except AssertionError as failed:  # a gate `helm()` timeout or refusal (yaadgaar 474 item 4); still exit 1
+        print(f"refused: {failed}", file=sys.stderr)
         return EXIT_ERROR
 
     if evidence is None:

@@ -60,8 +60,7 @@ import urllib.request
 from pathlib import Path
 
 import pytest
-import yaml
-from test_no_two_owners import REPOSITORY, parent_render, tuples_of  # noqa: F401  (same flags as P)
+from test_no_two_owners import REPOSITORY, parent_render, strict_load, tuples_of  # noqa: F401  (same flags as P)
 
 APPLICATION = REPOSITORY / "applications" / "yadgar.yaml"
 TABLE = Path(__file__).resolve().parent / "yadgar_render.sha256"
@@ -77,7 +76,7 @@ EXCEPTED = (("spec", "syncPolicy"), ("spec", "source", "helm", "valuesObject"))
 
 def fetch_example(revision: str) -> dict:
     with urllib.request.urlopen(EXAMPLE_URL.format(revision=revision), timeout=30) as response:  # noqa: S310
-        return yaml.safe_load(response.read())
+        return strict_load(response.read())
 
 
 def without_excepted(document: dict) -> dict:
@@ -107,7 +106,7 @@ def example_differences(document: dict, example: dict) -> list[str]:
 
 
 def committed() -> dict:
-    return yaml.safe_load(APPLICATION.read_text())
+    return strict_load(APPLICATION.read_text())
 
 
 def revision_of(document: dict) -> str:
@@ -344,7 +343,7 @@ def test_every_server_states_its_client_auth_and_stages_its_own_ca() -> None:
     dropped or unplanned `clientAuth` would pass K3. Read both the values and
     the render.
     """
-    application = yaml.safe_load(APPLICATION.read_text())
+    application = strict_load(APPLICATION.read_text())
     values = application["spec"]["source"]["helm"]["valuesObject"]
     stated = {server: (values.get(server) or {}).get("tls") or {} for server in SERVERS}
     assert {

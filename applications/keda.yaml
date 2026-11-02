@@ -3,10 +3,11 @@
 # Application by name, keeping its uid.
 #
 # WHAT D4 CHANGED, AND ONLY THIS: `source`. It was KEDA's own chart, `keda`
-# 2.20.2 from kedacore. It is now `platform` at the version
-# `yadgarhq/chart@v0.3.15` embeds, with `operators.keda.create` true and every
-# other operator explicitly false. `platform` 0.1.21 carries the same `keda`
-# 2.20.2 as a subchart, so the image tags and the chart label do not move.
+# 2.20.2 from kedacore. It became `platform` at the version
+# `yadgarhq/chart@v0.3.15` embedded, with `operators.keda.create` true and every
+# other operator explicitly false. At that handover `platform` 0.1.21 carried
+# the same `keda` 2.20.2 as a subchart, so the image tags and the chart label
+# did not move.
 #
 # WHAT D4 KEPT, so that the handover adopts in place: the Application name, the
 # destination namespace `keda`, `syncPolicy`, and no `releaseName`. Argo uses

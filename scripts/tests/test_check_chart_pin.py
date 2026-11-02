@@ -132,6 +132,18 @@ def test_an_unreachable_chart_repository_reddens(script, monkeypatch: pytest.Mon
     assert error is not None and "URLError" in error
 
 
+@pytest.mark.parametrize("code", [403, 429])
+def test_a_rate_limited_chart_read_reddens_naming_github_token(script, code: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A bare `HTTPError` said nothing about the anonymous rate limit (yaadgaar 157); it stays red and names the fix."""
+
+    def fetch(*_args, **_kwargs):
+        raise urllib.error.HTTPError("https://api.github.com/x", code, "rate limit exceeded", {}, None)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(script, "fetch_contents", fetch)
+    error = script.check_platform_version("v0.3.13", "0.1.21")
+    assert error is not None and f"HTTPError {code}" in error and "GITHUB_TOKEN" in error
+
+
 def test_main_needs_no_request_beyond_the_chart_and_its_digest(script, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
     calls = []
 

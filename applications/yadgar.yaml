@@ -27,8 +27,12 @@
 # `example/application.yaml` everywhere outside `spec.syncPolicy` and
 # `spec.source.helm.valuesObject`, and that the render at the pin equals the
 # committed per-object digests in `scripts/gates/yadgar_render.sha256` (K3).
-# A pin bump therefore moves three things in one merge: `targetRevision`
-# below, `scripts/chart_pin.json`'s `chart_tag`, and that digest table.
+# A pin bump therefore moves, in one merge, `targetRevision` below,
+# `scripts/chart_pin.json` (`chart_tag`, `chart_digest`) and that digest table,
+# and, when the parent carries a new `platform`, every operator Application's
+# `targetRevision` and `chart_pin.json`'s `platform_version` with them
+# (`pin_bump.pin_files`). `check_chart_pin.py` and
+# `scripts/tests/test_operator_applications.py` refuse a partial move.
 #
 # THE EXAMPLE'S OWN COMMENTS BELOW ARE AN ADOPTER'S. Where they say "EDIT
 # THIS" or "in your copy", this file is that copy.
@@ -856,7 +860,7 @@ spec:
           # Jobs' line matcher. 0.1.13 sends `?pretty=false` and a non-curl agent.
           # `platform` 0.1.20 then gave the Envoy Gateway probe its own EnvoyProxy, so
           # it no longer asks for the edge's pinned nodePort 30443, and 0.1.21 added the
-          # Prometheus arm. Parent 0.3.13 carries 0.1.21.
+          # Prometheus arm. Parent 0.3.13 carried 0.1.21 then.
           #
           # WHAT IT RUNS ON EVERY SYNC, because Argo runs hooks on every sync,
           # `selfHeal` ones included. PreSync: `Job/preflight` probes cert-manager,
