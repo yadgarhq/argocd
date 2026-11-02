@@ -64,14 +64,44 @@ def test_a_hung_helm_raises_within_the_bound_naming_command_and_bound(
     assert str(TINY) in message
 
 
-def test_a_hung_writer_is_refused_within_the_bound(
-    sleeping_helm: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_hung_writer_is_refused_within_the_bound(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     writer = tmp_path / "writer.py"
-    writer.write_text(f"import time\ntime.sleep({FAKE_SLEEP})\n")
+    writer.write_text(f"import sys, time\nsys.stderr.write('pulling oci://x\\n'); sys.stderr.flush()\ntime.sleep({FAKE_SLEEP})\n")
     monkeypatch.setattr(pb, "WRITER_TIMEOUT_SECONDS", TINY)
     started = time.monotonic()
     with pytest.raises(pb.Refused, match="timed out") as raised:
         pb.run_writer(writer)
     assert time.monotonic() - started < FAKE_SLEEP / 2
     assert str(TINY) in str(raised.value)
+    assert "pulling oci://x" in str(raised.value), "the writer's stderr so far is part of the refusal (yaadgaar 474 item 3)"
+
+
+def test_the_production_bounds_are_the_measured_ones() -> None:
+    """The tests patch the bounds down; the shipped values are pinned here (yaadgaar 474 item 5)."""
+    assert pb.WRITER_TIMEOUT_SECONDS == 300
+    assert gate_module().HELM_TIMEOUT_SECONDS == 300
+    assert pb.HELM_VERSION_TIMEOUT_SECONDS == 30
+
+
+def test_a_hung_helm_version_is_refused_within_the_bound(sleeping_helm: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`helm version --short` ran with no bound (yaadgaar 474 item 1)."""
+    monkeypatch.setattr(pb, "HELM_VERSION_TIMEOUT_SECONDS", TINY)
+    started = time.monotonic()
+    with pytest.raises(pb.Refused, match="helm version --short timed out") as raised:
+        pb.helm_version("helm")
+    assert time.monotonic() - started < FAKE_SLEEP / 2
+    assert str(TINY) in str(raised.value)
+
+
+def test_main_reports_a_gate_helm_timeout_as_a_refusal_not_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A gate `helm()` timeout is an AssertionError; `main` ends it as `refused:` and exit 1 (yaadgaar 474 item 4)."""
+
+    def hung(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("helm template ... did not finish within 300 s")
+
+    monkeypatch.setattr(pb, "decide", lambda pin, target: None)
+    monkeypatch.setattr(pb, "write_files", hung)
+    assert pb.main(["--target", "9.9.9", "--write"]) == pb.EXIT_ERROR
+    assert "refused: helm template ... did not finish within 300 s" in capsys.readouterr().err

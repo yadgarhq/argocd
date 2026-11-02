@@ -94,7 +94,8 @@ which is what merging the PR makes main.
    checkout (`main`), never from the event.
 
    THE CLEARING ENTRY MUST BE NEW IN THIS PR. An entry already on the base,
-   byte-equal after parsing, clears nothing (`base_ack_text` reads the base's
+   equal after parsing (same target, same reasons in the same order, same
+   why), clears nothing (`base_ack_text` reads the base's
    copy from the merge commit's first parent; no file there is no entry).
    Otherwise an ack merged earlier for the same target, by a revert and a
    re-pin or by an ack-only PR merged first, would clear a later PR nobody

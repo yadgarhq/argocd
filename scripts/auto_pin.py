@@ -86,7 +86,9 @@ version hold would read as a clear). A writer that dies between its create and
 its re-read leaves the duplicate to the next `ensure_hold`.
 
 `push` (release App token, contents + pull-requests write, R3-a). Reads main
-again (moved → stop). Deletes stale orphan branches of the target that are
+again (moved → stop). Deletes stale orphan branches of the target, and every
+`auto/pin-<v>-*` branch whose `v` is at or below main's pin (an E2-hold's kept
+branch once main passed it, yaadgaar 472), when no open PR heads it and it is
 provably the bot's (author PIN_LOGIN, verified, one parent); anything else is
 kept. Then it makes ONE commit through the Git Data API (blobs, a tree on main's
 tree, a commit whose only parent is main) and points a NEW branch
@@ -618,6 +620,21 @@ def target_refs(api: Client, target: str) -> list[tuple[str, str]]:
     return refs
 
 
+def passed_refs(api: Client, pin: str) -> list[tuple[str, str]]:
+    """`(ref, sha)` of every `auto/pin-<v>[-<sha12>]` branch with `v` at or below main's `pin` (yaadgaar 472)."""
+    ceiling = release(pin)
+    if ceiling is None:
+        return []
+    refs = []
+    for item in api.get(f"/repos/{REPOSITORY}/git/matching-refs/heads/{BRANCH_PREFIX}") or []:
+        ref = str(item.get("ref") or "")
+        match = BRANCH.match(ref.removeprefix("refs/heads/"))
+        version = release(match.group(1)) if match else None
+        if version is not None and version <= ceiling:
+            refs.append((ref, str((item.get("object") or {}).get("sha") or "")))
+    return refs
+
+
 def backoff(api: Client, target: str, main_sha: str, now: dt.datetime, *, open_heads: frozenset[str]) -> str | None:
     """Why to wait, or None: an orphan branch of `target` whose `pin / e1` on this main is younger than BACKOFF_HOURS."""
     for ref, sha in target_refs(api, target):
@@ -876,11 +893,23 @@ def push(api: Client, tree: Path, state: State, *, changed: list[str], open_head
         raise Refused(problem)
     if main_head(api) != state.main_sha:
         raise MainMoved(f"main moved since the gate read {state.main_sha}")
-    for ref, sha in target_refs(api, state.target):
+    # The target's orphans, and every branch of a version main's pin already reached (yaadgaar 472): an E2-hold
+    # keeps its branch as evidence (ADR-1075), which a merged or passed version no longer needs. A passed
+    # branch's DELETE failing (404: gone already; 422: a stale ref) is a warning, not a stop: that sweep is
+    # housekeeping, and it must not block every pin push. The target's own orphans keep raising.
+    targets = target_refs(api, state.target)
+    passed = [(ref, sha) for ref, sha in passed_refs(api, state.pin) if ref not in {r for r, _ in targets}]
+    for ref, sha, is_target in [*((r, s, True) for r, s in targets), *((r, s, False) for r, s in passed)]:
         if sha in open_heads:
             continue
         if bot_owned(api, sha):
-            api.delete(f"/repos/{REPOSITORY}/git/{ref}")
+            try:
+                api.delete(f"/repos/{REPOSITORY}/git/{ref}")
+            except ApiError as failure:
+                if is_target:
+                    raise
+                print(f"warning: could not delete the passed branch {ref}: {failure}; the push continues", file=sys.stderr)
+                continue
             print(f"deleted the stale orphan {ref} (the bot's commit {sha})")
         else:
             print(f"kept {ref}: its head {sha} is not provably the bot's commit")

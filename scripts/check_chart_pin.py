@@ -115,6 +115,14 @@ def fetch_contents(repo: str, path: str, ref: str | None = None) -> str:
     return base64.b64decode(payload["content"]).decode()
 
 
+def read_failure(exc: Exception) -> str:
+    """The exception's type, its HTTP status, and for 403/429 the rate-limit hint (yaadgaar 157). Never its text."""
+    if isinstance(exc, urllib.error.HTTPError):
+        hint = " (the anonymous rate limit, most likely: set GITHUB_TOKEN)" if exc.code in (403, 429) else ""
+        return f"{type(exc).__name__} {exc.code}{hint}"
+    return type(exc).__name__
+
+
 def platform_version_at(chart_tag: str) -> str | None:
     """`platform`'s pinned `version` among `chart/Chart.yaml`'s `dependencies`, or `None`."""
     document = yaml.safe_load(fetch_contents(CHART_REPO, CHART_PATH, ref=chart_tag)) or {}
@@ -155,7 +163,7 @@ def check_platform_version(chart_tag: str, committed_version: str) -> str | None
     except (urllib.error.URLError, json.JSONDecodeError, yaml.YAMLError, KeyError) as exc:
         return (
             f"could not read `platform`'s version from `{CHART_REPO}@{chart_tag}`'s "
-            f"`{CHART_PATH}`: {type(exc).__name__}."
+            f"`{CHART_PATH}`: {read_failure(exc)}."
         )
     if live_version is None:
         return (

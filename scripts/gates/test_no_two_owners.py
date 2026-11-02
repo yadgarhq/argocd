@@ -112,6 +112,67 @@ import pytest
 import yaml
 
 REPOSITORY = Path(__file__).resolve().parents[2]
+
+
+# ONE READING OF A DUPLICATE KEY (yaadgaar 219). PyYAML keeps the last of two
+# equal mapping keys; another reader (a first-key reader) may read the document
+# apart, as `pin_dryrun.yaml_ambiguities` already says. A gate that judged one
+# reading could pass a document deployed as the other, so every YAML read under
+# `scripts/gates/`, and `scripts/policy_sources_named.py`'s, goes through
+# `strict_load` / `strict_load_all`, which refuse a duplicate key at any depth.
+#
+# A MERGE KEY (`<<: *anchor`) IS REFUSED BY NAME. SafeLoader expands it; a reader
+# without merge support reads a key named `<<`, and a merged key and a local key
+# of the same name are a duplicate under one reading and not the other. Refusing
+# is the non-weakening choice, and no manifest here uses one.
+#
+# THE LIMIT, STATED. Keys compare as the values PyYAML constructs, so two keys
+# that differ only by type (`1:` and `'1':`, `true:` and `'true':`) are two keys
+# here and pass, though a string-keyed reader (YAML to JSON) collides them. This
+# loader refuses the ambiguities named above; it does not read every document as
+# Argo CD does.
+#
+# IT STAYS IN THIS FILE: `pin_evidence.WRITERS`, `pin_dryrun.CHECKER_FILES` and
+# `test_pin_bump_replay` copy or digest this module by name, and a loader moved
+# into a new file would be a dependency none of them carries.
+MERGE_TAG = "tag:yaml.org,2002:merge"
+
+
+class StrictLoader(yaml.SafeLoader):
+    pass
+
+
+def _mapping_without_duplicate_keys(loader: StrictLoader, node: yaml.MappingNode) -> dict:
+    seen: list = []
+    for key_node, _value_node in node.value:
+        if key_node.tag == MERGE_TAG:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "merge keys are not allowed: `<<` reads differently in a reader without merge support",
+                key_node.start_mark,
+            )
+        key = loader.construct_object(key_node, deep=True)
+        if key in seen:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping", node.start_mark, f"found duplicate key {key!r}", key_node.start_mark
+            )
+        seen.append(key)
+    return loader.construct_mapping(node, deep=True)
+
+
+StrictLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _mapping_without_duplicate_keys)
+
+
+def strict_load(stream: str | bytes):
+    """`yaml.safe_load` that refuses a duplicate key and a merge key."""
+    return yaml.load(stream, Loader=StrictLoader)  # a SafeLoader subclass
+
+
+def strict_load_all(stream: str | bytes):
+    """`yaml.safe_load_all` that refuses a duplicate key and a merge key."""
+    return yaml.load_all(stream, Loader=StrictLoader)  # a SafeLoader subclass
+
 APPLICATIONS = "applications"
 THIS_REPOSITORY = "https://github.com/yadgarhq/argocd"
 
@@ -350,7 +411,7 @@ def applications(tree: Path):
     (`scripts/tests/test_infra_children.py`), not an owner this gate reads.
     """
     for path in sorted((tree / APPLICATIONS).glob("*.yaml")):
-        for document in yaml.safe_load_all(path.read_text()):
+        for document in strict_load_all(path.read_text()):
             if isinstance(document, dict) and document.get("kind") == "Application":
                 yield path, document
 
@@ -431,7 +492,7 @@ def source_tuples(tree: Path, name: str, namespace: str | None, source: dict):
             )
         documents = []
         for manifest in sorted((tree / source["path"]).glob("*.yaml")):
-            documents += list(yaml.safe_load_all(manifest.read_text()))
+            documents += list(strict_load_all(manifest.read_text()))
         candidates = tuples_of(documents)
         origin = f"Application `{name}` ({source['path']})"
     elif source.get("chart") and namespace == TARGET_NAMESPACE:
@@ -456,7 +517,7 @@ def source_tuples(tree: Path, name: str, namespace: str | None, source: dict):
                 str(values_object),
                 *api_version_flags(),
             )
-        candidates = tuples_of(yaml.safe_load_all(rendered))
+        candidates = tuples_of(strict_load_all(rendered))
         origin = f"Application `{name}` ({source['repoURL']} {source['chart']})"
     else:
         return
@@ -569,7 +630,7 @@ def parent_render(tree: Path, overrides: tuple[str, ...] = ()) -> list:
             *api_version_flags(),
             *overrides,
         )
-    return list(yaml.safe_load_all(rendered))
+    return list(strict_load_all(rendered))
 
 
 def two_owners(tree: Path, overrides: tuple[str, ...] = ()) -> tuple[list[Failure], int]:
@@ -597,6 +658,61 @@ def render(failures: list[Failure], examined: int) -> str:
         )
     lines.append(f"  examined {examined} tuple(s) on the D side")
     return "\n".join(lines)
+
+
+# ── ONE READING OF A DUPLICATE KEY (yaadgaar 219) ─────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["a: 1\na: 2\n", "spec:\n  source:\n    targetRevision: 1\n    targetRevision: 2\n", "- x: 1\n  x: 1\n"],
+    ids=["top-level", "nested", "in-a-sequence-even-equal"],
+)
+def test_the_gates_refuse_a_duplicate_key(text: str) -> None:
+    """PyYAML keeps the LAST of two equal keys; another reader may keep the first. The gates refuse the ambiguity."""
+    with pytest.raises(yaml.YAMLError, match="duplicate key"):
+        strict_load(text)
+    with pytest.raises(yaml.YAMLError, match="duplicate key"):
+        list(strict_load_all("---\nok: 1\n---\n" + text))
+
+
+def test_a_gate_read_path_refuses_a_duplicate_key(tmp_path: Path) -> None:
+    """Through `applications()`, a path the gates read the tree by, not the loader alone (yaadgaar 219).
+
+    PyYAML keeps the LAST `targetRevision`; a first-key reader keeps the first. Reverting `applications()` to
+    `yaml.safe_load_all` reads the document as `2.0.0` and yields it: this goes red.
+    """
+    (tmp_path / APPLICATIONS).mkdir()
+    (tmp_path / APPLICATIONS / "x.yaml").write_text(
+        "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: x\n"
+        "spec:\n  source:\n    targetRevision: 1.0.0\n    targetRevision: 2.0.0\n"
+    )
+    with pytest.raises(yaml.YAMLError, match="duplicate key"):
+        list(applications(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["base: &b {a: 1}\nx:\n  <<: *b\n  a: 2\n", "base: &b {a: 1}\nx:\n  <<: *b\n", "- <<: [{a: 1}]\n"],
+    ids=["merge-then-override", "merge-only", "merge-of-a-list-in-a-sequence"],
+)
+def test_the_gates_refuse_a_merge_key_by_name(text: str) -> None:
+    """`<<` is refused on purpose, not by PyYAML's accidental "could not determine a constructor"."""
+    with pytest.raises(yaml.YAMLError, match="merge keys are not allowed"):
+        strict_load(text)
+    with pytest.raises(yaml.YAMLError, match="merge keys are not allowed"):
+        list(strict_load_all("---\nok: 1\n---\n" + text))
+
+
+def test_a_quoted_merge_key_is_a_plain_string_key() -> None:
+    """`'<<'` is a key named `<<` under every reader: no merge, nothing to refuse."""
+    assert strict_load("x:\n  '<<': 1\n") == {"x": {"<<": 1}}
+
+
+def test_the_strict_loader_reads_what_safe_load_reads_otherwise() -> None:
+    text = "a: 1\nb: [x, {c: 2}]\nd: {e: f}\n"
+    assert strict_load(text) == yaml.safe_load(text)
+    assert list(strict_load_all("x: 1\n---\ny: 2\n")) == [{"x": 1}, {"y": 2}]
 
 
 # ── THE RED CASES' OWN SUBJECTS ───────────────────────────────────────────────
@@ -1286,7 +1402,7 @@ def unguarded_handovers(
             continue
         paths = [s["path"] for s in sources_of(application.get("spec") or {}) if s.get("path")]
         for manifest in (m for p in paths for m in sorted((tree / p).glob("*.yaml"))):
-            for document in yaml.safe_load_all(manifest.read_text()):
+            for document in strict_load_all(manifest.read_text()):
                 found = tuples_of([document])
                 if found and found <= hooks:
                     hooked |= found
@@ -1591,7 +1707,7 @@ def test_deleting_the_iam_keys_block_reddens_and_names_the_key(tmp_path: Path) -
     """
     tree = a_copy_of_the_tree(tmp_path)
     path = tree / "applications" / "yadgar.yaml"
-    application = yaml.safe_load(path.read_text())
+    application = strict_load(path.read_text())
     del application["spec"]["source"]["helm"]["valuesObject"]["platform"]["bootstrap"]["iamKeys"]
     path.write_text(yaml.safe_dump(application))
     problems = iam_keys_violations(tree)
@@ -1874,7 +1990,7 @@ def edge_differences(rendered: list) -> set[tuple[str, str, str]]:
         if isinstance(d, dict) and (d.get("kind"), (d.get("metadata") or {}).get("name"))
         in STEP_7_OBJECTS
     ]
-    copies = [comparable(d) for d in yaml.safe_load_all(DELETED_EDGE_COPIES) if d]
+    copies = [comparable(d) for d in strict_load_all(DELETED_EDGE_COPIES) if d]
     return field_changes(copies, ours)
 
 
@@ -1991,7 +2107,7 @@ def gateway_ingress_differences(rendered: list) -> set[tuple[str, str, str]]:
         and d.get("kind") == "NetworkPolicy"
         and (d.get("metadata") or {}).get("name") == "gateway-ingress"
     ]
-    return field_changes([comparable(yaml.safe_load(DELETED_GATEWAY_INGRESS))], ours)
+    return field_changes([comparable(strict_load(DELETED_GATEWAY_INGRESS))], ours)
 
 
 def test_step_8_adds_the_policy_and_changes_nothing_else(working_tree: Path) -> None:

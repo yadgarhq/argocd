@@ -1322,6 +1322,12 @@ def test_the_body_carries_the_template_headings_and_one_bullet() -> None:
     assert "0.25.14" in lines[0] and "gateway 0.12.11" in lines[0]
 
 
+def test_the_body_says_the_pin_records_the_chart_digest() -> None:
+    """`chart_pin.json` carries `chart_digest` since argocd#205; the body named only the tag (yaadgaar 494 item 2)."""
+    what = pb.pr_body(evidence()).split("## What\n", 1)[1].split("\n## ", 1)[0]
+    assert "`chart_tag` to `v" in what and "`chart_digest`" in what
+
+
 def test_the_body_carries_the_commit_table_the_digest_and_the_rollback() -> None:
     body = pb.pr_body(evidence())
     assert "abc1234" in body and DIGEST[("gateway", "0.12.11")] in body
@@ -1464,6 +1470,94 @@ def test_a_semicolon_in_an_array_parameter_does_not_hide_the_body() -> None:
 def test_a_fn_with_an_array_signature_moved_verbatim_between_files_is_green() -> None:
     fn = ARRAY_PARAM.replace("{P}", "APP")
     assert audit({"src/a.rs": fn}, {"src/a.rs": "// gone\n", "src/b.rs": fn}) == []
+
+
+# ── yaadgaar 471: a wrapper fn keyed on its own parameter hides its callers ──
+
+WRAPPER = 'fn rd(p: &str) -> Option<String> {\n    std::env::var(&format!("{p}_X")).ok()\n}\n'
+INDIRECT_WRAPPER = 'fn rd(req: &str) -> Option<String> {\n    let p = req;\n    std::env::var(&format!("{p}_X")).ok()\n}\n'
+
+
+def caller(*keys: str, name: str = "boot") -> str:
+    return f"fn {name}() {{\n" + "".join(f'    let _ = rd("{key}");\n' for key in keys) + "}\n"
+
+
+@pytest.mark.parametrize("wrapper", [WRAPPER, INDIRECT_WRAPPER], ids=["direct", "through-a-let"])
+@pytest.mark.parametrize(
+    "new_caller",
+    [caller("SECRET"), caller("APP", "SECRET"), caller("APP") + caller("SECRET", name="other")],
+    ids=["argument-changed", "caller-added", "caller-in-a-new-fn"],
+)
+def test_a_new_call_into_a_wrapper_keyed_on_its_parameter_is_needs_human(wrapper: str, new_caller: str) -> None:
+    """N7/N7b: E3 keyed only the site inside `rd`, so `rd("SECRET")` reading `SECRET_X` was GREEN."""
+    reasons = audit({"src/a.rs": wrapper + caller("APP")}, {"src/a.rs": wrapper + new_caller})
+    assert any("cannot resolve" in r and 'rd("SECRET")' in r for r in reasons), reasons
+
+
+def test_a_wrapper_of_a_wrapper_is_followed() -> None:
+    outer = 'fn rd2(q: &str) -> Option<String> {\n    rd(q)\n}\n'
+    old = WRAPPER + outer + 'fn boot() {\n    let _ = rd2("APP");\n}\n'
+    new = WRAPPER + outer + 'fn boot() {\n    let _ = rd2("SECRET");\n}\n'
+    reasons = audit({"src/a.rs": old}, {"src/a.rs": new})
+    assert any("cannot resolve" in r and 'rd2("SECRET")' in r for r in reasons), reasons
+
+
+@pytest.mark.parametrize(
+    "outer",
+    [
+        "fn f(q: &str) -> Option<String> {\n    rd(q)\n}\n",
+        "fn f(k: &str) -> Option<String> {\n    let p = k;\n    rd(p)\n}\n",
+        "fn f(k: &str) -> Option<String> {\n    let g = |p: &str| rd(p);\n    g(k)\n}\n",
+        "fn f(K: &str) -> Option<String> {\n    rd(K)\n}\n",
+    ],
+    ids=["control-name-in-the-call", "let-rebind", "closure", "uppercase-parameter"],
+)
+def test_a_wrapper_whose_parameter_does_not_appear_in_the_call_is_followed(outer: str) -> None:
+    """Fail-closed fixpoint: a fn taking a parameter and calling a wrapper with a non-literal is a wrapper.
+
+    The fixpoint used to need the caller's parameter NAME, lowercase, in the call's arguments, so a rebind, a
+    closure or an uppercase name hid `f("SECRET")` (reading `SECRET_X`) and E3 stayed GREEN.
+    """
+    old = WRAPPER + outer + 'fn boot() {\n    let _ = f("APP");\n}\n'
+    new = WRAPPER + outer + 'fn boot() {\n    let _ = f("SECRET");\n}\n'
+    reasons = audit({"src/a.rs": old}, {"src/a.rs": new})
+    assert any("cannot resolve" in r and 'f("SECRET")' in r for r in reasons), reasons
+
+
+def test_a_parameterless_caller_of_a_wrapper_with_a_variable_is_not_a_wrapper() -> None:
+    """No parameter, so no caller can choose what it reads: its call stays keyed on its own body hash."""
+    files = {"src/a.rs": WRAPPER + 'fn boot() {\n    let k = "APP";\n    let _ = rd(k);\n}\nfn main() {\n    boot();\n}\n'}
+    assert audit(files, dict(files)) == []
+
+
+def test_unchanged_callers_of_a_wrapper_stay_green() -> None:
+    files = {"src/a.rs": WRAPPER + caller("APP")}
+    assert audit(files, dict(files)) == []
+
+
+def test_a_wrapper_and_its_caller_moved_verbatim_between_files_stay_green() -> None:
+    assert audit({"src/a.rs": WRAPPER + caller("APP")}, {"src/a.rs": "// gone\n", "src/b.rs": WRAPPER + caller("APP")}) == []
+
+
+def test_an_unrelated_edit_beside_a_literal_wrapper_call_stays_green() -> None:
+    """A literal-only call is its own binding: the caller's body hash is not in its key."""
+    old = WRAPPER + 'fn boot() {\n    let _ = rd("APP");\n}\n'
+    new = WRAPPER + 'fn boot() {\n    let _ = rd("APP");\n    let _x = 1;\n}\n'
+    assert audit({"src/a.rs": old}, {"src/a.rs": new}) == []
+
+
+def test_a_variable_argument_whose_binding_changed_is_needs_human() -> None:
+    old = WRAPPER + 'fn boot() {\n    let k = "APP";\n    let _ = rd(k);\n}\n'
+    new = WRAPPER + 'fn boot() {\n    let k = "SECRET";\n    let _ = rd(k);\n}\n'
+    reasons = audit({"src/a.rs": old}, {"src/a.rs": new})
+    assert any("cannot resolve" in r and "via rd: rd(k)" in r for r in reasons), reasons
+
+
+def test_a_parameterless_fn_with_an_unresolved_site_does_not_key_its_callers() -> None:
+    """`keyed_fn` binds its key inside: a new caller reads nothing new, and the site itself is keyed already."""
+    old = keyed_fn("APP") + "fn boot() {\n    let _ = timeout();\n}\n"
+    new = keyed_fn("APP") + "fn boot() {\n    let _ = timeout();\n    let _ = timeout();\n}\n"
+    assert audit({"src/a.rs": old}, {"src/a.rs": new}) == []
 
 
 TOP_LEVEL = 'static P: &str = "{P}";\nstatic T: Option<String> = std::env::var(&format!("{p}_X")).ok();\n'

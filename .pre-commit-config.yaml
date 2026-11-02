@@ -107,9 +107,9 @@ repos:
       # `manifests/estate-front/networkpolicy.yaml`'s `estate-front-egress` is
       # the subject; the script walks the whole tree.
       - id: policy-sources-named
-        name: every ingress rule names a source (ledger 897)
+        name: every ingress rule names a source, every egress rule a destination and a port (ledger 897, 1064)
         entry: python scripts/policy_sources_named.py
         language: python
-        additional_dependencies: ["pyyaml==6.0.3"]
+        additional_dependencies: ["pytest==9.1.1", "pyyaml==6.0.3"]
         always_run: true
         pass_filenames: false

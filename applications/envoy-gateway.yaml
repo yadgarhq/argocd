@@ -3,16 +3,16 @@
 # Application by name, keeping its uid.
 #
 # WHAT D4 CHANGED, AND ONLY THIS: `source`. It was Envoy's own chart,
-# `gateway-helm` 1.9.1 from oci://docker.io/envoyproxy. It is now `platform` at
-# the version `yadgarhq/chart@v0.3.15` embeds, with
+# `gateway-helm` 1.9.1 from oci://docker.io/envoyproxy. It became `platform` at
+# the version `yadgarhq/chart@v0.3.15` embedded, with
 # `operators.envoyGateway.create` true and every other operator explicitly
-# false. `platform` 0.1.21 carries the same Envoy Gateway v1.9.1 as its
-# `gateway-helm` subchart, so the image tags do not move. The subchart's own
-# version string is `v1.9.1`, not `1.9.1`, so the `helm.sh/chart` label moves
-# from `gateway-helm-1.9.1` to `gateway-helm-v1.9.1` on 17 objects. That label is
-# in no selector and no pod template, so nothing rolls. Ten of the 17 are
-# ordinary objects, which Argo patches in place. The other 7 are helm hooks,
-# which Argo does not patch (below).
+# false. At that handover `platform` 0.1.21 carried the same Envoy Gateway
+# v1.9.1 as its `gateway-helm` subchart, so the image tags did not move. The
+# subchart's own version string is `v1.9.1`, not `1.9.1`, so the `helm.sh/chart`
+# label moves from `gateway-helm-1.9.1` to `gateway-helm-v1.9.1` on 17 objects.
+# That label is in no selector and no pod template, so nothing rolls. Ten of the
+# 17 are ordinary objects, which Argo patches in place. The other 7 are helm
+# hooks, which Argo does not patch (below).
 #
 # WHAT D4 KEPT, so that the handover adopts in place: the Application name, the
 # destination namespace `envoy-gateway-system`, `syncPolicy`, and no
@@ -23,7 +23,7 @@
 # `envoy-gateway-system`: the same 40 objects, and the only difference is that
 # label. The Deployment's selector and pod template are equal, and the 21 CRDs
 # (Envoy Gateway's own and Gateway API v1.6.1 experimental) have equal `spec`.
-# `platform` 0.1.21's Chart.yaml and Chart.lock pin `gateway-helm` at v1.9.1.
+# `platform` 0.1.21's Chart.yaml and Chart.lock pinned `gateway-helm` at v1.9.1.
 #
 # EACH OPERATOR KEY IS WRITTEN, NOT LEFT UNSET. `platform` resolves an unset
 # `operators.<op>.create` through `operators.create`, so an unset key is a

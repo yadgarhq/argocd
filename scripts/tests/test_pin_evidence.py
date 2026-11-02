@@ -38,6 +38,8 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
+import subprocess
 import sys
 import tarfile
 from pathlib import Path
@@ -1226,3 +1228,61 @@ def test_the_base_copy_of_the_seed_allowlist_is_read_from_the_first_parent(monke
     monkeypatch.setattr(pe.subprocess, "run", run_with(f"100644 blob {'d' * 40}\t{pb.SEED_ALLOWLIST_FILE}\n".encode()))
     assert pe.base_file_if_any(Path("/repo"), pb.SEED_ALLOWLIST_FILE) == b"[]\n"
     assert calls == [["ls-tree", "HEAD^1", "--", pb.SEED_ALLOWLIST_FILE], ["show", f"HEAD^1:{pb.SEED_ALLOWLIST_FILE}"]]
+
+
+# ── yaadgaar 479 item 2: the base copy is the merge commit's FIRST parent, in real git ──
+
+
+def real_git(repo: Path, *args: str) -> str:
+    """No `git config` write, and no inherited `GIT_*` (a hook's GIT_DIR overrides `-C`; yaadgaar 498)."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    command = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.org", "-c", "commit.gpgsign=false", *args]
+    return subprocess.run(command, capture_output=True, text=True, check=True, env=env).stdout.strip()
+
+
+def test_base_ack_text_reads_the_first_parent_of_a_real_merge_commit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """refs/pull/N/merge: parent 1 is main's tip, parent 2 the PR head. The PR's own ack must not be read as base."""
+    for key in [k for k in os.environ if k.startswith("GIT_")]:
+        monkeypatch.delenv(key)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    ack = tmp_path / pe.ACK_FILE
+    ack.parent.mkdir(parents=True)
+    real_git(tmp_path, "init", "-q", "-b", "main")
+    ack.write_text("main\n")
+    real_git(tmp_path, "add", "-A")
+    real_git(tmp_path, "commit", "-q", "-m", "main")
+    real_git(tmp_path, "switch", "-q", "-c", "pr")
+    ack.write_text("pr\n")
+    real_git(tmp_path, "commit", "-q", "-am", "pr")
+    real_git(tmp_path, "switch", "-q", "main")
+    (tmp_path / "other").write_text("x\n")
+    real_git(tmp_path, "add", "-A")
+    real_git(tmp_path, "commit", "-q", "-m", "main moves on")
+    real_git(tmp_path, "merge", "-q", "--no-ff", "-X", "theirs", "-m", "merge", "pr")
+    assert ack.read_text() == "pr\n", "the merge result carries the PR's copy"
+    assert pe.base_ack_text(tmp_path) == "main\n"
+
+
+def test_base_ack_text_is_none_when_only_the_pr_adds_the_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The base has no ack file, the PR adds one: no base entry, read through the first parent's tree."""
+    for key in [k for k in os.environ if k.startswith("GIT_")]:
+        monkeypatch.delenv(key)
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    real_git(tmp_path, "init", "-q", "-b", "main")
+    (tmp_path / "other").write_text("x\n")
+    real_git(tmp_path, "add", "-A")
+    real_git(tmp_path, "commit", "-q", "-m", "main")
+    real_git(tmp_path, "switch", "-q", "-c", "pr")
+    ack = tmp_path / pe.ACK_FILE
+    ack.parent.mkdir(parents=True)
+    ack.write_text("pr\n")
+    real_git(tmp_path, "add", "-A")
+    real_git(tmp_path, "commit", "-q", "-m", "pr")
+    real_git(tmp_path, "switch", "-q", "main")
+    (tmp_path / "other").write_text("y\n")
+    real_git(tmp_path, "commit", "-q", "-am", "main moves on")
+    real_git(tmp_path, "merge", "-q", "--no-ff", "-m", "merge", "pr")
+    assert pe.base_ack_text(tmp_path) is None

@@ -3,11 +3,11 @@
 # Application by name, keeping its uid.
 #
 # WHAT D4 CHANGED, AND ONLY THIS: `source`. It was the community chart,
-# `prometheus` 29.27.0 from prometheus-community.github.io. It is now `platform`
-# at the version `yadgarhq/chart@v0.3.15` embeds, with
+# `prometheus` 29.27.0 from prometheus-community.github.io. It became `platform`
+# at the version `yadgarhq/chart@v0.3.15` embedded, with
 # `operators.prometheus.create` true and every other operator explicitly false.
-# `platform` 0.1.21 carries the same `prometheus` 29.27.0 as a subchart, so the
-# image tags and the chart label do not move.
+# At that handover `platform` 0.1.21 carried the same `prometheus` 29.27.0 as a
+# subchart, so the image tags and the chart label did not move.
 #
 # WHAT D4 KEPT, so that the handover adopts in place: the Application name, the
 # destination namespace `observability`, `syncPolicy` (CreateNamespace only, no

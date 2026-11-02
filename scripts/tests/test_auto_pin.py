@@ -432,6 +432,7 @@ def test_the_marker_round_trips_and_hides_from_the_template() -> None:
 
 ORPHAN = "9" * 40
 MATCHING = f"{R}/git/matching-refs/heads/auto/pin-0.34.11"
+EVERY_PIN_BRANCH = f"{R}/git/matching-refs/heads/auto/pin-"
 
 
 def e1_status(age_hours: float, main: str = MAIN, creator: str = "yadgarhq-settled-dispatch[bot]") -> dict:
@@ -490,17 +491,19 @@ def test_a_prefix_match_of_another_version_is_not_an_orphan() -> None:
 NEW_BRANCH = f"auto/pin-0.34.11-{PUSHED[:12]}"
 
 
-def push_routes(orphans: list[dict] | None = None, commits: dict | None = None) -> dict:
+def push_routes(orphans: list[dict] | None = None, commits: dict | None = None, every: list[dict] | None = None) -> dict:
+    """`orphans`: the target's `auto/pin-<target>-*` refs; `every`: what the `auto/pin-` prefix listing adds."""
     routes = {
         ("GET", f"{R}/branches/main"): {"commit": {"sha": MAIN}},
         ("GET", f"{R}/git/commits/{MAIN}"): {"tree": {"sha": TREE}},
         ("GET", MATCHING): orphans or [],
+        ("GET", EVERY_PIN_BRANCH): [*(every or []), *(orphans or [])],
         ("POST", f"{R}/git/blobs"): lambda body: {"sha": "1" * 40},
         ("POST", f"{R}/git/trees"): {"sha": "2" * 40},
         ("POST", f"{R}/git/commits"): {"sha": PUSHED},
         ("POST", f"{R}/git/refs"): {"ref": f"refs/heads/{NEW_BRANCH}"},
     }
-    for orphan in orphans or []:
+    for orphan in [*(orphans or []), *(every or [])]:
         routes[("DELETE", f"{R}/git/{orphan['ref']}")] = None
     for sha, commit in (commits or {}).items():
         routes[("GET", f"{R}/commits/{sha}")] = commit
@@ -583,6 +586,81 @@ def test_an_open_prs_branch_is_never_an_orphan(tmp_path: Path) -> None:
     api = Fake(push_routes([ORPHAN_REF], {ORPHAN: bot_commit()}))
     ap.push(api, tree_with(tmp_path), state(), changed=sorted(ap.PIN_FILES), open_heads=frozenset({ORPHAN}))
     assert not [w for w in api.writes() if w[0] == "DELETE"]
+
+
+# ── yaadgaar 472: branches of versions main already passed are swept ───────
+
+HELD = "8" * 40
+
+
+def pin_ref(version: str, sha: str = HELD) -> dict:
+    return {"ref": f"refs/heads/auto/pin-{version}-{sha[:12]}", "object": {"sha": sha}}
+
+
+@pytest.mark.parametrize("version", ["0.34.8", "0.34.7", "0.33.99"], ids=["the-pin", "older", "older-minor"])
+def test_a_kept_branch_of_a_version_at_or_below_mains_pin_is_deleted_when_the_bots(tmp_path: Path, version: str) -> None:
+    """An E2-hold keeps its branch as evidence (ADR-1075); once main's pin reached that version it is evidence of nothing."""
+    api = Fake(push_routes(every=[pin_ref(version)], commits={HELD: bot_commit()}))
+    ap.push(api, tree_with(tmp_path), state(), changed=sorted(ap.PIN_FILES), open_heads=frozenset())
+    assert ("DELETE", f"{R}/git/{pin_ref(version)['ref']}", None) in api.calls
+
+
+@pytest.mark.parametrize("version", ["0.34.9", "0.35.0"], ids=["newer-patch", "newer-minor"])
+def test_a_kept_branch_of_a_version_above_mains_pin_is_kept(tmp_path: Path, version: str) -> None:
+    """A version main has not reached may still be a held version's evidence; only the target's own orphans go."""
+    api = Fake(push_routes(every=[pin_ref(version)], commits={HELD: bot_commit()}))
+    ap.push(api, tree_with(tmp_path), state(), changed=sorted(ap.PIN_FILES), open_heads=frozenset())
+    assert not [w for w in api.writes() if w[0] == "DELETE"]
+
+
+@pytest.mark.parametrize("commit", [bot_commit(verified=False), bot_commit(login="m-agahi")], ids=["unverified", "foreign"])
+def test_an_old_branch_not_provably_the_bots_is_kept(tmp_path: Path, commit: dict) -> None:
+    api = Fake(push_routes(every=[pin_ref("0.34.7")], commits={HELD: commit}))
+    ap.push(api, tree_with(tmp_path), state(), changed=sorted(ap.PIN_FILES), open_heads=frozenset())
+    assert not [w for w in api.writes() if w[0] == "DELETE"]
+
+
+def test_an_old_branch_with_an_open_pr_is_kept(tmp_path: Path) -> None:
+    api = Fake(push_routes(every=[pin_ref("0.34.7")], commits={HELD: bot_commit()}))
+    ap.push(api, tree_with(tmp_path), state(), changed=sorted(ap.PIN_FILES), open_heads=frozenset({HELD}))
+    assert not [w for w in api.writes() if w[0] == "DELETE"]
+
+
+@pytest.mark.parametrize("ref", ["refs/heads/auto/pin-0.34.7-x", "refs/heads/auto/pin-old", "refs/heads/auto/pin-0.34.7-rc1-" + "8" * 12])
+def test_a_branch_not_of_the_bots_name_shape_is_kept(tmp_path: Path, ref: str) -> None:
+    api = Fake(push_routes(every=[{"ref": ref, "object": {"sha": HELD}}], commits={HELD: bot_commit()}))
+    ap.push(api, tree_with(tmp_path), state(), changed=sorted(ap.PIN_FILES), open_heads=frozenset())
+    assert not [w for w in api.writes() if w[0] == "DELETE"]
+
+
+def refusing(status: int):
+    def answer(_body: object) -> None:
+        raise ap.ApiError(status, "DELETE", "<ref>")
+
+    return answer
+
+
+@pytest.mark.parametrize("status", [404, 422])
+def test_a_passed_branch_that_cannot_be_deleted_warns_and_the_push_continues(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], status: int
+) -> None:
+    """yaadgaar 472: a stale ref's DELETE raised ApiError, which stopped every pin push behind it."""
+    routes = push_routes(every=[pin_ref("0.34.7")], commits={HELD: bot_commit()})
+    routes[("DELETE", f"{R}/git/{pin_ref('0.34.7')['ref']}")] = refusing(status)
+    api = Fake(routes)
+    assert ap.push(api, tree_with(tmp_path), state(), changed=sorted(ap.PIN_FILES), open_heads=frozenset()) == PUSHED
+    assert ("POST", f"{R}/git/refs", {"ref": f"refs/heads/{NEW_BRANCH}", "sha": PUSHED}) in api.calls
+    err = capsys.readouterr().err
+    assert "warning" in err and pin_ref("0.34.7")["ref"] in err and f"HTTP {status}" in err
+
+
+def test_the_targets_own_orphan_that_cannot_be_deleted_still_stops_the_push(tmp_path: Path) -> None:
+    routes = push_routes([ORPHAN_REF], {ORPHAN: bot_commit()})
+    routes[("DELETE", f"{R}/git/{ORPHAN_REF['ref']}")] = refusing(422)
+    api = Fake(routes)
+    with pytest.raises(ap.ApiError):
+        ap.push(api, tree_with(tmp_path), state(), changed=sorted(ap.PIN_FILES), open_heads=frozenset())
+    assert ("POST", f"{R}/git/refs", {"ref": f"refs/heads/{NEW_BRANCH}", "sha": PUSHED}) not in api.calls
 
 
 # ── E2: dispatch, bind to OUR run, bounded waits and re-dispatch ───────────
