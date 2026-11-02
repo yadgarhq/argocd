@@ -299,11 +299,13 @@ jobs:
   #
   # A MERGE GATE THROUGH `ci`'s `needs:` (above). PULL REQUESTS ONLY.
   #
-  # A PR THAT DOES NOT MOVE `targetRevision` PASSES IN THE FIRST STEP. `detect`
-  # reads both sides of `applications/yadgar.yaml` from the merge commit
-  # (`fetch-depth: 2`: its first parent is the base, its second the PR head) and
-  # writes `moved=false`; every later step is gated on `moved`, so such a PR
-  # downloads no helm and renders nothing.
+  # A PR THAT MOVES NEITHER `targetRevision` NOR THE PLATFORM PASSES IN THE
+  # FIRST STEP. `detect` reads both sides of `applications/yadgar.yaml`, the
+  # five operator Applications and `scripts/chart_pin.json` from the merge
+  # commit (`fetch-depth: 2`: its first parent is the base, its second the PR
+  # head) and writes `moved=false`; every later step is gated on `moved`, so
+  # such a PR downloads no helm and renders nothing. A platform-only move
+  # (yaadgaar #514) is `moved=true` and is judged by the operator E1.
   #
   # TWO HELMS, NOT `azure/setup-helm`, which takes no checksum (C1 review
   # finding). `install-helms` downloads v3.18.4 (the helm Argo CD v3.1.8
@@ -340,7 +342,7 @@ jobs:
       - name: install PyYAML
         run: python3 -m pip install --disable-pip-version-check "pyyaml==6.0.3"
 
-      - name: does this pull request move the yadgar pin
+      - name: does this pull request move the yadgar pin or the platform
         id: detect
         run: python3 scripts/pin_evidence.py detect --event "$GITHUB_EVENT_PATH" --output "$GITHUB_OUTPUT"
 

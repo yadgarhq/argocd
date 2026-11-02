@@ -1,0 +1,60 @@
+name: chart-digest
+
+# THE RETAG CHECK, DAILY, AGAINST MAIN (yaadgaar #494 item 5, Max 2026-11-02).
+# `ci.yaml`'s `chart-pin` job runs `scripts/check_chart_pin.py`'s chart-digest
+# half only when an argocd pull request runs CI. Argo CD pulls the `yadgar`
+# chart by tag, and a GHCR tag is mutable, so a re-push between two argocd PRs
+# changes what kind-yadgar syncs and nothing here says so. This workflow closes
+# that window to a day: it resolves `ghcr.io/yadgarhq/charts/yadgar:<chart_tag>`
+# for main's `scripts/chart_pin.json` and FAILS when the digest is not the
+# committed `chart_digest`. The script's docstring has the whole argument.
+# A retag is detected, and the next scheduled run goes red.
+#
+# THE DIGEST HALF ALONE (`--digest-only`). The platform-version and chart-tag
+# halves judge a PR's edit; on main they would only repeat what the merge
+# already passed. The digest half is the one that can go red with no commit.
+#
+# NO SECRET, NO TOKEN. The registry read is anonymous (`pin_bump.Net`), so the
+# job holds `contents: read` for the checkout and nothing else. A red run is
+# not a merge gate, and GitHub notifies only the user who last edited this
+# cron about a failed scheduled run: anyone else sees it only in the Actions
+# tab. Find who re-pushed the tag before moving `chart_digest` (the error says
+# so).
+#
+# GitHub disables a scheduled workflow after 60 days with no activity in the
+# repository. `workflow_dispatch` runs it by hand; a disabled schedule is
+# enabled again in the repository's Actions tab.
+
+on:
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: chart-digest
+  cancel-in-progress: true
+
+jobs:
+  digest:
+    name: main's chart_pin.json tag still resolves to its recorded digest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.x"
+
+      - name: install pyyaml
+        run: python3 -m pip install --disable-pip-version-check "pyyaml==6.0.3"
+
+      - name: the chart tag still resolves to the recorded chart_digest
+        run: python3 scripts/check_chart_pin.py --digest-only

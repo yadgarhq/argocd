@@ -188,7 +188,7 @@ class Refused(Exception):
 
 # ── versions ────────────────────────────────────────────────────────────────
 
-RELEASE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+RELEASE = re.compile(r"^v?([0-9]+)\.([0-9]+)\.([0-9]+)$")
 
 
 def release(version: str) -> tuple[int, int, int] | None:

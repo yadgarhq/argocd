@@ -12,9 +12,45 @@ THE PLAN IS `yadgarhq/docs` `plans/auto-deploy-parent-chart.md`, section 3
 `statuses: read`, public registry and public module repositories only.
 
 `detect` IS THE FAST PATH. It compares `spec.source.targetRevision` of the
-base and the head `applications/yadgar.yaml` and writes `moved=false` for a
-PR that does not move it. Every later step of the job is gated on `moved`, so
-such a PR installs no helm and renders nothing.
+base and the head `applications/yadgar.yaml`, and, when that does not move,
+the platform version the six `PLATFORM_FILES` name (the five operator
+Applications' `targetRevision` and `chart_pin.json`'s `platform_version`). It
+writes `moved=false` for a PR that moves neither. Every later step of the job
+is gated on `moved`, so such a PR installs no helm and renders nothing.
+
+A PLATFORM-ONLY MOVE IS JUDGED TOO (yaadgaar #514 option (a), Max 2026-11-02).
+A PR that leaves the yadgar pin alone and moves the platform writes
+`moved=true` with `platform=` and `platform_target=`. A move is read from the
+versions, never the bytes: an edit that leaves all six versions alone is no
+move. AN OPERATOR VALUES EDIT THAT MOVES NO VERSION IS `moved=false` HERE, and
+pin-evidence does not judge it: only the D4 clauses of the `operator-applications`
+pre-commit hook (`scripts/tests/test_operator_applications.py`,
+`platform_clause_errors`) bind those values. The six move together: on either side they must name one version, so a
+partial move (`platform_version` alone, the operators alone, some of them) FAILS
+in `detect` already, as does a missing or duplicate-keyed file (`chart_pin.json`
+is read by `strict_json`, one parse). A pin move beside them is bound too: on
+a pin move the files must move exactly as the target chart's `platform` does,
+the move E1 judged (no move, the same move, never one without the other), or
+the PR FAILS on any head (argocd#230 review). And on every PR, `detect` and
+`judge` refuse Applications that are not the known ones
+(`unknown_applications`, an allowlist, `KNOWN_APPLICATIONS`): any file under
+`applications/` (recursive, as root's include, any suffix) not on the list, a
+symlink there, an ApplicationSet, a known non-operator file that sources the
+platform, and an Application document anywhere else in the tree outside
+scripts/ (an app-of-apps child). The six files are a fixed list, so a sixth
+platform Application would move unjudged. `judge` then
+(`judge_platform`): the six files and `yadgar.yaml` must be the base with only
+the version lines moved, byte for byte (`platform_evidence` renders the HEAD
+values at both versions, so a values change beside the move would go unjudged):
+FAIL otherwise, before any render. Both versions must be releases; a lower one
+is judged like any other (E1 compares both directions), never skipped. Both
+helms must be installed. E1 is `pin_bump.platform_evidence`, the operator
+classifier `classify_platform`, with `yadgar` rendered at its one pin joining
+the selector set (ADR-1095). A NEEDS-HUMAN verdict FAILS, as on a pin (step 4),
+and on a human head it clears only through a NEW `ACK_FILE` entry whose
+`target` is `platform:<to>`. An automatic head never gets here: it must move
+`targetRevision` (step 0); automatic platform moves go through auto-pin with
+the pin. E2 is read as on a pin, reported on a human head.
 
 BASE AND HEAD COME FROM THE MERGE COMMIT. On `pull_request`, the checkout is
 `refs/pull/<n>/merge`: its first parent is the base the merge was made on and
@@ -82,7 +118,8 @@ which is what merging the PR makes main.
    K3 dropped, argocd#193 and ADR-1075, a hand pin PR that changes non-image
    fields had no hard red at all). The acknowledgement is an entry in
    `ACK_FILE`, `scripts/pin_needs_human_ack.json`:
-   `{"target": X.Y.Z, "reasons": [...], "why": "..."}`. It clears the verdict
+   `{"target": X.Y.Z, "reasons": [...], "why": "..."}` (`platform:X.Y.Z` on a
+   platform-only move; any other target shape is refused). It clears the verdict
    only when its `target` is this PR's target AND its `reasons` hold every
    reason of the verdict, string for string; any reason it does not name
    stays a failure. The failure prints the exact entry to commit. Nothing
@@ -165,12 +202,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import auto_pin  # noqa: E402  (stdlib only: the one status description form, `auto_pin.DESCRIPTION`)
 import pin_bump as pb  # after the path insert: scripts/ is not a package
+import yaml  # noqa: E402  (pin_bump needs it too; the job installs PyYAML before `detect`)
 
 # Human heads only: report, do not require. An automatic head always requires E2.
 E2_REQUIRED = False
 # A human head's acknowledgement of a NEEDS-HUMAN verdict, by target (module docstring, step 4).
 ACK_FILE = "scripts/pin_needs_human_ack.json"
 ACK_FIELDS = ("target", "reasons", "why")
+# An ack's target: a yadgar pin `X.Y.Z`, or `platform:X.Y.Z` for a platform-only move (yaadgaar #514).
+ACK_PLATFORM_PREFIX = "platform:"
+ACK_TARGET = re.compile(r"^(platform:)?[0-9]+\.[0-9]+\.[0-9]+$")
+# The six files that name the platform version: the five operator Applications and `chart_pin.json` (car C10).
+PLATFORM_FILES = (*pb.OPERATOR_APPLICATIONS, pb.CHART_PIN)
 # The `why` the failure prints. Committed unchanged, it says nobody wrote what was checked: refused.
 ACK_WHY_PLACEHOLDER = "<what the reviewer checked, per reason>"
 E2_CONTEXT = "pin / kind-dryrun"
@@ -289,6 +332,197 @@ def move_of(base_text: str, head_text: str) -> tuple[str, str] | None:
     return None if pin == target else (pin, target)
 
 
+def platform_texts(repo: Path) -> tuple[dict[str, str | None], dict[str, str | None]]:
+    """`(base, head)` texts of `PLATFORM_FILES`: the base from the merge commit's first parent, the head from the
+    checkout. A file a side does not have is None."""
+
+    def text(raw: bytes | None) -> str | None:
+        return None if raw is None else raw.decode()
+
+    base = {path: text(base_file_if_any(repo, path)) for path in PLATFORM_FILES}
+    head = {path: (repo / path).read_text() if (repo / path).exists() else None for path in PLATFORM_FILES}
+    return base, head
+
+
+def strict_json(text: str):
+    """`json.loads` that refuses a duplicate key instead of keeping the last (as `pin_dryrun.strict_json`)."""
+
+    def pairs(items: list) -> dict:
+        found: dict = {}
+        for key, value in items:
+            if key in found:
+                raise Refused(f"duplicate key {key!r}: two readers may read it apart")
+            found[key] = value
+        return found
+
+    return json.loads(text, object_pairs_hook=pairs)
+
+
+def platform_versions(files: dict[str, str | None], side: str) -> dict[str, str]:
+    """`{path: platform version}` of one side: each operator Application's `targetRevision` (line regex and YAML
+    parse must agree, as `pin_of`) and `chart_pin.json`'s `platform_version`. A missing or unreadable file is refused."""
+    found: dict[str, str] = {}
+    for path in PLATFORM_FILES:
+        text = files.get(path)
+        if text is None:
+            raise Refused(f"the {side} has no {path}; a platform move moves all five operator Applications and {pb.CHART_PIN}")
+        try:
+            if path == pb.CHART_PIN:
+                version = strict_json(text).get("platform_version")
+                if not isinstance(version, str) or not version:
+                    raise Refused(f"the {side} {path} has no platform_version string")
+            else:
+                version = pb.current_pin(text, path)
+                parsed = pb.parsed_revision(text)
+                if parsed != version:
+                    raise Refused(
+                        f"the {side} {path}: the targetRevision line reads {version} but YAML reads "
+                        f"spec.source.targetRevision as {parsed} (a duplicate key?)"
+                    )
+        except (ValueError, AttributeError, KeyError, TypeError, yaml.YAMLError, pb.Refused) as error:
+            raise Refused(f"the {side} {path} could not be read for its platform version: {error}") from error
+        found[path] = version
+    return found
+
+
+# THE APPLICATIONS ROOT SYNCS (argocd#230 review F2). Root's `include: applications/*.yaml` lets `*` cross `/`, so
+# any file under applications/ becomes an Application, and `PLATFORM_FILES` is a fixed list: a sixth Application that
+# deploys the platform (by `chart: platform`, an OCI or git `repoURL` with a `path`, a templated ApplicationSet, or an
+# app-of-apps child) would move with no platform move detected and no E1. So the guard is an allowlist, not a
+# heuristic: a new Application is an edit here AND in the gate that pins its shape (test_operator_applications'
+# ADOPTED, test_infra_children's CHILDREN, test_runner_image_pinned, test_pin_estate_selectors' ESTATE), and
+# `test_known_applications_is_the_union_of_the_other_gates_lists` holds the two equal.
+KNOWN_APPLICATIONS = tuple(
+    f"applications/{name}.yaml"
+    for name in (
+        "arc", "argocd", "cert-manager", "envoy-gateway", "estate-front", "estate-front-runner", "keda",
+        "mariadb-operator", "post-merge-verifier", "post-merge-verifier-runner", "prometheus", "tls", "yadgar",
+    )
+)
+# Where an Application document may sit: the allowlist and root itself. scripts/ holds test fixtures only; nothing
+# syncs it (root includes applications/ alone, and no known Application sources scripts/).
+APPLICATION_HOMES = ("applications/", "projects/root.yaml")
+APPLICATION_KINDS = ("Application", "ApplicationSet")
+
+
+def sources_platform(document) -> bool:
+    """True when any mapping inside `document` names the `platform` chart (`chart: platform`) or a `repoURL` whose
+    last segment is `platform` (an OCI or git source with a `path`), at any depth. An extra check on the known
+    non-operator files; the guard is `KNOWN_APPLICATIONS`."""
+    if isinstance(document, dict):
+        url = str(document.get("repoURL") or "").rstrip("/").removesuffix(".git")
+        if document.get("chart") == pb.PLATFORM or url.rsplit("/", 1)[-1] == pb.PLATFORM:
+            return True
+        return any(sources_platform(v) for v in document.values())
+    if isinstance(document, list):
+        return any(sources_platform(v) for v in document)
+    return False
+
+
+def documents_of(path: Path) -> list:
+    return [d for d in yaml.safe_load_all(path.read_text()) if d is not None]
+
+
+def unknown_applications(repo: Path) -> list[str]:
+    """Why `repo`'s Applications are not the known ones, one line per problem; empty when they are (F2).
+
+    Under applications/ (recursive, any suffix): a symlink, a path not in `KNOWN_APPLICATIONS`, an unparseable known
+    file, an ApplicationSet, and a known file other than the five operator Applications that sources the platform.
+    Elsewhere in `repo` (less `.git` and scripts/): an Application or ApplicationSet document outside
+    `APPLICATION_HOMES`, the child an app-of-apps wrapper would sync, and an unparseable YAML or JSON file.
+    `main` refuses every one, on every PR, in `detect` and `judge`.
+    """
+    problems: list[str] = []
+    applications = repo / "applications"
+    for path in sorted(applications.rglob("*")) if applications.is_dir() else []:
+        relative = path.relative_to(repo).as_posix()
+        if path.is_symlink():
+            problems.append(f"{relative}: a symlink under applications/; refused, Argo CD and this check may read it apart")
+            continue
+        if path.is_dir():
+            continue
+        if relative not in KNOWN_APPLICATIONS:
+            problems.append(f"{relative}: not one of the {len(KNOWN_APPLICATIONS)} known Applications (KNOWN_APPLICATIONS)")
+            continue
+        try:
+            documents = documents_of(path)
+        except (OSError, UnicodeDecodeError, yaml.YAMLError) as error:
+            problems.append(f"{relative}: could not be read: {error}")
+            continue
+        if any(isinstance(d, dict) and d.get("kind") == "ApplicationSet" for d in documents):
+            problems.append(f"{relative}: holds an ApplicationSet; its generated Applications are not known ones")
+        if relative not in pb.OPERATOR_APPLICATIONS and any(sources_platform(d) for d in documents):
+            problems.append(f"{relative}: sources the {pb.PLATFORM} chart but is not one of the five operator Applications")
+    for path in sorted(repo.rglob("*")):
+        relative = path.relative_to(repo).as_posix()
+        top = relative.split("/", 1)[0]
+        if top in (".git", "scripts", "applications") or relative in APPLICATION_HOMES:
+            continue
+        if not path.is_file() or path.suffix not in (".yaml", ".yml", ".json"):
+            continue
+        try:
+            documents = documents_of(path)
+        except (OSError, UnicodeDecodeError, yaml.YAMLError) as error:
+            problems.append(f"{relative}: could not be read for an Application document: {error}")
+            continue
+        if any(isinstance(d, dict) and d.get("kind") in APPLICATION_KINDS for d in documents):
+            problems.append(f"{relative}: an Application or ApplicationSet outside applications/; an app-of-apps child is refused")
+    return problems
+
+
+def platform_move_of(base_files: dict[str, str | None], head_files: dict[str, str | None]) -> tuple[str, str] | None:
+    """`(base platform, head platform)`, or None when no platform version moved (yaadgaar #514).
+
+    A move is judged by the VERSIONS, never the bytes: an edit that leaves all six versions (`PLATFORM_FILES`) as
+    they are is no move. On each side the six must agree; a move of some but not all of them is refused, because
+    the operators and `platform_version` move together or not at all.
+    """
+    base, head = platform_versions(base_files, "base"), platform_versions(head_files, "head")
+    if base == head:
+        return None
+    for side, versions in (("base", base), ("head", head)):
+        if len(set(versions.values())) != 1:
+            named = ", ".join(f"{path} {version}" for path, version in versions.items())
+            raise Refused(
+                f"a platform move: the {side}'s five operator Applications and {pb.CHART_PIN} platform_version "
+                f"must move together and name one platform version; they name {named}"
+            )
+    return next(iter(base.values())), next(iter(head.values()))
+
+
+def platform_only_problem(
+    base_text: str, head_text: str, base_files: dict[str, str | None], head_files: dict[str, str | None], to: str
+) -> str | None:
+    """Why a platform-only move is more than the version lines, or None (the pin-only rule of step 1, for platform).
+
+    `platform_evidence` renders each operator Application's HEAD values at both versions, so a values change beside
+    the version move would be on both sides of E1 and never judged. Each operator head must be its base with the one
+    `targetRevision` line moved, `chart_pin.json` its base with `platform_version` alone moved, and
+    `applications/yadgar.yaml` unchanged, byte for byte.
+    """
+    differs = [] if head_text == base_text else [pb.APPLICATION]
+    for path in PLATFORM_FILES:
+        base = base_files[path] or ""
+        try:
+            if path == pb.CHART_PIN:
+                pin = json.loads(base)
+                expected = pb.rewrite_chart_pin(
+                    base, str(pin.get("chart_tag", "")).removeprefix("v"), digest=str(pin.get("chart_digest", "")), platform=to
+                )
+            else:
+                expected = pb.rewrite_target_revision(base, to, path)[0]
+        except (ValueError, pb.Refused) as error:
+            return f"not a platform-only change: {path} could not be rewritten from the base to platform {to}: {error}"
+        if head_files[path] != expected:
+            differs.append(path)
+    if differs:
+        return (
+            f"not a platform-only change: {', '.join(differs)} differ(s) from the base beyond the platform version lines "
+            f"moved to {to} (a values change beside a platform move is a separate PR)"
+        )
+    return None
+
+
 def automatic_problem(pr: Pr, move: tuple[str, str] | None, changed: list[str]) -> str | None:
     """Why an automatic PR is not a pure pin PR, or None. A human head is not judged here."""
     if not pr.automatic:
@@ -403,6 +637,8 @@ def parse_acknowledgements(text: str | None) -> dict[str, dict]:
         typed = isinstance(entry["target"], str) and isinstance(entry["why"], str) and isinstance(reasons, list)
         if not typed or not all(isinstance(r, str) for r in reasons):
             raise Refused(f"{ACK_FILE} entry {entry!r}: target and why are strings and reasons a list of strings")
+        if not ACK_TARGET.fullmatch(entry["target"]):
+            raise Refused(f"{ACK_FILE} entry target {entry['target']!r} is neither a pin X.Y.Z nor {ACK_PLATFORM_PREFIX}X.Y.Z")
         if entry["why"] == ACK_WHY_PLACEHOLDER:
             raise Refused(f"{ACK_FILE} entry for {entry['target']}: replace the placeholder why with what the reviewer checked")
         if entry["target"] in found:
@@ -452,6 +688,38 @@ def evidence(
             allowlist.parent.mkdir(parents=True, exist_ok=True)
             allowlist.write_bytes(seeds)
         return pb.check(tree, target, net or pb.Net(), helms)
+
+
+def platform_evidence(
+    head_text: str, old: str, new: str, helms: dict[str, str], net=None, repo: Path | None = None
+) -> dict:
+    """The operator E1 of a platform-only move (yaadgaar #514): `pin_bump.platform_evidence` on the merge checkout.
+
+    The tree is `repo` less `.git`. `yadgar` does not move, so it is rendered once per helm at its one pin with the
+    HEAD values, and those documents join the selector set (`others`, ADR-1095) as `check` passes them on a pin move.
+    The result has `check`'s shape (`accept`, `reasons`, `helms`, `changed`, the audits empty) so `judge` and
+    `summary_lines` read it the same way, with the platform verdict under `platform`.
+    """
+    repo = repo or pb.REPOSITORY
+    net = net or pb.Net()
+    pin = pb.current_pin(head_text)
+    with tempfile.TemporaryDirectory() as scratch:
+        tree = Path(scratch) / "tree"
+        shutil.copytree(repo, tree, ignore=shutil.ignore_patterns(".git"), symlinks=True)
+        yadgar = [d for _, binary in sorted(helms.items()) for d in pb.render(head_text, pin, binary)]
+        platform = pb.platform_evidence(tree, old, new, helms, net, yadgar)
+    return {
+        "pin": pin,
+        "target": pin,
+        "helms": sorted(helms),
+        "objects": sum(platform["objects"].values()),
+        "changed": platform["changed"],
+        "boot_audit": {},
+        "migrations": {},
+        "platform": platform,
+        "accept": not platform["reasons"],
+        "reasons": list(platform["reasons"]),
+    }
 
 
 def statuses(repository: str, sha: str) -> list[dict]:
@@ -513,8 +781,15 @@ def judge(
     acks: dict[str, dict] | None = None,
     base_acks: dict[str, dict] | None = None,
     e2_required: bool = E2_REQUIRED,
+    platform_texts: tuple[dict[str, str | None], dict[str, str | None]] | None = None,
+    platform_evidence_of: Callable[[str, str, str, dict], dict] | None = None,
 ) -> Outcome:
-    """The verdict of `pin-evidence` on one PR (see the module docstring for the order)."""
+    """The verdict of `pin-evidence` on one PR (see the module docstring for the order).
+
+    `platform_texts` is `(base, head)` of `PLATFORM_FILES` (`main` always passes it); None reads as no platform move.
+    `platform_evidence_of(head_text, from, to, helms)` is the operator E1 of a platform-only move; a platform move
+    with none wired FAILS.
+    """
     outcome = Outcome()
     kind = "automatic" if pr.automatic else "human"
     try:
@@ -530,8 +805,19 @@ def judge(
         outcome.failures.append(problem)
         return outcome
     if move is None:
-        outcome.notes.append(f"no pin move: targetRevision stays {pb.current_pin(base_text)}")
-        return outcome
+        try:
+            platform_move = platform_move_of(*platform_texts) if platform_texts is not None else None
+        except Refused as refused:
+            outcome.failures.append(str(refused))
+            return outcome
+        if platform_move is None:
+            outcome.notes.append(f"no pin move: targetRevision stays {pb.current_pin(base_text)}")
+            return outcome
+        return judge_platform(
+            outcome, pr, base_text, head_text, platform_move, platform_texts,
+            platform_evidence_of=platform_evidence_of, statuses_of=statuses_of, helms=helms,
+            acks=acks or {}, base_acks=base_acks or {}, e2_required=e2_required,
+        )
     pin, target = move
     outcome.notes.append(f"{kind} pin PR: targetRevision {pin} -> {target}")
 
@@ -581,33 +867,71 @@ def judge(
                 f"platform move {platform['from']} -> {platform['to']}: {', '.join(behind)} left behind on the old platform; "
                 f"a platform move changes all eight pin files ({', '.join(pb.pin_files(platform_moved=True))})"
             )
-    if not found["accept"]:
-        # An acknowledgement never clears an automatic head: it may change only the three mechanical files anyway.
-        acks, base_acks = acks or {}, base_acks or {}
-        open_reasons = found["reasons"] if pr.automatic else unacknowledged(target, found["reasons"], acks, base_acks)
-        outcome.failures += [f"NEEDS-HUMAN: {reason}" for reason in open_reasons]
-        outcome.warnings += [f"NEEDS-HUMAN (acknowledged in {ACK_FILE}): {r}" for r in found["reasons"] if r not in open_reasons]
-        if open_reasons and not pr.automatic:
-            entry = json.dumps({"target": target, "reasons": found["reasons"], "why": ACK_WHY_PLACEHOLDER})
-            if target not in acks:
-                how = f"commits this entry to {ACK_FILE} in this PR"
-            elif base_acks.get(target) == acks[target]:
-                how = (
-                    f"rewrites {ACK_FILE}'s entry for {target}: the one there is already on the base (it acknowledged an "
-                    f"earlier PR), so it clears nothing here; replace the existing entry in this PR "
-                    f"(E2 (pin / kind-dryrun) refuses the rewrite, as {ACK_FILE} is append-only there (ADR-1094): run the "
-                    f"hand dry run) with"
+    # argocd#230 review F1: E1 judged the platform move the TARGET CHART names; what deploys is the version the six
+    # platform files name. They are one move or the PR FAILS, on any head, never a warning.
+    if platform_texts is not None:
+        try:
+            files_move = platform_move_of(*platform_texts)
+        except Refused as refused:
+            outcome.failures.append(str(refused))
+        else:
+            judged = (platform["from"], platform["to"]) if platform else None
+            if files_move is not None and judged is None:
+                outcome.failures.append(
+                    f"the platform files move platform {files_move[0]} -> {files_move[1]}, but the target chart's platform "
+                    f"does not move; E1 judged no platform move, so the operators would deploy a version nobody judged"
                 )
-            else:
-                how = f"edits {ACK_FILE} in this PR to replace the existing entry for {target}, which misses a reason, with"
-            outcome.failures.append(
-                f"NEEDS-HUMAN-UNACKNOWLEDGED: a human pin PR to {target} merges only after a human reads each NEEDS-HUMAN "
-                f"reason above and {how}: {entry} (a commit in the reviewed diff re-runs this check; a label or an "
-                f"approval does not)"
-            )
-        elif not pr.automatic:
-            outcome.notes.append(f"a human pin PR: every NEEDS-HUMAN reason is acknowledged in {ACK_FILE} for {target}")
+            elif judged is not None and files_move is not None and files_move != judged:
+                outcome.failures.append(
+                    f"the platform files move platform {files_move[0]} -> {files_move[1]}, but E1 judged the target chart's "
+                    f"platform {judged[0]} -> {judged[1]}; the operators would deploy a version nobody judged"
+                )
+            elif judged is not None and files_move is None:
+                outcome.failures.append(
+                    f"E1 judged the target chart's platform {judged[0]} -> {judged[1]}, but the platform files stay on "
+                    f"platform {judged[0]}; the operators would stay on a version the chart no longer ships"
+                )
+    if not found["accept"]:
+        needs_human(outcome, pr, target, found["reasons"], acks or {}, base_acks or {}, f"a human pin PR to {target}")
+    e2(outcome, pr, statuses_of, e2_required)
+    return outcome
 
+
+def needs_human(
+    outcome: Outcome, pr: Pr, key: str, reasons: list[str], acks: dict[str, dict], base_acks: dict[str, dict], subject: str
+) -> None:
+    """Step 4's NEEDS-HUMAN rule: every reason FAILS, on a human head unless this PR's `ACK_FILE` entry for `key` names it.
+
+    `key` is the pin target, or `platform:<to>` on a platform-only move; `subject` names the PR in the failure.
+    """
+    # An acknowledgement never clears an automatic head: it may change only the three mechanical files anyway.
+    open_reasons = reasons if pr.automatic else unacknowledged(key, reasons, acks, base_acks)
+    outcome.failures += [f"NEEDS-HUMAN: {reason}" for reason in open_reasons]
+    outcome.warnings += [f"NEEDS-HUMAN (acknowledged in {ACK_FILE}): {r}" for r in reasons if r not in open_reasons]
+    if open_reasons and not pr.automatic:
+        entry = json.dumps({"target": key, "reasons": reasons, "why": ACK_WHY_PLACEHOLDER})
+        if key not in acks:
+            how = f"commits this entry to {ACK_FILE} in this PR"
+        elif base_acks.get(key) == acks[key]:
+            how = (
+                f"rewrites {ACK_FILE}'s entry for {key}: the one there is already on the base (it acknowledged an "
+                f"earlier PR), so it clears nothing here; replace the existing entry in this PR "
+                f"(E2 (pin / kind-dryrun) refuses the rewrite, as {ACK_FILE} is append-only there (ADR-1094): run the "
+                f"hand dry run) with"
+            )
+        else:
+            how = f"edits {ACK_FILE} in this PR to replace the existing entry for {key}, which misses a reason, with"
+        outcome.failures.append(
+            f"NEEDS-HUMAN-UNACKNOWLEDGED: {subject} merges only after a human reads each NEEDS-HUMAN "
+            f"reason above and {how}: {entry} (a commit in the reviewed diff re-runs this check; a label or an "
+            f"approval does not)"
+        )
+    elif not pr.automatic:
+        outcome.notes.append(f"{subject}: every NEEDS-HUMAN reason is acknowledged in {ACK_FILE} for {key}")
+
+
+def e2(outcome: Outcome, pr: Pr, statuses_of: Callable[[str], list[dict]], e2_required: bool) -> None:
+    """Step 5: E2 read as the head sha's `pin / kind-dryrun` status; required on an automatic head, else reported."""
     try:
         problem = e2_problem(statuses_of(pr.head_sha), pr.head_sha, pr.base_sha)
     except Exception as error:  # noqa: BLE001  (an unreadable status is a missing status)
@@ -619,6 +943,54 @@ def judge(
         (outcome.failures if required else outcome.warnings).append(f"E2 ({mode}): {problem}")
     else:
         outcome.notes.append(f"E2: `{E2_CONTEXT}` is success on {pr.head_sha}")
+
+
+def judge_platform(
+    outcome: Outcome,
+    pr: Pr,
+    base_text: str,
+    head_text: str,
+    move: tuple[str, str],
+    texts_of_platform: tuple[dict[str, str | None], dict[str, str | None]],
+    *,
+    platform_evidence_of: Callable[[str, str, str, dict], dict] | None,
+    statuses_of: Callable[[str], list[dict]],
+    helms: dict[str, str],
+    acks: dict[str, dict],
+    base_acks: dict[str, dict],
+    e2_required: bool,
+) -> Outcome:
+    """A platform-only move (yaadgaar #514 option (a)): the operator E1 (`classify_platform`), its NEEDS-HUMAN rule
+    keyed `platform:<to>`, and E2 as on a pin. An automatic head never reaches here (`automatic_problem`)."""
+    old, new = move
+    kind = "automatic" if pr.automatic else "human"
+    outcome.notes.append(f"{kind} platform PR: platform {old} -> {new}, targetRevision stays {pb.current_pin(base_text)}")
+    if problem := platform_only_problem(base_text, head_text, *texts_of_platform, new):
+        outcome.failures.append(problem)
+        return outcome
+    # Fail-closed: a lower platform is judged as any other move (E1 compares both directions), never skipped.
+    if pb.release(new) is None or pb.release(old) is None:
+        outcome.failures.append(f"platform {old} -> {new}: both must be release versions X.Y.Z; a prerelease is never pinned")
+        return outcome
+    missing = [version for version in HELMS if version not in helms]
+    if missing:
+        outcome.failures.append(f"helm {', '.join(missing)} not installed; E1 renders on exactly {', '.join(HELMS)}")
+        return outcome
+    if platform_evidence_of is None:
+        outcome.failures.append(f"platform move {old} -> {new}: no operator E1 is wired; a platform move is never left unjudged")
+        return outcome
+    try:
+        found = platform_evidence_of(head_text, old, new, {version: helms[version] for version in HELMS})
+    except pb.Refused as refused:
+        outcome.failures.append(f"platform move {old} -> {new}: the operator E1 refused: {refused}")
+        return outcome
+    outcome.evidence = found
+    if not found["accept"]:
+        key = f"{ACK_PLATFORM_PREFIX}{new}"
+        needs_human(outcome, pr, key, found["reasons"], acks, base_acks, f"a human platform PR to {key}")
+    else:
+        outcome.notes.append(f"platform {old} -> {new}: the operator E1 found no reason")
+    e2(outcome, pr, statuses_of, e2_required)
     return outcome
 
 
@@ -697,14 +1069,28 @@ def main(argv: list[str] | None = None) -> int:
         base_text, head_text = texts(arguments.repo, pr.head_sha)
         pr.base_sha = merge_parent(arguments.repo)
         changed = changed_files(arguments.repo)
+        if problems := unknown_applications(arguments.repo):
+            raise Refused(
+                "the Applications are not the known ones (argocd#230 review F2): " + "; ".join(problems)
+                + f". pin-evidence judges a platform move over {', '.join(pb.OPERATOR_APPLICATIONS)} only; a new Application "
+                "is an edit to KNOWN_APPLICATIONS and to the gate that pins its shape"
+            )
         if arguments.command == "detect":
             move = move_of(base_text, head_text)
             if problem := automatic_problem(pr, move, changed) or seed_allowlist_problem(move, changed):
                 raise Refused(problem)
-            lines = ["moved=false"] if move is None else ["moved=true", f"pin={move[0]}", f"target={move[1]}"]
+            # A platform-only move is a move too (yaadgaar #514); a partial one is refused here already.
+            platform_move = platform_move_of(*platform_texts(arguments.repo)) if move is None else None
+            if move is not None:
+                lines, said = ["moved=true", f"pin={move[0]}", f"target={move[1]}"], f"pin move {move[0]} -> {move[1]}"
+            elif platform_move is not None:
+                lines = ["moved=true", f"platform={platform_move[0]}", f"platform_target={platform_move[1]}"]
+                said = f"platform-only move {platform_move[0]} -> {platform_move[1]}"
+            else:
+                lines, said = ["moved=false"], "no pin move"
             with arguments.output.open("a") as output:
                 output.write("\n".join(lines) + "\n")
-            print("no pin move" if move is None else f"pin move {move[0]} -> {move[1]}")
+            print(said)
             return 0
         outcome = judge(
             pr,
@@ -717,6 +1103,10 @@ def main(argv: list[str] | None = None) -> int:
             regenerated_of=lambda target: regenerated_differences(arguments.repo, target),
             acks=acknowledgements(arguments.repo / ACK_FILE),
             base_acks=parse_acknowledgements(base_ack_text(arguments.repo)),
+            platform_texts=platform_texts(arguments.repo),
+            platform_evidence_of=lambda head_text, old, new, found: platform_evidence(
+                head_text, old, new, found, repo=arguments.repo
+            ),
         )
     except (Refused, pb.Refused) as refused:
         print(f"::error::pin-evidence refused: {refused}")

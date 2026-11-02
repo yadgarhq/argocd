@@ -1425,3 +1425,41 @@ def test_an_unreadable_target_platform_refuses_a_three_file_pin(repo: Path) -> N
     result = run(repo, pin_branch(repo), kubectl=NoCluster(), platform_of=unreadable)
     assert result["result"] == "refused"
     assert any("could not be read" in p for p in result["problems"]), result["problems"]
+
+
+# ── yaadgaar #514: a platform-only move's ack is keyed `platform:<to>` ──────
+
+
+def platform_only_branch(repo: Path, ack_target: str) -> str:
+    """The yadgar pin stays; platform_version and the five operator files move; one ack entry is appended."""
+    def move(r: Path) -> None:
+        write(r, "scripts/chart_pin.json", chart_pin(PIN).replace(PLATFORM, NEW_PLATFORM))
+        for name in OPERATORS:
+            write(r, operator_file(name), OPERATOR.format(name=name, version=NEW_PLATFORM))
+        write(r, ACK, ack_text([ack_entry(ack_target)]))
+
+    return pin_branch(repo, "platform-only", target=PIN, extra=move)
+
+
+def ack_problems(result: dict) -> list[str]:
+    return [p for p in result["problems"] if ACK in p]
+
+
+def test_a_platform_ack_for_a_platform_only_move_is_appendable(platform_repo: Path) -> None:
+    result = run_platform(platform_repo, platform_only_branch(platform_repo, f"platform:{NEW_PLATFORM}"))
+    assert ack_problems(result) == [], result["problems"]
+
+
+@pytest.mark.parametrize("target", ["platform:0.2.99", NEW_PLATFORM, TARGET])
+def test_another_ack_target_for_a_platform_only_move_is_refused(platform_repo: Path, target: str) -> None:
+    result = run_platform(platform_repo, platform_only_branch(platform_repo, target))
+    assert result["result"] == "refused"
+    assert any("appended entry targets" in p for p in ack_problems(result)), result["problems"]
+
+
+def test_a_platform_ack_on_a_pin_move_is_refused(platform_repo: Path) -> None:
+    """A pin that moves the platform too acks its pin target; `platform:<to>` is for a platform-only move."""
+    sha = platform_branch(platform_repo, extra=lambda r: write(r, ACK, ack_text([ack_entry(f"platform:{NEW_PLATFORM}")])))
+    result = run_platform(platform_repo, sha)
+    assert result["result"] == "refused"
+    assert any("appended entry targets" in p for p in ack_problems(result)), result["problems"]
