@@ -39,6 +39,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -64,6 +65,17 @@ PIN = pb.current_pin(BASE)
 TARGET = "99.0.0"
 HEAD_SHA = "b" * 40
 HELMS = {"v3.18.4": "/helm3", "v4.3.0": "/helm4"}
+
+
+READ_PLATFORM_TEXTS = pe.platform_texts
+
+
+@pytest.fixture(autouse=True)
+def no_platform_move(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`main` reads the six platform files from the checkout and HEAD^1; a test that drives `main` sees no platform
+    move unless it says otherwise, whatever this repository's own last commit moved."""
+    unmoved = {path: (REPOSITORY / path).read_text() for path in (*pb.OPERATOR_APPLICATIONS, pb.CHART_PIN)}
+    monkeypatch.setattr(pe, "platform_texts", lambda repo: (dict(unmoved), dict(unmoved)))
 
 
 def event(name: str) -> dict:
@@ -93,7 +105,7 @@ ACCEPT = {"accept": True, "reasons": [], "helms": sorted(HELMS), "changed": [], 
 
 def judge(
     pr_event: str, head: str, *, evidence=None, statuses=None, required=False, helms=None, base: str = BASE,
-    changed=pb.MECHANICAL_FILES, differs=(), acks=None, base_acks=None,
+    changed=pb.MECHANICAL_FILES, differs=(), acks=None, base_acks=None, platform_texts=None,
 ):
     calls: list = []
 
@@ -113,6 +125,7 @@ def judge(
         regenerated_of=lambda target: list(differs),
         acks={} if acks is None else acks,
         base_acks={} if base_acks is None else base_acks,
+        platform_texts=platform_texts,
     )
     return outcome, calls
 
@@ -1286,3 +1299,612 @@ def test_base_ack_text_is_none_when_only_the_pr_adds_the_file(tmp_path: Path, mo
     real_git(tmp_path, "commit", "-q", "-am", "main moves on")
     real_git(tmp_path, "merge", "-q", "--no-ff", "-m", "merge", "pr")
     assert pe.base_ack_text(tmp_path) is None
+
+
+# ── a platform-only move is judged (yaadgaar #514 option (a), Max 2026-11-02) ─
+#
+# A PR that leaves `targetRevision` alone but moves the platform (the five
+# operator Applications and `chart_pin.json`'s `platform_version`) is a move:
+# `detect` writes moved=true, `judge` runs the operator E1 (`classify_platform`
+# through `pin_bump.platform_evidence`), and a NEEDS-HUMAN verdict FAILS a human
+# head unless the PR commits an ack whose target is `platform:<to>` (ADR-1080's
+# rule, keyed by the platform version).
+
+PLATFORM_FILES = (*pb.OPERATOR_APPLICATIONS, pb.CHART_PIN)
+PLATFORM_BASE = {path: (REPOSITORY / path).read_text() for path in PLATFORM_FILES}
+PLATFORM_FROM = json.loads(PLATFORM_BASE[pb.CHART_PIN])["platform_version"]
+PLATFORM_TO = "0.99.0"
+PLATFORM_KEY = f"platform:{PLATFORM_TO}"
+
+
+def platform_moved(to: str = PLATFORM_TO, only=PLATFORM_FILES, base: dict | None = None) -> dict:
+    """The base platform files with `to` written into `only`, each by its one line edit."""
+    files = dict(PLATFORM_BASE if base is None else base)
+    pin = json.loads(files[pb.CHART_PIN])
+    for path in only:
+        if path == pb.CHART_PIN:
+            files[path] = pb.rewrite_chart_pin(
+                files[path], pin["chart_tag"].removeprefix("v"), digest=pin["chart_digest"], platform=to
+            )
+        else:
+            files[path] = pb.rewrite_target_revision(files[path], to, path)[0]
+    return files
+
+
+PLATFORM_ACCEPT = {**ACCEPT, "platform": {"from": PLATFORM_FROM, "to": PLATFORM_TO, "reasons": []}}
+PLATFORM_NEEDS_HUMAN = {
+    **PLATFORM_ACCEPT,
+    "accept": False,
+    "reasons": ["keda: apps/Deployment/keda/keda-operator: field spec.template.spec.containers[0].args changed; outside the platform-move set"],
+}
+
+
+def platform_judge(
+    pr_event: str = "event-human.json", head_files: dict | None = None, *, evidence=None, acks=None, base_acks=None,
+    head: str = BASE, helms=None, wired: bool = True, statuses=None,
+):
+    calls: list = []
+    files = platform_moved() if head_files is None else head_files
+
+    def platform_evidence_of(head_text, old, new, found):
+        calls.append((old, new, sorted(found)))
+        return copy.deepcopy(evidence if evidence is not None else PLATFORM_ACCEPT)
+
+    def no_pin_evidence(*_):
+        raise AssertionError("a platform-only move renders no yadgar pin move")
+
+    outcome = pe.judge(
+        pe.pr_of(event(pr_event)),
+        BASE,
+        head,
+        evidence_of=no_pin_evidence,
+        statuses_of=lambda sha: [] if statuses is None else statuses,
+        helms=HELMS if helms is None else helms,
+        changed=sorted(p for p in PLATFORM_FILES if files[p] != PLATFORM_BASE[p]) + ([pb.APPLICATION] if head != BASE else []),
+        regenerated_of=lambda target: [],
+        acks={} if acks is None else acks,
+        base_acks={} if base_acks is None else base_acks,
+        platform_texts=(dict(PLATFORM_BASE), files),
+        platform_evidence_of=platform_evidence_of if wired else None,
+    )
+    return outcome, calls
+
+
+def platform_ack(target: str = PLATFORM_KEY, reasons=None, why: str = "keda args read by hand") -> dict:
+    return {target: {"target": target, "reasons": list(PLATFORM_NEEDS_HUMAN["reasons"] if reasons is None else reasons), "why": why}}
+
+
+def test_the_repository_platform_files_agree() -> None:
+    assert pe.platform_move_of(PLATFORM_BASE, PLATFORM_BASE) is None
+
+
+def test_a_platform_only_move_is_a_move() -> None:
+    assert pe.platform_move_of(PLATFORM_BASE, platform_moved()) == (PLATFORM_FROM, PLATFORM_TO)
+
+
+def test_a_platform_only_move_is_judged_by_the_operator_e1() -> None:
+    outcome, calls = platform_judge()
+    assert calls == [(PLATFORM_FROM, PLATFORM_TO, sorted(HELMS))], "the operator E1 runs on a platform-only move"
+    assert outcome.passed, outcome.failures
+    assert any(f"platform {PLATFORM_FROM} -> {PLATFORM_TO}" in n for n in outcome.notes), outcome.notes
+    assert not any("no pin move" in n for n in outcome.notes), outcome.notes
+
+
+def test_a_platform_only_needs_human_fails_a_human_head_without_an_ack() -> None:
+    outcome, _ = platform_judge(evidence=PLATFORM_NEEDS_HUMAN)
+    assert not outcome.passed
+    assert f"NEEDS-HUMAN: {PLATFORM_NEEDS_HUMAN['reasons'][0]}" in outcome.failures, outcome.failures
+    told = "\n".join(outcome.failures)
+    assert "NEEDS-HUMAN-UNACKNOWLEDGED" in told and pe.ACK_FILE in told, told
+    entry = json.loads(told[told.index("{"):told.rindex("}") + 1])
+    assert entry["target"] == PLATFORM_KEY and entry["reasons"] == PLATFORM_NEEDS_HUMAN["reasons"], entry
+
+
+def test_a_platform_ack_for_the_moved_version_clears_a_human_head() -> None:
+    outcome, _ = platform_judge(evidence=PLATFORM_NEEDS_HUMAN, acks=platform_ack())
+    assert outcome.passed, outcome.failures
+    assert any(PLATFORM_NEEDS_HUMAN["reasons"][0] in w for w in outcome.warnings), outcome.warnings
+
+
+@pytest.mark.parametrize(
+    "acks",
+    [
+        pytest.param(platform_ack("platform:0.98.0"), id="another-platform-version"),
+        pytest.param(platform_ack(PLATFORM_TO), id="bare-version-no-prefix"),
+        pytest.param(platform_ack(PIN), id="the-yadgar-pin"),
+        pytest.param(platform_ack(reasons=["keda: something else"]), id="another-reason"),
+    ],
+)
+def test_a_wrong_platform_ack_is_refused(acks: dict) -> None:
+    outcome, _ = platform_judge(evidence=PLATFORM_NEEDS_HUMAN, acks=acks)
+    assert not outcome.passed
+    assert any("NEEDS-HUMAN-UNACKNOWLEDGED" in f for f in outcome.failures), outcome.failures
+
+
+def test_a_platform_ack_already_on_the_base_does_not_clear() -> None:
+    outcome, _ = platform_judge(evidence=PLATFORM_NEEDS_HUMAN, acks=platform_ack(), base_acks=platform_ack())
+    assert not outcome.passed
+    assert any("already on the base" in f for f in outcome.failures), outcome.failures
+
+
+def test_an_automatic_head_that_moves_only_the_platform_fails_and_renders_nothing() -> None:
+    outcome, calls = platform_judge("event-auto.json", acks=platform_ack())
+    assert not outcome.passed and calls == []
+    assert any("must move targetRevision" in f for f in outcome.failures), outcome.failures
+
+
+def test_a_no_op_edit_of_the_platform_files_is_not_judged() -> None:
+    files = dict(PLATFORM_BASE)
+    path = pb.OPERATOR_APPLICATIONS[0]
+    files[path] = "# a comment only\n" + files[path]
+    assert pe.platform_move_of(PLATFORM_BASE, files) is None
+    outcome, calls = platform_judge(head_files=files)
+    assert outcome.passed and calls == [], outcome.failures
+    assert any("no pin move" in n for n in outcome.notes), outcome.notes
+
+
+@pytest.mark.parametrize(
+    "only",
+    [
+        pytest.param((pb.CHART_PIN,), id="platform_version-alone"),
+        pytest.param(pb.OPERATOR_APPLICATIONS, id="operators-without-platform_version"),
+        pytest.param((pb.OPERATOR_APPLICATIONS[0], pb.CHART_PIN), id="one-operator-and-platform_version"),
+    ],
+)
+def test_a_partial_platform_move_fails_and_renders_nothing(only: tuple) -> None:
+    files = platform_moved(only=only)
+    with pytest.raises(pe.Refused):
+        pe.platform_move_of(PLATFORM_BASE, files)
+    outcome, calls = platform_judge(head_files=files)
+    assert not outcome.passed and calls == []
+    assert any("move together" in f for f in outcome.failures), outcome.failures
+
+
+def test_a_base_whose_platform_files_disagree_is_refused() -> None:
+    base = platform_moved(only=(pb.CHART_PIN,))
+    with pytest.raises(pe.Refused):
+        pe.platform_move_of(base, platform_moved(base=base))
+
+
+def test_a_missing_platform_file_is_refused() -> None:
+    files = platform_moved()
+    files[pb.OPERATOR_APPLICATIONS[3]] = None
+    with pytest.raises(pe.Refused):
+        pe.platform_move_of(PLATFORM_BASE, files)
+
+
+def test_a_duplicate_operator_target_revision_is_refused() -> None:
+    files = platform_moved()
+    path = pb.OPERATOR_APPLICATIONS[1]
+    line = f"    targetRevision: {PLATFORM_TO}\n"
+    assert files[path].count(line) == 1
+    files[path] = files[path].replace(line, line + '    "targetRevision": 0.0.1\n', 1)
+    with pytest.raises(pe.Refused, match="duplicate key"):
+        pe.platform_move_of(PLATFORM_BASE, files)
+
+
+def test_a_values_change_beside_a_platform_move_fails_before_any_render() -> None:
+    files = platform_moved()
+    path = pb.OPERATOR_APPLICATIONS[2]
+    files[path] = files[path].replace("    targetRevision: ", "    # moved\n    targetRevision: ", 1)
+    assert pe.platform_move_of(PLATFORM_BASE, files) == (PLATFORM_FROM, PLATFORM_TO)
+    outcome, calls = platform_judge(head_files=files)
+    assert not outcome.passed and calls == []
+    assert any("not a platform-only change" in f and path in f for f in outcome.failures), outcome.failures
+
+
+def test_a_chart_pin_change_beside_a_platform_move_fails_before_any_render() -> None:
+    files = platform_moved()
+    files[pb.CHART_PIN] = files[pb.CHART_PIN] + "\n"
+    outcome, calls = platform_judge(head_files=files)
+    assert not outcome.passed and calls == []
+    assert any("not a platform-only change" in f and pb.CHART_PIN in f for f in outcome.failures), outcome.failures
+
+
+def test_a_yadgar_values_change_beside_a_platform_move_fails_before_any_render() -> None:
+    outcome, calls = platform_judge(head=BASE + "# a values change\n")
+    assert not outcome.passed and calls == []
+    assert any("not a platform-only change" in f and pb.APPLICATION in f for f in outcome.failures), outcome.failures
+
+
+def test_a_platform_prerelease_fails() -> None:
+    outcome, calls = platform_judge(head_files=platform_moved(to="0.99.0-rc.1"))
+    assert not outcome.passed and calls == []
+
+
+def test_a_platform_downgrade_is_still_judged() -> None:
+    """Fail-closed: E1 compares both directions, so a lower platform is judged, never skipped."""
+    outcome, calls = platform_judge(head_files=platform_moved(to="0.0.1"), evidence=PLATFORM_NEEDS_HUMAN)
+    assert calls and calls[0][:2] == (PLATFORM_FROM, "0.0.1")
+    assert not outcome.passed
+
+
+def test_a_platform_move_needs_both_helms() -> None:
+    outcome, calls = platform_judge(helms={"v3.18.4": "/helm3"})
+    assert not outcome.passed and calls == []
+
+
+def test_a_platform_move_with_no_operator_e1_wired_fails() -> None:
+    outcome, _ = platform_judge(wired=False)
+    assert not outcome.passed
+
+
+def test_platform_e2_is_reported_on_a_human_head() -> None:
+    outcome, _ = platform_judge()
+    assert any("E2 (report mode on a human head)" in w for w in outcome.warnings), outcome.warnings
+
+
+def detect_with(monkeypatch, tmp_path: Path, head_files: dict, changed: list) -> Path:
+    monkeypatch.setattr(pe, "texts", lambda repo, sha: (BASE, BASE))
+    monkeypatch.setattr(pe, "changed_files", lambda repo: list(changed))
+    monkeypatch.setattr(pe, "merge_parent", lambda repo: "c" * 40)
+    monkeypatch.setattr(pe, "platform_texts", lambda repo: (dict(PLATFORM_BASE), head_files))
+    event_file = tmp_path / "event.json"
+    event_file.write_text(json.dumps(event("event-human.json")))
+    return event_file
+
+
+def test_detect_writes_moved_true_for_a_platform_only_move(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    event_file = detect_with(monkeypatch, tmp_path, platform_moved(), list(PLATFORM_FILES))
+    output = tmp_path / "output"
+    assert pe.main(["detect", "--event", str(event_file), "--output", str(output)]) == 0
+    assert output.read_text().splitlines() == ["moved=true", f"platform={PLATFORM_FROM}", f"platform_target={PLATFORM_TO}"]
+
+
+def test_detect_writes_moved_false_for_a_no_op_platform_edit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    event_file = detect_with(monkeypatch, tmp_path, dict(PLATFORM_BASE), [pb.CHART_PIN])
+    output = tmp_path / "output"
+    assert pe.main(["detect", "--event", str(event_file), "--output", str(output)]) == 0
+    assert output.read_text().splitlines() == ["moved=false"]
+
+
+def test_detect_fails_a_partial_platform_move(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    event_file = detect_with(monkeypatch, tmp_path, platform_moved(only=(pb.CHART_PIN,)), [pb.CHART_PIN])
+    output = tmp_path / "output"
+    assert pe.main(["detect", "--event", str(event_file), "--output", str(output)]) == 1
+    assert "move together" in capsys.readouterr().out
+
+
+def test_main_judges_with_the_platform_texts_and_the_operator_e1(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list = []
+    files = platform_moved()
+    event_file = detect_with(monkeypatch, tmp_path, files, list(PLATFORM_FILES))
+    monkeypatch.setattr(
+        pe, "judge", lambda pr, *a, **k: seen.append((k.get("platform_texts"), callable(k.get("platform_evidence_of")))) or pe.Outcome()
+    )
+    assert pe.main(["judge", "--event", str(event_file)]) == 0
+    assert seen == [((PLATFORM_BASE, files), True)]
+
+
+def test_platform_texts_read_the_base_from_the_first_parent_and_the_head_from_the_checkout(tmp_path: Path, monkeypatch) -> None:
+    for path in PLATFORM_FILES:
+        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / path).write_text(f"head {path}\n")
+    monkeypatch.setattr(pe, "base_file_if_any", lambda repo, path: None if path == pb.CHART_PIN else f"base {path}\n".encode())
+    base, head = READ_PLATFORM_TEXTS(tmp_path)
+    assert sorted(base) == sorted(head) == sorted(PLATFORM_FILES)
+    assert base[pb.CHART_PIN] is None and base[pb.OPERATOR_APPLICATIONS[0]] == f"base {pb.OPERATOR_APPLICATIONS[0]}\n"
+    assert head[pb.CHART_PIN] == f"head {pb.CHART_PIN}\n"
+
+
+def test_the_default_platform_evidence_gives_yadgars_render_to_the_selector_set(monkeypatch, tmp_path: Path) -> None:
+    """ADR-1095: yadgar's selectors join the operators' even when the yadgar pin does not move."""
+    seen: dict = {}
+    yadgar_doc = {"kind": "Service", "metadata": {"name": "y"}}
+
+    def render(application_text, version, binary):
+        seen.setdefault("renders", []).append((version, binary))
+        assert application_text == BASE
+        return [yadgar_doc]
+
+    def platform_evidence(repo, old, new, helms, net, others):
+        seen.update(old=old, new=new, others=others, files={p.name for p in repo.iterdir()})
+        return {"from": old, "to": new, "objects": {}, "changed": [], "applications": [], "selector_keys": {}, "reasons": ["r"]}
+
+    (tmp_path / "applications").mkdir()
+    (tmp_path / "applications" / "x.yaml").write_text("x\n")
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(pb, "render", render)
+    monkeypatch.setattr(pb, "platform_evidence", platform_evidence)
+    found = pe.platform_evidence(BASE, PLATFORM_FROM, PLATFORM_TO, HELMS, net=object(), repo=tmp_path)
+    assert sorted(seen["renders"]) == sorted((PIN, binary) for binary in HELMS.values())
+    assert seen["others"] == [yadgar_doc, yadgar_doc]
+    assert (seen["old"], seen["new"]) == (PLATFORM_FROM, PLATFORM_TO)
+    assert ".git" not in seen["files"] and "applications" in seen["files"]
+    assert found["accept"] is False and found["reasons"] == ["r"] and found["platform"]["to"] == PLATFORM_TO
+    assert set(found) >= {"helms", "changed", "boot_audit", "migrations"}, "summary_lines reads these"
+    assert pe.summary_lines(pe.Outcome(evidence=found)), "the summary renders a platform evidence"
+
+
+def test_an_unreadable_operator_application_is_a_failure_not_a_traceback() -> None:
+    def refuse(*_):
+        raise pb.Refused("operator Application keda: source keys are not the platform shape")
+
+    outcome = pe.judge(
+        pe.pr_of(event("event-human.json")), BASE, BASE,
+        evidence_of=lambda *_: ACCEPT, statuses_of=lambda sha: [], helms=HELMS, changed=list(PLATFORM_FILES),
+        regenerated_of=lambda target: [], platform_texts=(dict(PLATFORM_BASE), platform_moved()), platform_evidence_of=refuse,
+    )
+    assert any("platform shape" in f for f in outcome.failures), outcome.failures
+
+
+@pytest.mark.parametrize("target", [PLATFORM_KEY, "0.50.0"])
+def test_the_acknowledgement_file_accepts_a_platform_key(tmp_path: Path, target: str) -> None:
+    path = tmp_path / "ack.json"
+    entry = platform_ack(target)[target]
+    path.write_text(json.dumps([entry]))
+    assert pe.acknowledgements(path) == {target: entry}
+
+
+@pytest.mark.parametrize("target", ["platform:", "platform:0.2", "platform:v0.2.18", "latest", "v0.50.0", "platform: 0.2.18"])
+def test_the_acknowledgement_file_refuses_a_target_of_another_shape(tmp_path: Path, target: str) -> None:
+    path = tmp_path / "ack.json"
+    path.write_text(json.dumps([platform_ack(target)[target]]))
+    with pytest.raises(pe.Refused):
+        pe.acknowledgements(path)
+
+
+# ── argocd#230 review: a pin move beside a platform move (F1) ───────────────
+#
+# On a pin move E1 judges the platform move the TARGET CHART names
+# (`found["platform"]`). What deploys is the version the six platform files
+# name. They must be one move: files that move while the chart's platform does
+# not, or that move to another version than the chart's, FAIL on any head.
+
+
+def pin_and_platform(pr_event: str, chart_platform: dict | None, files: dict) -> pe.Outcome:
+    evidence = {**ACCEPT, "platform": chart_platform}
+    outcome, _ = judge(
+        pr_event, moved(), evidence=evidence, statuses=[green_status()], required=True,
+        changed=pb.pin_files(platform_moved=True), platform_texts=(dict(PLATFORM_BASE), files),
+    )
+    return outcome
+
+
+@pytest.mark.parametrize("pr_event", ["event-human.json", "event-auto.json"])
+def test_operator_files_that_move_while_the_charts_platform_stays_fail(pr_event: str) -> None:
+    """Review repro (A): the pin moves, the target chart keeps its platform, the six files move. E1 judged no
+    platform move at all."""
+    outcome = pin_and_platform(pr_event, None, platform_moved())
+    assert not outcome.passed
+    assert any("the target chart's platform does not move" in f for f in outcome.failures), outcome.failures
+
+
+@pytest.mark.parametrize("pr_event", ["event-human.json", "event-auto.json"])
+def test_operator_files_that_move_to_another_version_than_the_charts_platform_fail(pr_event: str) -> None:
+    """Review repro (B): the chart moves platform to 0.3.0, the files to 0.99.0. E1 judged 0.3.0; 0.99.0 deploys."""
+    outcome = pin_and_platform(pr_event, {"from": PLATFORM_FROM, "to": "0.3.0", "reasons": []}, platform_moved())
+    assert not outcome.passed
+    assert any("0.3.0" in f and PLATFORM_TO in f and "E1 judged" in f for f in outcome.failures), outcome.failures
+
+
+def test_operator_files_that_move_with_the_charts_platform_pass() -> None:
+    outcome = pin_and_platform("event-auto.json", {"from": PLATFORM_FROM, "to": PLATFORM_TO, "reasons": []}, platform_moved())
+    assert outcome.passed, outcome.failures
+
+
+def test_a_pin_move_with_unmoved_platform_files_and_no_chart_platform_move_passes() -> None:
+    outcome = pin_and_platform("event-auto.json", None, dict(PLATFORM_BASE))
+    assert outcome.passed, outcome.failures
+
+
+def test_a_pin_move_with_partially_moved_platform_files_fails() -> None:
+    outcome = pin_and_platform("event-human.json", None, platform_moved(only=(pb.CHART_PIN,)))
+    assert not outcome.passed
+    assert any("move together" in f for f in outcome.failures), outcome.failures
+
+
+# ── argocd#230 review: applications/ is an explicit allowlist (F2) ──────────
+#
+# The heuristic (`chart: platform` anywhere) missed an OCI repoURL with a path,
+# a git repoURL, a templated ApplicationSet and an app-of-apps. The guard is
+# now fail-closed: every file under applications/ must be one of
+# KNOWN_APPLICATIONS, no symlink, no ApplicationSet, and no Application document
+# anywhere else in the tree (outside scripts/ and projects/root.yaml).
+
+
+def known_tree(tmp_path: Path) -> Path:
+    """A tree holding this repository's applications/ and projects/ as they are."""
+    tree = tmp_path / "tree"
+    shutil.copytree(REPOSITORY / "applications", tree / "applications")
+    shutil.copytree(REPOSITORY / "projects", tree / "projects")
+    return tree
+
+
+def test_the_repository_has_no_unknown_application() -> None:
+    assert pe.unknown_applications(REPOSITORY) == []
+
+
+def test_known_applications_is_the_tree() -> None:
+    on_disk = sorted(p.relative_to(REPOSITORY).as_posix() for p in (REPOSITORY / "applications").rglob("*") if p.is_file())
+    assert sorted(pe.KNOWN_APPLICATIONS) == on_disk
+    assert len(pe.KNOWN_APPLICATIONS) == 13
+    assert set(pb.OPERATOR_APPLICATIONS) <= set(pe.KNOWN_APPLICATIONS)
+
+
+def test_known_applications_is_the_union_of_the_other_gates_lists() -> None:
+    """A new Application is a visible edit in two places: here and in the gate that pins its shape."""
+    for path in (REPOSITORY / "scripts" / "tests",):
+        if str(path) not in sys.path:
+            sys.path.insert(0, str(path))
+    import test_infra_children
+    import test_operator_applications
+    import test_pin_estate_selectors
+    import test_runner_image_pinned
+
+    union = {f"applications/{name}.yaml" for name in test_operator_applications.ADOPTED}
+    union |= {f"applications/{name}.yaml" for name in test_infra_children.CHILDREN}
+    union |= {p.as_posix() for p in (test_runner_image_pinned.VERIFIER_RUNNER, test_runner_image_pinned.ESTATE_RUNNER)}
+    # argocd and post-merge-verifier are named in the estate-selectors gate's own list (root is projects/root.yaml).
+    union |= {f"applications/{name}.yaml" for name in test_pin_estate_selectors.ESTATE if name != "root"}
+    assert sorted(union) == sorted(pe.KNOWN_APPLICATIONS)
+
+
+OCI_PATH_APPLICATION = """\
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata: {name: sneaky, namespace: argocd}
+spec:
+  project: default
+  source: {repoURL: "oci://ghcr.io/yadgarhq/charts/platform", targetRevision: 0.2.17, path: .}
+  destination: {server: https://kubernetes.default.svc, namespace: sneaky}
+"""
+GIT_PATH_APPLICATION = """\
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata: {name: sneaky, namespace: argocd}
+spec:
+  project: default
+  source: {repoURL: "https://github.com/yadgarhq/platform", targetRevision: main, path: chart}
+  destination: {server: https://kubernetes.default.svc, namespace: sneaky}
+"""
+APPLICATION_SET = """\
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata: {name: sneaky, namespace: argocd}
+spec:
+  generators: [{list: {elements: [{n: platform}]}}]
+  template:
+    metadata: {name: "{{n}}"}
+    spec:
+      project: default
+      source: {repoURL: ghcr.io/yadgarhq/charts, chart: "{{n}}", targetRevision: 0.2.17}
+      destination: {server: https://kubernetes.default.svc, namespace: sneaky}
+"""
+WRAPPER = """\
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata: {name: wrapper, namespace: argocd}
+spec:
+  project: default
+  source: {repoURL: https://github.com/yadgarhq/argocd, targetRevision: main, path: extra}
+  destination: {server: https://kubernetes.default.svc, namespace: argocd}
+"""
+
+
+@pytest.mark.parametrize(
+    "path, text",
+    [
+        pytest.param("applications/sneaky.yaml", OCI_PATH_APPLICATION, id="oci-repourl-with-path"),
+        pytest.param("applications/sneaky.yaml", GIT_PATH_APPLICATION, id="git-repourl-with-path"),
+        pytest.param("applications/sneaky.yaml", APPLICATION_SET, id="templated-applicationset"),
+        pytest.param("applications/wrapper.yaml", WRAPPER, id="app-of-apps-wrapper"),
+        pytest.param("applications/nested/deeper/x.yaml", OCI_PATH_APPLICATION, id="nested"),
+        pytest.param("applications/notes.txt", "not yaml at all\n", id="any-suffix"),
+    ],
+)
+def test_a_file_under_applications_outside_the_allowlist_is_refused(tmp_path: Path, path: str, text: str) -> None:
+    tree = known_tree(tmp_path)
+    (tree / path).parent.mkdir(parents=True, exist_ok=True)
+    (tree / path).write_text(text)
+    problems = pe.unknown_applications(tree)
+    assert any(path in p and "not one of the" in p for p in problems), problems
+
+
+def test_the_app_of_apps_child_outside_applications_is_refused(tmp_path: Path) -> None:
+    """The child of a wrapper, wherever it sits: an Application document outside applications/ is refused."""
+    tree = known_tree(tmp_path)
+    (tree / "extra").mkdir()
+    (tree / "extra" / "child.yaml").write_text(OCI_PATH_APPLICATION)
+    problems = pe.unknown_applications(tree)
+    assert any("extra/child.yaml" in p and "outside applications/" in p for p in problems), problems
+
+
+def test_an_applicationset_in_a_known_file_is_refused(tmp_path: Path) -> None:
+    tree = known_tree(tmp_path)
+    (tree / "applications" / "tls.yaml").write_text(APPLICATION_SET)
+    problems = pe.unknown_applications(tree)
+    assert any("applications/tls.yaml" in p and "ApplicationSet" in p for p in problems), problems
+
+
+@pytest.mark.parametrize("text", [OCI_PATH_APPLICATION, GIT_PATH_APPLICATION], ids=["oci", "git"])
+def test_a_known_non_operator_file_that_sources_the_platform_is_refused(tmp_path: Path, text: str) -> None:
+    tree = known_tree(tmp_path)
+    (tree / "applications" / "tls.yaml").write_text(text)
+    problems = pe.unknown_applications(tree)
+    assert any("applications/tls.yaml" in p and "platform" in p for p in problems), problems
+
+
+def test_a_symlink_under_applications_is_refused(tmp_path: Path) -> None:
+    tree = known_tree(tmp_path)
+    (tree / "applications" / "tls.yaml").unlink()
+    (tree / "applications" / "tls.yaml").symlink_to(tree / "applications" / "keda.yaml")
+    problems = pe.unknown_applications(tree)
+    assert any("applications/tls.yaml" in p and "symlink" in p for p in problems), problems
+
+
+def test_a_symlinked_directory_under_applications_is_refused(tmp_path: Path) -> None:
+    tree = known_tree(tmp_path)
+    (tmp_path / "elsewhere").mkdir()
+    (tree / "applications" / "linked").symlink_to(tmp_path / "elsewhere", target_is_directory=True)
+    problems = pe.unknown_applications(tree)
+    assert any("applications/linked" in p and "symlink" in p for p in problems), problems
+
+
+def test_an_unparseable_known_file_is_refused(tmp_path: Path) -> None:
+    tree = known_tree(tmp_path)
+    (tree / "applications" / "tls.yaml").write_text("a: [\n")
+    problems = pe.unknown_applications(tree)
+    assert any("applications/tls.yaml" in p and "could not be read" in p for p in problems), problems
+
+
+def test_the_five_operator_files_may_source_the_platform(tmp_path: Path) -> None:
+    assert pe.unknown_applications(known_tree(tmp_path)) == []
+
+
+def test_detect_refuses_an_unknown_application(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    tree = known_tree(tmp_path)
+    event_file = detect_with(monkeypatch, tmp_path, dict(PLATFORM_BASE), ["applications/sneaky.yaml"])
+    (tree / "applications" / "sneaky.yaml").write_text(OCI_PATH_APPLICATION)
+    output = tmp_path / "output"
+    assert pe.main(["detect", "--event", str(event_file), "--output", str(output), "--repo", str(tree)]) == 1
+    assert "applications/sneaky.yaml" in capsys.readouterr().out
+
+
+def test_judge_refuses_an_unknown_application(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    tree = known_tree(tmp_path)
+    event_file = detect_with(monkeypatch, tmp_path, dict(PLATFORM_BASE), ["applications/sneaky.yaml"])
+    monkeypatch.setattr(pe, "base_ack_text", lambda repo: None)
+    (tree / "applications" / "sneaky.yaml").write_text(OCI_PATH_APPLICATION)
+    assert pe.main(["judge", "--event", str(event_file), "--repo", str(tree)]) == 1
+    assert "applications/sneaky.yaml" in capsys.readouterr().out
+
+
+# ── argocd#230 review: the chart moves the platform, the files stay (F1, third branch) ─
+
+
+@pytest.mark.parametrize("pr_event", ["event-human.json", "event-auto.json"])
+def test_a_chart_platform_move_with_the_operator_files_left_on_the_old_platform_fails(pr_event: str) -> None:
+    """The chart moves platform P -> Q, the operator files stay on P yet are in `changed` (a comment edit, say)."""
+    files = dict(PLATFORM_BASE)
+    for path in pb.OPERATOR_APPLICATIONS:
+        files[path] = "# touched\n" + files[path]
+    outcome = pin_and_platform(pr_event, {"from": PLATFORM_FROM, "to": PLATFORM_TO, "reasons": []}, files)
+    assert not outcome.passed
+    assert any("stay on platform" in f and PLATFORM_TO in f for f in outcome.failures), outcome.failures
+
+
+# ── argocd#230 review: one parse of chart_pin.json (F4), ASCII digits (F5) ──
+
+
+def test_a_duplicate_key_in_chart_pin_is_refused() -> None:
+    files = dict(PLATFORM_BASE)
+    files[pb.CHART_PIN] = files[pb.CHART_PIN].replace(
+        f'"platform_version": "{PLATFORM_FROM}"', f'"platform_version": "{PLATFORM_FROM}",\n  "platform_version": "{PLATFORM_TO}"', 1
+    )
+    assert json.loads(files[pb.CHART_PIN])["platform_version"] == PLATFORM_TO
+    with pytest.raises(pe.Refused, match="duplicate"):
+        pe.platform_move_of(PLATFORM_BASE, files)
+
+
+def test_an_ack_target_of_non_ascii_digits_is_refused(tmp_path: Path) -> None:
+    target = "platform:١.٢.٣"
+    path = tmp_path / "ack.json"
+    path.write_text(json.dumps([platform_ack(target)[target]]))
+    with pytest.raises(pe.Refused):
+        pe.acknowledgements(path)
+
+
+def test_a_release_of_non_ascii_digits_is_no_release() -> None:
+    assert pb.release("١.٢.٣") is None
+    assert pb.release("1.2.3") == (1, 2, 3) and pb.release("v0.2.17") == (0, 2, 17)

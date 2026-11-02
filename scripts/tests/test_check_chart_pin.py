@@ -14,6 +14,7 @@ not GitHub. The real request runs in the `chart-pin` CI job.
 from __future__ import annotations
 
 import importlib.util
+import re
 import shutil
 import urllib.error
 from pathlib import Path
@@ -210,3 +211,74 @@ def test_the_resolver_is_pin_bumps_registry_client(script) -> None:
     """One anonymous GHCR client: `pin_bump.Net.ghcr_digest`, the one that resolves module digests for E1."""
     assert script.CHART_PACKAGE == "charts/yadgar"
     assert script.pin_bump.Net.ghcr_digest is not None
+
+
+# ── the scheduled retag check: the digest half alone (yaadgaar #494 item 5) ─
+
+
+def no_other_half(monkeypatch: pytest.MonkeyPatch, script) -> None:
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("--digest-only ran another half")
+
+    for name in ("fetch_contents", "check_platform_version", "check_chart_tag"):
+        monkeypatch.setattr(script, name, refuse)
+
+
+def test_digest_only_is_green_when_the_tag_still_resolves(script, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    no_other_half(monkeypatch, script)
+    recorded = script.committed_pin()["chart_digest"]
+    asked: list = []
+    monkeypatch.setattr(script, "resolve_chart_digest", lambda version: asked.append(version) or recorded)
+    assert script.main(["--digest-only"]) == 0
+    assert asked == [script.committed_pin()["chart_tag"].removeprefix("v")]
+    assert recorded in capsys.readouterr().out
+
+
+def test_digest_only_refuses_a_retag(script, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    no_other_half(monkeypatch, script)
+    monkeypatch.setattr(script, "resolve_chart_digest", lambda version: RETAGGED)
+    assert script.main(["--digest-only"]) == 1
+    assert RETAGGED in capsys.readouterr().out
+
+
+def test_digest_only_refuses_an_unreachable_registry(script, monkeypatch: pytest.MonkeyPatch) -> None:
+    no_other_half(monkeypatch, script)
+
+    def resolve(version):
+        raise urllib.error.URLError("offline")
+
+    monkeypatch.setattr(script, "resolve_chart_digest", resolve)
+    assert script.main(["--digest-only"]) == 1
+
+
+def test_an_unknown_argument_is_refused(script) -> None:
+    with pytest.raises(SystemExit):
+        script.main(["--platform-only"])
+
+
+SCHEDULED = REPOSITORY / ".github" / "workflows" / "chart-digest.yaml"
+
+
+def test_the_scheduled_workflow_runs_the_digest_half_on_main_daily_with_read_only_permissions() -> None:
+    import yaml
+
+    workflow = yaml.safe_load(SCHEDULED.read_text())
+    triggers = workflow[True]  # PyYAML reads the bare `on:` key as True
+    assert set(triggers) == {"schedule", "workflow_dispatch"}, "scheduled and by hand, never on a pull request"
+    (cron,) = triggers["schedule"]
+    minute, hour, *rest = cron["cron"].split()
+    assert minute.isdigit() and hour.isdigit() and rest == ["*", "*", "*"], "once a day"
+    assert workflow["permissions"] == {}
+    (job,) = workflow["jobs"].values()
+    assert job["permissions"] == {"contents": "read"}
+    assert 1 <= job["timeout-minutes"] <= 15
+    steps = job["steps"]
+    checkout = next(s for s in steps if str(s.get("uses", "")).startswith("actions/checkout@"))
+    assert checkout["with"] == {"ref": "main", "persist-credentials": False}
+    for step in steps:
+        if "uses" in step:
+            assert re.fullmatch(r"[\w./-]+@[0-9a-f]{40}", step["uses"].split(" ")[0]), step["uses"]
+    runs = [s["run"] for s in steps if "run" in s]
+    assert any(r.strip() == "python3 scripts/check_chart_pin.py --digest-only" for r in runs), runs
+    assert not any("${{" in r for r in runs), "no expression inside a run line"
+    assert "secrets." not in SCHEDULED.read_text()

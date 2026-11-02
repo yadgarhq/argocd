@@ -35,7 +35,9 @@ WHAT `run` DOES, in order. Every refusal comes before any cluster read.
      pin files: `applications/yadgar.yaml`, `scripts/chart_pin.json`,
      `scripts/gates/yadgar_render.sha256`, plus, on a platform move, the five
      operator Applications (`OPERATOR_FILES`, car C10), plus `scripts/pin_needs_human_ack.json`
-     only as an append (`ack_refusals`, ADR-1094; a re-ack of a target already on main
+     only as an append (`ack_refusals`, ADR-1094; each appended entry names the pin
+     target, or `platform:<platform_version>` when the pin stays and the platform
+     moves, yaadgaar #514; a re-ack of a target already on main
      rewrites an entry, so it leaves E2 refused: run the hand dry run). Any other path is
      refused, `scripts/gates/migration_seed_allowlist.json` among them (ADR-1099). A platform move is
      refused unless each operator file is main's with only its one
@@ -574,7 +576,7 @@ def pin_refusals(
     if RELEASE.fullmatch(pin) and _version(target) < _version(pin):
         problems.append(f"{APPLICATION}: targetRevision {target} is lower than main's pin {pin}; a downgrade is a human revert")
     if ACK_FILE in changed:
-        problems += ack_refusals(repo, base, sha, runner, target)
+        problems += ack_refusals(repo, base, sha, runner, target, platform_only_target(repo, base, sha, runner, pin, target))
     try:
         expected = pin_bump.rewrite_target_revision(main_application.decode(), target)[0].encode()
     except pin_bump.Refused as refused:
@@ -607,9 +609,22 @@ def pin_refusals(
     return pin, target, expected, problems
 
 
-def ack_refusals(repo: Path, base: str, sha: str, runner: Callable, target: str) -> list[str]:
+def platform_only_target(repo: Path, base: str, sha: str, runner: Callable, pin: str, target: str) -> str | None:
+    """The sha's `platform_version` when the yadgar pin stays and the platform moves (yaadgaar #514), else None.
+    Anything unreadable is None: the ack then names the pin target only, and step 1 refuses the file elsewhere."""
+    if pin != target:
+        return None
+    try:
+        main_platform, head_platform = (strict_json(read_at(repo, commit, CHART_PIN, runner) or b"").get("platform_version") for commit in (base, sha))
+    except (ValueError, AttributeError, DuplicateKey):
+        return None
+    return head_platform if isinstance(head_platform, str) and head_platform != main_platform else None
+
+
+def ack_refusals(repo: Path, base: str, sha: str, runner: Callable, target: str, platform_to: str | None = None) -> list[str]:
     """ADR-1094: a changed `ACK_FILE` only appends. Main's entries are an unchanged prefix of the sha's list (parsed
-    JSON), and every new entry is well-formed (`pin_evidence`'s own validator) and names `target`."""
+    JSON), and every new entry is well-formed (`pin_evidence`'s own validator) and names `target`, or, on a
+    platform-only move to `platform_to` (yaadgaar #514), `platform:<platform_to>`, the key `pin_evidence` asks for."""
     evidence = _load("pin_evidence")
     texts = [read_at(repo, commit, ACK_FILE, runner) for commit in (base, sha)]
     if texts[1] is None:
@@ -636,6 +651,13 @@ def ack_refusals(repo: Path, base: str, sha: str, runner: Callable, target: str)
     added = after[len(before) :]
     if not added:
         return [f"{ACK_FILE}: changed with no entry appended; the file is append-only"]
+    if platform_to is not None:
+        wanted = f"{evidence.ACK_PLATFORM_PREFIX}{platform_to}"
+        return [
+            f"{ACK_FILE}: appended entry targets {entry['target']}, not this platform-only move's {wanted}"
+            for entry in added
+            if entry["target"] != wanted
+        ]
     return [
         f"{ACK_FILE}: appended entry targets {entry['target']}, not this pin's {target}"
         for entry in added

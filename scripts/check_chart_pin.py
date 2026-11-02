@@ -26,6 +26,31 @@ THREE INDEPENDENT CHECKS, because one tag alone cannot prove any of them:
                      both digests. It DETECTS a retag at gate time. Argo still
                      pulls by tag, so a retag between this check and a sync is
                      not prevented. A pin with no `chart_digest` is refused.
+                     `--digest-only` runs this half alone, as
+                     `.github/workflows/chart-digest.yaml` does daily against
+                     main (yaadgaar #494 item 5): a re-push with no argocd PR
+                     is detected, and the next scheduled run goes red. GitHub
+                     notifies only the user who last edited the workflow's cron
+                     about a failed scheduled run; nobody else is told.
+
+ACCEPTED RESIDUAL: OTHER PULLS STAY BY TAG (yaadgaar #494 item 3, Max ruled
+2026-11-02: accept). The digest record covers the `yadgar` parent chart's tag
+only. Five reads still pull a chart by tag, and no digest binds them:
+
+  - the CRD gate's base side (`scripts/gates/test_crd_no_silent_drop.py`
+    renders the base pin by tag);
+  - the operator Applications' `platform` chart
+    (`ghcr.io/yadgarhq/charts/platform:<platform_version>`, which Argo CD
+    and `pin_bump.render_operator` / `platform_facts` pull by tag);
+  - `pin_bump.render`, the E1 classifier's one-file-tree render of the parent;
+  - `settled_gate.default_render`, the render `pin_dryrun` E2 compares with;
+  - `pin_bump.estate_selectors`' chart-source renders
+    (`pin_bump.chart_source_arguments`, `--version <targetRevision>`), which
+    read the selectors of every other Application on a platform move.
+
+A re-push of one of those tags changes what is rendered or synced with no
+record here to catch it. Revisit if `platform` (or any chart these reads pull)
+is published by more than the release workflow, or if a retag is ever seen.
 
 OPTION A LANDED, AND THIS READ FOLLOWED IT. The `yadgar` Application moved out
 of `yadgarhq/deploy` (`infra/yadgar-app.yaml`) and into this repository as
@@ -55,6 +80,7 @@ either read possible.
 
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 import os
@@ -237,8 +263,25 @@ def check_chart_digest(chart_tag: str, recorded: str | None) -> str | None:
     return None
 
 
-def main() -> int:
+def main(argv: list[str] | tuple[str, ...] = ()) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser.add_argument(
+        "--digest-only",
+        action="store_true",
+        help="run the chart-digest half alone: the daily retag check on main (chart-digest.yaml, yaadgaar #494 item 5)",
+    )
+    arguments = parser.parse_args(list(argv))
     pin = committed_pin()
+    if arguments.digest_only:
+        chart_tag = pin.get("chart_tag")
+        if not chart_tag:
+            print(f"::error file={CHART_PIN}::`chart_tag` must be a non-empty string; got {pin!r}.")
+            return 1
+        if error := check_chart_digest(chart_tag, pin.get("chart_digest")):
+            print(f"::error file={CHART_PIN}::{error}")
+            return 1
+        print(f"{CHART_PIN.name}: {chart_tag} still resolves to chart_digest {pin['chart_digest']}.")
+        return 0
     chart_tag, committed_version = pin.get("chart_tag"), pin.get("platform_version")
     if not chart_tag or not committed_version:
         print(
@@ -271,4 +314,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))
