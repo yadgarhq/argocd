@@ -544,6 +544,16 @@ def test_push_refuses_a_change_outside_the_three_pin_files(tmp_path: Path) -> No
     assert api.writes() == []
 
 
+def test_push_refuses_a_pin_that_moves_a_service_port(tmp_path: Path) -> None:
+    """yaadgaar #547: the derived Services file is not a pin file, so a pin that moves a Service stops for a human."""
+    api = Fake(push_routes())
+    services = "scripts/gates/yadgar_services.txt"
+    assert services not in ap.PIN_FILES
+    with pytest.raises(ap.Refused, match="yadgar_services.txt"):
+        ap.push(api, tree_with(tmp_path), state(), changed=[*sorted(ap.PIN_FILES), services], open_heads=frozenset())
+    assert api.writes() == []
+
+
 @pytest.mark.parametrize(
     "changed", [[], ["scripts/chart_pin.json", "scripts/gates/yadgar_render.sha256"]], ids=["empty", "no-application"]
 )

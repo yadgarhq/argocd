@@ -9,7 +9,8 @@ its PR body. Two arms:
 - the bump leaves both gate files byte-identical, with the writer stubbed
   (the real one needs helm and the network). The stub pins the exact command
   and `pb.WRITER`, and an AST check holds that the real writer file writes
-  `TABLE` and nothing else, so the stub stands for what the writer does;
+  `TABLE` and `SERVICES` (the derived Services file, yaadgaar #547) and
+  nothing else, so the stub stands for what the writer does;
 - neither gate source carries a per-pin log any more; the render gate says
   where a measurement lives, and the other gate keeps no previous-pin baseline.
 """
@@ -38,7 +39,7 @@ FIXTURE_PIN = "9.9.9"
 
 @pytest.fixture
 def tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """A copy of the five files a bump could touch, with the writer stubbed to what it really writes: the table."""
+    """A copy of the five files a bump could touch, with the writer stubbed to what it really writes: the table and the Services file."""
     for name in (*pb.MECHANICAL_FILES, *GATES):
         target = tmp_path / name
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -51,6 +52,7 @@ def tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     def writer(command, **_):
         assert command == [sys.executable, str(tmp_path / pb.WRITER), "--write"], command
         (tmp_path / pb.TABLE).write_text(f"stub table for {FIXTURE_PIN}\n")
+        (tmp_path / "scripts/gates/yadgar_services.txt").write_text(f"# stub Services for {FIXTURE_PIN}\n")
         return Finished()
 
     monkeypatch.setattr(pb, "writer_helm", lambda: "/bin/true")
@@ -93,9 +95,9 @@ def file_writes(source: str) -> list[str]:
     return found
 
 
-def test_the_writer_writes_the_table_and_nothing_else() -> None:
+def test_the_writer_writes_the_table_and_the_services_file_and_nothing_else() -> None:
     writes = file_writes((REPOSITORY / pb.WRITER).read_text())
-    assert writes == ["TABLE"], writes
+    assert writes == ["TABLE", "SERVICES"], writes
 
 
 @pytest.mark.parametrize(
@@ -109,7 +111,7 @@ def test_the_writer_writes_the_table_and_nothing_else() -> None:
     ],
 )
 def test_the_write_scan_names_a_write_to_any_other_file(line: str) -> None:
-    assert file_writes(line) != ["TABLE"]
+    assert file_writes(line) not in (["TABLE"], ["TABLE", "SERVICES"])
 
 
 def flat(text: str) -> str:

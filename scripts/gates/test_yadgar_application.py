@@ -43,6 +43,19 @@ CI job, never in the offline pre-commit hook.
       BEFORE its name carries no assignment for the rule to match, so the
       file stays scannable rather than allow-listed.
 
+  S   `--write` also derives `yadgar_services.txt` beside the table from the
+      same render: one `<namespace>/<name>:<port>` line per Service port, and
+      `<cr>` and `<cr>-internal` at the CR's port for each MariaDB CR
+      (yaadgaar #547). K3's digests say that an object changed, not to which
+      port; yadgarhq/estate's C-18 check reads this file for the ports. The
+      derivation reads the RENDERED MariaDB spec, so a chart release that
+      turns on `replication`, `galera`, `metrics` or MaxScale by default is
+      refused here, not only one argocd's values turn on (yaadgaar #559).
+      This file is NOT one of `pin_bump.MECHANICAL_FILES`: a pin bump that
+      moves a Service or a port changes it, and `auto_pin.push_problem` then
+      refuses the bot's push by name. That is on purpose: a Service change is
+      the change estate's inventory must be re-measured for.
+
 WHAT IS ONLY MEASURED, NOT GATED: that this render equals what Argo CD renders
 live. Argo passes the cluster's own `--api-versions` and `--kube-version`; this
 gate passes the six `test_no_two_owners.py` uses. The pull request that
@@ -60,7 +73,7 @@ import urllib.request
 from pathlib import Path
 
 import pytest
-from test_no_two_owners import REPOSITORY, parent_render, strict_load, tuples_of  # noqa: F401  (same flags as P)
+from test_no_two_owners import REPOSITORY, TARGET_NAMESPACE, parent_render, strict_load, tuples_of  # noqa: F401  (same flags as P)
 
 APPLICATION = REPOSITORY / "applications" / "yadgar.yaml"
 TABLE = Path(__file__).resolve().parent / "yadgar_render.sha256"
@@ -1919,13 +1932,165 @@ def test_a_valkey_ingress_port_from_another_peer_names_it(rendered: list) -> Non
     }
 
 
+# ── THE SERVICES FILE (yaadgaar #547, #559 item 2) ───────────────────────────
+#
+# K3's digests say an object changed, not to which port. Estate's C-18 check
+# needs the ports, so `--write` also derives `yadgar_services.txt` from the
+# same render, and the gate below holds it equal to the render.
+
+SERVICES = Path(__file__).resolve().parent / "yadgar_services.txt"
+SERVICES_HEADER = (
+    "# The Services `applications/yadgar.yaml` renders: one `<namespace>/<name>:<port>` per port.",
+    "# A MariaDB CR counts as mariadb-operator's `<cr>` and `<cr>-internal`, at its spec.port (default 3306).",
+    "# Read by yadgarhq/estate's C-18 inventory check. Regenerate: python3 scripts/gates/test_yadgar_application.py --write",
+)
+MARIADB_DEFAULT_PORT = 3306
+MARIADB_OPERATOR_SUFFIXES = ("", "-internal")
+# A rendered MariaDB spec key that makes mariadb-operator create Services
+# MARIADB_OPERATOR_SUFFIXES omits: `-primary`/`-secondary` (replication,
+# galera), `-metrics` (metrics) and MaxScale's own. Nobody has measured their
+# names or ports, so any of these is a refusal until someone does (fail closed).
+OPERATOR_EXTRA_KEYS = ("replication", "galera", "metrics", "maxScale", "maxScaleRef")
+
+
+class ServicesRefused(Exception):
+    """The render holds a Service whose host name or port cannot be derived."""
+
+
+def _port(where: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ServicesRefused(f"{where} port {value!r} is not a whole number")
+    return value
+
+
+def service_lines(documents: list) -> list[str]:
+    """`<namespace>/<name>:<port>` for every Service port the render makes, sorted. Refuses what it cannot derive."""
+    lines: list[str] = []
+    for document in documents:
+        if not isinstance(document, dict):
+            continue
+        kind, metadata = document.get("kind"), document.get("metadata") or {}
+        name, namespace = metadata.get("name"), metadata.get("namespace") or TARGET_NAMESPACE
+        spec = document.get("spec") or {}
+        if kind == "Service":
+            ports = spec.get("ports") or []
+            if not ports:
+                raise ServicesRefused(f"Service/{name} has no ports")
+            lines += [f"{namespace}/{name}:{_port(f'Service/{name}', p.get('port'))}" for p in ports]
+        elif kind == "MariaDB" and str(document.get("apiVersion", "")).startswith("k8s.mariadb.com/"):
+            extra = [key for key in OPERATOR_EXTRA_KEYS if key in spec]
+            if extra:
+                raise ServicesRefused(
+                    f"MariaDB/{name} sets spec.{extra[0]}: mariadb-operator then creates Services "
+                    "this file does not derive; measure them and extend OPERATOR_EXTRA_KEYS' handling first"
+                )
+            port = _port(f"MariaDB/{name}", spec.get("port", MARIADB_DEFAULT_PORT))
+            lines += [f"{namespace}/{name}{suffix}:{port}" for suffix in MARIADB_OPERATOR_SUFFIXES]
+    seen: set[str] = set()
+    for line in lines:
+        if line in seen:
+            raise ServicesRefused(f"{line} derived twice")
+        seen.add(line)
+    return sorted(lines)
+
+
+def services_text(lines: list[str]) -> str:
+    return "\n".join((*SERVICES_HEADER, *lines)) + "\n"
+
+
+def read_services(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line and not line.startswith("#")]
+
+
+
+def svc(name: str, *ports, namespace: str | None = None) -> dict:
+    metadata = {"name": name} | ({"namespace": namespace} if namespace else {})
+    return {"apiVersion": "v1", "kind": "Service", "metadata": metadata,
+            "spec": {"ports": [{"name": f"p{p}", "port": p} for p in ports]}}
+
+
+def mariadb(name: str, **spec) -> dict:
+    return {"apiVersion": "k8s.mariadb.com/v1alpha1", "kind": "MariaDB", "metadata": {"name": name},
+            "spec": {"replicas": 1, "storage": {"size": "1Gi"}} | spec}
+
+
+def test_one_line_per_service_port_in_the_target_namespace_unless_it_names_one() -> None:
+    documents = [svc("nats-headless", 4222, 8222), svc("gateway", 8080), svc("probe", 80, namespace="observability")]
+    assert service_lines(documents) == [
+        "observability/probe:80",
+        f"{TARGET_NAMESPACE}/gateway:8080",
+        f"{TARGET_NAMESPACE}/nats-headless:4222",
+        f"{TARGET_NAMESPACE}/nats-headless:8222",
+    ]
+
+
+def test_a_mariadb_cr_is_its_two_operator_services_at_3306() -> None:
+    assert service_lines([mariadb("task-db-mariadb")]) == [
+        f"{TARGET_NAMESPACE}/task-db-mariadb-internal:3306",
+        f"{TARGET_NAMESPACE}/task-db-mariadb:3306",
+    ]
+
+
+def test_a_mariadb_cr_with_its_own_port_is_that_port() -> None:
+    assert service_lines([mariadb("iam-db-mariadb", port=3307)]) == [
+        f"{TARGET_NAMESPACE}/iam-db-mariadb-internal:3307",
+        f"{TARGET_NAMESPACE}/iam-db-mariadb:3307",
+    ]
+
+
+def test_other_kinds_are_not_services() -> None:
+    assert service_lines([{"apiVersion": "apps/v1", "kind": "Deployment", "metadata": {"name": "gateway"}}, None]) == []
+
+
+@pytest.mark.parametrize("key", ["replication", "galera", "metrics", "maxScale", "maxScaleRef"])
+def test_a_rendered_mariadb_spec_that_adds_operator_services_is_refused(key: str) -> None:
+    """#559 item 2: read off the RENDER, so a chart default is seen, not only argocd's values."""
+    with pytest.raises(ServicesRefused, match=rf"MariaDB/task-db-mariadb sets spec\.{key}"):
+        service_lines([mariadb("task-db-mariadb", **{key: {"enabled": False}})])
+
+
+@pytest.mark.parametrize(
+    "document,why",
+    [
+        (svc("empty"), "Service/empty has no ports"),
+        ({"apiVersion": "v1", "kind": "Service", "metadata": {"name": "bare"}}, "Service/bare has no ports"),
+        (svc("named", "http"), "Service/named port 'http' is not a whole number"),
+        (svc("flag", True), "Service/flag port True is not a whole number"),
+        (mariadb("odd-mariadb", port="3306"), "MariaDB/odd-mariadb port '3306' is not a whole number"),
+    ],
+)
+def test_a_service_whose_port_cannot_be_read_is_refused(document: dict, why: str) -> None:
+    with pytest.raises(ServicesRefused, match=re.escape(why)):
+        service_lines([document])
+
+
+def test_a_line_derived_twice_is_refused() -> None:
+    with pytest.raises(ServicesRefused, match=r"yadgar/task-db-mariadb:3306 derived twice"):
+        service_lines([mariadb("task-db-mariadb"), svc("task-db-mariadb", 3306)])
+
+
+def test_the_services_file_round_trips() -> None:
+    lines = ["yadgar/gateway:8080", "yadgar/valkey:6380"]
+    assert read_services(services_text(lines)) == lines
+
+
+def test_the_render_is_the_committed_services_file(rendered: list) -> None:
+    derived = service_lines(rendered)
+    print(f"[services] {len(derived)} line(s) derived, {SERVICES.name} committed")
+    assert read_services(SERVICES.read_text()) == derived
+
+
 def write_table() -> None:
     document = committed()
-    rendered = digests(parent_render(REPOSITORY))
+    documents = parent_render(REPOSITORY)
+    rendered = digests(documents)
     lines = [TABLE_HEADER, TABLE_REGENERATE, f"targetRevision  {revision_of(document)}"]
     lines += [f"{digest}  {key}" for key, digest in sorted(rendered.items())]
     TABLE.write_text("\n".join(lines) + "\n")
     print(f"wrote {len(rendered)} object digest(s) at {revision_of(document)} to {TABLE}")
+    services = service_lines(documents)
+    SERVICES.write_text(services_text(services))
+    print(f"wrote {len(services)} Service port line(s) to {SERVICES}")
 
 
 if __name__ == "__main__":

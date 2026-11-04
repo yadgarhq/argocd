@@ -1,0 +1,20 @@
+# The Services `applications/yadgar.yaml` renders: one `<namespace>/<name>:<port>` per port.
+# A MariaDB CR counts as mariadb-operator's `<cr>` and `<cr>-internal`, at its spec.port (default 3306).
+# Read by yadgarhq/estate's C-18 inventory check. Regenerate: python3 scripts/gates/test_yadgar_application.py --write
+yadgar/gateway:8080
+yadgar/iam-db-mariadb-internal:3306
+yadgar/iam-db-mariadb:3306
+yadgar/iam-db:50051
+yadgar/iam:50052
+yadgar/nats-headless:4222
+yadgar/nats-headless:8222
+yadgar/nats:4222
+yadgar/project-db-mariadb-internal:3306
+yadgar/project-db-mariadb:3306
+yadgar/project-db:50051
+yadgar/project:50052
+yadgar/task-db-mariadb-internal:3306
+yadgar/task-db-mariadb:3306
+yadgar/task-db:50051
+yadgar/task:50052
+yadgar/valkey:6380
