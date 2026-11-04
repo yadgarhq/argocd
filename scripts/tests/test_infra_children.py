@@ -133,7 +133,7 @@ CHILDREN: dict[str, dict] = {
             "chart": "gha-runner-scale-set",
             "targetRevision": "0.14.2",
         },
-        "values_digest": "270725924f4a46d6368f246e04e751096b3ca396269b44fb88f416138bb6a067",
+        "values_digest": "97884c28756662a6d7c6f2528395dcec0e0e3632c02a5c3debb0268183d25155",
         "unchanged": {"project": "default", "destination": {"server": DESTINATION, "namespace": "estate-front"}},
         "sync_policy": s0("CreateNamespace=true"),
     },
