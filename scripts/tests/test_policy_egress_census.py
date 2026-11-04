@@ -105,6 +105,42 @@ def test_a_to_less_or_port_less_rule_is_refused_in_any_policy(shape: dict) -> No
     assert any(other in problem for problem in problems)
 
 
+@pytest.mark.parametrize(
+    "port",
+    [
+        {"protocol": "TCP", "port": 1, "endPort": 65535},
+        {"protocol": "TCP", "port": 443, "endPort": 444},
+        {"protocol": "UDP", "port": 53, "endPort": 53},
+        {"port": 1, "endPort": None},
+    ],
+    ids=["every-port", "narrow-range", "range-of-one", "null-end-port"],
+)
+def test_an_end_port_is_refused_in_a_policy_outside_the_census(port: dict) -> None:
+    """yaadgaar 533: outside the census only `to` and `port` were checked, so `{port: 1, endPort: 65535}` passed."""
+    found = copy.deepcopy(tree())
+    other = next(name for name in found if name not in psn.EXPECTED_EGRESS)
+    found[other][1]["spec"].setdefault("egress", []).append({"to": [{"ipBlock": {"cidr": "1.2.3.4/32"}}], "ports": [port]})
+    problems = psn.check_egress(found)
+    assert any(other in problem and "endPort" in problem for problem in problems), problems
+
+
+def test_an_end_port_in_an_existing_rule_outside_the_census_is_refused() -> None:
+    found = copy.deepcopy(tree())
+    other = next(name for name in found if name not in psn.EXPECTED_EGRESS)
+    rules = found[other][1]["spec"]["egress"]
+    assert rules and rules[0].get("ports"), "the fixture needs a written-down port to widen"
+    rules[0]["ports"][0]["endPort"] = 65535
+    assert any(other in problem and "endPort" in problem for problem in psn.check_egress(found))
+
+
+def test_a_census_policy_end_port_is_still_caught_by_the_census_not_doubled() -> None:
+    """Inside the census an `endPort` changes the tuple (yaadgaar 328); the refusal here is for the rest."""
+    found = with_rules(lambda rules: rules[3]["ports"][0].__setitem__("endPort", 65535))
+    problems = psn.check_egress(found)
+    assert any("'443-65535'" in problem for problem in problems)
+    assert not any("outside the census" in problem for problem in problems)
+
+
 def test_main_runs_the_egress_census(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     """Kills a `check_egress` that is defined but never called from `main`."""
     declared = copy.deepcopy(psn.policies())

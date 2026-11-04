@@ -130,6 +130,9 @@ MINIMUM_POLICIES = len(EXPECTED_ALLOW_ALL_PORTS)
 # absent or empty admits EVERY port (ADR-0664, by symmetry with `from`); both
 # are refused in every policy the tree declares, census or not. So is a port
 # entry with no `port`, which admits every port of its protocol (yaadgaar 328).
+# So is ANY `endPort` in a policy outside the census (yaadgaar 533): there only
+# `to` and `port` are checked, and `{port: 1, endPort: 65535}` opens every port.
+# Inside the census an `endPort` changes the tuple below and reddens it there.
 #
 # THE PORT TEXT CARRIES `endPort` (`443-65535`), and any other key of the port
 # entry verbatim, as `peer_key` does for a peer: a range or an unmodelled key
@@ -290,6 +293,12 @@ def check_egress(found: dict[str, tuple[Path, dict]]) -> list[str]:
                     problems.append(
                         f"{path}: {name} egress rule {index} port {entry} has no `port`: it admits EVERY "
                         f"port of its protocol. Write the port it needs."
+                    )
+                if isinstance(port, dict) and "endPort" in port and name not in EXPECTED_EGRESS:
+                    problems.append(
+                        f"{path}: {name} egress rule {index} port {entry} carries `endPort` "
+                        f"({port.get('port')}-{port['endPort']}) in a policy outside the census: a range can "
+                        f"admit every port (yaadgaar 533). Write single ports, or add the policy to EXPECTED_EGRESS."
                     )
     for name, expected in EXPECTED_EGRESS.items():
         if name not in found:
