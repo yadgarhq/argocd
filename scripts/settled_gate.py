@@ -77,6 +77,12 @@ no cluster read. Then every clause is evaluated and every problem reported:
             names each object marked `requiresPruning` with status OutOfSync
             (ADR-0851: FLAGGED, not tolerated). A Synced Application with
             hook objects marked `requiresPruning` (measured live) is not failed.
+            ONE EXCEPTION (yaadgaar #297): gateway's HTTPRoute and Service
+            carry Prune=false, so a render that drops them leaves them live and
+            OutOfSync `requiresPruning`. When those two, matched by group,
+            kind, namespace and name, are the ONLY OutOfSync objects, the
+            Application's OutOfSync is an expected skipped prune: a note, not
+            a problem. Anything else OutOfSync still fails, named.
 
   A verdict carries what estate's verdict job reads: `S`, `A`, `K`, `P`,
   `result` (green or red) and, when red, `clause` (the failed clauses and the
@@ -606,6 +612,16 @@ VERDICT_ARTIFACT = "settled-verdict"
 TRIAL_ARTIFACT = "settled-trial"
 VERDICT_FILE = "verdict.json"
 IMAGE_ID_DIGEST = re.compile(r"(sha256:[0-9a-f]{64})$")
+# ADR-0851, yaadgaar #297: the objects whose skipped prune is expected, as
+# (group, kind, namespace, name). yadgarhq/gateway chart/templates/httproute.yaml
+# and service.yaml at d22fe10 carry Prune=false and are named `{{ .Chart.Name }}`
+# (`gateway`). Argo leaves a core group empty. Nothing else is tolerated.
+EXPECTED_SKIPPED_PRUNES = frozenset(
+    {
+        ("gateway.networking.k8s.io", "HTTPRoute", TARGET_NAMESPACE, "gateway"),
+        ("", "Service", TARGET_NAMESPACE, "gateway"),
+    }
+)
 
 
 def handover():
@@ -739,9 +755,21 @@ def _parsed(value):
     return json.loads(json.dumps(value))
 
 
-def clause_b(derived: dict, root: dict, application: dict, deployments: list[dict], root_sha: str, is_ancestor) -> list[str]:
+def _resource_id(resource: dict) -> str:
+    return f"{resource.get('group', '')}/{resource.get('kind')}/{resource.get('namespace', '')}/{resource.get('name')}"
+
+
+def _expected_skipped_prune(resource: dict) -> bool:
+    key = (resource.get("group") or "", resource.get("kind"), resource.get("namespace"), resource.get("name"))
+    return resource.get("requiresPruning") is True and resource.get("status") == "OutOfSync" and key in EXPECTED_SKIPPED_PRUNES
+
+
+def clause_b(
+    derived: dict, root: dict, application: dict, deployments: list[dict], root_sha: str, is_ancestor, notes: list[str] | None = None
+) -> list[str]:
     """Clause B: root at S, the Application Synced at P with V and a Succeeded operation, every rollout complete."""
     problems: list[str] = []
+    notes = notes if notes is not None else []
     state, message = handover().revision_state(root, root_sha, is_ancestor)
     if state != "done":
         problems.append(f"Clause B: root is not Synced at {root_sha} or a descendant: {message}")
@@ -763,13 +791,20 @@ def clause_b(derived: dict, root: dict, application: dict, deployments: list[dic
     if _parsed((compared.get("helm") or {}).get("valuesObject")) != _parsed(derived["values"]):
         problems.append(f"Clause B: {APPLICATION_NAME} status.sync.comparedTo.source.helm.valuesObject differs from V")
     if sync.get("status") != "Synced":
-        pruning = [
-            f"{r.get('group', '')}/{r.get('kind')}/{r.get('namespace', '')}/{r.get('name')}"
-            for r in status.get("resources") or []
-            if r.get("requiresPruning") and r.get("status") == "OutOfSync"
-        ]
-        why = f"; each of these requires pruning (ADR-0851: delete it by hand): {pruning}" if pruning else ""
-        problems.append(f"Clause B: {APPLICATION_NAME} status.sync.status is {sync.get('status')}, wanted Synced{why}")
+        resources = status.get("resources") or []
+        skipped = [_resource_id(r) for r in resources if _expected_skipped_prune(r)]
+        # Fail closed: every object with a status other than Synced must be an
+        # expected skipped prune. Hook leftovers carry no status and are not judged.
+        others = [r for r in resources if r.get("status") not in (None, "Synced") and not _expected_skipped_prune(r)]
+        if sync.get("status") == "OutOfSync" and skipped and not others:
+            notes.append(
+                f"{APPLICATION_NAME} reads OutOfSync only for an expected skipped prune (ADR-0851, Prune=false): {skipped};"
+                " delete them by hand when they are no longer wanted"
+            )
+        else:
+            pruning = [_resource_id(r) for r in others if r.get("requiresPruning") and r.get("status") == "OutOfSync"]
+            why = f"; each of these requires pruning (ADR-0851: delete it by hand): {pruning}" if pruning else ""
+            problems.append(f"Clause B: {APPLICATION_NAME} status.sync.status is {sync.get('status')}, wanted Synced{why}")
     health = (status.get("health") or {}).get("status")
     if health != "Healthy":
         problems.append(f"Clause B: {APPLICATION_NAME} status.health.status is {health}, wanted Healthy")
@@ -840,7 +875,7 @@ def judge(derived: dict, cluster, *, root_sha: str, now: dt.datetime, trial: boo
     except (verify_handover.KubectlError, verify_handover.UsageError, ValueError) as error:
         raise InfrastructureError(f"a cluster read failed: {error}") from error
     problems, notes, not_counted = clause_a(derived, deployments, pods)
-    problems += clause_b(derived, root, application, deployments, root_sha, is_ancestor)
+    problems += clause_b(derived, root, application, deployments, root_sha, is_ancestor, notes)
     verdict.update(notes=notes, not_counted=not_counted, problems=problems)
     if not problems:
         return {**verdict, "result": "green"}

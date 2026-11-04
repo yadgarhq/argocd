@@ -23,7 +23,10 @@ WHAT IS ASSERTED, and each has a red case below:
      parsed objects, `Synced`, `Healthy`, and `operationState.phase`
      `Succeeded` (a failed PostSync hook is not settled); each Deployment's
      rollout is complete. An OutOfSync Application names the objects that
-     require pruning (ADR-0851: flagged, not tolerated).
+     require pruning (ADR-0851: flagged, not tolerated). The one exception
+     (yaadgaar #297): gateway's HTTPRoute and Service, matched by group, kind,
+     namespace and name, as the only OutOfSync objects are an expected
+     skipped prune (a note); anything else OutOfSync still fails, named.
   4. Every clause is reported in one result, never only the first.
   5. Trial mode reads data at another sha, treats the deadline as passed, and
      writes `settled-trial`, never `settled-verdict`.
@@ -458,6 +461,102 @@ def test_hook_leftovers_that_require_pruning_do_not_fail_a_synced_application(es
     """Measured live 2026-10-03: `yadgar` reads Synced with 13 hook objects marked `requiresPruning` and no status."""
     estate.yadgar["status"]["resources"] = [{"group": "batch", "kind": "Job", "namespace": "yadgar", "name": "preflight", "requiresPruning": True}]
     assert judge(estate)[0]["result"] == "green"
+
+
+# ADR-0851, yaadgaar #297: gateway's HTTPRoute and Service carry Prune=false
+# (yadgarhq/gateway chart/templates/httproute.yaml and service.yaml at d22fe10,
+# both named `{{ .Chart.Name }}` = `gateway`). A render that drops them leaves
+# them live, and Argo reads the Application OutOfSync with each marked
+# `requiresPruning`: an expected skipped prune, not a red. Only those two
+# objects, by group, kind, namespace and name; every other object that
+# requires pruning still fails, and is named.
+SKIPPED_ROUTE = {"group": "gateway.networking.k8s.io", "kind": "HTTPRoute", "namespace": "yadgar", "name": "gateway", "status": "OutOfSync", "requiresPruning": True}
+SKIPPED_SERVICE = {"kind": "Service", "namespace": "yadgar", "name": "gateway", "status": "OutOfSync", "requiresPruning": True}
+
+
+def out_of_sync_with(estate: Estate, *resources: dict) -> dict:
+    estate.yadgar["status"]["sync"]["status"] = "OutOfSync"
+    estate.yadgar["status"]["resources"] = [copy.deepcopy(r) for r in resources]
+    return judge(estate)[0]
+
+
+@pytest.mark.parametrize(
+    "resources",
+    [
+        (SKIPPED_ROUTE,),
+        (SKIPPED_SERVICE,),
+        ({**SKIPPED_SERVICE, "group": ""},),
+        (SKIPPED_ROUTE, SKIPPED_SERVICE),
+        (SKIPPED_ROUTE, SKIPPED_SERVICE, {"group": "apps", "kind": "Deployment", "namespace": "yadgar", "name": "gateway", "status": "Synced"}),
+        (SKIPPED_ROUTE, {"group": "batch", "kind": "Job", "namespace": "yadgar", "name": "preflight", "requiresPruning": True}),
+    ],
+    ids=["route", "service", "service-empty-group", "both", "both-and-synced", "route-and-hook-leftover"],
+)
+def test_a_skipped_prune_of_gateways_route_or_service_is_expected(estate: Estate, resources) -> None:
+    verdict = out_of_sync_with(estate, *resources)
+    assert verdict["result"] == "green", verdict["problems"]
+    notes = " ".join(verdict["notes"])
+    assert "ADR-0851" in notes and "skipped prune" in notes
+    for r in resources:
+        if r.get("requiresPruning") and r.get("status") == "OutOfSync":
+            assert f"{r['kind']}/yadgar/gateway" in notes
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        {**SKIPPED_ROUTE, "name": "iam"},
+        {**SKIPPED_SERVICE, "name": "gateway-old"},
+        {**SKIPPED_ROUTE, "namespace": "default"},
+        {**SKIPPED_SERVICE, "namespace": "argocd"},
+        {**SKIPPED_ROUTE, "group": "example.com"},
+        {**SKIPPED_SERVICE, "group": "apps"},
+        {**SKIPPED_ROUTE, "kind": "GRPCRoute"},
+        {**SKIPPED_SERVICE, "kind": "Deployment", "group": "apps"},
+        {**SKIPPED_SERVICE, "kind": "ConfigMap"},
+        {"group": "gateway.networking.k8s.io", "kind": "Gateway", "namespace": "yadgar", "name": "edge", "status": "OutOfSync", "requiresPruning": True},
+    ],
+    ids=["route-other-name", "service-other-name", "route-other-namespace", "service-other-namespace", "route-other-group",
+         "service-other-group", "other-route-kind", "deployment-named-gateway", "configmap-named-gateway", "edge-gateway"],
+)
+def test_any_other_object_that_requires_pruning_still_fails_and_is_named(estate: Estate, other: dict) -> None:
+    verdict = out_of_sync_with(estate, SKIPPED_ROUTE, other)
+    text = problems_of(verdict)
+    assert verdict["result"] != "green"
+    assert "requires pruning" in text and "delete it by hand" in text
+    assert f"{other.get('group', '')}/{other['kind']}/{other['namespace']}/{other['name']}" in text
+
+
+@pytest.mark.parametrize(
+    "resources",
+    [
+        ({**SKIPPED_ROUTE, "requiresPruning": False},),
+        ({k: v for k, v in SKIPPED_SERVICE.items() if k != "requiresPruning"},),
+        (SKIPPED_ROUTE, {"group": "apps", "kind": "Deployment", "namespace": "yadgar", "name": "gateway", "status": "OutOfSync"}),
+        (SKIPPED_ROUTE, {"kind": "Service", "namespace": "yadgar", "name": "iam", "status": "Unknown"}),
+        (),
+        ({**SKIPPED_ROUTE, "status": "Synced"},),
+    ],
+    ids=["route-drifted-not-pruning", "service-drifted-no-flag", "plus-drifted-deployment", "plus-unknown-service", "no-resources",
+         "pruning-but-synced"],
+)
+def test_out_of_sync_for_any_other_reason_still_fails(estate: Estate, resources) -> None:
+    verdict = out_of_sync_with(estate, *resources)
+    assert verdict["result"] != "green"
+    assert "status.sync.status is OutOfSync" in problems_of(verdict)
+
+
+@pytest.mark.parametrize("sync_status", ["Unknown", None])
+def test_a_skipped_prune_is_tolerated_only_when_argo_reads_out_of_sync(estate: Estate, sync_status) -> None:
+    estate.yadgar["status"]["sync"]["status"] = sync_status
+    estate.yadgar["status"]["resources"] = [copy.deepcopy(SKIPPED_ROUTE)]
+    assert judge(estate)[0]["result"] != "green"
+
+
+def test_a_skipped_prune_does_not_mask_another_clause_b_failure(estate: Estate) -> None:
+    estate.yadgar["status"]["health"]["status"] = "Degraded"
+    verdict = out_of_sync_with(estate, SKIPPED_ROUTE)
+    assert verdict["result"] != "green" and "Degraded" in problems_of(verdict)
 
 
 def test_root_not_yet_at_s_fails_clause_b(estate: Estate) -> None:
