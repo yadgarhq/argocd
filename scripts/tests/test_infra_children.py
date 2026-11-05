@@ -53,6 +53,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -202,6 +203,32 @@ def child_clause_errors(tree: Path) -> list[tuple[str, str]]:
         }
         errors.extend((name, clause) for clause, passed in checks.items() if not passed)
     return errors
+
+
+RUNNER = "estate-front-runner"
+RECOMPUTE_COMMAND = (
+    "python3 -c \"import hashlib,json,yaml;print(hashlib.sha256(json.dumps(yaml.safe_load("
+    "open('applications/estate-front-runner.yaml'))['spec']['source']['helm']['valuesObject'],"
+    "sort_keys=True).encode()).hexdigest())\""
+)
+
+
+def assert_clause_errors(tree: Path, expected: list[tuple[str, str]]) -> None:
+    """`child_clause_errors(tree) == expected`; when the runner's pinned digest is stale, say how to repin."""
+    actual = child_clause_errors(tree)
+    if actual == expected:
+        return
+    message = f"child clause errors {actual!r} != expected {expected!r}"
+    values = ((load(tree, RUNNER).get("spec") or {}).get("source") or {}).get("helm", {}).get("valuesObject")
+    new = canonical_digest(values)
+    pinned = CHILDREN[RUNNER]["values_digest"]
+    if new != pinned:
+        message += (
+            f"\n{RUNNER} valuesObject digest is now {new}, pinned {pinned}."
+            f"\nIf the change is intended, set CHILDREN['{RUNNER}']['values_digest'] to the new value."
+            f"\nRecompute (run from the repo root): {RECOMPUTE_COMMAND}"
+        )
+    raise AssertionError(message)
 
 
 def identity_errors(tree: Path) -> list[str]:
@@ -386,7 +413,7 @@ def mutate(tree: Path, name: str, change) -> None:
 
 def test_every_child_is_its_row() -> None:
     print(f"[infra retire] {len(CHILDREN)} adopted child(ren) pinned to {SOURCE} + S0: {', '.join(CHILDREN)}")
-    assert child_clause_errors(REPOSITORY) == []
+    assert_clause_errors(REPOSITORY, [])
 
 
 def test_every_child_is_the_application_root_adopts_by_name() -> None:
@@ -437,23 +464,23 @@ def test_every_scale_set_is_read_for_the_coupling() -> None:
 
 def test_a_reintroduced_prune_reddens(copy: Path) -> None:
     mutate(copy, "yadgar", lambda d: d["spec"]["syncPolicy"]["automated"].update(prune=True))
-    assert child_clause_errors(copy) == [("yadgar", "sync-policy")]
+    assert_clause_errors(copy, [("yadgar", "sync-policy")])
 
 
 def test_tls_back_on_sixty_retries_reddens(copy: Path) -> None:
     mutate(copy, "tls", lambda d: d["spec"]["syncPolicy"]["retry"].update(limit=60))
-    assert child_clause_errors(copy) == [("tls", "sync-policy")]
+    assert_clause_errors(copy, [("tls", "sync-policy")])
 
 
 def test_a_dropped_retry_reddens(copy: Path) -> None:
     mutate(copy, "arc", lambda d: d["spec"]["syncPolicy"].pop("retry"))
-    assert child_clause_errors(copy) == [("arc", "sync-policy")]
+    assert_clause_errors(copy, [("arc", "sync-policy")])
 
 
 def test_a_dropped_sync_option_reddens(copy: Path) -> None:
     """`ServerSideApply=true` is what lets arc's four large CRDs apply at all."""
     mutate(copy, "arc", lambda d: d["spec"]["syncPolicy"]["syncOptions"].remove("ServerSideApply=true"))
-    assert child_clause_errors(copy) == [("arc", "sync-policy")]
+    assert_clause_errors(copy, [("arc", "sync-policy")])
 
 
 def test_prune_false_carried_over_reddens(copy: Path) -> None:
@@ -462,17 +489,17 @@ def test_prune_false_carried_over_reddens(copy: Path) -> None:
         "estate-front",
         lambda d: d["metadata"]["annotations"].update({"argocd.argoproj.io/sync-options": "Prune=false"}),
     )
-    assert child_clause_errors(copy) == [("estate-front", "annotations")]
+    assert_clause_errors(copy, [("estate-front", "annotations")])
 
 
 def test_a_wave_on_yadgar_reddens(copy: Path) -> None:
     mutate(copy, "yadgar", lambda d: d["metadata"].update(annotations={"argocd.argoproj.io/sync-wave": "10"}))
-    assert child_clause_errors(copy) == [("yadgar", "annotations")]
+    assert_clause_errors(copy, [("yadgar", "annotations")])
 
 
 def test_a_moved_wave_reddens(copy: Path) -> None:
     mutate(copy, "estate-front-runner", lambda d: d["metadata"]["annotations"].update({"argocd.argoproj.io/sync-wave": "-10"}))
-    assert child_clause_errors(copy) == [("estate-front-runner", "annotations")]
+    assert_clause_errors(copy, [("estate-front-runner", "annotations")])
 
 
 def test_tls_pointed_back_at_deploy_reddens(copy: Path) -> None:
@@ -480,7 +507,7 @@ def test_tls_pointed_back_at_deploy_reddens(copy: Path) -> None:
         d["spec"]["source"].update(repoURL="https://github.com/yadgarhq/deploy", path="infra/tls")
 
     mutate(copy, "tls", back)
-    assert child_clause_errors(copy) == [("tls", "source")]
+    assert_clause_errors(copy, [("tls", "source")])
     assert retired_repository_sources(copy) == ["applications/tls.yaml: https://github.com/yadgarhq/deploy"]
 
 
@@ -494,13 +521,13 @@ def test_yadgar_back_on_two_sources_reddens(copy: Path) -> None:
         ]
 
     mutate(copy, "yadgar", two)
-    assert child_clause_errors(copy) == [("yadgar", "source")]
+    assert_clause_errors(copy, [("yadgar", "source")])
     assert retired_repository_sources(copy) == ["applications/yadgar.yaml: https://github.com/yadgarhq/deploy"]
 
 
 def test_yadgar_with_a_value_file_beside_the_object_reddens(copy: Path) -> None:
     mutate(copy, "yadgar", lambda d: d["spec"]["source"]["helm"].update(valueFiles=["values.yaml"]))
-    assert child_clause_errors(copy) == [("yadgar", "source")]
+    assert_clause_errors(copy, [("yadgar", "source")])
 
 
 def test_yadgar_with_an_ignore_differences_entry_reddens(copy: Path) -> None:
@@ -511,17 +538,17 @@ def test_yadgar_with_an_ignore_differences_entry_reddens(copy: Path) -> None:
         "jsonPointers": ["/spec/rootPasswordSecretKeyRef/generate", "/spec/passwordSecretKeyRef/generate"],
     }
     mutate(copy, "yadgar", lambda d: d["spec"].update(ignoreDifferences=[entry]))
-    assert child_clause_errors(copy) == [("yadgar", "unchanged")]
+    assert_clause_errors(copy, [("yadgar", "unchanged")])
 
 
 def test_a_moved_destination_reddens(copy: Path) -> None:
     mutate(copy, "estate-front", lambda d: d["spec"]["destination"].update(namespace="yadgar"))
-    assert child_clause_errors(copy) == [("estate-front", "unchanged")]
+    assert_clause_errors(copy, [("estate-front", "unchanged")])
 
 
 def test_a_changed_runner_value_reddens(copy: Path) -> None:
     mutate(copy, "estate-front-runner", lambda d: d["spec"]["source"]["helm"]["valuesObject"].update(maxRunners=3))
-    assert child_clause_errors(copy) == [("estate-front-runner", "source")]
+    assert_clause_errors(copy, [("estate-front-runner", "source")])
 
 
 def test_runner_values_back_in_a_string_reddens(copy: Path) -> None:
@@ -530,7 +557,7 @@ def test_runner_values_back_in_a_string_reddens(copy: Path) -> None:
         helm["values"] = yaml.safe_dump(helm.pop("valuesObject"))
 
     mutate(copy, "estate-front-runner", string)
-    assert child_clause_errors(copy) == [("estate-front-runner", "source")]
+    assert_clause_errors(copy, [("estate-front-runner", "source")])
 
 
 def test_changed_arc_sizing_reddens(copy: Path) -> None:
@@ -539,7 +566,7 @@ def test_changed_arc_sizing_reddens(copy: Path) -> None:
         "arc",
         lambda d: d["spec"]["source"]["helm"]["valuesObject"]["resources"]["limits"].update(memory="512Mi"),
     )
-    assert child_clause_errors(copy) == [("arc", "source")]
+    assert_clause_errors(copy, [("arc", "source")])
 
 
 def test_a_missing_child_reddens(copy: Path) -> None:
@@ -650,10 +677,36 @@ def test_sources_beside_source_reddens(copy: Path) -> None:
         "yadgar",
         lambda d: d["spec"].update(sources=[{"repoURL": THIS_REPOSITORY, "targetRevision": "main", "ref": "self"}]),
     )
-    assert child_clause_errors(copy) == [("yadgar", "source")]
+    assert_clause_errors(copy, [("yadgar", "source")])
 
 
 def test_a_release_name_on_the_runner_reddens(copy: Path) -> None:
     """A `releaseName` moves every object the chart names after its release."""
     mutate(copy, "estate-front-runner", lambda d: d["spec"]["source"]["helm"].update(releaseName="runner"))
-    assert child_clause_errors(copy) == [("estate-front-runner", "source")]
+    assert_clause_errors(copy, [("estate-front-runner", "source")])
+
+
+def test_a_stale_values_digest_failure_prints_the_new_digest_and_the_recompute_command(copy: Path) -> None:
+    """Yaadgaar 640: an image bump reddens 15 tests; the message must say how to repin."""
+    mutate(copy, "estate-front-runner", lambda d: d["spec"]["source"]["helm"]["valuesObject"].update(maxRunners=3))
+    actual = canonical_digest(load(copy, "estate-front-runner")["spec"]["source"]["helm"]["valuesObject"])
+    with pytest.raises(AssertionError) as raised:
+        assert_clause_errors(copy, [])
+    message = str(raised.value)
+    assert actual in message
+    assert CHILDREN["estate-front-runner"]["values_digest"] in message
+    assert RECOMPUTE_COMMAND in message
+    assert "applications/estate-front-runner.yaml" in RECOMPUTE_COMMAND
+
+
+def test_a_matching_values_digest_failure_carries_no_repin_hint(copy: Path) -> None:
+    mutate(copy, "yadgar", lambda d: d["spec"]["syncPolicy"]["automated"].update(prune=True))
+    with pytest.raises(AssertionError) as raised:
+        assert_clause_errors(copy, [])
+    assert RECOMPUTE_COMMAND not in str(raised.value)
+
+
+def test_the_recompute_command_prints_the_pinned_digest_on_the_repository() -> None:
+    """The printed command works as printed: on main data it yields the pinned digest."""
+    result = subprocess.run(RECOMPUTE_COMMAND, shell=True, cwd=REPOSITORY, capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == CHILDREN["estate-front-runner"]["values_digest"]
