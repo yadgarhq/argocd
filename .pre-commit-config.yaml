@@ -8,7 +8,9 @@ repos:
       - id: mixed-line-ending
         args: [--fix=lf]
       - id: check-merge-conflict
+        args: [--assume-in-merge]
       - id: check-added-large-files
+        args: [--enforce-all]
       - id: check-yaml
         # Argo CRDs and multi-document manifests.
         args: [--allow-multiple-documents]
