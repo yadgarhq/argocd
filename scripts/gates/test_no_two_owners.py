@@ -1801,7 +1801,8 @@ def test_a_hook_rendered_copy_is_named_by_the_guard(tmp_path: Path) -> None:
 # Two halves, and both are what `prune: true` and `selfHeal: true` would apply
 # unattended.
 #
-# FIRST, THE VALUES MOVE ADDS THE FOUR EDGE OBJECTS AND CHANGES NOTHING ELSE.
+# FIRST, THE VALUES MOVE ADDS THE FOUR EDGE OBJECTS AND CHANGES NOTHING ELSE
+# BUT GATEWAY'S ORIGIN ALLOWLIST (since parent 0.51.117; `STEP_7_ORIGINS`).
 # Step 7's keys, reverted with `--set`, against the current values: exactly
 # the four objects differ, and all other objects are byte-identical. That
 # includes `global.hostname`, and only because `iam.enrolment.gateway` is
@@ -1862,6 +1863,28 @@ STEP_7_LISTENER_ADDED = frozenset(
         ("ClientTrafficPolicy", "edge-request-headers"),
     }
 )
+# THE ONE CHANGED FIELD, FROM PARENT 0.51.117 (gateway 0.16, gateway#185,
+# yaadgaar 294): `global.hostname` now also derives gateway's browser-Origin
+# allowlist. Reverted (no hostname) it renders empty, the closed posture; with
+# the hostname stated it renders the edge's own https origin. So stating the
+# hostname changes this one env value on `Deployment/gateway` and rolls it.
+# Found by its env NAME, never by position.
+STEP_7_ORIGINS = "YADGAR_ALLOWED_ORIGINS"
+STEP_7_ORIGINS_VALUES = ("", "https://gateway.yadgar.internal")
+
+
+def gateway_origins(rendered: list) -> tuple[str, str | None]:
+    """`Deployment/gateway`'s field path for `STEP_7_ORIGINS`, and its rendered value."""
+    for document in rendered:
+        if isinstance(document, dict) and (document.get("kind"), (document.get("metadata") or {}).get("name")) == (
+            "Deployment",
+            "gateway",
+        ):
+            env = document["spec"]["template"]["spec"]["containers"][0].get("env") or []
+            for position, entry in enumerate(env):
+                if entry.get("name") == STEP_7_ORIGINS:
+                    return f"spec.template.spec.containers[0].env[{position}].value", entry.get("value")
+    raise AssertionError(f"Deployment/gateway renders no {STEP_7_ORIGINS}")
 DELETED_EDGE_COPIES = """
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -1997,14 +2020,16 @@ def edge_differences(rendered: list) -> set[tuple[str, str, str]]:
 def test_step_7_adds_the_four_edge_objects_and_changes_nothing_else(
     working_tree: Path,
 ) -> None:
-    """K3, first half: the values move is exactly four added objects."""
+    """K3, first half: the values move is the added edge objects and gateway's hostname-derived Origin allowlist."""
     before = parent_render(working_tree, STEP_7_REVERTED)
     after = parent_render(working_tree, PREFLIGHT_OFF)
     changes = field_changes(before, after)
     print(f"[K3 step 7] {len(before)} -> {len(after)} object(s), {len(changes)} change(s)")
+    (field, old), (same_field, new) = gateway_origins(before), gateway_origins(after)
+    assert field == same_field and (old, new) == STEP_7_ORIGINS_VALUES, (field, same_field, old, new)
     assert changes == {
         (*o, "<object added or removed>") for o in STEP_7_OBJECTS | STEP_7_LISTENER_ADDED
-    }, sorted(changes)
+    } | {("Deployment", "gateway", field)}, sorted(changes)
 
 
 def test_the_four_edge_objects_equal_the_deleted_copies(working_tree: Path) -> None:
@@ -2027,9 +2052,13 @@ def test_the_hostname_without_the_enrolment_port_reddens(working_tree: Path) -> 
     """Red case: `global.hostname` alone moves iam's enrolment URL off `:18443`."""
     before = parent_render(working_tree, STEP_7_REVERTED)
     after = parent_render(working_tree, (*PREFLIGHT_OFF, "--set", "iam.enrolment.gateway="))
+    # The origin field is admitted only with its exact values, as in the step-7 test:
+    # a chart that rendered any other origin here would otherwise pass.
+    (field, old), (same_field, new) = gateway_origins(before), gateway_origins(after)
+    assert field == same_field and (old, new) == STEP_7_ORIGINS_VALUES, (field, same_field, old, new)
     unexpected = field_changes(before, after) - {
         (*o, "<object added or removed>") for o in STEP_7_OBJECTS | STEP_7_LISTENER_ADDED
-    }
+    } - {("Deployment", "gateway", field)}
     assert len(unexpected) == 1, unexpected
     ((kind, name, field),) = unexpected
     assert (kind, name) == ("Deployment", "iam") and ".env[" in field, unexpected
