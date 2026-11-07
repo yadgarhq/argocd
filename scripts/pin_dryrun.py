@@ -91,10 +91,14 @@ WHAT `run` DOES, in order. Every refusal comes before any cluster read.
      only when the object set is the same at both pins, every object keeps its
      hook status (`helm.sh/hook` neither added nor removed), and every changed
      path is exactly `spec.template.spec.containers[N].image` (anchored) of a
-     Deployment, StatefulSet or Job whose image repository does not move. An
+     Deployment, StatefulSet or Job whose image repository does not move, or
+     `spec.minReadySeconds` of an apps/v1 Deployment or StatefulSet that
+     `pin_bump.rollout_tuning` admits (`pin_bump.ROLLOUT_FIELDS`, Max ruled
+     2026-11-07, argocd#215: group bound, dotted-key aliases refused, value
+     0..2147483647). An
      initContainer image is red, as in `pin_bump.py`'s classifier.
   8. The live head diff: the fields where the head render differs from live,
-     steady objects only, held to the same image rule.
+     steady objects only, held to the same image and rollout-tuning rule.
   9. On a platform move only (car C10 part 2), the same over the five operator
      Applications, ALL OF THEM ONE JUDGMENT. Each is rendered from MAIN's file
      (the sha's differs only in `targetRevision`, step 1) at main's and at the
@@ -871,11 +875,14 @@ def image_repository(reference: str) -> str:
 def render_problems(base: dict[str, dict], head: dict[str, dict]) -> list[str]:
     """Step 7: base render against head render, every object, hooks included."""
     problems: list[str] = []
+    rollout_tuning = _load("pin_bump").rollout_tuning
     for key in sorted(base.keys() & head.keys()):
         old, new = base[key], head[key]
         if is_hook(old) != is_hook(new):
             problems.append(f"render diff: {key} hook status changed ({HOOK} {'added' if is_hook(new) else 'removed'} at head)")
         for path in render_paths(old, new):
+            if rollout_tuning(old, new, path):
+                continue
             # The key carries the kind, so `old` and `new` share it. This clause is
             # the only guard on a hook of a non-workload kind (hooks skip READS).
             if new.get("kind") not in WORKLOAD_KINDS or not IMAGE_PATH.fullmatch(path):
@@ -1262,7 +1269,8 @@ def dry_run(
         problems += [
             f"head diff outside the image rule: {key} {path}"
             for path in paths
-            if kind not in WORKLOAD_KINDS or not IMAGE_PATH.fullmatch(path)
+            if not _load("pin_bump").rollout_tuning(live[key], document, path)
+            and (kind not in WORKLOAD_KINDS or not IMAGE_PATH.fullmatch(path))
         ]
     compared = len(base_steady)
     selectors = {}

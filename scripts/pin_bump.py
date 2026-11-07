@@ -41,7 +41,10 @@ with a reason per failure:
   at both pins;
 - the object set is identical at both pins;
 - every changed object is a Deployment, StatefulSet or Job, and every changed
-  field is a `containers[*].image` (an initContainer's image is NEEDS-HUMAN);
+  field is a `containers[*].image` (an initContainer's image is NEEDS-HUMAN)
+  or `spec.minReadySeconds` of an apps/v1 Deployment or StatefulSet
+  (`ROLLOUT_FIELDS`, Max ruled 2026-11-07, argocd#215), unaliased by a dotted
+  literal key, as a whole number in 0..2147483647 or removed;
 - each changed image keeps its repository, and the repository is
   `ghcr.io/yadgarhq/<module>`;
 - `<module>`'s version moved in the parent's `chart/Chart.yaml`, and the new
@@ -168,6 +171,53 @@ DEFAULT_HELMS = ("/tmp/helm3184/linux-amd64/helm", "helm")  # noqa: S108  (a dev
 
 WORKLOAD_KINDS = frozenset({"Deployment", "StatefulSet", "Job"})
 IMAGE_FIELD = re.compile(r"^spec\.template\.spec\.containers\[\d+\]\.image$")
+# ROLLOUT TUNING (Max ruled 2026-11-07, argocd#215): `(apiVersion, kind,
+# exact path)` triples that may change beside the images.
+# - `minReadySeconds`: how long a new pod must stay Ready before it counts as
+#   available, so the rollout goes slower. apps/v1 Deployment and StatefulSet.
+# Left out, so NEEDS-HUMAN: `progressDeadlineSeconds` (it tunes the
+# Progressing condition that `settled_gate.py` Clause B reads as the settle
+# signal), `rollingUpdate.maxUnavailable` (an availability bound),
+# `rollingUpdate.maxSurge` (more pods of one workload at once, which matters to
+# a single-writer module), `terminationGracePeriodSeconds` (a pod's shutdown
+# window, not rollout pace), `replicas`, and every other field.
+# The group is bound, not the kind alone: a `kind: Deployment` of another
+# group is a different resource. `field_paths` dot-joins keys, so a literal
+# key such as "spec.minReadySeconds" would alias the field: `rollout_tuning`
+# refuses any such alias on either side.
+ROLLOUT_FIELDS = frozenset(
+    {
+        ("apps/v1", "Deployment", "spec.minReadySeconds"),
+        ("apps/v1", "StatefulSet", "spec.minReadySeconds"),
+    }
+)
+# The API server's int32 bound on `minReadySeconds`.
+ROLLOUT_MAX = 2**31 - 1
+
+
+def dotted_alias(document, parts: list[str]) -> bool:
+    """True when some literal key in `document` dot-joins to the same path as `parts` without being it."""
+    node = document
+    for i in range(len(parts)):
+        if not isinstance(node, dict):
+            return False
+        if i < len(parts) - 1 and ".".join(parts[i:]) in node:
+            return True
+        node = node.get(parts[i])
+    return False
+
+
+def rollout_tuning(old: dict, new: dict, path: str) -> bool:
+    """True when `path` is a ROLLOUT_FIELDS entry of both objects, no literal key aliases it, and the head value is
+    absent or a whole number in 0..ROLLOUT_MAX."""
+    if any((d.get("apiVersion"), d.get("kind"), path) not in ROLLOUT_FIELDS for d in (old, new)):
+        return False
+    parts = path.split(".")
+    if any(dotted_alias(d, parts) for d in (old, new)):
+        return False
+    spec = new.get("spec")
+    value = spec.get(parts[1]) if isinstance(spec, dict) else None
+    return value is None or (isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= ROLLOUT_MAX)
 
 # Names a module reads that the render may leave unset, measured by hand on
 # #107 (gateway 0.12.11): optional SNI overrides, a development-only opt-in and
@@ -421,6 +471,8 @@ def classify(renders: dict, old_modules: dict, new_modules: dict, digest_of) -> 
     for key in sorted(base.keys() & head.keys()):
         old, new = base[key], head[key]
         for path in field_paths(old, new):
+            if rollout_tuning(old, new, path):
+                continue
             if old.get("kind") not in WORKLOAD_KINDS or not IMAGE_FIELD.match(path):
                 reasons.append(f"{key}: field {path} changed; only a workload's container image may change")
                 continue
