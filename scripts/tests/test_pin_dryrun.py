@@ -23,8 +23,12 @@ WHAT IS ASSERTED, each with a red case:
      tracking-id naming `yadgar` and the object. Quantities are normalised at
      resource-quantity paths only. Lists compare by index and length.
   4. The head diff: only `containers[*].image` of a Deployment, StatefulSet or
-     Job; anything else is red, initContainers included. The object set is the
-     same at both pins.
+     Job, or `spec.minReadySeconds` of an apps/v1 Deployment or StatefulSet
+     (`pin_bump.ROLLOUT_FIELDS`, argocd#215); anything else is red,
+     initContainers, another group's `kind: Deployment`, a dotted-key alias,
+     `progressDeadlineSeconds`, `replicas`, `maxUnavailable` and
+     `terminationGracePeriodSeconds` included. The object
+     set is the same at both pins.
   5. The result holds object keys and field paths, never a value; every kubectl
      call is `get ... -o json` with the context; a kubectl failure is
      infrastructure (exit 3, nothing written).
@@ -760,6 +764,87 @@ def head_with(change) -> list:
 def judged(repo: Path, head: list) -> dict:
     sha = pin_branch(repo, table_docs=head)
     return run(repo, sha, render=Render({PIN: base_documents(), TARGET: head}))
+
+
+# Rollout tuning (Max ruled 2026-11-07, argocd#215): `pin_bump.ROLLOUT_FIELDS`
+# may change beside the image, in the render diff and in the live head diff.
+
+
+def test_min_ready_seconds_beside_the_image_is_green_in_both_diffs(repo: Path) -> None:
+    """The #215 shape: `spec.minReadySeconds` new at head, absent live."""
+    result = judged(repo, head_with(lambda d: by_kind_name(d, "Deployment", "gateway")["spec"].update(minReadySeconds=10)))
+    assert result["result"] == "green", result["problems"]
+    assert {"key": "apps/Deployment//gateway", "paths": ["spec.minReadySeconds", "spec.template.spec.containers[0].image"]} in result["objects"]
+
+
+def test_min_ready_seconds_on_a_stateful_set_is_green(repo: Path) -> None:
+    result = judged(repo, head_with(lambda d: by_kind_name(d, "StatefulSet", "nats")["spec"].update(minReadySeconds=10)))
+    assert result["result"] == "green", result["problems"]
+
+
+@pytest.mark.parametrize(
+    ("kind", "name", "field", "value"),
+    [
+        ("Job", "seeder", "minReadySeconds", 10),
+        ("StatefulSet", "nats", "progressDeadlineSeconds", 300),
+        ("Deployment", "gateway", "progressDeadlineSeconds", 300),
+        ("Deployment", "gateway", "minReadySeconds", "10"),
+        ("Deployment", "gateway", "minReadySeconds", -1),
+        ("Deployment", "gateway", "minReadySeconds", 2**31),
+        ("Deployment", "gateway", "replicas", 3),
+        ("Deployment", "gateway", "strategy", {"rollingUpdate": {"maxUnavailable": "50%"}}),
+    ],
+)
+def test_a_rollout_like_field_outside_the_ruled_set_is_red(repo: Path, kind: str, name: str, field: str, value) -> None:
+    result = judged(repo, head_with(lambda d: by_kind_name(d, kind, name)["spec"].update({field: value})))
+    assert result["result"] == "red"
+    assert any(f"/{kind}//{name}" in p and f"spec.{field}" in p for p in result["problems"]), result["problems"]
+
+
+def test_termination_grace_period_is_red(repo: Path) -> None:
+    def change(documents: list) -> None:
+        by_kind_name(documents, "Deployment", "gateway")["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] = 5
+
+    result = judged(repo, head_with(change))
+    assert result["result"] == "red"
+    assert any("spec.template.spec.terminationGracePeriodSeconds" in p for p in result["problems"]), result["problems"]
+
+
+def test_min_ready_seconds_on_a_hook_deployment_of_another_group_is_red(repo: Path) -> None:
+    """A `kind: Deployment` outside the apps group skips READS as a hook, so the render diff is its only guard."""
+    def spoof(seconds: int) -> dict:
+        return {
+            "apiVersion": "evil.io/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "spoof", "annotations": {"helm.sh/hook": "pre-upgrade"}},
+            "spec": {"minReadySeconds": seconds, "template": {"spec": {"containers": [{"name": "c", "image": "busybox:1.37"}]}}},
+        }
+
+    base = base_documents() + [spoof(5)]
+    head = head_documents() + [spoof(10)]
+    sha = pin_branch(repo, table_docs=head)
+    result = run(repo, sha, render=Render({PIN: base, TARGET: head}))
+    assert result["result"] == "red"
+    assert any("evil.io/Deployment//spoof" in p and "spec.minReadySeconds" in p for p in result["problems"]), result["problems"]
+
+
+@pytest.mark.parametrize("value", [{"anything": "at all"}, "a string"])
+def test_a_literal_dotted_key_aliasing_min_ready_seconds_is_red(repo: Path, value) -> None:
+    """`render_paths` and `differences` dot-join keys: a key named "spec.minReadySeconds" is not the field."""
+    result = judged(repo, head_with(lambda d: by_kind_name(d, "Deployment", "gateway").update({"spec.minReadySeconds": value})))
+    assert result["result"] == "red"
+    assert any("apps/Deployment//gateway" in p and "spec.minReadySeconds" in p for p in result["problems"]), result["problems"]
+
+
+def test_a_literal_dotted_key_removed_at_head_is_red(repo: Path) -> None:
+    """The alias on the base side only: the render diff sees its removal at the aliased path."""
+    base = base_documents()
+    by_kind_name(base, "Deployment", "gateway")["spec.minReadySeconds"] = "a string"
+    head = head_documents()
+    sha = pin_branch(repo, table_docs=head)
+    result = run(repo, sha, render=Render({PIN: base, TARGET: head}))
+    assert result["result"] == "red"
+    assert any("render diff" in p and "apps/Deployment//gateway spec.minReadySeconds" in p for p in result["problems"]), result["problems"]
 
 
 def test_a_field_removed_at_head_is_red(repo: Path) -> None:
