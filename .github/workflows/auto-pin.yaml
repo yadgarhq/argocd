@@ -18,7 +18,7 @@ name: auto-pin
 # highest `yadgarhq/chart` release whose OCI chart resolves, computed here. The
 # schedule is the backstop for a nudge that never arrives (a dispatch answers
 # 204 whether or not a workflow matched); GitHub throttles cron on this
-# repository to every few hours at worst, so 15 minutes is a ceiling, not a
+# repository to every few hours at worst, so 30 minutes is a ceiling, not a
 # promise. `workflow_dispatch` is the manual run, plus two inputs:
 #   regenerate     close that automatic PR and open a fresh one on current
 #                  main (C6 dispatches this for a spent sha or a moved base);
@@ -84,7 +84,7 @@ on:
   repository_dispatch:
     types: [chart-published]
   schedule:
-    - cron: "7,22,37,52 * * * *"
+    - cron: "7,37 * * * *"
   workflow_dispatch:
     inputs:
       regenerate:

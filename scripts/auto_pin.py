@@ -50,7 +50,7 @@ in this order, cheapest first:
      carries a `pin / e1` status by STATUS_LOGIN (the settled-dispatch App), on this same main,
      younger than BACKOFF_HOURS, is a recent attempt that failed after its push
      (E2 never usable, or the open refused): no PR until it ages out or main
-     moves. Without it the cron would re-dispatch the private runner every 15
+     moves. Without it the cron would re-dispatch the private runner every 30
      minutes for the same failure.
 
 `tidy` (release App token): the target's PR is in flight but an older automatic

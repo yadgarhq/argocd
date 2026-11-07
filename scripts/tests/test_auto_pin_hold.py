@@ -488,7 +488,7 @@ def test_hold_version_refuses_an_accept_verdict(tmp_path: Path, monkeypatch: pyt
 
 
 def test_a_version_whose_hold_a_human_closed_is_not_opened_again() -> None:
-    """Closing the hold is the clear: without this the cron would hold V again every 15 minutes."""
+    """Closing the hold is the clear: without this the cron would hold V again every 30 minutes."""
     decision = ap.decide(
         pin="0.34.8", main_sha=MAIN, holds=[], epoch=ap.EpochState(kind="green", reason="g"), prs=[], target="0.34.12",
         human_closed=frozenset(), regenerate=None, hold_cleared=frozenset({"0.34.12"}),
