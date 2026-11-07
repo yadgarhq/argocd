@@ -26,6 +26,13 @@ One constructed case per arm:
   NEEDS-HUMAN; a DaemonSet, an initContainer and a swap inside the registry are
   NEEDS-HUMAN; a platform move is left to the operator evidence (car C10,
   `test_pin_platform.py`);
+- E1 rollout tuning (Max ruled 2026-11-07, argocd#215): `spec.minReadySeconds`
+  of a Deployment or StatefulSet and `spec.progressDeadlineSeconds` of a
+  Deployment, as a whole number >= 0 or removed, ACCEPT beside or without an
+  image move; the same field on another kind, at another path or of another
+  type, and the neighbours (`replicas`, `maxUnavailable`, `maxSurge`,
+  `revisionHistoryLimit`, `terminationGracePeriodSeconds`, the
+  ServiceAccount, a securityContext, a new env var) stay NEEDS-HUMAN;
 - E3 fail-closed tripwires (re-review at aad2e9d): a new shared-crate env entry
   point, every unknown reader shape (use-as, bare use, module alias, dotenvy,
   vars scan, generic and boxed `Fn(&str)`, clap `env =`), a new key through a fn
@@ -372,6 +379,110 @@ def test_an_init_container_image_change_is_needs_human() -> None:
     verdict = classify(two_helms(gateway_init("0.12.10"), gateway_init("0.12.11")))
     assert not verdict.accept
     assert any("initContainers" in r for r in verdict.reasons), verdict.reasons
+
+
+# ── E1: rollout tuning (Max ruled 2026-11-07, argocd#215) ───────────────────
+
+
+def tuned(documents: list, index: int, path: tuple, value) -> list:
+    """`documents` with `value` set at `path` of document `index` (created on the way)."""
+    node = documents[index]
+    for part in path[:-1]:
+        node = node.setdefault(part, {})
+    node[path[-1]] = value
+    return documents
+
+
+def test_the_215_shape_min_ready_seconds_with_an_image_move_is_accept() -> None:
+    """argocd#215 (parent 0.50.1): a module's image moved and `spec.minReadySeconds` appeared beside it."""
+    head = tuned(render_at("0.12.11"), 0, ("spec", "minReadySeconds"), 10)
+    verdict = classify(two_helms(render_at("0.12.10"), head))
+    assert verdict.reasons == []
+    assert verdict.accept
+    assert [c["object"] for c in verdict.changed] == ["apps/Deployment//gateway"]
+
+
+def test_min_ready_seconds_alone_is_accept() -> None:
+    old = tuned(render_at("0.12.10"), 1, ("spec", "minReadySeconds"), 5)
+    new = tuned(render_at("0.12.10"), 1, ("spec", "minReadySeconds"), 30)
+    verdict = classify(two_helms(old, new), new_modules=OLD_MODULES)
+    assert verdict.reasons == []
+    assert verdict.accept
+    assert verdict.changed == []
+
+
+def test_min_ready_seconds_on_a_stateful_set_is_accept() -> None:
+    old = render_at("0.12.10")[:2] + [workload("StatefulSet", "store", "busybox:1.37")]
+    new = tuned(copy.deepcopy(old), 2, ("spec", "minReadySeconds"), 10)
+    verdict = classify(two_helms(old, new), new_modules=OLD_MODULES)
+    assert verdict.reasons == []
+    assert verdict.accept
+
+
+def test_progress_deadline_seconds_on_a_deployment_is_accept() -> None:
+    old = tuned(render_at("0.12.10"), 1, ("spec", "progressDeadlineSeconds"), 600)
+    new = tuned(render_at("0.12.10"), 1, ("spec", "progressDeadlineSeconds"), 300)
+    verdict = classify(two_helms(old, new), new_modules=OLD_MODULES)
+    assert verdict.reasons == []
+    assert verdict.accept
+
+
+def test_min_ready_seconds_removed_is_accept() -> None:
+    old = tuned(render_at("0.12.10"), 1, ("spec", "minReadySeconds"), 10)
+    verdict = classify(two_helms(old, render_at("0.12.10")), new_modules=OLD_MODULES)
+    assert verdict.reasons == []
+    assert verdict.accept
+
+
+@pytest.mark.parametrize(
+    ("kind", "path", "value"),
+    [
+        ("DaemonSet", ("spec", "minReadySeconds"), 10),
+        ("Job", ("spec", "minReadySeconds"), 10),
+        ("StatefulSet", ("spec", "progressDeadlineSeconds"), 300),
+        ("Deployment", ("spec", "template", "spec", "minReadySeconds"), 10),
+        ("Deployment", ("spec", "minReadySeconds"), "10"),
+        ("Deployment", ("spec", "minReadySeconds"), -1),
+        ("Deployment", ("spec", "minReadySeconds"), True),
+        ("Deployment", ("spec", "progressDeadlineSeconds"), "{{ .Values.x }}"),
+    ],
+)
+def test_a_rollout_field_outside_its_kind_place_or_type_is_needs_human(kind: str, path: tuple, value) -> None:
+    old = render_at("0.12.10")[:2] + [workload(kind, "other", "busybox:1.37")]
+    new = tuned(copy.deepcopy(old), 2, path, value)
+    verdict = classify(two_helms(old, new), new_modules=OLD_MODULES)
+    assert not verdict.accept
+    assert any(f"/{kind}//other" in r and ".".join(path) in r for r in verdict.reasons), verdict.reasons
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ("spec", "replicas"),
+        ("spec", "strategy", "rollingUpdate", "maxUnavailable"),
+        ("spec", "strategy", "rollingUpdate", "maxSurge"),
+        ("spec", "revisionHistoryLimit"),
+        ("spec", "template", "spec", "terminationGracePeriodSeconds"),
+        ("spec", "template", "spec", "serviceAccountName"),
+        ("spec", "template", "spec", "securityContext", "runAsUser"),
+    ],
+)
+def test_a_neighbouring_deployment_field_is_still_needs_human(path: tuple) -> None:
+    """Only the ruled rollout-tuning fields widen the gate; their neighbours stay NEEDS-HUMAN."""
+    old = tuned(render_at("0.12.10"), 1, path, 1)
+    new = tuned(render_at("0.12.10"), 1, path, 2)
+    verdict = classify(two_helms(old, new), new_modules=OLD_MODULES)
+    assert not verdict.accept
+    assert any("apps/Deployment//iam" in r and ".".join(path) in r for r in verdict.reasons), verdict.reasons
+
+
+def test_min_ready_seconds_beside_a_new_env_var_is_still_needs_human() -> None:
+    head = tuned(render_at("0.12.11"), 0, ("spec", "minReadySeconds"), 10)
+    head[0]["spec"]["template"]["spec"]["containers"][0]["env"].append({"name": "NEW_KEY", "value": "x"})
+    verdict = classify(two_helms(render_at("0.12.10"), head))
+    assert not verdict.accept
+    assert [r for r in verdict.reasons if "minReadySeconds" in r] == []
+    assert any("containers[0].env" in r for r in verdict.reasons), verdict.reasons
 
 
 # ── E3: the boot audit ──────────────────────────────────────────────────────

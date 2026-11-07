@@ -41,7 +41,10 @@ with a reason per failure:
   at both pins;
 - the object set is identical at both pins;
 - every changed object is a Deployment, StatefulSet or Job, and every changed
-  field is a `containers[*].image` (an initContainer's image is NEEDS-HUMAN);
+  field is a `containers[*].image` (an initContainer's image is NEEDS-HUMAN)
+  or a rollout-tuning field in `ROLLOUT_FIELDS` with a whole-number value
+  (`spec.minReadySeconds`, `spec.progressDeadlineSeconds`; Max ruled
+  2026-11-07, argocd#215);
 - each changed image keeps its repository, and the repository is
   `ghcr.io/yadgarhq/<module>`;
 - `<module>`'s version moved in the parent's `chart/Chart.yaml`, and the new
@@ -168,6 +171,33 @@ DEFAULT_HELMS = ("/tmp/helm3184/linux-amd64/helm", "helm")  # noqa: S108  (a dev
 
 WORKLOAD_KINDS = frozenset({"Deployment", "StatefulSet", "Job"})
 IMAGE_FIELD = re.compile(r"^spec\.template\.spec\.containers\[\d+\]\.image$")
+# ROLLOUT TUNING (Max ruled 2026-11-07, argocd#215): `(kind, exact path)` pairs
+# that may change beside the images. Each paces or reports a rollout and changes
+# no pod, no security setting and no availability bound:
+# - `minReadySeconds`: how long a new pod must stay Ready before it counts as
+#   available, so the rollout goes slower. Deployment and StatefulSet.
+# - `progressDeadlineSeconds`: when a stalled rollout reports
+#   Progressing=False. Status only. Deployment only (a StatefulSet has none).
+# Left out, so NEEDS-HUMAN: `rollingUpdate.maxUnavailable` (an availability
+# bound), `rollingUpdate.maxSurge` (more pods of one workload at once, which
+# matters to a single-writer module), `terminationGracePeriodSeconds` (a pod's
+# shutdown window, not rollout pace), `replicas`, and every other field.
+ROLLOUT_FIELDS = frozenset(
+    {
+        ("Deployment", "spec.minReadySeconds"),
+        ("StatefulSet", "spec.minReadySeconds"),
+        ("Deployment", "spec.progressDeadlineSeconds"),
+    }
+)
+
+
+def rollout_tuning(new: dict, path: str) -> bool:
+    """True when `path` of the head object `new` is a ROLLOUT_FIELDS entry whose value is absent or a whole number >= 0."""
+    if (new.get("kind"), path) not in ROLLOUT_FIELDS:
+        return False
+    spec = new.get("spec")
+    value = spec.get(path.removeprefix("spec.")) if isinstance(spec, dict) else None
+    return value is None or (isinstance(value, int) and not isinstance(value, bool) and value >= 0)
 
 # Names a module reads that the render may leave unset, measured by hand on
 # #107 (gateway 0.12.11): optional SNI overrides, a development-only opt-in and
@@ -421,6 +451,8 @@ def classify(renders: dict, old_modules: dict, new_modules: dict, digest_of) -> 
     for key in sorted(base.keys() & head.keys()):
         old, new = base[key], head[key]
         for path in field_paths(old, new):
+            if rollout_tuning(new, path):
+                continue
             if old.get("kind") not in WORKLOAD_KINDS or not IMAGE_FIELD.match(path):
                 reasons.append(f"{key}: field {path} changed; only a workload's container image may change")
                 continue

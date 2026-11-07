@@ -23,8 +23,10 @@ WHAT IS ASSERTED, each with a red case:
      tracking-id naming `yadgar` and the object. Quantities are normalised at
      resource-quantity paths only. Lists compare by index and length.
   4. The head diff: only `containers[*].image` of a Deployment, StatefulSet or
-     Job; anything else is red, initContainers included. The object set is the
-     same at both pins.
+     Job, or a `pin_bump.ROLLOUT_FIELDS` field of its kind with a whole-number
+     value (argocd#215); anything else is red, initContainers, `replicas`,
+     `maxUnavailable` and `terminationGracePeriodSeconds` included. The object
+     set is the same at both pins.
   5. The result holds object keys and field paths, never a value; every kubectl
      call is `get ... -o json` with the context; a kubectl failure is
      infrastructure (exit 3, nothing written).
@@ -760,6 +762,53 @@ def head_with(change) -> list:
 def judged(repo: Path, head: list) -> dict:
     sha = pin_branch(repo, table_docs=head)
     return run(repo, sha, render=Render({PIN: base_documents(), TARGET: head}))
+
+
+# Rollout tuning (Max ruled 2026-11-07, argocd#215): `pin_bump.ROLLOUT_FIELDS`
+# may change beside the image, in the render diff and in the live head diff.
+
+
+def test_min_ready_seconds_beside_the_image_is_green_in_both_diffs(repo: Path) -> None:
+    """The #215 shape: `spec.minReadySeconds` new at head, absent live."""
+    result = judged(repo, head_with(lambda d: by_kind_name(d, "Deployment", "gateway")["spec"].update(minReadySeconds=10)))
+    assert result["result"] == "green", result["problems"]
+    assert {"key": "apps/Deployment//gateway", "paths": ["spec.minReadySeconds", "spec.template.spec.containers[0].image"]} in result["objects"]
+
+
+def test_min_ready_seconds_on_a_stateful_set_is_green(repo: Path) -> None:
+    result = judged(repo, head_with(lambda d: by_kind_name(d, "StatefulSet", "nats")["spec"].update(minReadySeconds=10)))
+    assert result["result"] == "green", result["problems"]
+
+
+def test_progress_deadline_seconds_moved_from_live_is_green(repo: Path) -> None:
+    result = judged(repo, head_with(lambda d: by_kind_name(d, "Deployment", "gateway")["spec"].update(progressDeadlineSeconds=300)))
+    assert result["result"] == "green", result["problems"]
+
+
+@pytest.mark.parametrize(
+    ("kind", "name", "field", "value"),
+    [
+        ("Job", "seeder", "minReadySeconds", 10),
+        ("StatefulSet", "nats", "progressDeadlineSeconds", 300),
+        ("Deployment", "gateway", "minReadySeconds", "10"),
+        ("Deployment", "gateway", "minReadySeconds", -1),
+        ("Deployment", "gateway", "replicas", 3),
+        ("Deployment", "gateway", "strategy", {"rollingUpdate": {"maxUnavailable": "50%"}}),
+    ],
+)
+def test_a_rollout_like_field_outside_the_ruled_set_is_red(repo: Path, kind: str, name: str, field: str, value) -> None:
+    result = judged(repo, head_with(lambda d: by_kind_name(d, kind, name)["spec"].update({field: value})))
+    assert result["result"] == "red"
+    assert any(f"/{kind}//{name}" in p and f"spec.{field}" in p for p in result["problems"]), result["problems"]
+
+
+def test_termination_grace_period_is_red(repo: Path) -> None:
+    def change(documents: list) -> None:
+        by_kind_name(documents, "Deployment", "gateway")["spec"]["template"]["spec"]["terminationGracePeriodSeconds"] = 5
+
+    result = judged(repo, head_with(change))
+    assert result["result"] == "red"
+    assert any("spec.template.spec.terminationGracePeriodSeconds" in p for p in result["problems"]), result["problems"]
 
 
 def test_a_field_removed_at_head_is_red(repo: Path) -> None:
