@@ -479,7 +479,10 @@ spec:
         # yadgarhq organisation, read with `gh repo list yadgarhq` on 2026-10-18. The
         # one archived repository, `deploy` (retired, ADR-0828), is left out. A new
         # repository is a new line here. `scripts/gates/test_yadgar_application.py`
-        # (`DECLARED_REPOSITORIES`) holds this list.
+        # (`DECLARED_REPOSITORIES`) holds this list. Max's ruling of 2026-11-15
+        # (yaadgaar #699) adds the roots `quinyx`, `m-agahi`, `maxagahi` and
+        # `jamshidhq`, and the projects under them, so the yadgar ledger's tasks
+        # can migrate into yaadgaar; the gate holds them as `LEDGER_MIGRATION_*`.
         #
         # THE TWO ROOTS are namespace anchors (ADR-0673): resolvable through, never a
         # landing site. `estate` and `estate/smoke` are ledger 1244 option B: estate's
@@ -548,6 +551,26 @@ spec:
                   - team: administrators
                     level: readWrite
                   - team: estate-runners
+                    level: readWrite
+              - path: quinyx
+                sourceRepo: yadgarhq/argocd
+                grants:
+                  - team: administrators
+                    level: readWrite
+              - path: m-agahi
+                sourceRepo: yadgarhq/argocd
+                grants:
+                  - team: administrators
+                    level: readWrite
+              - path: maxagahi
+                sourceRepo: yadgarhq/argocd
+                grants:
+                  - team: administrators
+                    level: readWrite
+              - path: jamshidhq
+                sourceRepo: yadgarhq/argocd
+                grants:
+                  - team: administrators
                     level: readWrite
             projects:
               - path: yadgarhq/actions
@@ -619,6 +642,69 @@ spec:
               - path: estate/smoke
                 displayName: estate smoke
                 sourceRepo: yadgarhq/estate
+              # THE TASK-LEDGER MIGRATION'S PROJECTS (Max, 2026-11-15; yaadgaar #699).
+              # `quinyx/aws-work` and `maxagahi/scaleway` name no git repository: they
+              # re-home the ledger's `local/aws-work` and `local/scaleway`.
+              - path: quinyx/flux
+                displayName: flux
+                sourceRepo: quinyx/flux
+              - path: quinyx/infrastructure
+                displayName: infrastructure
+                sourceRepo: quinyx/infrastructure
+              - path: quinyx/application-gitops
+                displayName: application-gitops
+                sourceRepo: quinyx/application-gitops
+              - path: quinyx/daneel
+                displayName: daneel
+                sourceRepo: quinyx/daneel
+              - path: quinyx/argo-workflows
+                displayName: argo-workflows
+                sourceRepo: quinyx/argo-workflows
+              - path: quinyx/db-copy
+                displayName: db-copy
+                sourceRepo: quinyx/db-copy
+              - path: quinyx/infrastructure-services
+                displayName: infrastructure-services
+                sourceRepo: quinyx/infrastructure-services
+              - path: quinyx/tf-toolkit
+                displayName: tf-toolkit
+                sourceRepo: quinyx/tf-toolkit
+              - path: quinyx/terraform-modules
+                displayName: terraform-modules
+                sourceRepo: quinyx/terraform-modules
+              - path: quinyx/aws-work
+                displayName: aws-work
+                sourceRepo: quinyx/aws-work
+              - path: m-agahi/yadgar
+                displayName: yadgar
+                sourceRepo: m-agahi/yadgar
+              - path: m-agahi/ccpm
+                displayName: ccpm
+                sourceRepo: m-agahi/ccpm
+              - path: m-agahi/reachgraph
+                displayName: reachgraph
+                sourceRepo: m-agahi/reachgraph
+              - path: m-agahi/karyab
+                displayName: karyab
+                sourceRepo: m-agahi/karyab
+              - path: m-agahi/github-runners
+                displayName: github-runners
+                sourceRepo: m-agahi/github-runners
+              - path: maxagahi/nix
+                displayName: nix
+                sourceRepo: maxagahi/nix
+              - path: maxagahi/ledger
+                displayName: ledger
+                sourceRepo: maxagahi/ledger
+              - path: maxagahi/ccpm
+                displayName: ccpm
+                sourceRepo: maxagahi/ccpm
+              - path: maxagahi/scaleway
+                displayName: scaleway
+                sourceRepo: maxagahi/scaleway
+              - path: jamshidhq/jamshid
+                displayName: jamshid
+                sourceRepo: jamshidhq/jamshid
               # ABSENT ON PURPOSE: `estate/probe-archived` (team access stage 9 step 3;
               # ADR-0966). No repository: the pre-flip gate's leg (c) probe row, under
               # `estate/`, where `estate-runners` holds the probe user's grant.

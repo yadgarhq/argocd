@@ -1002,6 +1002,34 @@ DECLARED_REPOSITORIES = (
 # `estate`, because the store refuses a root that contains `/`.
 DECLARED_ROOTS = {"yadgarhq": "yadgarhq/argocd", "estate": "yadgarhq/estate"}
 DECLARED_EXTRA_PROJECTS = {"estate/smoke": "yadgarhq/estate"}
+# Max's ruling (2026-11-15, yaadgaar #699): roots outside yadgarhq, and the
+# projects under them, so the yadgar ledger's tasks can migrate into yaadgaar.
+# Each root's sourceRepo is yadgarhq/argocd, as for `yadgarhq`; each project's
+# sourceRepo is its own path. `quinyx/aws-work` and `maxagahi/scaleway` name no
+# git repository: they re-home the ledger's `local/aws-work` and `local/scaleway`.
+LEDGER_MIGRATION_ROOTS = {root: "yadgarhq/argocd" for root in ("quinyx", "m-agahi", "maxagahi", "jamshidhq")}
+LEDGER_MIGRATION_PROJECTS = (
+    "quinyx/flux",
+    "quinyx/infrastructure",
+    "quinyx/application-gitops",
+    "quinyx/daneel",
+    "quinyx/argo-workflows",
+    "quinyx/db-copy",
+    "quinyx/infrastructure-services",
+    "quinyx/tf-toolkit",
+    "quinyx/terraform-modules",
+    "quinyx/aws-work",
+    "m-agahi/yadgar",
+    "m-agahi/ccpm",
+    "m-agahi/reachgraph",
+    "m-agahi/karyab",
+    "m-agahi/github-runners",
+    "maxagahi/nix",
+    "maxagahi/ledger",
+    "maxagahi/ccpm",
+    "maxagahi/scaleway",
+    "jamshidhq/jamshid",
+)
 # ARCHIVED ON PURPOSE, AND THEREFORE NEVER DECLARED AGAIN (ledger 1624, Max's
 # ruling; team access stage 9 step 3). `estate/probe-archived` is no
 # repository: it is the pre-flip gate's leg (c) probe row. argocd#155 declared
@@ -1035,10 +1063,14 @@ def registry_failures(registry: object) -> dict[str, object]:
     if registry.get("allowMassArchive") is not False:
         failures["allowMassArchive"] = registry.get("allowMassArchive")
     roots = {r.get("path"): r.get("sourceRepo") for r in registry.get("roots") or []}
-    if roots != DECLARED_ROOTS:
+    if roots != DECLARED_ROOTS | LEDGER_MIGRATION_ROOTS:
         failures["roots"] = roots
     projects = {p.get("path"): p.get("sourceRepo") for p in registry.get("projects") or []}
-    expected = {f"yadgarhq/{name}": f"yadgarhq/{name}" for name in DECLARED_REPOSITORIES} | DECLARED_EXTRA_PROJECTS
+    expected = (
+        {f"yadgarhq/{name}": f"yadgarhq/{name}" for name in DECLARED_REPOSITORIES}
+        | DECLARED_EXTRA_PROJECTS
+        | {path: path for path in LEDGER_MIGRATION_PROJECTS}
+    )
     if projects != expected:
         failures["projects"] = {
             "missing": sorted(expected.keys() - projects.keys()),
@@ -1117,6 +1149,8 @@ TEAM_MEMBER_COUNTS = {"administrators": 3, "estate-runners": 3}
 TEAM_ROOT_GRANTS = {
     "yadgarhq": {("administrators", "readWrite")},
     "estate": {("administrators", "readWrite"), ("estate-runners", "readWrite")},
+    # The ledger-migration roots (yaadgaar #699) carry the `yadgarhq` root's grant exactly.
+    **{root: {("administrators", "readWrite")} for root in LEDGER_MIGRATION_ROOTS},
 }
 UUIDV7 = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 
