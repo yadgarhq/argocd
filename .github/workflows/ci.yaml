@@ -202,7 +202,7 @@ jobs:
       # THE SAME PIN THE PUBLISHING WORKFLOW USES. `yadgarhq/actions`'s
       # `estate-runner image` workflow signs with this action at this digest;
       # verifying with a different cosign major is a question nobody asked.
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       # NO REGISTRY CREDENTIAL, DELIBERATELY, and it matches how the pod pulls.
       # `applications/estate-front-runner.yaml` carries no `imagePullSecrets`
