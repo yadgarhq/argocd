@@ -1,5 +1,5 @@
 {
-  "chart_tag": "v0.51.117",
-  "chart_digest": "sha256:965482be9b2e26f49ead529386e3303ec132dd8262d62a2943aa6a8ac9a9f699",
+  "chart_tag": "v0.51.119",
+  "chart_digest": "sha256:a6b44d7235289981069d4cfe9ff656ecb461379c9bd294b67859896d73a8919c",
   "platform_version": "0.2.31"
 }
